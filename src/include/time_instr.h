@@ -59,6 +59,25 @@ void timing_start(int timer_id);
 void timing_end(int timer_id);
 
 /**
+ * @brief Pauses a running timer without incrementing its call count.
+ *
+ * This is intended for leaf timers that need to exclude nested wait/child work
+ * while keeping the outer logical call counted only once.
+ *
+ * @param timer_id The enum value of the timer to pause.
+ */
+void timing_pause(int timer_id);
+
+/**
+ * @brief Resumes a previously paused timer.
+ *
+ * This restarts timing for the same logical call after timing_pause().
+ *
+ * @param timer_id The enum value of the timer to resume.
+ */
+void timing_resume(int timer_id);
+
+/**
  * @brief Adds a value to a custom statistic for a specific timer.
  *
  * This function allows tracking additional metrics beyond just timing,
@@ -94,6 +113,66 @@ void logger_cleanup();
  * timers are cleared and reinitialized.
  */
 void logger_reset();
+
+/**
+ * @brief Start the top-level active execution wall timer for the current query cycle.
+ *
+ * This timer is the primary denominator for communication-stack percentages.
+ * It spans the logical query cycle on this backend and is paused around waits
+ * via logger_query_active_wall_pause_wait()/resume_wait().
+ */
+void logger_query_active_wall_start(void);
+
+/**
+ * @brief Stop the current query-cycle active execution wall timer.
+ *
+ * This finalizes QUERY_ACTIVE_WALL for the just-finished logical query cycle.
+ * If the timer is currently paused inside a wait, the helper closes the wait
+ * bucket first and then ends the active-wall timer.
+ */
+void logger_query_active_wall_stop(void);
+
+/**
+ * @brief Pause the current query-cycle active wall timer because the backend is waiting.
+ *
+ * Nested waits are tracked with a small depth counter so the top-level timer is
+ * only paused once until the outermost wait finishes. QUERY_WAIT_WALL is the
+ * matching optional/debug bucket that accumulates the excluded wait time.
+ */
+void logger_query_active_wall_pause_wait(void);
+
+/**
+ * @brief Resume the current query-cycle active wall timer after a wait ends.
+ *
+ * This is the counterpart to logger_query_active_wall_pause_wait().
+ */
+void logger_query_active_wall_resume_wait(void);
+
+/**
+ * @brief Return true if a logical query-cycle active wall timer is currently open.
+ */
+bool logger_query_active_wall_is_running(void);
+
+#ifndef FRONTEND
+/**
+ * @brief Register that this backend entered a logical query cycle for node-wide perf control.
+ *
+ * The perf FIFO controls a node-wide recorder, so backends coordinate through
+ * shared memory. The caller should issue the external "enable" command only
+ * when this helper returns true, which corresponds to the first active query
+ * cycle on the node.
+ */
+bool logger_perf_query_cycle_enter(void);
+
+/**
+ * @brief Register that this backend left a logical query cycle for node-wide perf control.
+ *
+ * The caller should issue the external "disable" command only when this helper
+ * returns true, which corresponds to the last active query cycle on the node
+ * finishing.
+ */
+bool logger_perf_query_cycle_exit(void);
+#endif
 
 /**
  * @brief Marks whether the logger is inside a distributed transaction.

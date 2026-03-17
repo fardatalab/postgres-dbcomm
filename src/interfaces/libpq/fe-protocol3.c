@@ -1752,6 +1752,13 @@ pqGetCopyData3(PGconn *conn, char **buffer, int async)
 {
 	int			msgLength;
 
+	/*
+	 * PQ_getCopyData is the buffered COPY-row extraction/copy leaf. Lower
+	 * PG_FE_WAIT and PG_FE_SOCK_READ account for any blocking or socket I/O
+	 * needed to make the row available.
+	 */
+	timing_start(PQ_getCopyData);
+
 	for (;;)
 	{
 		/*
@@ -1761,16 +1768,36 @@ pqGetCopyData3(PGconn *conn, char **buffer, int async)
 		 */
 		msgLength = getCopyDataMessage(conn);
 		if (msgLength < 0)
+		{
+			timing_end(PQ_getCopyData);
 			return msgLength;	/* end-of-copy or error */
+		}
 		if (msgLength == 0)
 		{
 			/* Don't block if async read requested */
 			if (async)
+			{
+				timing_end(PQ_getCopyData);
 				return 0;
+			}
 			/* Need to load more data */
-			if (pqWait(true, false, conn) ||
-				pqReadData(conn) < 0)
+			timing_pause(PQ_getCopyData);
+			msgLength = pqWait(true, false, conn);
+			timing_resume(PQ_getCopyData);
+			if (msgLength)
+			{
+				timing_end(PQ_getCopyData);
 				return -2;
+			}
+
+			timing_pause(PQ_getCopyData);
+			msgLength = pqReadData(conn);
+			timing_resume(PQ_getCopyData);
+			if (msgLength < 0)
+			{
+				timing_end(PQ_getCopyData);
+				return -2;
+			}
 			continue;
 		}
 
@@ -1785,6 +1812,7 @@ pqGetCopyData3(PGconn *conn, char **buffer, int async)
 			if (*buffer == NULL)
 			{
 				libpq_append_conn_error(conn, "out of memory");
+				timing_end(PQ_getCopyData);
 				return -2;
 			}
 			memcpy(*buffer, &conn->inBuffer[conn->inCursor], msgLength);
@@ -1793,6 +1821,7 @@ pqGetCopyData3(PGconn *conn, char **buffer, int async)
 			/* Mark message consumed */
 			conn->inStart = conn->inCursor + msgLength;
 
+			timing_end(PQ_getCopyData);
 			return msgLength;
 		}
 

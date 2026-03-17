@@ -6,8 +6,8 @@ Parse PostgreSQL/Citus logs and aggregate timing reports per *transaction*.
 aggregates timers within each logged transaction.
 
 - A "transaction log block" starts when we see a line containing "Query executed: BEGIN".
-- It ends when we see either:
-    - "Query executed: END" (coordinator), or
+- It ends when we see a transaction terminator such as:
+    - "Query executed: END" / "COMMIT" / "ROLLBACK" (coordinator), or
     - "Query executed: COMMIT PREPARED" (worker).
 - Timing report blocks are attributed to the correct transaction using the logged
     DistributedTransactionId line, which can appear immediately before a timing report block.
@@ -37,6 +37,15 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import DefaultDict, Dict, Iterable, List, Optional, Set, Tuple
 
+from timing_bucket_utils import (
+    QUERY_ACTIVE_WALL_QUALITY,
+    QUERY_EXEC_CORE_QUALITY,
+    XACT_LIFECYCLE_WALL_QUALITY,
+    build_bucket_values,
+    safe_pct,
+    summary_notes,
+)
+
 
 # Regex used to parse timer lines within a timing report table.
 # Example:
@@ -52,8 +61,10 @@ _SEPARATOR_RE = re.compile(r"^\s*-{10,}\s*$")
 
 # Transaction delimiters.
 _BEGIN_RE = re.compile(r"Query executed:\s*BEGIN\b")
+_COMMIT_RE = re.compile(r"Query executed:\s*COMMIT\b(?!\s+PREPARED)")
 _COMMIT_PREPARED_RE = re.compile(r"Query executed:\s*COMMIT\s+PREPARED\b")
 _END_RE = re.compile(r"Query executed:\s*END\b")
+_ROLLBACK_RE = re.compile(r"Query executed:\s*ROLLBACK\b")
 
 
 # Distributed transaction id marker.
@@ -317,10 +328,14 @@ def parse_transactions_from_log(filepath: str) -> List[TransactionAggregate]:
                     pending_close_for_pid.discard(last_pid_context)
                 continue
 
-            # Coordinator logs typically end a transaction with "Query executed: END;".
-            # Worker logs (prepared transactions) end with "Query executed: COMMIT PREPARED ...".
-            # We accept either marker as a transaction terminator.
-            if _COMMIT_PREPARED_RE.search(line) or _END_RE.search(line):
+            # Coordinator logs typically end a transaction with END/COMMIT/ROLLBACK.
+            # Worker prepared transactions end with COMMIT PREPARED.
+            if (
+                _COMMIT_PREPARED_RE.search(line)
+                or _COMMIT_RE.search(line)
+                or _END_RE.search(line)
+                or _ROLLBACK_RE.search(line)
+            ):
                 if last_pid_context is None:
                     print(
                         f"Warning (line {line_number}): Transaction end marker encountered without pid context; ignoring",
@@ -372,7 +387,7 @@ def parse_transactions_from_log(filepath: str) -> List[TransactionAggregate]:
                 for timer_name, total_ns in block_totals.items():
                     current_txn.timer_total_ns[timer_name] += total_ns
 
-                # If this pid was marked for closure by an END / COMMIT PREPARED marker, close it
+                # If this pid was marked for closure by a transaction-end marker, close it
                 # now that we have consumed a timing report block for the terminating statement.
                 if last_pid_context in pending_close_for_pid:
                     pending_close_for_pid.discard(last_pid_context)
@@ -415,12 +430,86 @@ def write_transactions_csv(transactions: List[TransactionAggregate], output_file
         writer.writerow(row)
 
 
+def write_transaction_bucket_csv(transactions: List[TransactionAggregate], output_file) -> None:
+    """Write one summary row per transaction with bucket totals and denominators."""
+
+    fieldnames = [
+        "transaction_index",
+        "transaction_key",
+        "query_active_wall_ns",
+        "query_wait_wall_ns",
+        "transport_protocol_cpu_ns",
+        "row_serde_cpu_ns",
+        "result_materialization_cpu_ns",
+        "file_comm_io_ns",
+        "optional_connection_setup_cpu_ns",
+        "communication_stack_core_total_ns",
+        "communication_stack_extended_total_ns",
+        "communication_stack_extended_with_optional_setup_total_ns",
+        "nonadditive_debug_total_ns",
+        "legacy_query_exec_core_ns",
+        "legacy_distributed_tx_lifecycle_wall_ns",
+        "core_pct_of_query_active_wall",
+        "extended_pct_of_query_active_wall",
+        "extended_with_optional_setup_pct_of_query_active_wall",
+        "query_exec_core_quality",
+        "query_active_wall_quality",
+        "xact_lifecycle_wall_quality",
+    ]
+
+    writer = csv.DictWriter(output_file, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+
+    for txn in transactions:
+        bucket_values = build_bucket_values(txn.timer_total_ns)
+        query_active_total_ns = bucket_values["query_active_wall_ns"]
+        query_exec_core_ns = bucket_values["query_exec_core_ns"]
+        xact_total_ns = bucket_values["distributed_tx_lifecycle_wall_ns"]
+
+        row: Dict[str, object] = {
+            "transaction_index": txn.index,
+            "transaction_key": txn.txn_key,
+            "query_active_wall_ns": query_active_total_ns,
+            "query_wait_wall_ns": bucket_values["query_wait_wall_ns"],
+            "transport_protocol_cpu_ns": bucket_values["transport_protocol_cpu_ns"],
+            "row_serde_cpu_ns": bucket_values["row_serde_cpu_ns"],
+            "result_materialization_cpu_ns": bucket_values["result_materialization_cpu_ns"],
+            "file_comm_io_ns": bucket_values["file_comm_io_ns"],
+            "optional_connection_setup_cpu_ns": bucket_values["optional_connection_setup_cpu_ns"],
+            "communication_stack_core_total_ns": bucket_values["communication_stack_core_total_ns"],
+            "communication_stack_extended_total_ns": bucket_values["communication_stack_extended_total_ns"],
+            "communication_stack_extended_with_optional_setup_total_ns": bucket_values[
+                "communication_stack_extended_with_optional_setup_total_ns"
+            ],
+            "nonadditive_debug_total_ns": bucket_values["nonadditive_debug_total_ns"],
+            "legacy_query_exec_core_ns": query_exec_core_ns,
+            "legacy_distributed_tx_lifecycle_wall_ns": xact_total_ns,
+            "core_pct_of_query_active_wall": safe_pct(
+                bucket_values["communication_stack_core_total_ns"], query_active_total_ns
+            ),
+            "extended_pct_of_query_active_wall": safe_pct(
+                bucket_values["communication_stack_extended_total_ns"], query_active_total_ns
+            ),
+            "extended_with_optional_setup_pct_of_query_active_wall": safe_pct(
+                bucket_values["communication_stack_extended_with_optional_setup_total_ns"],
+                query_active_total_ns,
+            ),
+            "query_exec_core_quality": QUERY_EXEC_CORE_QUALITY,
+            "query_active_wall_quality": QUERY_ACTIVE_WALL_QUALITY,
+            "xact_lifecycle_wall_quality": XACT_LIFECYCLE_WALL_QUALITY,
+        }
+        writer.writerow(row)
+
+
 def main() -> None:
     """CLI entrypoint."""
 
     parser = argparse.ArgumentParser(
         description=(
-            "Aggregate timing report blocks per transaction (BEGIN..END/COMMIT PREPARED) and output a wide CSV."
+            "Aggregate timing report blocks per transaction (BEGIN..END/COMMIT/"
+            "ROLLBACK/COMMIT PREPARED). Summary view emits additive communication "
+            "buckets plus the active-execution denominator and legacy/debug "
+            "context timers."
         )
     )
     parser.add_argument("log_file", help="Path to the log file to parse")
@@ -429,6 +518,15 @@ def main() -> None:
         "--output",
         help="Write CSV output to this file instead of stdout",
         default=None,
+    )
+    parser.add_argument(
+        "--view",
+        choices=("summary", "raw"),
+        default="summary",
+        help=(
+            "summary: per-transaction communication buckets and current denominator "
+            "context timers; raw: original wide per-timer CSV."
+        ),
     )
 
     args = parser.parse_args()
@@ -439,11 +537,21 @@ def main() -> None:
         print("No transactions found (no BEGIN transaction blocks).", file=sys.stderr)
         sys.exit(1)
 
+    if args.view == "summary":
+        for note in summary_notes():
+            print(f"Note: {note}", file=sys.stderr)
+
     if args.output:
         with open(args.output, "w", newline="", encoding="utf-8") as out_f:
-            write_transactions_csv(transactions, out_f)
+            if args.view == "summary":
+                write_transaction_bucket_csv(transactions, out_f)
+            else:
+                write_transactions_csv(transactions, out_f)
     else:
-        write_transactions_csv(transactions, sys.stdout)
+        if args.view == "summary":
+            write_transaction_bucket_csv(transactions, sys.stdout)
+        else:
+            write_transactions_csv(transactions, sys.stdout)
 
 
 if __name__ == "__main__":

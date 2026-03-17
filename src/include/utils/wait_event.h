@@ -28,6 +28,9 @@
 
 /* enums for wait events */
 #include "utils/wait_event_types.h"
+#ifndef FRONTEND
+#include "time_instr.h"
+#endif
 
 extern const char *pgstat_get_wait_event(uint32 wait_event_info);
 extern const char *pgstat_get_wait_event_type(uint32 wait_event_info);
@@ -84,6 +87,14 @@ extern char **GetWaitEventCustomNames(uint32 classId, int *nwaitevents);
 static inline void
 pgstat_report_wait_start(uint32 wait_event_info)
 {
+#ifndef FRONTEND
+	/*
+	 * QUERY_ACTIVE_WALL is the execution-only denominator, so pause it around
+	 * any wait event that PostgreSQL reports through the standard wait-event
+	 * backbone.
+	 */
+	logger_query_active_wall_pause_wait();
+#endif
 	/*
 	 * Since this is a four-byte field which is always read and written as
 	 * four-bytes, updates are atomic.
@@ -100,6 +111,9 @@ pgstat_report_wait_start(uint32 wait_event_info)
 static inline void
 pgstat_report_wait_end(void)
 {
+#ifndef FRONTEND
+	logger_query_active_wall_resume_wait();
+#endif
 	/* see pgstat_report_wait_start() */
 	*(volatile uint32 *) my_wait_event_info = 0;
 }

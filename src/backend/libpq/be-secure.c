@@ -214,6 +214,11 @@ retry:
 
 		Assert(waitfor);
 
+		/*
+		 * Treat PG_BE_SOCK_READ as the active recv/copy portion only; the
+		 * actual blocked sleep is accounted for separately in PG_WAIT.
+		 */
+		timing_pause(PG_BE_SOCK_READ);
 		timing_start(PG_WAIT);
 		if (measureDontCount)
 			timing_start(PG_WAIT_DONT_COUNT);
@@ -259,6 +264,7 @@ retry:
 			 * socket to become ready again.
 			 */
 		}
+		timing_resume(PG_BE_SOCK_READ);
 		goto retry;
 	}
 
@@ -352,6 +358,11 @@ retry:
 
 		Assert(waitfor);
 
+		/*
+		 * Treat PG_BE_SOCK_WRITE as the active send/copy portion only; the
+		 * actual blocked sleep is accounted for separately in PG_WAIT.
+		 */
+		timing_pause(PG_BE_SOCK_WRITE);
 		timing_start(PG_WAIT);
 		if (measureDontCount)
 			timing_start(PG_WAIT_DONT_COUNT);
@@ -381,6 +392,7 @@ retry:
 			 * for the socket to become ready again.
 			 */
 		}
+		timing_resume(PG_BE_SOCK_WRITE);
 		goto retry;
 	}
 

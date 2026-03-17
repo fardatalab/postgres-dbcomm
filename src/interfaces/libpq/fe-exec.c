@@ -1454,6 +1454,13 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 	if (entry == NULL)
 		return 0;				/* error msg already set */
 
+	/*
+	 * PQ_sendCommand is the staging/buffer-management leaf for libpq query
+	 * submission. Lower PG_FE_SOCK_WRITE accounts for any actual socket
+	 * flush work separately.
+	 */
+	timing_start(PQ_sendCommand);
+
 	/* Send the query message(s) */
 	/* construct the outgoing Query message */
 	if (pqPutMsgStart(PqMsg_Query, conn) < 0 ||
@@ -1461,8 +1468,7 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 		pqPutMsgEnd(conn) < 0)
 	{
 		/* error message should be set up already */
-		pqRecycleCmdQueueEntry(conn, entry);
-		return 0;
+		goto sendFailed;
 	}
 
 	/* remember we are using simple query protocol */
@@ -1474,16 +1480,23 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 	 * Give the data a push.  In nonblock mode, don't complain if we're unable
 	 * to send it all; PQgetResult() will do any additional flushing needed.
 	 */
+	timing_pause(PQ_sendCommand);
 	if (pqFlush(conn) < 0)
+	{
+		timing_resume(PQ_sendCommand);
 		goto sendFailed;
+	}
+	timing_resume(PQ_sendCommand);
 
 	/* OK, it's launched! */
 	pqAppendCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 
 	return 1;
 
 sendFailed:
 	pqRecycleCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 	/* error message should be set up already */
 	return 0;
 }
@@ -1568,6 +1581,12 @@ PQsendPrepare(PGconn *conn,
 	if (entry == NULL)
 		return 0;				/* error msg already set */
 
+	/*
+	 * Keep Parse/Sync message assembly separate from the lower flush/write
+	 * path so the resulting leaf remains additive with PG_FE_SOCK_WRITE.
+	 */
+	timing_start(PQ_sendCommand);
+
 	/* construct the Parse message */
 	if (pqPutMsgStart(PqMsg_Parse, conn) < 0 ||
 		pqPuts(stmtName, conn) < 0 ||
@@ -1614,16 +1633,23 @@ PQsendPrepare(PGconn *conn,
 	 * threshold).  In nonblock mode, don't complain if we're unable to send
 	 * it all; PQgetResult() will do any additional flushing needed.
 	 */
+	timing_pause(PQ_sendCommand);
 	if (pqPipelineFlush(conn) < 0)
+	{
+		timing_resume(PQ_sendCommand);
 		goto sendFailed;
+	}
+	timing_resume(PQ_sendCommand);
 
 	/* OK, it's launched! */
 	pqAppendCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 
 	return 1;
 
 sendFailed:
 	pqRecycleCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 	/* error message should be set up already */
 	return 0;
 }
@@ -1776,6 +1802,12 @@ PQsendQueryGuts(PGconn *conn,
 		return 0;				/* error msg already set */
 
 	/*
+	 * As with simple-query sends, keep extended-protocol message assembly in
+	 * PQ_sendCommand and let PG_FE_SOCK_WRITE account for any lower flush.
+	 */
+	timing_start(PQ_sendCommand);
+
+	/*
 	 * We will send Parse (if needed), Bind, Describe Portal, Execute, Sync
 	 * (if not in pipeline mode), using specified statement name and the
 	 * unnamed portal.
@@ -1908,16 +1940,23 @@ PQsendQueryGuts(PGconn *conn,
 	 * threshold).  In nonblock mode, don't complain if we're unable to send
 	 * it all; PQgetResult() will do any additional flushing needed.
 	 */
+	timing_pause(PQ_sendCommand);
 	if (pqPipelineFlush(conn) < 0)
+	{
+		timing_resume(PQ_sendCommand);
 		goto sendFailed;
+	}
+	timing_resume(PQ_sendCommand);
 
 	/* OK, it's launched! */
 	pqAppendCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 
 	return 1;
 
 sendFailed:
 	pqRecycleCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 	/* error message should be set up already */
 	return 0;
 }
@@ -2072,14 +2111,19 @@ PQgetResult(PGconn *conn)
 	if (!conn)
 		return NULL;
 
+	/*
+	 * PQ_getResult is the buffered-result/control leaf. Lower PG_FE_WAIT,
+	 * PG_FE_SOCK_READ/WRITE, and PG_parseInput account for the blocking,
+	 * socket I/O, and protocol parsing that happen underneath.
+	 */
+	timing_start(PQ_getResult);
+
 	/* Parse any available data, if our state permits. */
+	timing_pause(PQ_getResult);
+	parseInput(conn);
+	timing_resume(PQ_getResult);
 
-    // // jason: timing start for deserialization (timing done in parseInput directly)
-    // timing_start(ExecQueryAndProcessResults_parse_results);
-    parseInput(conn);
-    // timing_end(ExecQueryAndProcessResults_parse_results);
-
-    /* If not ready to return something, block until we are. */
+	/* If not ready to return something, block until we are. */
 	while (conn->asyncStatus == PGASYNC_BUSY)
 	{
 		int			flushResult;
@@ -2088,13 +2132,23 @@ PQgetResult(PGconn *conn)
 		 * If data remains unsent, send it.  Else we might be waiting for the
 		 * result of a command the backend hasn't even got yet.
 		 */
-		while ((flushResult = pqFlush(conn)) > 0)
+		timing_pause(PQ_getResult);
+		flushResult = pqFlush(conn);
+		timing_resume(PQ_getResult);
+		while (flushResult > 0)
 		{
+			timing_pause(PQ_getResult);
 			if (pqWait(false, true, conn))
 			{
+				timing_resume(PQ_getResult);
 				flushResult = -1;
 				break;
 			}
+			timing_resume(PQ_getResult);
+
+			timing_pause(PQ_getResult);
+			flushResult = pqFlush(conn);
+			timing_resume(PQ_getResult);
 		}
 
 		/*
@@ -2104,28 +2158,45 @@ PQgetResult(PGconn *conn)
 		 * EOF indication.  We expect therefore that this won't result in any
 		 * undue delay in reporting a previous write failure.)
 		 */
-        // // jason: time pqWait which will eventually block on poll/select, now calling it PG_FE_WAIT, timed within that func
-        // int pqWaitResult;
-        // int pqReadDataResult;
-
-        if (flushResult ||
-            (pqWait(true, false, conn)) ||
-            (pqReadData(conn) < 0))
-        {
-            /* Report the error saved by pqWait or pqReadData */
+		if (flushResult)
+		{
+			/* Report the error saved by pqWait or pqReadData */
 			pqSaveErrorResult(conn);
 			conn->asyncStatus = PGASYNC_IDLE;
+			timing_end(PQ_getResult);
 			return pqPrepareAsyncResult(conn);
-        }
+		}
 
-        /* Parse it. */
+		timing_pause(PQ_getResult);
+		flushResult = pqWait(true, false, conn);
+		timing_resume(PQ_getResult);
+		if (flushResult)
+		{
+			/* Report the error saved by pqWait or pqReadData */
+			pqSaveErrorResult(conn);
+			conn->asyncStatus = PGASYNC_IDLE;
+			timing_end(PQ_getResult);
+			return pqPrepareAsyncResult(conn);
+		}
 
-        // // jason: timing start for deserialization (timing done in parseInput directly)
-        // timing_start(ExecQueryAndProcessResults_parse_results);
-        parseInput(conn);
-        // timing_end(ExecQueryAndProcessResults_parse_results);
+		timing_pause(PQ_getResult);
+		flushResult = pqReadData(conn);
+		timing_resume(PQ_getResult);
+		if (flushResult < 0)
+		{
+			/* Report the error saved by pqWait or pqReadData */
+			pqSaveErrorResult(conn);
+			conn->asyncStatus = PGASYNC_IDLE;
+			timing_end(PQ_getResult);
+			return pqPrepareAsyncResult(conn);
+		}
 
-        /*
+		/* Parse it. */
+		timing_pause(PQ_getResult);
+		parseInput(conn);
+		timing_resume(PQ_getResult);
+
+		/*
 		 * If we had a write error, but nothing above obtained a query result
 		 * or detected a read error, report the write error.
 		 */
@@ -2133,6 +2204,7 @@ PQgetResult(PGconn *conn)
 		{
 			pqSaveWriteError(conn);
 			conn->asyncStatus = PGASYNC_IDLE;
+			timing_end(PQ_getResult);
 			return pqPrepareAsyncResult(conn);
 		}
 	}
@@ -2226,6 +2298,8 @@ PQgetResult(PGconn *conn)
 			res = pqPrepareAsyncResult(conn);
 			break;
 	}
+
+	timing_end(PQ_getResult);
 
 	/* Time to fire PGEVT_RESULTCREATE events, if there are any */
 	if (res && res->nEvents > 0)
@@ -2619,6 +2693,13 @@ PQsendTypedCommand(PGconn *conn, char command, char type, const char *target)
 	if (entry == NULL)
 		return 0;				/* error msg already set */
 
+	/*
+	 * Describe/Close command assembly belongs to the same staging bucket as
+	 * the other libpq command-send helpers. The lower flush/write path stays
+	 * in PG_FE_SOCK_WRITE.
+	 */
+	timing_start(PQ_sendCommand);
+
 	/* construct the Close message */
 	if (pqPutMsgStart(command, conn) < 0 ||
 		pqPutc(type, conn) < 0 ||
@@ -2654,16 +2735,23 @@ PQsendTypedCommand(PGconn *conn, char command, char type, const char *target)
 	 * threshold).  In nonblock mode, don't complain if we're unable to send
 	 * it all; PQgetResult() will do any additional flushing needed.
 	 */
+	timing_pause(PQ_sendCommand);
 	if (pqPipelineFlush(conn) < 0)
+	{
+		timing_resume(PQ_sendCommand);
 		goto sendFailed;
+	}
+	timing_resume(PQ_sendCommand);
 
 	/* OK, it's launched! */
 	pqAppendCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 
 	return 1;
 
 sendFailed:
 	pqRecycleCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 	/* error message should be set up already */
 	return 0;
 }
@@ -2722,6 +2810,11 @@ PQputCopyData(PGconn *conn, const char *buffer, int nbytes)
 	}
 
 	/*
+	 * PQ_putCopyData is the COPY message staging/copy leaf. parseInput() and
+	 * any lower flush/write work remain in PG_parseInput and PG_FE_SOCK_WRITE.
+	 */
+
+	/*
 	 * Process any NOTICE or NOTIFY messages that might be pending in the
 	 * input buffer.  Since the server might generate many notices during the
 	 * COPY, we want to clean those out reasonably promptly to prevent
@@ -2730,6 +2823,7 @@ PQputCopyData(PGconn *conn, const char *buffer, int nbytes)
 	 * it's not authorized to get rid of the data again.)
 	 */
 	parseInput(conn);
+	timing_start(PQ_putCopyData);
 
 	if (nbytes > 0)
 	{
@@ -2741,18 +2835,33 @@ PQputCopyData(PGconn *conn, const char *buffer, int nbytes)
 		 */
 		if ((conn->outBufSize - conn->outCount - 5) < nbytes)
 		{
-			if (pqFlush(conn) < 0)
+			int flushStatus;
+
+			timing_pause(PQ_putCopyData);
+			flushStatus = pqFlush(conn);
+			timing_resume(PQ_putCopyData);
+			if (flushStatus < 0)
+			{
+				timing_end(PQ_putCopyData);
 				return -1;
+			}
 			if (pqCheckOutBufferSpace(conn->outCount + 5 + (size_t) nbytes,
 									  conn))
+			{
+				timing_end(PQ_putCopyData);
 				return pqIsnonblocking(conn) ? 0 : -1;
+			}
 		}
 		/* Send the data (too simple to delegate to fe-protocol files) */
 		if (pqPutMsgStart(PqMsg_CopyData, conn) < 0 ||
 			pqPutnchar(buffer, nbytes, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
+		{
+			timing_end(PQ_putCopyData);
 			return -1;
+		}
 	}
+	timing_end(PQ_putCopyData);
 	return 1;
 }
 
@@ -2776,6 +2885,12 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 	}
 
 	/*
+	 * Keep COPY-end message assembly separate from the lower flush/write
+	 * transport leaf.
+	 */
+	timing_start(PQ_putCopyEnd);
+
+	/*
 	 * Send the COPY END indicator.  This is simple enough that we don't
 	 * bother delegating it to the fe-protocol files.
 	 */
@@ -2785,14 +2900,20 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 		if (pqPutMsgStart(PqMsg_CopyFail, conn) < 0 ||
 			pqPuts(errormsg, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
+		{
+			timing_end(PQ_putCopyEnd);
 			return -1;
+		}
 	}
 	else
 	{
 		/* Send COPY DONE */
 		if (pqPutMsgStart(PqMsg_CopyDone, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
+		{
+			timing_end(PQ_putCopyEnd);
 			return -1;
+		}
 	}
 
 	/*
@@ -2804,7 +2925,10 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 	{
 		if (pqPutMsgStart(PqMsg_Sync, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
+		{
+			timing_end(PQ_putCopyEnd);
 			return -1;
+		}
 	}
 
 	/* Return to active duty */
@@ -2814,9 +2938,16 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 		conn->asyncStatus = PGASYNC_BUSY;
 
 	/* Try to flush data */
+	timing_pause(PQ_putCopyEnd);
 	if (pqFlush(conn) < 0)
+	{
+		timing_resume(PQ_putCopyEnd);
+		timing_end(PQ_putCopyEnd);
 		return -1;
+	}
+	timing_resume(PQ_putCopyEnd);
 
+	timing_end(PQ_putCopyEnd);
 	return 1;
 }
 
@@ -3347,6 +3478,13 @@ pqPipelineSyncInternal(PGconn *conn, bool immediate_flush)
 	entry->queryclass = PGQUERY_SYNC;
 	entry->query = NULL;
 
+	/*
+	 * Pipeline sync is still a frontend protocol control message. Keep its
+	 * staging in PQ_sendCommand so callers can account for command assembly
+	 * separately from the lower socket-write work.
+	 */
+	timing_start(PQ_sendCommand);
+
 	/* construct the Sync message */
 	if (pqPutMsgStart(PqMsg_Sync, conn) < 0 ||
 		pqPutMsgEnd(conn) < 0)
@@ -3360,22 +3498,34 @@ pqPipelineSyncInternal(PGconn *conn, bool immediate_flush)
 	 */
 	if (immediate_flush)
 	{
+		timing_pause(PQ_sendCommand);
 		if (pqFlush(conn) < 0)
+		{
+			timing_resume(PQ_sendCommand);
 			goto sendFailed;
+		}
+		timing_resume(PQ_sendCommand);
 	}
 	else
 	{
+		timing_pause(PQ_sendCommand);
 		if (pqPipelineFlush(conn) < 0)
+		{
+			timing_resume(PQ_sendCommand);
 			goto sendFailed;
+		}
+		timing_resume(PQ_sendCommand);
 	}
 
 	/* OK, it's launched! */
 	pqAppendCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 
 	return 1;
 
 sendFailed:
 	pqRecycleCmdQueueEntry(conn, entry);
+	timing_end(PQ_sendCommand);
 	/* error message should be set up already */
 	return 0;
 }
@@ -3406,9 +3556,16 @@ PQsendFlushRequest(PGconn *conn)
 		return 0;
 	}
 
+	/*
+	 * Treat Flush as another protocol-control staging operation so it is
+	 * reported consistently with the rest of the libpq send helpers.
+	 */
+	timing_start(PQ_sendCommand);
+
 	if (pqPutMsgStart(PqMsg_Flush, conn) < 0 ||
 		pqPutMsgEnd(conn) < 0)
 	{
+		timing_end(PQ_sendCommand);
 		return 0;
 	}
 
@@ -3417,8 +3574,15 @@ PQsendFlushRequest(PGconn *conn)
 	 * threshold).  In nonblock mode, don't complain if we're unable to send
 	 * it all; PQgetResult() will do any additional flushing needed.
 	 */
+	timing_pause(PQ_sendCommand);
 	if (pqPipelineFlush(conn) < 0)
+	{
+		timing_resume(PQ_sendCommand);
+		timing_end(PQ_sendCommand);
 		return 0;
+	}
+	timing_resume(PQ_sendCommand);
+	timing_end(PQ_sendCommand);
 
 	return 1;
 }

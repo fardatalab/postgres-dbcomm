@@ -149,13 +149,26 @@ static char *stack_base_ptr = NULL;
 static bool xact_started = false;
 
 /*
- * Track whether this backend has successfully enabled the external perf capture.
- *
- * The control FIFO toggles node-wide perf recording, so we only keep this state
- * local to decide whether this backend should attempt the matching disable after
- * the corresponding ReadyForQuery() flush completes.
+ * Original backend-local perf flag. The FIFO controls a node-wide perf
+ * recorder, so local state alone was not sufficient once concurrent backends
+ * could overlap.
  */
-static bool PerfControlCaptureActive = false;
+/* static bool PerfControlCaptureActive = false; */
+
+/*
+ * Track whether this backend registered the current logical query cycle in the
+ * shared first-enable/last-disable perf refcount. This local flag prevents
+ * double-exit bugs on error or proc-exit cleanup paths.
+ */
+static bool PerfControlQueryCycleRegistered = false;
+
+/*
+ * Query timing is now printed only after the backend finishes the matching
+ * ReadyForQuery() flush. These flags preserve that decision across message
+ * processing and error recovery.
+ */
+static bool QueryTimingPrintPending = false;
+static bool QueryTimingSkipPrint = false;
 
 /*
  * Flag to indicate that we are doing the outer loop's read-from-client,
@@ -219,6 +232,9 @@ static bool PerfControlWriteCommand(const char *command, size_t commandLength,
 static void PerfControlEnableIfNeeded(void);
 static void PerfControlDisableIfNeeded(void);
 static void PerfControlOnProcExit(int code, Datum arg);
+static void BeginQueryTimingCycle(void);
+static void SetCurrentQueryTimingSkipPrint(bool skipPrint);
+static void FinishQueryTimingCycle(void);
 
 
 /* ----------------------------------------------------------------
@@ -596,47 +612,70 @@ PerfControlWriteCommand(const char *command, size_t commandLength, bool logFailu
 }
 
 /*
- * PerfControlEnableIfNeeded enables the external perf capture for a simple
- * query once the backend has already accepted the query message and is about to
- * execute it.
+ * PerfControlEnableIfNeeded registers the current logical query cycle with the
+ * shared node-wide perf refcount and issues the external FIFO enable only for
+ * the first active query on the node.
+ *
+ * This keeps the perf capture window aligned with QUERY_ACTIVE_WALL semantics
+ * rather than the older simple-query-only bracket.
  */
 static void
 PerfControlEnableIfNeeded(void)
 {
 	static const char PerfEnableCommand[] = "enable\n";
+	bool		shouldEnableNodePerf = false;
 
-	if (PerfControlCaptureActive)
+	if (PerfControlQueryCycleRegistered)
 	{
 		return;
 	}
 
-	if (PerfControlWriteCommand(PerfEnableCommand,
-								sizeof(PerfEnableCommand) - 1,
-								true))
+	PerfControlQueryCycleRegistered = true;
+	shouldEnableNodePerf = logger_perf_query_cycle_enter();
+
+	if (!shouldEnableNodePerf)
 	{
-		PerfControlCaptureActive = true;
+		return;
 	}
+
+	/*
+	 * Keep the shared registration even if the FIFO write fails. The intended
+	 * workflow starts perf record before running queries, and preserving the
+	 * refcount keeps the later last-disable transition correct under overlap.
+	 * A late-starting recorder will only be picked up after the node returns to
+	 * zero active query cycles and a new first-enable happens.
+	 */
+	(void) PerfControlWriteCommand(PerfEnableCommand,
+								   sizeof(PerfEnableCommand) - 1,
+								   true);
 }
 
 /*
- * PerfControlDisableIfNeeded disables the external perf capture after the
- * backend has finished the matching ReadyForQuery() flush.
+ * PerfControlDisableIfNeeded unregisters the current logical query cycle from
+ * the shared node-wide perf refcount and issues the external FIFO disable only
+ * when the last active query on the node finishes.
  *
- * We clear the local active flag even if the disable write fails so subsequent
- * simple queries can still attempt to re-enable perf if the external recorder
- * was restarted.
+ * We clear the backend-local registration flag even if the disable write fails
+ * so proc-exit cleanup does not underflow the shared refcount.
  */
 static void
 PerfControlDisableIfNeeded(void)
 {
 	static const char PerfDisableCommand[] = "disable\n";
+	bool		shouldDisableNodePerf = false;
 
-	if (!PerfControlCaptureActive)
+	if (!PerfControlQueryCycleRegistered)
 	{
 		return;
 	}
 
-	PerfControlCaptureActive = false;
+	PerfControlQueryCycleRegistered = false;
+	shouldDisableNodePerf = logger_perf_query_cycle_exit();
+
+	if (!shouldDisableNodePerf)
+	{
+		return;
+	}
 
 	(void) PerfControlWriteCommand(PerfDisableCommand,
 								   sizeof(PerfDisableCommand) - 1,
@@ -645,8 +684,8 @@ PerfControlDisableIfNeeded(void)
 
 /*
  * PerfControlOnProcExit is a last-resort cleanup hook to stop perf capture if
- * this backend exits while still believing it enabled the FIFO-controlled
- * recorder.
+ * this backend exits while still registered in the FIFO-controlled node-wide
+ * perf refcount.
  */
 static void
 PerfControlOnProcExit(int code, Datum arg)
@@ -656,12 +695,20 @@ PerfControlOnProcExit(int code, Datum arg)
 
 	static const char PerfDisableCommand[] = "disable\n";
 
-	if (!PerfControlCaptureActive)
+	bool		shouldDisableNodePerf = false;
+
+	if (!PerfControlQueryCycleRegistered)
 	{
 		return;
 	}
 
-	PerfControlCaptureActive = false;
+	PerfControlQueryCycleRegistered = false;
+	shouldDisableNodePerf = logger_perf_query_cycle_exit();
+
+	if (!shouldDisableNodePerf)
+	{
+		return;
+	}
 
 	/*
 	 * Avoid extra logging during backend exit paths. The main query lifecycle
@@ -670,6 +717,70 @@ PerfControlOnProcExit(int code, Datum arg)
 	(void) PerfControlWriteCommand(PerfDisableCommand,
 								   sizeof(PerfDisableCommand) - 1,
 								   false);
+}
+
+/*
+ * BeginQueryTimingCycle opens the QUERY_ACTIVE_WALL denominator for the current
+ * logical query cycle. For extended protocol, the same cycle can span multiple
+ * frontend messages until the later Sync/ReadyForQuery handoff.
+ */
+static void
+BeginQueryTimingCycle(void)
+{
+	if (logger_query_active_wall_is_running())
+	{
+		return;
+	}
+
+	logger_query_active_wall_start();
+	PerfControlEnableIfNeeded();
+	QueryTimingPrintPending = true;
+	QueryTimingSkipPrint = false;
+}
+
+/*
+ * SetCurrentQueryTimingSkipPrint lets specific internal probe queries suppress
+ * report emission at the eventual ReadyForQuery() boundary while still keeping
+ * the timing state coherent.
+ */
+static void
+SetCurrentQueryTimingSkipPrint(bool skipPrint)
+{
+	if (!QueryTimingPrintPending)
+	{
+		return;
+	}
+
+	QueryTimingSkipPrint = skipPrint;
+}
+
+/*
+ * FinishQueryTimingCycle closes QUERY_ACTIVE_WALL after the final
+ * ReadyForQuery() flush and then either prints or resets the per-query timing
+ * block.
+ */
+static void
+FinishQueryTimingCycle(void)
+{
+	if (!QueryTimingPrintPending)
+	{
+		return;
+	}
+
+	logger_query_active_wall_stop();
+	PerfControlDisableIfNeeded();
+
+	if (QueryTimingSkipPrint)
+	{
+		logger_reset();
+	}
+	else
+	{
+		logger_print_timings();
+	}
+
+	QueryTimingPrintPending = false;
+	QueryTimingSkipPrint = false;
 }
 
 /*
@@ -4860,22 +4971,26 @@ PostgresMain(const char *dbname, const char *username)
 			/* Report any recently-changed GUC options */
 			ReportChangedGUCOptions();
 
-			pg_wait_dont_count_active = true;
-			PG_TRY();
-			{
-				ReadyForQuery(whereToSendOutput);
-			}
-			PG_FINALLY();
-			{
-				pg_wait_dont_count_active = false;
-			}
-			PG_END_TRY();
+			/*
+			 * Legacy PG_WAIT_DONT_COUNT timing used to toggle here. The new
+			 * QUERY_ACTIVE_WALL denominator instead pauses centrally around all
+			 * wait events and closes only after this final flush returns.
+			 */
+			ReadyForQuery(whereToSendOutput);
 
 			/*
-			 * Keep perf enabled until after ReadyForQuery() flushes the final
-			 * client-visible output for the simple query.
+			 * Original code disabled perf directly here. FinishQueryTimingCycle()
+			 * now owns that transition so the perf window follows the same
+			 * logical query-cycle boundary as QUERY_ACTIVE_WALL.
 			 */
-			PerfControlDisableIfNeeded();
+			/* PerfControlDisableIfNeeded(); */
+
+			/*
+			 * Emit the logical query-cycle report only after the matching
+			 * ReadyForQuery() flush completes. This aligns the printed timing
+			 * block with the real client-visible end of the query.
+			 */
+			FinishQueryTimingCycle();
 
 			send_ready_for_query = false;
 		}
@@ -4891,16 +5006,12 @@ PostgresMain(const char *dbname, const char *username)
 		/*
 		 * (3) read a command (loop blocks here)
 		 */
-			pg_wait_dont_count_active = true;
-			PG_TRY();
-			{
-				firstchar = ReadCommand(&input_message);
-			}
-			PG_FINALLY();
-			{
-				pg_wait_dont_count_active = false;
-			}
-			PG_END_TRY();
+			/*
+			 * Legacy PG_WAIT_DONT_COUNT used to mark this outer idle read.
+			 * QUERY_ACTIVE_WALL now simply stays inactive until a logical query
+			 * cycle begins, which naturally excludes this client-idle wait.
+			 */
+			firstchar = ReadCommand(&input_message);
 
         /*
          * (4) turn off the idle-in-transaction and idle-session timeouts if
@@ -4950,7 +5061,7 @@ PostgresMain(const char *dbname, const char *username)
 		if (ignore_till_sync && firstchar != EOF)
 			continue;
 
-        // don't print certain Citus internal queries
+        /* Some internal probe queries should reset timing without printing. */
         bool skip_query_str_print = false;
 
         switch (firstchar)
@@ -4961,6 +5072,8 @@ PostgresMain(const char *dbname, const char *username)
 
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
+
+					BeginQueryTimingCycle();
 
 					query_string = pq_getmsgstring(&input_message);
 					pq_getmsgend(&input_message);
@@ -4981,9 +5094,14 @@ PostgresMain(const char *dbname, const char *username)
 							else
 								skip_query_str_print = false;
 						}
+						SetCurrentQueryTimingSkipPrint(skip_query_str_print);
 
-						/* perf capture starts at backend execution, not at client read. */
-						PerfControlEnableIfNeeded();
+						/*
+						 * Original code enabled perf only for simple protocol
+						 * here. BeginQueryTimingCycle() now owns that transition
+						 * so extended-protocol query cycles are covered too.
+						 */
+						/* PerfControlEnableIfNeeded(); */
 
 						// jason: timing the execution of a query (coordinator side should be full query time)
 						timing_start(ExecSimpleQuery);
@@ -5018,6 +5136,8 @@ PostgresMain(const char *dbname, const char *username)
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
 
+					BeginQueryTimingCycle();
+
 					stmt_name = pq_getmsgstring(&input_message);
 					query_string = pq_getmsgstring(&input_message);
 					numParams = pq_getmsgint(&input_message, 2);
@@ -5046,6 +5166,8 @@ PostgresMain(const char *dbname, const char *username)
 				/* Set statement_timestamp() */
 				SetCurrentStatementStartTimestamp();
 
+				BeginQueryTimingCycle();
+
 				/*
 				 * this message is complex enough that it seems best to put
 				 * the field extraction out-of-line
@@ -5064,6 +5186,8 @@ PostgresMain(const char *dbname, const char *username)
 
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
+
+					BeginQueryTimingCycle();
 
 					portal_name = pq_getmsgstring(&input_message);
 					max_rows = pq_getmsgint(&input_message, 4);
@@ -5087,6 +5211,8 @@ PostgresMain(const char *dbname, const char *username)
 
 				/* Set statement_timestamp() */
 				SetCurrentStatementStartTimestamp();
+
+				BeginQueryTimingCycle();
 
 				/* Report query to various monitoring facilities. */
 				pgstat_report_activity(STATE_FASTPATH, NULL);
@@ -5175,6 +5301,8 @@ PostgresMain(const char *dbname, const char *username)
 					/* Set statement_timestamp() (needed for xact) */
 					SetCurrentStatementStartTimestamp();
 
+					BeginQueryTimingCycle();
+
 					describe_type = pq_getmsgbyte(&input_message);
 					describe_target = pq_getmsgstring(&input_message);
 					pq_getmsgend(&input_message);
@@ -5259,18 +5387,12 @@ PostgresMain(const char *dbname, const char *username)
 						 errmsg("invalid frontend message type %d",
 								firstchar)));
 		}
-        // jason: print logger timings here (should be the end of executing a query/command)
-        if (skip_query_str_print)
-        {
-            /* For specific internal queries, reset logger instead of printing */
-            ////jason: well maybe don't reset, this would mess up some timings for citus dist transactions
-            logger_reset();
-        }
-        else
-        {
-            logger_print_timings();
-        }
-    } /* end of input-reading loop */
+		/*
+		 * Original code printed/reset here, which made each block end before
+		 * the later ReadyForQuery() flush. Query timing now stays open until
+		 * FinishQueryTimingCycle() runs at the shared ReadyForQuery boundary.
+		 */
+	} /* end of input-reading loop */
 }
 
 /*

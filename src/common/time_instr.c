@@ -28,6 +28,8 @@ typedef struct
     uint64_t total_ns;
     uint64_t count;
     struct timespec start_time;
+	bool active;
+	bool paused;
     uint64_t custom_stats[_NUM_CUSTOM_STATS]; // Array of custom statistics indexed by stat_key
 } timer_stat_t;
 
@@ -53,7 +55,15 @@ static struct
     bool in_distributed_xact;
     char *identity;
     bool identity_persist;
-} logger_state = {0, NULL, false, NULL, false};
+    /*
+     * QUERY_ACTIVE_WALL spans one logical query cycle on the backend. It can
+     * be paused by nested waits, so keep explicit state instead of inferring
+     * it from the low-level timer fields.
+     */
+    bool query_active_wall_running;
+    int query_active_wait_depth;
+    bool query_wait_wall_running;
+} logger_state = {0, NULL, false, NULL, false, false, 0, false};
 
 /**
  * @brief Returns true if a timing spot should persist across a distributed transaction.
@@ -84,6 +94,12 @@ IsTransactionalTimingSpot(int timer_id)
 typedef struct LoggerSharedState
 {
     LWLock lock;
+    /*
+     * Node-wide count of logical query cycles that currently want FIFO-based
+     * perf capture. The first entrant enables perf and the last leaver
+     * disables it.
+     */
+    uint32 perf_active_query_cycles;
 } LoggerSharedState;
 
 static LoggerSharedState *logger_shared = NULL;
@@ -99,6 +115,7 @@ void LoggerShmemInit(void)
     if (!found)
     {
         LWLockInitialize(&logger_shared->lock, LWTRANCHE_LOGGER);
+        logger_shared->perf_active_query_cycles = 0;
     }
 }
 #else
@@ -183,6 +200,19 @@ logger_set_identity_persist(bool persist)
     logger_state.identity_persist = persist;
 }
 
+/*
+ * Reset the active-wall/query-wait bookkeeping without touching the timer
+ * arrays themselves. Callers use this whenever a logical query cycle is
+ * finalized or when logger_reset() discards non-transactional state.
+ */
+static void
+ResetQueryActiveWallState(void)
+{
+    logger_state.query_active_wall_running = false;
+    logger_state.query_active_wait_depth = 0;
+    logger_state.query_wait_wall_running = false;
+}
+
 /**
  * @brief Adds a value to a custom statistic for a specific timer.
  *
@@ -209,12 +239,18 @@ void timing_start(int timer_id)
     if (timer_id < 0 || timer_id >= logger_state.num_timers)
         return;
     clock_gettime(CLOCK_MONOTONIC_RAW, &logger_state.stats[timer_id].start_time);
+	logger_state.stats[timer_id].active = true;
+	logger_state.stats[timer_id].paused = false;
 }
 
-void timing_end(int timer_id)
+static void
+timing_accumulate(int timer_id, bool increment_count)
 {
     if (timer_id < 0 || timer_id >= logger_state.num_timers)
         return;
+
+	if (!logger_state.stats[timer_id].active)
+		return;
 
     struct timespec end_time;
     clock_gettime(CLOCK_MONOTONIC_RAW, &end_time);
@@ -226,8 +262,183 @@ void timing_end(int timer_id)
     uint64_t elapsed_ns = end_ns - start_ns;
 
     logger_state.stats[timer_id].total_ns += elapsed_ns;
-    logger_state.stats[timer_id].count++;
+	if (increment_count)
+		logger_state.stats[timer_id].count++;
+	logger_state.stats[timer_id].active = false;
+	logger_state.stats[timer_id].paused = !increment_count;
 }
+
+void timing_end(int timer_id)
+{
+	timing_accumulate(timer_id, true);
+}
+
+void timing_pause(int timer_id)
+{
+	timing_accumulate(timer_id, false);
+}
+
+void timing_resume(int timer_id)
+{
+	if (timer_id < 0 || timer_id >= logger_state.num_timers)
+		return;
+
+	if (!logger_state.stats[timer_id].paused)
+		return;
+
+	timing_start(timer_id);
+}
+
+void
+logger_query_active_wall_start(void)
+{
+    if (logger_state.stats == NULL)
+        return;
+
+    if (logger_state.query_active_wall_running)
+        return;
+
+    ResetQueryActiveWallState();
+    timing_start(QUERY_ACTIVE_WALL);
+    logger_state.query_active_wall_running = true;
+}
+
+void
+logger_query_active_wall_stop(void)
+{
+    if (!logger_state.query_active_wall_running)
+        return;
+
+    /*
+     * End any in-flight excluded wait first. Resume QUERY_ACTIVE_WALL before
+     * ending it so timing_end() can increment the logical query-cycle count.
+     */
+    if (logger_state.query_wait_wall_running)
+    {
+        timing_end(QUERY_WAIT_WALL);
+        logger_state.query_wait_wall_running = false;
+    }
+
+    if (logger_state.query_active_wait_depth > 0)
+    {
+        logger_state.query_active_wait_depth = 0;
+        timing_resume(QUERY_ACTIVE_WALL);
+    }
+
+    timing_end(QUERY_ACTIVE_WALL);
+    ResetQueryActiveWallState();
+}
+
+void
+logger_query_active_wall_pause_wait(void)
+{
+    if (!logger_state.query_active_wall_running)
+        return;
+
+    if (logger_state.query_active_wait_depth == 0)
+    {
+        timing_pause(QUERY_ACTIVE_WALL);
+        timing_start(QUERY_WAIT_WALL);
+        logger_state.query_wait_wall_running = true;
+    }
+
+    logger_state.query_active_wait_depth++;
+}
+
+void
+logger_query_active_wall_resume_wait(void)
+{
+    if (!logger_state.query_active_wall_running)
+        return;
+
+    if (logger_state.query_active_wait_depth <= 0)
+        return;
+
+    logger_state.query_active_wait_depth--;
+    if (logger_state.query_active_wait_depth > 0)
+        return;
+
+    if (logger_state.query_wait_wall_running)
+    {
+        timing_end(QUERY_WAIT_WALL);
+        logger_state.query_wait_wall_running = false;
+    }
+
+    timing_resume(QUERY_ACTIVE_WALL);
+}
+
+bool
+logger_query_active_wall_is_running(void)
+{
+    return logger_state.query_active_wall_running;
+}
+
+#ifndef FRONTEND
+/**
+ * @brief Enter the node-wide perf-controlled logical query-cycle set.
+ *
+ * Returns true only for the 0->1 transition, so the caller can issue the
+ * external FIFO "enable" command exactly once for the first active query on
+ * the node.
+ */
+bool
+logger_perf_query_cycle_enter(void)
+{
+    bool should_enable = true;
+
+    /*
+     * Standalone/frontend code paths do not install the shared logger state.
+     * Fall back to the original per-backend behavior there.
+     */
+    if (logger_shared == NULL)
+        return true;
+
+    LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE);
+    should_enable = (logger_shared->perf_active_query_cycles == 0);
+    logger_shared->perf_active_query_cycles++;
+    LWLockRelease(&logger_shared->lock);
+
+    return should_enable;
+}
+
+/**
+ * @brief Leave the node-wide perf-controlled logical query-cycle set.
+ *
+ * Returns true only for the 1->0 transition, so the caller can issue the
+ * external FIFO "disable" command exactly once when the last active query on
+ * the node finishes.
+ */
+bool
+logger_perf_query_cycle_exit(void)
+{
+    bool should_disable = true;
+
+    if (logger_shared == NULL)
+        return true;
+
+    LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE);
+
+    if (logger_shared->perf_active_query_cycles == 0)
+    {
+        /*
+         * This should never happen; keep running and avoid underflowing the
+         * shared count so a bad backend does not permanently wedge perf
+         * capture for the whole node.
+         */
+        log_message("perf query-cycle refcount underflow while leaving query cycle");
+        should_disable = false;
+    }
+    else
+    {
+        logger_shared->perf_active_query_cycles--;
+        should_disable = (logger_shared->perf_active_query_cycles == 0);
+    }
+
+    LWLockRelease(&logger_shared->lock);
+
+    return should_disable;
+}
+#endif
 
 /*
  * Legacy logger_print_timings implementation retained for reference. It
@@ -534,8 +745,12 @@ void logger_reset()
             stat->total_ns = 0;
             stat->count = 0;
             memset(&stat->start_time, 0, sizeof(stat->start_time));
+			stat->active = false;
+			stat->paused = false;
             memset(stat->custom_stats, 0, sizeof(stat->custom_stats));
         }
+
+        ResetQueryActiveWallState();
         return;
     }
 
@@ -579,6 +794,8 @@ void logger_reset()
             stat->total_ns = 0;
             stat->count = 0;
             memset(&stat->start_time, 0, sizeof(stat->start_time));
+			stat->active = false;
+			stat->paused = false;
             memset(stat->custom_stats, 0, sizeof(stat->custom_stats));
         }
         return;
@@ -596,6 +813,7 @@ void logger_reset()
         logger_state.identity = NULL;
     }
 
+    ResetQueryActiveWallState();
     logger_init(_NUM_TIMING_SPOTS, timing_spot_names);
 }
 

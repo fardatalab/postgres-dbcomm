@@ -6,10 +6,13 @@ Parses timing report blocks from log files and aggregates statistics
 for each unique timer name, including counts, total time, and custom stats.
 """
 
+import argparse
 import re
 import sys
 from collections import defaultdict
 from typing import Any, Dict, List
+
+from timing_bucket_utils import build_bucket_rows, summary_notes
 
 
 def parse_custom_stats(stats_str: str) -> Dict[str, float]:
@@ -162,13 +165,58 @@ def format_output_csv(stats: Dict[str, Dict[str, Any]]) -> str:
     return '\n'.join(lines)
 
 
+def format_summary_csv(stats: Dict[str, Dict[str, Any]]) -> str:
+    """Format derived bucket totals as CSV.
+
+    The emitted summary includes the primary active-execution denominator plus
+    additive communication buckets and clearly-marked optional/debug buckets.
+    """
+
+    timer_totals = {
+        timer_name: int(timer_data["total_time"])
+        for timer_name, timer_data in stats.items()
+    }
+    rows = build_bucket_rows(timer_totals)
+
+    header = (
+        "bucket_name,classification,total_ns,pct_of_query_active_wall,timers,description,note"
+    )
+    lines = [header]
+    for row in rows:
+        timers = str(row["timers"]).replace('"', '""')
+        description = str(row["description"]).replace('"', '""')
+        note = str(row["note"]).replace('"', '""')
+        lines.append(
+            f'{row["bucket_name"]},{row["classification"]},{row["total_ns"]},'
+            f'{row["pct_of_query_active_wall"]},'
+            f'"{timers}","{description}","{note}"'
+        )
+
+    return '\n'.join(lines)
+
+
 def main():
     """Main entry point."""
-    if len(sys.argv) < 2:
-        print("Usage: python aggregate_timing.py <log_file>", file=sys.stderr)
-        sys.exit(1)
-    
-    log_file = sys.argv[1]
+    parser = argparse.ArgumentParser(
+        description=(
+            "Aggregate timing report blocks from a log file. Summary view emits "
+            "derived communication-stack buckets directly, plus the active-"
+            "execution denominator and legacy/debug context timers."
+        )
+    )
+    parser.add_argument("log_file", help="Path to the log file to parse")
+    parser.add_argument(
+        "--view",
+        choices=("summary", "raw", "both"),
+        default="summary",
+        help=(
+            "summary: derived communication buckets; raw: original per-timer CSV; "
+            "both: print summary then raw."
+        ),
+    )
+
+    args = parser.parse_args()
+    log_file = args.log_file
     
     try:
         # Parse the log file
@@ -177,10 +225,17 @@ def main():
         if not stats:
             print("No timing statistics found in log file.", file=sys.stderr)
             sys.exit(1)
-        
-        # Output as CSV
-        csv_output = format_output_csv(stats)
-        print(csv_output)
+
+        if args.view in ("summary", "both"):
+            for note in summary_notes():
+                print(f"Note: {note}", file=sys.stderr)
+
+        if args.view in ("summary", "both"):
+            print(format_summary_csv(stats))
+        if args.view == "both":
+            print()
+        if args.view in ("raw", "both"):
+            print(format_output_csv(stats))
         
     except FileNotFoundError:
         print(f"Error: File '{log_file}' not found.", file=sys.stderr)

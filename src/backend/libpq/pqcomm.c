@@ -964,11 +964,30 @@ pq_getbyte(void)
 {
 	Assert(PqCommReadingMsg);
 
+	/*
+	 * Track message-type byte consumption as its own small protocol-framing
+	 * leaf so backend receive-side accounting includes the message dispatch
+	 * byte in addition to the later pq_getmessage()/pq_getbytes() work.
+	 */
+	timing_start(PQ_getbyte);
+
 	while (PqRecvPointer >= PqRecvLength)
 	{
+		/*
+		 * Socket refill belongs to PG_BE_SOCK_READ. Keep this leaf focused on
+		 * the buffered-byte handoff and message-type dispatch cost.
+		 */
+		timing_pause(PQ_getbyte);
 		if (pq_recvbuf())		/* If nothing in buffer, then recv some */
+		{
+			timing_resume(PQ_getbyte);
+			timing_end(PQ_getbyte);
 			return EOF;			/* Failed to recv data */
+		}
+		timing_resume(PQ_getbyte);
 	}
+
+	timing_end(PQ_getbyte);
 	return (unsigned char) PqRecvBuffer[PqRecvPointer++];
 }
 
@@ -1064,13 +1083,24 @@ pq_getbytes(char *s, size_t len)
 	size_t		amount;
 
 	Assert(PqCommReadingMsg);
+	timing_start(PQ_getbytes);
 
 	while (len > 0)
 	{
 		while (PqRecvPointer >= PqRecvLength)
 		{
+			/*
+			 * The receive-buffer refill itself is timed in PG_BE_SOCK_READ;
+			 * PQ_getbytes should only capture draining/copying buffered bytes.
+			 */
+			timing_pause(PQ_getbytes);
 			if (pq_recvbuf())	/* If nothing in buffer, then recv some */
+			{
+				timing_resume(PQ_getbytes);
+				timing_end(PQ_getbytes);
 				return EOF;		/* Failed to recv data */
+			}
+			timing_resume(PQ_getbytes);
 		}
 		amount = PqRecvLength - PqRecvPointer;
 		if (amount > len)
@@ -1080,6 +1110,7 @@ pq_getbytes(char *s, size_t len)
 		s += amount;
 		len -= amount;
 	}
+	timing_end(PQ_getbytes);
 	return 0;
 }
 
@@ -1204,17 +1235,27 @@ pq_getmessage(StringInfo s, int maxlen)
 	int32		len;
 
 	Assert(PqCommReadingMsg);
+	/*
+	 * Measure backend receive-side protocol framing and message-buffer
+	 * management separately from the lower buffered-byte copies in
+	 * pq_getbytes().
+	 */
+	timing_start(PQ_getmessage);
 
 	resetStringInfo(s);
 
 	/* Read message length word */
+	timing_pause(PQ_getmessage);
 	if (pq_getbytes((char *) &len, 4) == EOF)
 	{
+		timing_resume(PQ_getmessage);
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("unexpected EOF within message length word")));
+		timing_end(PQ_getmessage);
 		return EOF;
 	}
+	timing_resume(PQ_getmessage);
 
 	len = pg_ntoh32(len);
 
@@ -1223,6 +1264,7 @@ pq_getmessage(StringInfo s, int maxlen)
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("invalid message length")));
+		timing_end(PQ_getmessage);
 		return EOF;
 	}
 
@@ -1248,18 +1290,23 @@ pq_getmessage(StringInfo s, int maxlen)
 
 			/* we discarded the rest of the message so we're back in sync. */
 			PqCommReadingMsg = false;
+			timing_end(PQ_getmessage);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
 
 		/* And grab the message */
+		timing_pause(PQ_getmessage);
 		if (pq_getbytes(s->data, len) == EOF)
 		{
+			timing_resume(PQ_getmessage);
 			ereport(COMMERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
 					 errmsg("incomplete message from client")));
+			timing_end(PQ_getmessage);
 			return EOF;
 		}
+		timing_resume(PQ_getmessage);
 		s->len = len;
 		/* Place a trailing null per StringInfo convention */
 		s->data[len] = '\0';
@@ -1267,6 +1314,7 @@ pq_getmessage(StringInfo s, int maxlen)
 
 	/* finished reading the message. */
 	PqCommReadingMsg = false;
+	timing_end(PQ_getmessage);
 
 	return 0;
 }
@@ -1281,8 +1329,13 @@ internal_putbytes(const char *s, size_t len)
 		if (PqSendPointer >= PqSendBufferSize)
 		{
 			socket_set_nonblocking(false);
+			timing_pause(PQ_putmessage);
 			if (internal_flush())
+			{
+				timing_resume(PQ_putmessage);
 				return EOF;
+			}
+			timing_resume(PQ_putmessage);
 		}
 
 		/*
@@ -1295,8 +1348,13 @@ internal_putbytes(const char *s, size_t len)
 			size_t		start = 0;
 
 			socket_set_nonblocking(false);
+			timing_pause(PQ_putmessage);
 			if (internal_flush_buffer(s, &start, &len))
+			{
+				timing_resume(PQ_putmessage);
 				return EOF;
+			}
+			timing_resume(PQ_putmessage);
 		}
 		else
 		{
@@ -1493,6 +1551,14 @@ socket_putmessage(char msgtype, const char *s, size_t len)
 
 	if (PqCommBusy)
 		return 0;
+
+	/*
+	 * Treat one protocol message handoff as the leaf transport-staging unit.
+	 * This is coarse enough to avoid per-memcpy timing overhead while still
+	 * separating message construction from lower-level socket writes.
+	 */
+	timing_start(PQ_putmessage);
+
 	PqCommBusy = true;
 	if (internal_putbytes(&msgtype, 1))
 		goto fail;
@@ -1504,10 +1570,12 @@ socket_putmessage(char msgtype, const char *s, size_t len)
 	if (internal_putbytes(s, len))
 		goto fail;
 	PqCommBusy = false;
+	timing_end(PQ_putmessage);
 	return 0;
 
 fail:
 	PqCommBusy = false;
+	timing_end(PQ_putmessage);
 	return EOF;
 }
 

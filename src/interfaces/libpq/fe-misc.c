@@ -745,17 +745,26 @@ retry3:
     }
 #endif
 
+	/*
+	 * pqReadReady() can fall into PQsocketPoll() on this rare EOF-detection
+	 * path. Exclude that wait from the active socket-read leaf so the
+	 * lower-level PG_FE_WAIT bucket remains the only wait-bearing region.
+	 */
+	timing_pause(PG_FE_SOCK_READ);
 	switch (pqReadReady(conn))
 	{
 		case 0:
 			/* definitely no data available */
-            /* Stop timing instrumentation before returning */
-            timing_end(PG_FE_SOCK_READ);
+			timing_resume(PG_FE_SOCK_READ);
+			/* Stop timing instrumentation before returning */
+			timing_end(PG_FE_SOCK_READ);
             return 0;
 		case 1:
 			/* ready for read */
+			timing_resume(PG_FE_SOCK_READ);
 			break;
 		default:
+			timing_resume(PG_FE_SOCK_READ);
 			/* we override pqReadReady's message with something more useful */
 			goto definitelyEOF;
 	}
@@ -876,16 +885,19 @@ pqSendSome(PGconn *conn, int len)
 		/* Absorb input data if any, and detect socket closure */
 		if (conn->sock != PGINVALID_SOCKET)
 		{
+			timing_pause(PG_FE_SOCK_WRITE);
 			if (pqReadData(conn) < 0)
-            {
-                /* Stop timing instrumentation before returning */
-                timing_end(PG_FE_SOCK_WRITE);
-                return -1;
-            }
-        }
-        /* Stop timing instrumentation before returning */
-        timing_end(PG_FE_SOCK_WRITE);
-        return 0;
+			{
+				timing_resume(PG_FE_SOCK_WRITE);
+				/* Stop timing instrumentation before returning */
+				timing_end(PG_FE_SOCK_WRITE);
+				return -1;
+			}
+			timing_resume(PG_FE_SOCK_WRITE);
+		}
+		/* Stop timing instrumentation before returning */
+		timing_end(PG_FE_SOCK_WRITE);
+		return 0;
 	}
 
 	if (conn->sock == PGINVALID_SOCKET)
@@ -941,13 +953,16 @@ pqSendSome(PGconn *conn, int len)
 					/* Absorb input data if any, and detect socket closure */
 					if (conn->sock != PGINVALID_SOCKET)
 					{
+						timing_pause(PG_FE_SOCK_WRITE);
 						if (pqReadData(conn) < 0)
-                        {
-                            /* Stop timing instrumentation before returning */
-                            timing_end(PG_FE_SOCK_WRITE);
-                            return -1;
-                        }
-                    }
+						{
+							timing_resume(PG_FE_SOCK_WRITE);
+							/* Stop timing instrumentation before returning */
+							timing_end(PG_FE_SOCK_WRITE);
+							return -1;
+						}
+						timing_resume(PG_FE_SOCK_WRITE);
+					}
 
 					/*
 					 * Lower-level code should already have filled
@@ -1006,11 +1021,14 @@ pqSendSome(PGconn *conn, int len)
 			 * Note that errors here don't result in write_failed becoming
 			 * set.
 			 */
+			timing_pause(PG_FE_SOCK_WRITE);
 			if (pqReadData(conn) < 0)
 			{
+				timing_resume(PG_FE_SOCK_WRITE);
 				result = -1;	/* error message already set up */
 				break;
 			}
+			timing_resume(PG_FE_SOCK_WRITE);
 
 			if (pqIsnonblocking(conn))
 			{
@@ -1018,11 +1036,14 @@ pqSendSome(PGconn *conn, int len)
 				break;
 			}
 
+			timing_pause(PG_FE_SOCK_WRITE);
 			if (pqWait(true, true, conn))
 			{
+				timing_resume(PG_FE_SOCK_WRITE);
 				result = -1;
 				break;
 			}
+			timing_resume(PG_FE_SOCK_WRITE);
 		}
 	}
 
@@ -1193,7 +1214,12 @@ PQsocketPoll(int sock, int forRead, int forWrite, pg_usec_time_t end_time)
 	if (!forRead && !forWrite)
 		return 0;
 
-    // jason: this func should also be considered PG_WAIT, since it waits on a socket with poll or select
+    /*
+     * libpq frontend waits do not flow through PostgreSQL's backend
+     * pgstat_report_wait_start()/end() backbone, so pause the top-level query
+     * active wall explicitly here.
+     */
+    logger_query_active_wall_pause_wait();
     timing_start(PG_FE_WAIT);
 
     input_fd.fd = sock;
@@ -1223,6 +1249,7 @@ PQsocketPoll(int sock, int forRead, int forWrite, pg_usec_time_t end_time)
     /* Call poll() and mark the end of the wait instrumentation */
     int pollres = poll(&input_fd, 1, timeout_ms);
     timing_end(PG_FE_WAIT);
+    logger_query_active_wall_resume_wait();
     return pollres;
 #else							/* !HAVE_POLL */
 
@@ -1235,7 +1262,12 @@ PQsocketPoll(int sock, int forRead, int forWrite, pg_usec_time_t end_time)
 	if (!forRead && !forWrite)
 		return 0;
 
-    // jason: this func should also be considered PG_WAIT, since it waits on a socket with poll or select
+    /*
+     * libpq frontend waits do not flow through PostgreSQL's backend
+     * pgstat_report_wait_start()/end() backbone, so pause the top-level query
+     * active wall explicitly here.
+     */
+    logger_query_active_wall_pause_wait();
     timing_start(PG_FE_WAIT);
 
     FD_ZERO(&input_mask);
@@ -1276,6 +1308,7 @@ PQsocketPoll(int sock, int forRead, int forWrite, pg_usec_time_t end_time)
 
     int selres = select(sock + 1, &input_mask, &output_mask, &except_mask, ptr_timeout);
     timing_end(PG_FE_WAIT);
+    logger_query_active_wall_resume_wait();
     return selres;
 #endif							/* HAVE_POLL */
 }

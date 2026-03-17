@@ -316,6 +316,12 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
     timing_add_stat(Printtup, STAT_TOTAL_ROWS_SENT, 1);
     timing_start(Printtup);
 
+	/*
+	 * Split row serialization from the later transport handoff so reports can
+	 * keep executor-side format conversion separate from message staging/write.
+	 */
+	timing_start(Printtup_Ser);
+
     /* Set or update my derived attribute info, if needed */
 	if (myState->attrinfo != typeinfo || myState->nattrs != natts)
 		printtup_prepare_info(myState, typeinfo, natts);
@@ -378,8 +384,15 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 		}
 	}
 
-    // jason: timing the network send part
-    timing_start(Printtup_Net);
+	timing_end(Printtup_Ser);
+
+	/*
+	 * This leaf covers the handoff from the per-row message buffer into the
+	 * backend transport layer. Lower leaves like PQ_putmessage and
+	 * PG_BE_SOCK_WRITE can be used when a more transport-specific breakdown is
+	 * needed.
+	 */
+	timing_start(Printtup_Net);
 
     timing_add_stat(Printtup, STAT_TOTAL_BYTES_SENT, buf->len);
 
