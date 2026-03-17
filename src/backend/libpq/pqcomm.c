@@ -77,6 +77,7 @@
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
 #include "storage/ipc.h"
+#include "time_instr.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 

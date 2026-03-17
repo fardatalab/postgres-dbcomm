@@ -28,6 +28,7 @@
 #include "libpq-int.h"
 #include "mb/pg_wchar.h"
 #include "port/pg_bswap.h"
+#include "time_instr.h"
 
 /*
  * This macro lists the backend message types that could be "long" (more

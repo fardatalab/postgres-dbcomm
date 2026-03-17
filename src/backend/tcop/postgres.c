@@ -690,14 +690,13 @@ PerfControlDisableIfNeeded(void)
 static void
 PerfControlOnProcExit(int code, Datum arg)
 {
-	(void) code;
+    static const char PerfDisableCommand[] = "disable\n";
+    bool shouldDisableNodePerf = false;
+
+    (void) code;
 	(void) arg;
 
-	static const char PerfDisableCommand[] = "disable\n";
-
-	bool		shouldDisableNodePerf = false;
-
-	if (!PerfControlQueryCycleRegistered)
+    if (!PerfControlQueryCycleRegistered)
 	{
 		return;
 	}
@@ -4837,15 +4836,16 @@ PostgresMain(const char *dbname, const char *username)
 	 */
 
 	for (;;)
-	{
-		int			firstchar;
-		StringInfoData input_message;
+    {
+        int firstchar;
+        StringInfoData input_message;
+        bool skip_query_str_print = false;
 
-		/*
-		 * At top of loop, reset extended-query-message flag, so that any
-		 * errors encountered in "idle" state don't provoke skip.
-		 */
-		doing_extended_query_message = false;
+        /*
+         * At top of loop, reset extended-query-message flag, so that any
+         * errors encountered in "idle" state don't provoke skip.
+         */
+        doing_extended_query_message = false;
 
 		/*
 		 * For valgrind reporting purposes, the "current query" begins here.
@@ -5060,9 +5060,6 @@ PostgresMain(const char *dbname, const char *username)
 		 */
 		if (ignore_till_sync && firstchar != EOF)
 			continue;
-
-        /* Some internal probe queries should reset timing without printing. */
-        bool skip_query_str_print = false;
 
         switch (firstchar)
 		{
@@ -5392,7 +5389,7 @@ PostgresMain(const char *dbname, const char *username)
 		 * the later ReadyForQuery() flush. Query timing now stays open until
 		 * FinishQueryTimingCycle() runs at the shared ReadyForQuery boundary.
 		 */
-	} /* end of input-reading loop */
+    } /* end of input-reading loop */
 }
 
 /*
