@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -5,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * This is a standalone verifier for the binary dump emitted from printtup.c.
@@ -100,6 +103,12 @@ typedef struct
 	uint64_t	fields_checked;
 	uint64_t	mismatches;
 	uint64_t	max_mismatches;
+	uint64_t	type_serialize_ns;
+	uint64_t	serialize_proxy_ns;
+	uint64_t	serialize_rows;
+	uint64_t	serialize_fields;
+	uint64_t	type_serialize_bytes;
+	uint64_t	serialize_proxy_bytes;
 } VerifierState;
 
 static void
@@ -107,6 +116,17 @@ die_errno(const char *message)
 {
 	fprintf(stderr, "%s: %s\n", message, strerror(errno));
 	exit(1);
+}
+
+static uint64_t
+monotonic_now_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		die_errno("clock_gettime failed");
+
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
 }
 
 static void
@@ -662,6 +682,8 @@ verify_row_record(VerifierState *state, const uint8_t *payload, size_t payload_l
 	SchemaRecord *schema;
 	FieldView   *fields;
 	ByteBuf		rowbuf;
+	uint64_t	row_proxy_start_ns;
+	uint64_t	row_proxy_end_ns;
 
 	if (payload_len < 24)
 		die_parse("row record is truncated");
@@ -730,21 +752,30 @@ verify_row_record(VerifierState *state, const uint8_t *payload, size_t payload_l
 		die_parse("row record has trailing bytes");
 
 	state->rows_checked++;
+	state->serialize_rows++;
 	bytebuf_init(&rowbuf);
+	row_proxy_start_ns = monotonic_now_ns();
 	bytebuf_append_u16be(&rowbuf, (uint16_t) natts);
 
 	for (uint32_t i = 0; i < natts; i++)
 	{
 		AttrMeta   *attr = &schema->attrs[i];
 		ByteBuf		replay;
+		uint64_t	type_start_ns = 0;
+		uint64_t	type_end_ns = 0;
 
 		state->fields_checked++;
+		state->serialize_fields++;
 		bytebuf_init(&replay);
 
 		if (!fields[i].is_null)
 		{
+			type_start_ns = monotonic_now_ns();
 			if (!reserialize_field(state, attr, &fields[i], &replay))
 				die_parse("failed to replay field serializer");
+			type_end_ns = monotonic_now_ns();
+			state->type_serialize_ns += (type_end_ns - type_start_ns);
+			state->type_serialize_bytes += replay.len;
 		}
 
 		if (fields[i].is_null)
@@ -774,6 +805,9 @@ verify_row_record(VerifierState *state, const uint8_t *payload, size_t payload_l
 
 		bytebuf_free(&replay);
 	}
+	row_proxy_end_ns = monotonic_now_ns();
+	state->serialize_proxy_ns += (row_proxy_end_ns - row_proxy_start_ns);
+	state->serialize_proxy_bytes += rowbuf.len;
 
 	if (rowbuf.len != row_payload_len ||
 		memcmp(rowbuf.data, row_payload, rowbuf.len) != 0)
@@ -940,6 +974,38 @@ main(int argc, char **argv)
 		   state.head_count, state.schema_record_count, state.row_record_count);
 	printf("rows_checked=%" PRIu64 " fields_checked=%" PRIu64 " mismatches=%" PRIu64 "\n",
 		   state.rows_checked, state.fields_checked, state.mismatches);
+	printf("serialize_proxy_ns=%" PRIu64 " type_serialize_ns=%" PRIu64 "\n",
+		   state.serialize_proxy_ns, state.type_serialize_ns);
+	printf("serialize_proxy_bytes=%" PRIu64 " type_serialize_bytes=%" PRIu64 "\n",
+		   state.serialize_proxy_bytes, state.type_serialize_bytes);
+	if (state.serialize_rows > 0)
+	{
+		printf("serialize_proxy_ns_per_row=%.3f type_serialize_ns_per_row=%.3f\n",
+			   (double) state.serialize_proxy_ns / (double) state.serialize_rows,
+			   (double) state.type_serialize_ns / (double) state.serialize_rows);
+	}
+	if (state.serialize_fields > 0)
+	{
+		printf("serialize_proxy_ns_per_field=%.3f type_serialize_ns_per_field=%.3f\n",
+			   (double) state.serialize_proxy_ns / (double) state.serialize_fields,
+			   (double) state.type_serialize_ns / (double) state.serialize_fields);
+	}
+	if (state.serialize_proxy_ns > 0)
+	{
+		double proxy_mb_per_s =
+			((double) state.serialize_proxy_bytes / 1000000.0) /
+			((double) state.serialize_proxy_ns / 1000000000.0);
+
+		printf("serialize_proxy_throughput_mb_s=%.3f\n", proxy_mb_per_s);
+	}
+	if (state.type_serialize_ns > 0)
+	{
+		double type_mb_per_s =
+			((double) state.type_serialize_bytes / 1000000.0) /
+			((double) state.type_serialize_ns / 1000000000.0);
+
+		printf("type_serialize_throughput_mb_s=%.3f\n", type_mb_per_s);
+	}
 
 	free_state(&state);
 	free(data);
