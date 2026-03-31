@@ -303,13 +303,90 @@ head_records=1 schema_records=1 row_records=100
 rows_checked=100 fields_checked=1600 mismatches=0
 ```
 
+### Binary-Mode Driver
+
+[`printtup_binary_dump_client.c`](./printtup_binary_dump_client.c)
+
+This is the repo-local replacement for the temporary `/tmp` libpq programs used
+during earlier validation. Its only job is to make the frontend request binary
+result columns, which is required to exercise the binary path chosen in
+[`printtup_prepare_info()`](../../src/backend/access/common/printtup.c#L691)
+and the binary [`SendFunctionCall()`](../../src/backend/utils/fmgr/fmgr.c#L1743)
+inside [`printtup()`](../../src/backend/access/common/printtup.c#L823).
+
+Important pieces:
+
+- [`parse_options()`](./printtup_binary_dump_client.c#L69)
+  handles a small set of stable command-line options
+- [`run_single_row_query()`](./printtup_binary_dump_client.c#L154)
+  uses `PQsendQueryParams(..., resultFormat=1)` and `PQsetSingleRowMode()`
+  so large scans can be streamed one row at a time
+- [`run_materialized_query()`](./printtup_binary_dump_client.c#L215)
+  provides a small-result fallback built on `PQexecParams(..., resultFormat=1)`
+- [`print_column_formats()`](./printtup_binary_dump_client.c#L136)
+  prints `PQfformat()` for every output column, which is the first sanity check
+  that the query really ran in binary mode
+
+Build:
+
+```bash
+cc -O2 -Wall -Wextra -std=c11 \
+  fdl_utils/printtup_dump/printtup_binary_dump_client.c \
+  -I/data/dbcomm/pg-citus/include \
+  -L/data/dbcomm/pg-citus/lib/x86_64-linux-gnu \
+  -Wl,-rpath,/data/dbcomm/pg-citus/lib/x86_64-linux-gnu \
+  -lpq \
+  -o /tmp/printtup_binary_dump_client
+```
+
+Run a 100k-row streamed query against `tpch_sf10`:
+
+```bash
+sudo -u dbcomm /tmp/printtup_binary_dump_client \
+  --conninfo "dbname=tpch_sf10" \
+  --query "select * from lineitem limit 100000"
+```
+
+Run the full streamed `lineitem` scan with progress output every million rows:
+
+```bash
+sudo -u dbcomm /tmp/printtup_binary_dump_client \
+  --conninfo "dbname=tpch_sf10" \
+  --query "select * from lineitem" \
+  --progress-every 1000000
+```
+
+If you explicitly want the small non-streaming path for a tiny query:
+
+```bash
+sudo -u dbcomm /tmp/printtup_binary_dump_client \
+  --conninfo "dbname=tpch_sf10" \
+  --query "select * from lineitem limit 100" \
+  --no-single-row-mode
+```
+
+Typical output begins with:
+
+```text
+conninfo=dbname=tpch_sf10
+query=select * from lineitem limit 100000
+single_row_mode=1
+progress_every=0
+cols=16
+col=0 format=1
+...
+col=15 format=1
+```
+
+If any `col=... format=...` line prints `0` instead of `1`, the client did not
+exercise the binary result path and the dump is not suitable for these tools.
+
 ## Recommended Workflow
 
 1. Run PostgreSQL with `PG_PRINTTUP_BINARY_DUMP=1`.
-2. Ensure the client actually requests binary results.
-   The previous validation used a tiny libpq program with
-   `PQexecParams(..., resultFormat=1)` instead of plain `psql`, because
-   `psql` typically uses text results.
+2. Build and run [`printtup_binary_dump_client.c`](./printtup_binary_dump_client.c)
+   instead of plain `psql`, because `psql` typically uses text results while
+   this helper explicitly requests `resultFormat=1`.
 3. Inspect the dump with the inspector.
 4. Read the `sendname` entries from the schema.
 5. Map those names back to the backend C implementations.
