@@ -36,6 +36,16 @@ typedef struct BackendStartupData
 	CAC_state	canAcceptConnections;
 } BackendStartupData;
 
+typedef void (*remote_exec_backend_main_hook_type) (char *startup_data,
+												 size_t startup_data_len);
+
+extern PGDLLIMPORT remote_exec_backend_main_hook_type remote_exec_backend_main_hook;
+
 extern void BackendMain(char *startup_data, size_t startup_data_len) pg_attribute_noreturn();
+extern void RemoteExecBackendMain(char *startup_data,
+								  size_t startup_data_len) pg_attribute_noreturn();
+extern void RemoteExecBackendInitializeConnectionByOid(Oid dboid,
+													   Oid useroid,
+													   uint32 flags);
 
 #endif							/* BACKEND_STARTUP_H */

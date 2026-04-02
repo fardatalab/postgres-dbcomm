@@ -336,6 +336,7 @@ typedef enum BackendType
 
 	/* Backends and other backend-like processes */
 	B_BACKEND,
+	B_REMOTE_EXEC_BACKEND,
 	B_AUTOVAC_LAUNCHER,
 	B_AUTOVAC_WORKER,
 	B_BG_WORKER,
@@ -373,6 +374,7 @@ typedef enum BackendType
 extern PGDLLIMPORT BackendType MyBackendType;
 
 #define AmRegularBackendProcess()	(MyBackendType == B_BACKEND)
+#define AmRemoteExecBackendProcess() (MyBackendType == B_REMOTE_EXEC_BACKEND)
 #define AmAutoVacuumLauncherProcess() (MyBackendType == B_AUTOVAC_LAUNCHER)
 #define AmAutoVacuumWorkerProcess()	(MyBackendType == B_AUTOVAC_WORKER)
 #define AmBackgroundWorkerProcess() (MyBackendType == B_BG_WORKER)

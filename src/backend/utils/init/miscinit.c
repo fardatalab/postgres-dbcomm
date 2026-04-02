@@ -285,6 +285,9 @@ GetBackendTypeDesc(BackendType backendType)
 		case B_BG_WORKER:
 			backendDesc = "background worker";
 			break;
+		case B_REMOTE_EXEC_BACKEND:
+			backendDesc = "remote exec backend";
+			break;
 		case B_BG_WRITER:
 			backendDesc = "background writer";
 			break;
@@ -887,10 +890,12 @@ InitializeSessionUserIdStandalone(void)
 {
 	/*
 	 * This function should only be called in single-user mode, in autovacuum
-	 * workers, in slot sync worker and in background workers.
+	 * workers, in slot sync worker, in background workers, and in the
+	 * socketless remote-exec backend.
 	 */
 	Assert(!IsUnderPostmaster || AmAutoVacuumWorkerProcess() ||
-		   AmLogicalSlotSyncWorkerProcess() || AmBackgroundWorkerProcess());
+		   AmLogicalSlotSyncWorkerProcess() || AmBackgroundWorkerProcess() ||
+		   AmRemoteExecBackendProcess());
 
 	/* call only once */
 	Assert(!OidIsValid(AuthenticatedUserId));

@@ -15,6 +15,8 @@
 
 #include "miscadmin.h"
 
+typedef void (*postmaster_sigusr1_hook_type) (void);
+
 /* GUC options */
 extern PGDLLIMPORT bool EnableSSL;
 extern PGDLLIMPORT int SuperuserReservedConnections;
@@ -53,6 +55,7 @@ extern PGDLLIMPORT int postmaster_alive_fds[2];
 extern PGDLLIMPORT const char *progname;
 
 extern PGDLLIMPORT bool LoadedSSL;
+extern PGDLLIMPORT postmaster_sigusr1_hook_type postmaster_sigusr1_hook;
 
 extern void PostmasterMain(int argc, char *argv[]) pg_attribute_noreturn();
 extern void ClosePostmasterPorts(bool am_syslogger);
@@ -82,6 +85,7 @@ extern pid_t postmaster_child_launch(BackendType child_type,
 									 size_t startup_data_len,
 									 struct ClientSocket *client_sock);
 const char *PostmasterChildName(BackendType child_type);
+extern pid_t StartRemoteExecBackend(char *startup_data, size_t startup_data_len);
 #ifdef EXEC_BACKEND
 extern void SubPostmasterMain(int argc, char *argv[]) pg_attribute_noreturn();
 #endif

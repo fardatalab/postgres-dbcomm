@@ -177,6 +177,7 @@ typedef struct bkend
 } Backend;
 
 static dlist_head BackendList = DLIST_STATIC_INIT(BackendList);
+postmaster_sigusr1_hook_type postmaster_sigusr1_hook = NULL;
 
 #ifdef EXEC_BACKEND
 Backend    *ShmemBackendArray;
@@ -411,6 +412,7 @@ static void PostmasterStateMachine(void);
 static void ExitPostmaster(int status) pg_attribute_noreturn();
 static int	ServerLoop(void);
 static int	BackendStartup(ClientSocket *client_sock);
+static int	RemoteExecBackendStartup(char *startup_data, size_t startup_data_len);
 static void report_fork_failure_to_client(ClientSocket *client_sock, int errnum);
 static CAC_state canAcceptConnections(int backend_type);
 static bool RandomCancelKey(int32 *cancel_key);
@@ -3630,6 +3632,124 @@ BackendStartup(ClientSocket *client_sock)
 	return STATUS_OK;
 }
 
+
+/*
+ * RemoteExecBackendStartup launches one socketless backend-like child on
+ * behalf of an external-service request.
+ *
+ * We still track the child in BackendList and consume a normal backend child
+ * slot so postmaster's global connection/execution limits continue to apply.
+ * Unlike BackendStartup(), there is no frontend socket and no dead-end child
+ * mode here: if postmaster would reject an ordinary backend now, the remote-
+ * exec launch is rejected too.
+ */
+static int
+RemoteExecBackendStartup(char *startup_data, size_t startup_data_len)
+{
+	Backend    *bn = NULL;
+	pid_t		pid = 0;
+	CAC_state	cacState = CAC_OK;
+
+	if (startup_data == NULL || startup_data_len == 0)
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("remote exec backend startup requires non-empty startup data")));
+		return STATUS_ERROR;
+	}
+
+	cacState = canAcceptConnections(BACKEND_TYPE_NORMAL);
+	if (cacState != CAC_OK)
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+				 errmsg("postmaster cannot start a remote exec backend right now"),
+				 errdetail("can_accept_connections=%d", (int) cacState)));
+		return STATUS_ERROR;
+	}
+
+	bn = (Backend *) palloc_extended(sizeof(Backend), MCXT_ALLOC_NO_OOM);
+	if (bn == NULL)
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory while allocating remote exec backend state")));
+		return STATUS_ERROR;
+	}
+
+	if (!RandomCancelKey(&MyCancelKey))
+	{
+		pfree(bn);
+		ereport(LOG,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not generate random cancel key for remote exec backend")));
+		return STATUS_ERROR;
+	}
+
+	bn->dead_end = false;
+	bn->cancel_key = MyCancelKey;
+	bn->child_slot = MyPMChildSlot = AssignPostmasterChildSlot();
+	bn->bgworker_notify = false;
+
+	pid = postmaster_child_launch(B_REMOTE_EXEC_BACKEND,
+								  startup_data,
+								  startup_data_len,
+								  NULL);
+	if (pid < 0)
+	{
+		int save_errno = errno;
+
+		(void) ReleasePostmasterChildSlot(bn->child_slot);
+		pfree(bn);
+		errno = save_errno;
+		ereport(LOG,
+				(errmsg("could not fork new remote exec backend process: %m")));
+		return STATUS_ERROR;
+	}
+
+	ereport(DEBUG2,
+			(errmsg_internal("forked new remote exec backend, pid=%d",
+							 (int) pid)));
+
+	bn->pid = pid;
+	bn->bkend_type = BACKEND_TYPE_NORMAL;
+	dlist_push_head(&BackendList, &bn->elem);
+
+#ifdef EXEC_BACKEND
+	ShmemBackendArrayAdd(bn);
+#endif
+
+	return STATUS_OK;
+}
+
+
+pid_t
+StartRemoteExecBackend(char *startup_data, size_t startup_data_len)
+{
+	if (RemoteExecBackendStartup(startup_data, startup_data_len) != STATUS_OK)
+	{
+		return -1;
+	}
+
+	/*
+	 * RemoteExecBackendStartup already pushed the child into BackendList, so the
+	 * most recently assigned PM child slot now belongs to the new child. Return
+	 * the pid recorded there by scanning for that slot.
+	 */
+	dlist_iter	iter;
+	dlist_foreach(iter, &BackendList)
+	{
+		Backend *bp = dlist_container(Backend, elem, iter.cur);
+
+		if (bp->child_slot == MyPMChildSlot)
+		{
+			return bp->pid;
+		}
+	}
+
+	return -1;
+}
+
 /*
  * Try to report backend fork() failure to client before we close the
  * connection.  Since we do not care to risk blocking the postmaster on
@@ -3846,6 +3966,17 @@ process_pm_pmsignal(void)
 		 * do the unlink.
 		 */
 		signal_child(StartupPID, SIGUSR2);
+	}
+
+	/*
+	 * Extensions may use a plain SIGUSR1 wakeup as a cold-path notification
+	 * that some postmaster-owned external-service queue needs attention. Run
+	 * the hook after built-in pmsignal handling so the hook observes the same
+	 * postmaster state transitions that regular child-start paths do.
+	 */
+	if (postmaster_sigusr1_hook != NULL)
+	{
+		postmaster_sigusr1_hook();
 	}
 }
 

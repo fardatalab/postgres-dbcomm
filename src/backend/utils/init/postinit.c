@@ -84,6 +84,7 @@ static void ClientCheckTimeoutHandler(void);
 static bool ThereIsAtLeastOneRole(void);
 static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
+static void RemoteExecInitPostgresTrace(const char *stage);
 
 
 /*** InitPostgres support ***/
@@ -750,25 +751,32 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	int			nfree = 0;
 
 	elog(DEBUG3, "InitPostgres");
+	RemoteExecInitPostgresTrace("entry");
 
-    // jason: add init time instrumentation logger
-    logger_init(_NUM_TIMING_SPOTS, timing_spot_names);
-    // log_message("InitPostgres: init logger\n");
+	/* Keep the existing timing instrumentation, but bracket it for the
+	 * socketless remote-exec backend so startup crashes can be localized. */
+	RemoteExecInitPostgresTrace("before_logger_init");
+	logger_init(_NUM_TIMING_SPOTS, timing_spot_names);
+	RemoteExecInitPostgresTrace("after_logger_init");
+	/* log_message("InitPostgres: init logger\n"); */
 
-    /*
-     * Add my PGPROC struct to the ProcArray.
-     *
-     * Once I have done this, I am visible to other backends!
-     */
-    InitProcessPhase2();
+	/*
+	 * Add my PGPROC struct to the ProcArray.
+	 *
+	 * Once I have done this, I am visible to other backends!
+	 */
+	InitProcessPhase2();
+	RemoteExecInitPostgresTrace("after_init_process_phase2");
 
-    /*
-     * Initialize my entry in the shared-invalidation manager's array of
-     * per-backend data.
-     */
-    SharedInvalBackendInit(false);
+	/*
+	 * Initialize my entry in the shared-invalidation manager's array of
+	 * per-backend data.
+	 */
+	SharedInvalBackendInit(false);
+	RemoteExecInitPostgresTrace("after_shared_inval_backend_init");
 
 	ProcSignalInit();
+	RemoteExecInitPostgresTrace("after_proc_signal_init");
 
 	/*
 	 * Also set up timeout handlers needed for backend operation.  We need
@@ -838,6 +846,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * at least entries for pg_database and catalogs used for authentication.
 	 */
 	RelationCacheInitializePhase2();
+	RemoteExecInitPostgresTrace("after_relcache_phase2");
 
 	/*
 	 * Set up process-exit callback to do pre-shutdown cleanup.  This is the
@@ -886,6 +895,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		XactIsoLevel = XACT_READ_COMMITTED;
 
 		(void) GetTransactionSnapshot();
+		RemoteExecInitPostgresTrace("after_startup_snapshot");
 	}
 
 	/*
@@ -912,8 +922,14 @@ InitPostgres(const char *in_dbname, Oid dboid,
 					 errhint("You should immediately run CREATE USER \"%s\" SUPERUSER;.",
 							 username != NULL ? username : "postgres")));
 	}
-	else if (AmBackgroundWorkerProcess())
+	else if (AmBackgroundWorkerProcess() || AmRemoteExecBackendProcess())
 	{
+		/*
+		 * Background workers and the socketless remote-exec backend both enter
+		 * InitPostgres() without a frontend Port/MyProcPort. Their identity was
+		 * already chosen by the postmaster-owned startup path, so they must not
+		 * fall through into the normal client-authentication branch below.
+		 */
 		if (username == NULL && !OidIsValid(useroid))
 		{
 			InitializeSessionUserIdStandalone();
@@ -938,6 +954,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 								 hba_authname(MyClientConnectionInfo.auth_method));
 		am_superuser = superuser();
 	}
+	RemoteExecInitPostgresTrace("after_user_identity");
 
 	/*
 	 * Binary upgrades only allowed super-user connections
@@ -1057,6 +1074,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		}
 		return;
 	}
+	RemoteExecInitPostgresTrace("after_database_selection");
 
 	/*
 	 * Now, take a writer's lock on the database we are trying to connect to.
@@ -1153,6 +1171,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * the correct value on their next try.
 	 */
 	MyProc->databaseId = MyDatabaseId;
+	RemoteExecInitPostgresTrace("after_database_id_publish");
 
 	/*
 	 * We established a catalog snapshot while reading pg_authid and/or
@@ -1212,6 +1231,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	if (!bootstrap)
 		CheckMyDatabase(dbname, am_superuser,
 						(flags & INIT_PG_OVERRIDE_ALLOW_CONNS) != 0);
+	RemoteExecInitPostgresTrace("after_check_my_database");
 
 	/*
 	 * Now process any command-line switches and any additional GUC variable
@@ -1223,6 +1243,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* Process pg_db_role_setting options */
 	process_settings(MyDatabaseId, GetSessionUserId());
+	RemoteExecInitPostgresTrace("after_process_settings");
 
 	/* Apply PostAuthDelay as soon as we've read all options */
 	if (PostAuthDelay > 0)
@@ -1259,6 +1280,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	/* close the transaction we started above */
 	if (!bootstrap)
 		CommitTransactionCommand();
+	RemoteExecInitPostgresTrace("done");
 }
 
 /*
@@ -1472,4 +1494,23 @@ ThereIsAtLeastOneRole(void)
 	table_close(pg_authid_rel, AccessShareLock);
 
 	return result;
+}
+
+
+/*
+ * RemoteExecInitPostgresTrace emits stage markers only for the socketless
+ * remote-exec backend. This keeps ordinary backend startup quiet while making
+ * it obvious which InitPostgres phase still assumes a frontend Port-backed
+ * backend shape.
+ */
+static void
+RemoteExecInitPostgresTrace(const char *stage)
+{
+	if (!AmRemoteExecBackendProcess())
+	{
+		return;
+	}
+
+	fprintf(stderr, "remote exec backend: InitPostgres stage=%s\n", stage);
+	fflush(stderr);
 }

@@ -25,6 +25,7 @@
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "postmaster/bgworker.h"
 #include "postmaster/postmaster.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
@@ -39,6 +40,7 @@
 
 /* GUCs */
 bool		Trace_connection_negotiation = false;
+remote_exec_backend_main_hook_type remote_exec_backend_main_hook = NULL;
 
 static void BackendInitialize(ClientSocket *client_sock, CAC_state cac);
 static int	ProcessSSLStartup(Port *port);
@@ -103,6 +105,128 @@ BackendMain(char *startup_data, size_t startup_data_len)
 	MemoryContextSwitchTo(TopMemoryContext);
 
 	PostgresMain(MyProcPort->database_name, MyProcPort->user_name);
+}
+
+
+/*
+ * RemoteExecBackendInitializeConnectionByOid gives a socketless remote-exec
+ * backend the same InitPostgres-by-Oid entry point that background workers
+ * already use, but without forcing the execution context into the background-
+ * worker class.
+ */
+void
+RemoteExecBackendInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
+{
+	bits32		init_flags = 0;
+
+	if (!AmRemoteExecBackendProcess())
+	{
+		ereport(FATAL,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("remote exec backend connection initialization called outside a remote exec backend")));
+	}
+
+	if (flags & BGWORKER_BYPASS_ALLOWCONN)
+		init_flags |= INIT_PG_OVERRIDE_ALLOW_CONNS;
+	if (flags & BGWORKER_BYPASS_ROLELOGINCHECK)
+		init_flags |= INIT_PG_OVERRIDE_ROLE_LOGIN;
+
+	InitPostgres(NULL, dboid, NULL, useroid, init_flags, NULL);
+
+	if (!IsInitProcessingMode())
+	{
+		ereport(ERROR,
+				(errmsg("invalid processing mode in remote exec backend")));
+	}
+
+	SetProcessingMode(NormalProcessing);
+}
+
+
+/*
+ * RemoteExecBackendMain is the generic core entry point for socketless
+ * backend-like children launched for extension-owned remote execution work.
+ *
+ * Core owns only the process shell here: signal setup, PGPROC attachment, and
+ * BaseInit(). Extension code receives the opaque startup payload back through
+ * remote_exec_backend_main_hook and decides how to attach to a database/user
+ * and how to execute the requested work.
+ */
+void
+RemoteExecBackendMain(char *startup_data, size_t startup_data_len)
+{
+	sigjmp_buf	local_sigjmp_buf;
+	char	   *startupDataCopy = NULL;
+
+	if (startup_data == NULL || startup_data_len == 0)
+	{
+		elog(FATAL, "remote exec backend startup data must not be empty");
+	}
+
+	startupDataCopy = MemoryContextAlloc(TopMemoryContext, startup_data_len);
+	memcpy(startupDataCopy, startup_data, startup_data_len);
+
+	/*
+	 * This child no longer needs postmaster's working context. Switch away from
+	 * it explicitly before deletion so later error/reporting code cannot
+	 * accidentally allocate into freed memory during the cold-path bootstrap.
+	 */
+	MemoryContextSwitchTo(TopMemoryContext);
+	if (PostmasterContext)
+	{
+		MemoryContextDelete(PostmasterContext);
+		PostmasterContext = NULL;
+	}
+
+	MyBackendType = B_REMOTE_EXEC_BACKEND;
+	init_ps_display("remote exec backend");
+	SetProcessingMode(InitProcessing);
+	fprintf(stderr,
+			"remote exec backend: entered child shell startup_bytes=%zu\n",
+			startup_data_len);
+	fflush(stderr);
+
+	if (PostAuthDelay > 0)
+		pg_usleep(PostAuthDelay * 1000000L);
+
+	pqsignal(SIGINT, StatementCancelHandler);
+	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+	pqsignal(SIGFPE, FloatExceptionHandler);
+	pqsignal(SIGTERM, die);
+	pqsignal(SIGHUP, SIG_IGN);
+
+	InitializeTimeouts();
+
+	pqsignal(SIGPIPE, SIG_IGN);
+	pqsignal(SIGUSR2, SIG_IGN);
+	pqsignal(SIGCHLD, SIG_DFL);
+
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+	{
+		error_context_stack = NULL;
+		HOLD_INTERRUPTS();
+		EmitErrorReport();
+		proc_exit(1);
+	}
+
+	PG_exception_stack = &local_sigjmp_buf;
+
+	InitProcess();
+	BaseInit();
+	fprintf(stderr, "remote exec backend: init process/base init complete\n");
+	fflush(stderr);
+
+	if (remote_exec_backend_main_hook == NULL)
+	{
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("no remote exec backend hook was registered")));
+	}
+
+	fprintf(stderr, "remote exec backend: invoking extension main hook\n");
+	fflush(stderr);
+	remote_exec_backend_main_hook(startupDataCopy, startup_data_len);
+	proc_exit(0);
 }
 
 

@@ -185,6 +185,7 @@ child_process_kind child_process_kinds[] = {
 	[B_INVALID] = {"invalid", NULL, false},
 
 	[B_BACKEND] = {"backend", BackendMain, true},
+	[B_REMOTE_EXEC_BACKEND] = {"remote exec backend", RemoteExecBackendMain, true},
 	[B_AUTOVAC_LAUNCHER] = {"autovacuum launcher", AutoVacLauncherMain, true},
 	[B_AUTOVAC_WORKER] = {"autovacuum worker", AutoVacWorkerMain, true},
 	[B_BG_WORKER] = {"bgworker", BackgroundWorkerMain, true},
