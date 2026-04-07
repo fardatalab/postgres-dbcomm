@@ -46,3 +46,10 @@ lib*.pc
 /Release/
 /tmp_install/
 /portlock/
+
+# jason misc
+*.out
+*.pyc
+*log*
+*.pdf
+*.png

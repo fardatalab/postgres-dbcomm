@@ -1,0 +1,6 @@
+background_level,reader_sessions,writer_sessions,mode,clients,threads,duration_s,sampling_rate,transactions_processed,failed_transactions,latency_avg_ms,latency_stddev_ms,throughput_tps,sampled_transactions,total_log_lines,estimated_total_transactions,p50_ms,p95_ms,p99_ms,min_ms,max_ms,non_numeric_log_entries,reader_batches,writer_batches
+0,0,0,off,16,8,16,0.2,51238,0,4.985,-1.0,3209.579503,10232,10232,51160,4.857,6.521,7.551,2.107,68.648,0,0,0
+0,0,0,local,16,8,16,0.2,125157,0,2.041,-1.0,7841.069318,25081,25081,125405,1.962,2.638,3.276,1.008,113.665,0,0,0
+0,0,0,on,16,8,16,0.2,112416,0,2.272,-1.0,7042.506756,22269,22269,111345,2.211,3.206,3.884,1.144,68.722,0,0,0
+0,0,0,remote_write,16,8,16,0.2,115668,0,2.208,-1.0,7246.541607,23005,23005,115025,2.16,3.069,3.797,1.107,65.626,0,0,0
+0,0,0,remote_apply,16,8,16,0.2,112002,0,2.28,-1.0,7016.63778,22543,22543,112715,2.219,3.207,3.957,1.18,62.576,0,0,0
