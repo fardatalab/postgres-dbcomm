@@ -240,6 +240,7 @@ typedef struct ClientSocket
 {
 	pgsocket	sock;			/* File descriptor */
 	SockAddr	raddr;			/* remote addr (client) */
+	uint64		acceptedNs;		/* monotonic timestamp captured around accept() */
 } ClientSocket;
 
 #ifdef USE_SSL

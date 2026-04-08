@@ -38,6 +38,7 @@
 #include "executor/functions.h"
 #include "executor/tqueue.h"
 #include "executor/tstoreReceiver.h"
+#include "latency_instr.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "time_instr.h"
@@ -170,6 +171,7 @@ EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_o
 {
 	char		completionTag[COMPLETION_TAG_BUFSIZE];
 	Size		len;
+	LatencyTraceHandle latencyHandle = LATENCY_TRACE_INVALID_HANDLE;
 
     // jason: timing the network time for ACKing command completion
     timing_start(XACT_TS_EndCommand);
@@ -179,10 +181,13 @@ EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_o
 		case DestRemote:
 		case DestRemoteExecute:
 		case DestRemoteSimple:
+			latencyHandle = latency_trace_begin(LATENCY_STAGE_CLIENT_COMMAND_COMPLETE,
+												 0, 0);
 
 			len = BuildQueryCompletionString(completionTag, qc,
 											 force_undecorated_output);
 			pq_putmessage(PqMsg_CommandComplete, completionTag, len + 1);
+			latency_trace_end(latencyHandle);
 
 		case DestNone:
 		case DestDebug:
@@ -261,6 +266,8 @@ NullCommand(CommandDest dest)
 void
 ReadyForQuery(CommandDest dest)
 {
+	LatencyTraceHandle latencyHandle = LATENCY_TRACE_INVALID_HANDLE;
+
 	switch (dest)
 	{
 		case DestRemote:
@@ -268,6 +275,8 @@ ReadyForQuery(CommandDest dest)
 		case DestRemoteSimple:
 			{
 				StringInfoData buf;
+				latencyHandle = latency_trace_begin(LATENCY_STAGE_CLIENT_READY_FOR_QUERY,
+													 0, 0);
 
 				pq_beginmessage(&buf, PqMsg_ReadyForQuery);
 				pq_sendbyte(&buf, TransactionBlockStatusCode());
@@ -275,6 +284,7 @@ ReadyForQuery(CommandDest dest)
 			}
 			/* Flush output at end of cycle in any case. */
 			pq_flush();
+			latency_trace_end(latencyHandle);
 			break;
 
 		case DestNone:

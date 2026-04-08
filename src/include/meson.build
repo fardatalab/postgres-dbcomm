@@ -138,6 +138,7 @@ install_headers(
   'postgres.h',
   'postgres_ext.h',
   'postgres_fe.h',
+  'latency_instr.h',
   'time_instr.h',
   'timing_spots.h',
   'timing_custom_stats.h',

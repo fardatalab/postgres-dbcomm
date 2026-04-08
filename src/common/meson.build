@@ -42,6 +42,7 @@ common_sources = files(
 
 # Add instrumentation helpers so they are linked into libpgcommon variants.
 common_sources += files(
+  'latency_instr.c',
   'time_instr.c',
 )
 

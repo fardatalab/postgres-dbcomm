@@ -42,6 +42,7 @@
 #include "commands/prepare.h"
 #include "common/pg_prng.h"
 #include "jit/jit.h"
+#include "latency_instr.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
@@ -768,6 +769,7 @@ FinishQueryTimingCycle(void)
 
 	logger_query_active_wall_stop();
 	PerfControlDisableIfNeeded();
+	latency_trace_finish_query_cycle(QueryTimingSkipPrint);
 
 	if (QueryTimingSkipPrint)
 	{
@@ -1306,6 +1308,7 @@ exec_simple_query(const char *query_string)
 	bool		was_logged = false;
 	bool		use_implicit_block;
 	char		msec_str[32];
+	LatencyTraceHandle latencyParsePlanHandle = LATENCY_TRACE_INVALID_HANDLE;
 
 	/*
 	 * Report query to various monitoring facilities.
@@ -1349,7 +1352,11 @@ exec_simple_query(const char *query_string)
 	 * Do basic parsing of the query or queries (this should be safe even if
 	 * we are in aborted transaction state!)
 	 */
+	latencyParsePlanHandle =
+		latency_trace_begin(LATENCY_STAGE_BACKEND_PARSE_PLAN, 0, 0);
 	parsetree_list = pg_parse_query(query_string);
+	latency_trace_end(latencyParsePlanHandle);
+	latencyParsePlanHandle = LATENCY_TRACE_INVALID_HANDLE;
 
 	/* Log immediately if dictated by log_statement */
 	if (check_log_statement(parsetree_list))
@@ -1473,11 +1480,21 @@ exec_simple_query(const char *query_string)
 		else
 			oldcontext = MemoryContextSwitchTo(MessageContext);
 
+		/*
+		 * Count coordinator-local parse analysis / rewrite / planning as one
+		 * coarse backend-local stage. This intentionally excludes the later
+		 * distributed execution/orchestration path, which is traced via the
+		 * communication stages.
+		 */
+		latencyParsePlanHandle =
+			latency_trace_begin(LATENCY_STAGE_BACKEND_PARSE_PLAN, 0, 0);
 		querytree_list = pg_analyze_and_rewrite_fixedparams(parsetree, query_string,
 															NULL, 0, NULL);
 
 		plantree_list = pg_plan_queries(querytree_list, query_string,
 										CURSOR_OPT_PARALLEL_OK, NULL);
+		latency_trace_end(latencyParsePlanHandle);
+		latencyParsePlanHandle = LATENCY_TRACE_INVALID_HANDLE;
 
 		/*
 		 * Done with the snapshot used for parsing/planning.
@@ -5066,6 +5083,7 @@ PostgresMain(const char *dbname, const char *username)
 			case PqMsg_Query:
 				{
 					const char *query_string;
+					char remoteCommandTag[LATENCY_REMOTE_COMMAND_TAG_MAXLEN];
 
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
@@ -5074,6 +5092,17 @@ PostgresMain(const char *dbname, const char *username)
 
 					query_string = pq_getmsgstring(&input_message);
 					pq_getmsgend(&input_message);
+
+					if (latency_extract_remote_command_tag(query_string,
+													  remoteCommandTag,
+													  sizeof(remoteCommandTag)))
+					{
+						logger_set_command_tag(remoteCommandTag);
+					}
+					else
+					{
+						logger_set_command_tag(NULL);
+					}
 
 						/*
 						 * If the query string (after skipping leading whitespace)
@@ -5127,6 +5156,7 @@ PostgresMain(const char *dbname, const char *username)
 					const char *query_string;
 					int			numParams;
 					Oid		   *paramTypes = NULL;
+					char remoteCommandTag[LATENCY_REMOTE_COMMAND_TAG_MAXLEN];
 
 					forbidden_in_wal_sender(firstchar);
 
@@ -5145,6 +5175,17 @@ PostgresMain(const char *dbname, const char *username)
 							paramTypes[i] = pq_getmsgint(&input_message, 4);
 					}
 					pq_getmsgend(&input_message);
+
+					if (latency_extract_remote_command_tag(query_string,
+													  remoteCommandTag,
+													  sizeof(remoteCommandTag)))
+					{
+						logger_set_command_tag(remoteCommandTag);
+					}
+					else
+					{
+						logger_set_command_tag(NULL);
+					}
 
                     // jason: log the prepared statement, Citus adaptive scan seems to go this path, using
                     // StartPlacementExecutionOnSession which calls SendNextQuery

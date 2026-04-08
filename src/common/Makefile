@@ -61,6 +61,7 @@ OBJS_COMMON = \
 	hashfn.o \
 	ip.o \
 	jsonapi.o \
+	latency_instr.o \
 	keywords.o \
 	kwlookup.o \
 	link-canary.o \

@@ -33,6 +33,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_tablespace.h"
+#include "latency_instr.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "mb/pg_wchar.h"
@@ -252,6 +253,7 @@ PerformAuthentication(Port *port)
 	 * Done with authentication.  Disable the timeout, and log if needed.
 	 */
 	disable_timeout(STATEMENT_TIMEOUT, false);
+	latency_trace_client_session_end();
 
 	if (Log_connections)
 	{

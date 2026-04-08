@@ -20,6 +20,7 @@
 #include "access/xlog.h"
 #include "common/ip.h"
 #include "common/string.h"
+#include "latency_instr.h"
 #include "libpq/libpq.h"
 #include "libpq/libpq-be.h"
 #include "libpq/pqformat.h"
@@ -87,6 +88,14 @@ BackendMain(char *startup_data, size_t startup_data_len)
 #endif
 #endif
 
+	/*
+	 * Capture the postmaster accept/fork-to-backend handoff as its own
+	 * ordered trace stage before BackendInitialize() starts client protocol
+	 * setup and authentication. The inherited monotonic timestamp comes from
+	 * the postmaster-side accepted socket path.
+	 */
+	latency_trace_backend_spawn_start(bsdata->backendSpawnStartNs);
+
 	/* Perform additional initialization and collect startup packet */
 	BackendInitialize(MyClientSocket, bsdata->canAcceptConnections);
 
@@ -131,6 +140,8 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 
 	/* Tell fd.c about the long-lived FD associated with the client_sock */
 	ReserveExternalFD();
+	latency_trace_backend_spawn_end();
+	latency_trace_client_session_start();
 
 	/*
 	 * PreAuthDelay is a debugging aid for investigating problems in the

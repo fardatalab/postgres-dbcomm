@@ -3577,6 +3577,7 @@ BackendStartup(ClientSocket *client_sock)
 
 	/* Pass down canAcceptConnections state */
 	startup_data.canAcceptConnections = canAcceptConnections(BACKEND_TYPE_NORMAL);
+	startup_data.backendSpawnStartNs = client_sock->acceptedNs;
 	bn->dead_end = (startup_data.canAcceptConnections != CAC_OK);
 	bn->cancel_key = MyCancelKey;
 

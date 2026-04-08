@@ -58,6 +58,8 @@
 #endif
 #include <signal.h>
 #include <fcntl.h>
+
+#include "latency_instr.h"
 #include <grp.h>
 #include <unistd.h>
 #include <sys/file.h>
@@ -793,6 +795,8 @@ Setup_AF_UNIX(const char *sock_path)
 int
 AcceptConnection(pgsocket server_fd, ClientSocket *client_sock)
 {
+	client_sock->acceptedNs = latency_trace_now_ns();
+
 	/* accept connection and fill in the client (remote) address */
 	client_sock->raddr.salen = sizeof(client_sock->raddr.addr);
 	if ((client_sock->sock = accept(server_fd,

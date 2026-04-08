@@ -55,6 +55,8 @@ static struct
     bool in_distributed_xact;
     char *identity;
     bool identity_persist;
+	char command_tag[LATENCY_REMOTE_COMMAND_TAG_MAXLEN];
+	bool has_command_tag;
     /*
      * QUERY_ACTIVE_WALL spans one logical query cycle on the backend. It can
      * be paused by nested waits, so keep explicit state instead of inferring
@@ -63,7 +65,7 @@ static struct
     bool query_active_wall_running;
     int query_active_wait_depth;
     bool query_wait_wall_running;
-} logger_state = {0, NULL, false, NULL, false, false, 0, false};
+} logger_state = {0, NULL, false, NULL, false, "", false, false, 0, false};
 
 /**
  * @brief Returns true if a timing spot should persist across a distributed transaction.
@@ -198,6 +200,45 @@ logger_set_identity_persist(bool persist)
 {
     /* Keep identity until logger_reset clears it when persistence is disabled. */
     logger_state.identity_persist = persist;
+}
+
+bool
+logger_identity_persist_enabled(void)
+{
+	return logger_state.identity_persist;
+}
+
+bool
+logger_distributed_xact_active(void)
+{
+	return logger_state.in_distributed_xact;
+}
+
+const char *
+logger_get_identity(void)
+{
+	return logger_state.identity;
+}
+
+void
+logger_set_command_tag(const char *commandTag)
+{
+	logger_state.command_tag[0] = '\0';
+	logger_state.has_command_tag = false;
+
+	if (commandTag == NULL || commandTag[0] == '\0')
+	{
+		return;
+	}
+
+	strlcpy(logger_state.command_tag, commandTag, sizeof(logger_state.command_tag));
+	logger_state.has_command_tag = true;
+}
+
+const char *
+logger_get_command_tag(void)
+{
+	return logger_state.has_command_tag ? logger_state.command_tag : NULL;
 }
 
 /*
@@ -633,6 +674,8 @@ void logger_print_timings(void)
     {
         appendStringInfoString(&buf, "DistributedTransactionId: \n");
     }
+	appendStringInfo(&buf, "RemoteCommandTag: %s\n",
+					 logger_state.has_command_tag ? logger_state.command_tag : "");
     appendStringInfoString(&buf, "\n--- Timing Report (Nanoseconds) ---\n");
     appendStringInfo(&buf, "%-30s | %10s | %18s | %18s | %s\n", "Timer Name", "Count", "Total Time (ns)",
                      "Average Time (ns)", "Custom Stats");
@@ -812,6 +855,9 @@ void logger_reset()
         free(logger_state.identity);
         logger_state.identity = NULL;
     }
+
+	logger_state.command_tag[0] = '\0';
+	logger_state.has_command_tag = false;
 
     ResetQueryActiveWallState();
     logger_init(_NUM_TIMING_SPOTS, timing_spot_names);

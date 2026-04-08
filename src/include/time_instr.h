@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <time.h>
 
+#include "latency_instr.h"
 #include "./timing_spots.h"
 
 // --- API ---
@@ -205,6 +206,11 @@ void logger_set_identity(const char *identity);
  * @param persist true to keep identity across commands, false to clear on reset.
  */
 void logger_set_identity_persist(bool persist);
+bool logger_identity_persist_enabled(void);
+bool logger_distributed_xact_active(void);
+const char * logger_get_identity(void);
+void logger_set_command_tag(const char *commandTag);
+const char * logger_get_command_tag(void);
 
 #ifndef FRONTEND
 size_t LoggerShmemSize(void);
