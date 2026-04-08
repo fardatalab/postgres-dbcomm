@@ -50,6 +50,7 @@ lib*.pc
 # jason misc
 *.out
 *.pyc
-*log*
+pgbench_log*
+*.log
 *.pdf
 *.png
