@@ -164,7 +164,10 @@ def set_synchronous_commit(mode: str) -> None:
     """Apply synchronous_commit locally on the coordinator and reload."""
     set_system_setting_local("synchronous_commit", mode)
     for node in ("node-1", "node-2", "node-3", "node-4"):
-        set_system_setting_remote(node, "synchronous_commit", mode)
+        try:
+            set_system_setting_remote(node, "synchronous_commit", mode)
+        except Exception as exc:  # pragma: no cover - defensive cluster drift path
+            print(f"warning: could not set synchronous_commit={mode} on {node}: {exc}", file=sys.stderr)
 
 
 def configure_synchronous_standbys() -> None:

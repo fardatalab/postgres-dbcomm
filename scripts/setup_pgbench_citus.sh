@@ -16,6 +16,18 @@ pguser="${PGUSER:-JasonHu}"
 pghost="${PGHOST:-127.0.0.1}"
 pgport="${PGPORT:-5432}"
 
+#
+# Rebuild the benchmark tables from scratch so repeated setup runs do not keep
+# the old shard files around in the data directory. This keeps subsequent
+# physical base backups much smaller and makes the later standby bootstrap less
+# expensive.
+"${psql_bin}" -U "${pguser}" -h "${pghost}" -p "${pgport}" -d "${dbname}" -v ON_ERROR_STOP=1 <<'SQL'
+DROP TABLE IF EXISTS pgbench_history CASCADE;
+DROP TABLE IF EXISTS pgbench_tellers CASCADE;
+DROP TABLE IF EXISTS pgbench_branches CASCADE;
+DROP TABLE IF EXISTS pgbench_accounts CASCADE;
+SQL
+
 "${pgbench_bin}" -i -s "${scale}" -U "${pguser}" -h "${pghost}" -p "${pgport}" "${dbname}"
 
 "${psql_bin}" -U "${pguser}" -h "${pghost}" -p "${pgport}" -d "${dbname}" -v ON_ERROR_STOP=1 <<'SQL'
