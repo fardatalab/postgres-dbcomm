@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import shlex
 import subprocess
 import sys
 import time
@@ -33,12 +34,26 @@ def load_report_helper():
 
 
 REPORT = load_report_helper()
+ARCHIVE_SERVER_LOGS = REPO_ROOT / "scripts" / "archive_server_logs.py"
+RESET_SERVER_LOGS = REPO_ROOT / "scripts" / "reset_server_logs.py"
 
 PRIMARY_NODE = "node-0"
 STANDBY_NODE = "node-3"
 PRIMARY_APPNAME = "vanilla_stby"
 PRIMARY_HOST = "127.0.0.1"
 PRIMARY_PORT = "5432"
+SERVER_LOG_NODES = ("node-0", "node-3")
+
+
+def build_client_counts(max_clients: int) -> list[int]:
+    """Return a powers-of-two client sweep up to the requested maximum."""
+
+    counts: list[int] = []
+    clients = 1
+    while clients <= max_clients:
+        counts.append(clients)
+        clients *= 2
+    return counts
 
 
 def run_cmd(args: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -87,6 +102,46 @@ def set_system_setting_remote(node: str, setting: str, value: str) -> None:
         f"$HOME/pg/bin/pg_ctl reload -D $HOME/pg/data"
     )
     ssh_cmd(node, remote_cmd)
+
+
+def reset_server_logs() -> None:
+    """Rotate and prune the collector logs before the next benchmark row."""
+    run_cmd(
+        [
+            sys.executable,
+            str(RESET_SERVER_LOGS),
+            "--nodes",
+            *SERVER_LOG_NODES,
+        ]
+    )
+
+
+def archive_server_logs(run_dir: Path) -> None:
+    """Copy the current collector logfile from each node into this row's directory."""
+    run_cmd(
+        [
+            sys.executable,
+            str(ARCHIVE_SERVER_LOGS),
+            "--current-only",
+            "--output-dir",
+            str(run_dir / "server-logs"),
+            "--nodes",
+            *SERVER_LOG_NODES,
+        ]
+    )
+
+
+def emit_row_log_marker(*, mode: str, clients: int, nodes: tuple[str, ...]) -> None:
+    """Emit one explicit LOG line on each node so the row logfile is materialized."""
+
+    message = f"pgbench row marker mode={mode} clients={clients}"
+    sql = f"DO $$ BEGIN RAISE LOG {message!r}; END $$;"
+    remote_cmd = (
+        "export PATH=$HOME/pg/bin:$PATH; "
+        f"psql -v ON_ERROR_STOP=1 -X -d postgres -c {shlex.quote(sql)}"
+    )
+    for node in nodes:
+        ssh_cmd(node, remote_cmd)
 
 
 def configure_synchronous_standby() -> None:
@@ -218,6 +273,7 @@ def run_pgbench(
     metrics["threads"] = threads
     metrics["duration_s"] = duration_s
     metrics["sampling_rate"] = sample_rate
+    metrics["server_logs_dir"] = str(run_dir / "server-logs")
 
     print(
         "  done: "
@@ -325,6 +381,7 @@ def main() -> int:
         ensure_setup_ready(args.dbname)
 
     configure_synchronous_standby()
+    reset_server_logs()
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     results_dir = args.results_dir / f"pgbench-sync-commit-{timestamp}"
@@ -351,6 +408,7 @@ def main() -> int:
         "min_ms",
         "max_ms",
         "non_numeric_log_entries",
+        "server_logs_dir",
     ]
 
     try:
@@ -362,7 +420,7 @@ def main() -> int:
                 print(f"configuring synchronous_commit={mode}", flush=True)
                 configure_sync_commit(mode)
 
-                for clients in range(1, args.max_clients + 1):
+                for clients in build_client_counts(args.max_clients):
                     run_dir = results_dir / mode / f"c{clients:02d}"
                     metrics = run_pgbench(
                         mode=mode,
@@ -375,6 +433,9 @@ def main() -> int:
                     )
                     writer.writerow(metrics)
                     csv_file.flush()
+                    emit_row_log_marker(mode=mode, clients=clients, nodes=SERVER_LOG_NODES)
+                    archive_server_logs(run_dir)
+                    reset_server_logs()
 
                     # Keep only the summary and the CSV by default. Raw logs can
                     # be very large across 160 benchmark points.

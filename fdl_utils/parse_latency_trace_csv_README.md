@@ -1,29 +1,27 @@
 # Ordered Latency CSV Parser
 
-[`parse_latency_trace_csv.py`](/data/dbcomm/postgres-citus/fdl_utils/parse_latency_trace_csv.py#L1) converts the ordered latency trace blocks emitted by [`latency_instr.c`](/data/dbcomm/postgres-citus/src/common/latency_instr.c#L148) into one CSV row per coordinator transaction/query-cycle trace. When worker logs are also provided, it joins worker timing reports and worker ordered traces back into each coordinator row using the propagated `rsid` / `rcid` / `kind` tags plus timestamp proximity.
+[`parse_latency_trace_csv.py`](./parse_latency_trace_csv.py) converts the ordered latency trace blocks emitted by [`latency_instr.c`](../src/common/latency_instr.c) into one CSV row per coordinator transaction/query-cycle trace. When worker logs are also provided, it joins worker timing reports and worker ordered traces back into each coordinator row using the propagated `rsid` / `rcid` / `kind` tags plus timestamp proximity.
+
+The parser expects collector-backed PostgreSQL logs. In this cluster, the benchmark runbook archives those files with [`scripts/archive_server_logs.py`](../scripts/archive_server_logs.py) in `--current-only` mode after each benchmark row, and it uses [`scripts/reset_server_logs.py`](../scripts/reset_server_logs.py) to rotate/prune the collector directory before the next row starts.
 
 ## Usage
 
 Coordinator-only CSV:
 
 ```bash
-sudo -u dbcomm bash -lc '
-  /data/dbcomm/postgres-citus/fdl_utils/parse_latency_trace_csv.py \
-    /data/dbcomm/pg-citus/data/logfile \
-    -o /tmp/latency_trace.csv
-'
+python3 fdl_utils/parse_latency_trace_csv.py \
+  bench-results-tuned/<run-name>/server-logs/node-0.log \
+  -o /tmp/latency_trace.csv
 ```
 
 Coordinator + one or more worker logs:
 
 ```bash
-sudo -u dbcomm bash -lc '
-  /data/dbcomm/postgres-citus/fdl_utils/parse_latency_trace_csv.py \
-    /data/dbcomm/pg-citus/data/logfile \
-    --worker-log /tmp/worker0.log \
-    --worker-log /tmp/worker1.log \
-    -o /tmp/latency_joined.csv
-'
+python3 fdl_utils/parse_latency_trace_csv.py \
+  bench-results-tuned/<run-name>/server-logs/node-0.log \
+  --worker-log bench-results-tuned/<run-name>/server-logs/node-1.log \
+  --worker-log bench-results-tuned/<run-name>/server-logs/node-2.log \
+  -o /tmp/latency_joined.csv
 ```
 
 `--include-counts` adds `<stage>_count` columns so repeated stages inside one transaction row are visible.
@@ -156,7 +154,7 @@ This is enough for the current validation scenarios, including multiple worker l
 
 ## Plotting
 
-[`plot_latency_trace_scenario.py`](/data/dbcomm/postgres-citus/fdl_utils/plot_latency_trace_scenario.py#L1) plots the mean of all rows in one scenario CSV as a stacked horizontal bar and saves the result as PDF.
+[`plot_latency_trace_scenario.py`](./plot_latency_trace_scenario.py) plots the mean of all rows in one scenario CSV as a stacked horizontal bar and saves the result as PDF.
 
 The plot intentionally uses a smaller set of consolidated buckets instead of the
 full raw stage list:
@@ -208,7 +206,7 @@ the worker backends themselves are taking longer to do real work.
 
 ## Waterfall Plot
 
-[`plot_latency_trace_waterfall.py`](/data/dbcomm/postgres-citus/fdl_utils/plot_latency_trace_waterfall.py#L1) plots one traced transaction as a swimlane/waterfall timeline:
+[`plot_latency_trace_waterfall.py`](./plot_latency_trace_waterfall.py) plots one traced transaction as a swimlane/waterfall timeline:
 
 - one coordinator lane for local/backend/control stages
 - one lane per matched worker session (`rsid=...`) for the coordinator-observed

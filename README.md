@@ -35,9 +35,10 @@ Before running any benchmark, make sure these prerequisites are already true:
 1. PostgreSQL and Citus are built and installed under `~/pg` on every node.
 2. If a build tree was copied in with `scp`, it was reconfigured for this cluster before installation so generated paths point at `~/pg`.
 3. The `10.10.1.0/24` fabric is allowed in `pg_hba.conf` for normal connections and replication connections.
-4. The cluster nodes can SSH to each other with `BatchMode=yes`.
-5. For Citus runs, node-0 must currently preload `citus` and node-3/node-4 must be the worker standbys.
-6. For vanilla runs, node-0 must be a plain PostgreSQL primary and node-3 must be its standby.
+4. Collector-backed logging is enabled on all nodes (`logging_collector = on`) so the latency-trace parser can read the server logs for each run.
+5. The cluster nodes can SSH to each other with `BatchMode=yes`.
+6. For Citus runs, node-0 must currently preload `citus` and node-3/node-4 must be the worker standbys.
+7. For vanilla runs, node-0 must be a plain PostgreSQL primary and node-3 must be its standby.
 
 ### Build And Install Prerequisites
 
@@ -61,6 +62,7 @@ A full end-to-end reproduction usually goes in this order:
 7. Run the vanilla synchronous-commit sweep.
 8. Run the vanilla network-interference sweep.
 9. Restore Citus again before leaving the cluster in a reusable state for later Citus runs.
+10. Archive the collector logs from the nodes involved in each run and parse them with the latency-trace utilities if you want the trace-level measurements, not just the `pgbench` summary CSV.
 
 ## How The Scripts Fit Together
 
@@ -72,6 +74,39 @@ The repo has four benchmark families:
 - vanilla PostgreSQL network-interference sweep
 
 Each family has a setup script, a runner, and usually a plotter.
+
+### Latency Trace Collection
+
+The latency-instrumented branch writes ordered trace blocks into the collector-backed PostgreSQL logs, so after a benchmark row you should snapshot the collector logs from the participating nodes before parsing.
+
+Use:
+
+```bash
+python3 scripts/archive_server_logs.py --current-only --output-dir bench-results-tuned/<run-name>/server-logs
+```
+
+The benchmark runners now use a row-by-row log workflow:
+
+1. rotate/prune the collector logs on the participating nodes before the row starts
+2. run the benchmark row
+3. archive the current collector logfile from each participating node into that row's `server-logs/` subdirectory
+
+That keeps each CSV row paired with its own text logfile snapshot and avoids the huge multi-row collector directories we had earlier.
+
+For Citus benchmark families, archive node-0 plus the worker primaries `node-1` and `node-2`.
+For vanilla benchmark families, archive node-0 plus the standby node-3 if it has useful trace output; the primary log is the most important one.
+
+Then parse the archived logs with:
+
+```bash
+python3 fdl_utils/parse_latency_trace_csv.py \
+  bench-results-tuned/<run-name>/server-logs/node-0.log \
+  --worker-log bench-results-tuned/<run-name>/server-logs/node-1.log \
+  --worker-log bench-results-tuned/<run-name>/server-logs/node-2.log \
+  -o bench-results-tuned/<run-name>/latency-trace.csv
+```
+
+The scenario plotter and waterfall plotter then consume that latency CSV and the archived per-row log snapshots, respectively.
 
 ### Citus Synchronous-Commit Sweep
 
@@ -112,6 +147,8 @@ python3 scripts/plot_pgbench_sync_commit_bench.py \
   --csv bench-results-tuned/pgbench-sync-commit-<timestamp>/results.csv
 ```
 
+If you want the trace-level instrumentation for this run, archive the node logs from the same result directory after the sweep and then parse them with `fdl_utils/parse_latency_trace_csv.py` as described above.
+
 ### Vanilla PostgreSQL Synchronous-Commit Sweep
 
 Switch node-0/node-3 away from Citus and into the plain primary/standby topology, then initialize a separate `pgbench_vanilla` database:
@@ -148,6 +185,8 @@ python3 scripts/plot_pgbench_sync_commit_comparison.py \
   --citus-csv bench-results-tuned/pgbench-sync-commit-<timestamp>/results.csv \
   --vanilla-csv bench-results-vanilla/pgbench-sync-commit-<timestamp>/results.csv
 ```
+
+Archive the collector logs from node-0 and node-3 after the vanilla run if you want the trace-level latency decomposition for that family as well.
 
 ### Citus Network-Interference Sweep
 
@@ -195,6 +234,8 @@ python3 scripts/plot_pgbench_network_interference_comparison.py \
   --vanilla-csv bench-results-network-interference/vanilla-network-interference-<timestamp>/results.csv
 ```
 
+Archive node-0, node-1, and node-2 from the Citus interference run before parsing the trace logs with `fdl_utils/parse_latency_trace_csv.py`.
+
 ### Vanilla PostgreSQL Network-Interference Sweep
 
 Switch node-0/node-3 into the vanilla primary/standby topology and create the local background sink table:
@@ -224,6 +265,8 @@ Useful notes:
 - The foreground benchmark is still `pgbench` on node-0.
 - `background_level = 0` is the no-background baseline.
 - The default result directory is `bench-results-network-interference`.
+
+Archive node-0 and node-3 after the vanilla interference run if you want to parse the collector logs for the trace-level view.
 
 
 ## Switching Between Citus And Vanilla
