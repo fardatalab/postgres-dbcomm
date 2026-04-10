@@ -33,16 +33,19 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 KNOWN_STAGES: Tuple[str, ...] = (
     "backend_spawn",
     "client_session_establish",
+    "client_command_receive",
     "backend_parse_plan",
     "worker_session_acquire",
     "placement_bind",
     "remote_tx_attach",
     "remote_command_dispatch",
+    "remote_command_flush",
     "remote_command_wait",
     "remote_result_drain",
     "remote_tx_commit",
     "remote_tx_abort",
     "remote_tx_prepare",
+    "worker_session_release",
     "client_command_complete",
     "client_ready_for_query",
 )
@@ -72,6 +75,7 @@ STAGE_KIND_MAP: Dict[str, Tuple[str, ...]] = {
     "task_query": (
         "placement_bind",
         "remote_command_dispatch",
+        "remote_command_flush",
         "remote_command_wait",
         "remote_result_drain",
     ),

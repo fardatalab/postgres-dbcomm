@@ -44,6 +44,7 @@ from parse_latency_trace_csv import (
 COORDINATOR_STAGES: Tuple[str, ...] = (
     "backend_spawn",
     "client_session_establish",
+    "client_command_receive",
     "backend_parse_plan",
     "placement_bind",
     "remote_command_dispatch",
@@ -54,19 +55,23 @@ COORDINATOR_STAGES: Tuple[str, ...] = (
 WORKER_ENVELOPE_STAGES: Tuple[str, ...] = (
     "worker_session_acquire",
     "remote_tx_attach",
+    "remote_command_flush",
     "remote_command_wait",
     "remote_result_drain",
     "remote_tx_commit",
     "remote_tx_abort",
     "remote_tx_prepare",
+    "worker_session_release",
 )
 
 SHORT_STAGE_LABELS: Dict[str, str] = {
     "backend_spawn": "backend spawn",
     "client_session_establish": "auth/startup",
+    "client_command_receive": "client recv",
     "backend_parse_plan": "parse/plan",
     "placement_bind": "placement bind",
     "remote_command_dispatch": "dispatch",
+    "remote_command_flush": "flush",
     "client_command_complete": "cmd complete",
     "client_ready_for_query": "ready",
     "worker_session_acquire": "session acquire",
@@ -76,6 +81,7 @@ SHORT_STAGE_LABELS: Dict[str, str] = {
     "remote_tx_commit": "tx commit",
     "remote_tx_abort": "tx abort",
     "remote_tx_prepare": "tx prepare",
+    "worker_session_release": "session release",
 }
 
 COLORS: Dict[str, str] = {
@@ -247,7 +253,13 @@ def build_coordinator_segments(trace: TraceBlock) -> List[PlotSegment]:
             continue
 
         color_key = "coordinator"
-        if stage.stage_name in ("backend_spawn", "client_session_establish", "client_command_complete", "client_ready_for_query"):
+        if stage.stage_name in (
+            "backend_spawn",
+            "client_session_establish",
+            "client_command_receive",
+            "client_command_complete",
+            "client_ready_for_query",
+        ):
             color_key = "client"
 
         segments.append(

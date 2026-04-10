@@ -96,12 +96,6 @@ IsTransactionalTimingSpot(int timer_id)
 typedef struct LoggerSharedState
 {
     LWLock lock;
-    /*
-     * Node-wide count of logical query cycles that currently want FIFO-based
-     * perf capture. The first entrant enables perf and the last leaver
-     * disables it.
-     */
-    uint32 perf_active_query_cycles;
 } LoggerSharedState;
 
 static LoggerSharedState *logger_shared = NULL;
@@ -117,7 +111,6 @@ void LoggerShmemInit(void)
     if (!found)
     {
         LWLockInitialize(&logger_shared->lock, LWTRANCHE_LOGGER);
-        logger_shared->perf_active_query_cycles = 0;
     }
 }
 #else
@@ -413,73 +406,6 @@ logger_query_active_wall_is_running(void)
 {
     return logger_state.query_active_wall_running;
 }
-
-#ifndef FRONTEND
-/**
- * @brief Enter the node-wide perf-controlled logical query-cycle set.
- *
- * Returns true only for the 0->1 transition, so the caller can issue the
- * external FIFO "enable" command exactly once for the first active query on
- * the node.
- */
-bool
-logger_perf_query_cycle_enter(void)
-{
-    bool should_enable = true;
-
-    /*
-     * Standalone/frontend code paths do not install the shared logger state.
-     * Fall back to the original per-backend behavior there.
-     */
-    if (logger_shared == NULL)
-        return true;
-
-    LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE);
-    should_enable = (logger_shared->perf_active_query_cycles == 0);
-    logger_shared->perf_active_query_cycles++;
-    LWLockRelease(&logger_shared->lock);
-
-    return should_enable;
-}
-
-/**
- * @brief Leave the node-wide perf-controlled logical query-cycle set.
- *
- * Returns true only for the 1->0 transition, so the caller can issue the
- * external FIFO "disable" command exactly once when the last active query on
- * the node finishes.
- */
-bool
-logger_perf_query_cycle_exit(void)
-{
-    bool should_disable = true;
-
-    if (logger_shared == NULL)
-        return true;
-
-    LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE);
-
-    if (logger_shared->perf_active_query_cycles == 0)
-    {
-        /*
-         * This should never happen; keep running and avoid underflowing the
-         * shared count so a bad backend does not permanently wedge perf
-         * capture for the whole node.
-         */
-        log_message("perf query-cycle refcount underflow while leaving query cycle");
-        should_disable = false;
-    }
-    else
-    {
-        logger_shared->perf_active_query_cycles--;
-        should_disable = (logger_shared->perf_active_query_cycles == 0);
-    }
-
-    LWLockRelease(&logger_shared->lock);
-
-    return should_disable;
-}
-#endif
 
 /*
  * Legacy logger_print_timings implementation retained for reference. It

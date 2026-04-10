@@ -21,7 +21,6 @@
 #include "timing_spots.h"
 
 #include <ctype.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <sys/resource.h>
@@ -86,8 +85,6 @@
 
 #include "time_instr.h"
 
-#define PERF_CONTROL_FIFO_PATH "/tmp/perf_ctl"
-
 /* ----------------
  *		global variables
  * ----------------
@@ -150,20 +147,6 @@ static char *stack_base_ptr = NULL;
 static bool xact_started = false;
 
 /*
- * Original backend-local perf flag. The FIFO controls a node-wide perf
- * recorder, so local state alone was not sufficient once concurrent backends
- * could overlap.
- */
-/* static bool PerfControlCaptureActive = false; */
-
-/*
- * Track whether this backend registered the current logical query cycle in the
- * shared first-enable/last-disable perf refcount. This local flag prevents
- * double-exit bugs on error or proc-exit cleanup paths.
- */
-static bool PerfControlQueryCycleRegistered = false;
-
-/*
  * Query timing is now printed only after the backend finishes the matching
  * ReadyForQuery() flush. These flags preserve that decision across message
  * processing and error recovery.
@@ -213,6 +196,7 @@ static int	InteractiveBackend(StringInfo inBuf);
 static int	interactive_getc(void);
 static int	SocketBackend(StringInfo inBuf);
 static int	ReadCommand(StringInfo inBuf);
+static bool FrontendMessageStartsQueryTimingCycle(int qtype);
 static void forbidden_in_wal_sender(char firstchar);
 static bool check_log_statement(List *stmt_list);
 static int	errdetail_execute(List *raw_parsetree_list);
@@ -228,11 +212,6 @@ static void drop_unnamed_stmt(void);
 static void log_disconnections(int code, Datum arg);
 static void enable_statement_timeout(void);
 static void disable_statement_timeout(void);
-static bool PerfControlWriteCommand(const char *command, size_t commandLength,
-									bool logFailures);
-static void PerfControlEnableIfNeeded(void);
-static void PerfControlDisableIfNeeded(void);
-static void PerfControlOnProcExit(int code, Datum arg);
 static void BeginQueryTimingCycle(void);
 static void SetCurrentQueryTimingSkipPrint(bool skipPrint);
 static void FinishQueryTimingCycle(void);
@@ -391,6 +370,32 @@ interactive_getc(void)
 	return c;
 }
 
+/*
+ * FrontendMessageStartsQueryTimingCycle reports whether a frontend protocol
+ * message belongs to a logical query cycle that will later end in
+ * ReadyForQuery. We use this to keep client-command ingress timing scoped to
+ * the same ordered trace row instead of leaking CLOSE/FLUSH-only protocol
+ * messages into the next unrelated cycle.
+ */
+static bool
+FrontendMessageStartsQueryTimingCycle(int qtype)
+{
+	switch (qtype)
+	{
+		case PqMsg_Query:
+		case PqMsg_Parse:
+		case PqMsg_Bind:
+		case PqMsg_Execute:
+		case PqMsg_FunctionCall:
+		case PqMsg_Describe:
+		case PqMsg_Sync:
+			return true;
+
+		default:
+			return false;
+	}
+}
+
 /* ----------------
  *	SocketBackend()		Is called for frontend-backend connections
  *
@@ -404,6 +409,7 @@ SocketBackend(StringInfo inBuf)
 {
 	int			qtype;
 	int			maxmsglen;
+	LatencyTraceHandle latencyHandle = LATENCY_TRACE_INVALID_HANDLE;
 
 	/*
 	 * Get message type code from the frontend.
@@ -513,8 +519,30 @@ SocketBackend(StringInfo inBuf)
 	 * after the type code; we can read the message contents independently of
 	 * the type.
 	 */
+	if (FrontendMessageStartsQueryTimingCycle(qtype))
+	{
+		/*
+		 * Start after the type byte is already readable so this stage reflects
+		 * backend-side protocol/body ingress without charging the arbitrary
+		 * client-idle gap before the command began arriving.
+		 */
+		latencyHandle = latency_trace_begin(LATENCY_STAGE_CLIENT_COMMAND_RECEIVE,
+											0, 0);
+	}
+
 	if (pq_getmessage(inBuf, maxmsglen))
+	{
+		if (latencyHandle != LATENCY_TRACE_INVALID_HANDLE)
+		{
+			latency_trace_end(latencyHandle);
+		}
 		return EOF;				/* suitable message already logged */
+	}
+
+	if (latencyHandle != LATENCY_TRACE_INVALID_HANDLE)
+	{
+		latency_trace_end(latencyHandle);
+	}
 	RESUME_CANCEL_INTERRUPTS();
 
 	return qtype;
@@ -540,186 +568,6 @@ ReadCommand(StringInfo inBuf)
 }
 
 /*
- * PerfControlWriteCommand writes a small enable/disable command to the external
- * perf control FIFO without ever blocking the backend.
- *
- * We intentionally open the FIFO with O_NONBLOCK because perf is optional
- * external tooling. If perf record is not attached to the FIFO, we log the
- * failure and continue query execution rather than stalling the backend.
- */
-static bool
-PerfControlWriteCommand(const char *command, size_t commandLength, bool logFailures)
-{
-	int			perfControlFd = -1;
-	size_t		totalWritten = 0;
-
-	perfControlFd = open(PERF_CONTROL_FIFO_PATH, O_WRONLY | O_NONBLOCK);
-	if (perfControlFd < 0)
-	{
-		if (logFailures)
-		{
-			log_message("perf control open failed for %s: %m",
-						PERF_CONTROL_FIFO_PATH);
-		}
-		return false;
-	}
-
-	while (totalWritten < commandLength)
-	{
-		ssize_t		writtenBytes = write(perfControlFd,
-										 command + totalWritten,
-										 commandLength - totalWritten);
-
-		if (writtenBytes < 0)
-		{
-			if (errno == EINTR)
-			{
-				/* Retry interrupted writes so the tiny FIFO command stays atomic. */
-				continue;
-			}
-
-			if (logFailures)
-			{
-				log_message("perf control write failed for %s: %m",
-							PERF_CONTROL_FIFO_PATH);
-			}
-
-			(void) close(perfControlFd);
-			return false;
-		}
-
-		if (writtenBytes == 0)
-		{
-			if (logFailures)
-			{
-				log_message("perf control write wrote 0 bytes to %s",
-							PERF_CONTROL_FIFO_PATH);
-			}
-
-			(void) close(perfControlFd);
-			return false;
-		}
-
-		totalWritten += writtenBytes;
-	}
-
-	if (close(perfControlFd) != 0 && logFailures)
-	{
-		log_message("perf control close failed for %s: %m",
-					PERF_CONTROL_FIFO_PATH);
-	}
-
-	return true;
-}
-
-/*
- * PerfControlEnableIfNeeded registers the current logical query cycle with the
- * shared node-wide perf refcount and issues the external FIFO enable only for
- * the first active query on the node.
- *
- * This keeps the perf capture window aligned with QUERY_ACTIVE_WALL semantics
- * rather than the older simple-query-only bracket.
- */
-static void
-PerfControlEnableIfNeeded(void)
-{
-	static const char PerfEnableCommand[] = "enable\n";
-	bool		shouldEnableNodePerf = false;
-
-	if (PerfControlQueryCycleRegistered)
-	{
-		return;
-	}
-
-	PerfControlQueryCycleRegistered = true;
-	shouldEnableNodePerf = logger_perf_query_cycle_enter();
-
-	if (!shouldEnableNodePerf)
-	{
-		return;
-	}
-
-	/*
-	 * Keep the shared registration even if the FIFO write fails. The intended
-	 * workflow starts perf record before running queries, and preserving the
-	 * refcount keeps the later last-disable transition correct under overlap.
-	 * A late-starting recorder will only be picked up after the node returns to
-	 * zero active query cycles and a new first-enable happens.
-	 */
-	(void) PerfControlWriteCommand(PerfEnableCommand,
-								   sizeof(PerfEnableCommand) - 1,
-								   true);
-}
-
-/*
- * PerfControlDisableIfNeeded unregisters the current logical query cycle from
- * the shared node-wide perf refcount and issues the external FIFO disable only
- * when the last active query on the node finishes.
- *
- * We clear the backend-local registration flag even if the disable write fails
- * so proc-exit cleanup does not underflow the shared refcount.
- */
-static void
-PerfControlDisableIfNeeded(void)
-{
-	static const char PerfDisableCommand[] = "disable\n";
-	bool		shouldDisableNodePerf = false;
-
-	if (!PerfControlQueryCycleRegistered)
-	{
-		return;
-	}
-
-	PerfControlQueryCycleRegistered = false;
-	shouldDisableNodePerf = logger_perf_query_cycle_exit();
-
-	if (!shouldDisableNodePerf)
-	{
-		return;
-	}
-
-	(void) PerfControlWriteCommand(PerfDisableCommand,
-								   sizeof(PerfDisableCommand) - 1,
-								   true);
-}
-
-/*
- * PerfControlOnProcExit is a last-resort cleanup hook to stop perf capture if
- * this backend exits while still registered in the FIFO-controlled node-wide
- * perf refcount.
- */
-static void
-PerfControlOnProcExit(int code, Datum arg)
-{
-    static const char PerfDisableCommand[] = "disable\n";
-    bool shouldDisableNodePerf = false;
-
-    (void) code;
-	(void) arg;
-
-    if (!PerfControlQueryCycleRegistered)
-	{
-		return;
-	}
-
-	PerfControlQueryCycleRegistered = false;
-	shouldDisableNodePerf = logger_perf_query_cycle_exit();
-
-	if (!shouldDisableNodePerf)
-	{
-		return;
-	}
-
-	/*
-	 * Avoid extra logging during backend exit paths. The main query lifecycle
-	 * already logs failures on explicit enable/disable attempts.
-	 */
-	(void) PerfControlWriteCommand(PerfDisableCommand,
-								   sizeof(PerfDisableCommand) - 1,
-								   false);
-}
-
-/*
  * BeginQueryTimingCycle opens the QUERY_ACTIVE_WALL denominator for the current
  * logical query cycle. For extended protocol, the same cycle can span multiple
  * frontend messages until the later Sync/ReadyForQuery handoff.
@@ -733,7 +581,6 @@ BeginQueryTimingCycle(void)
 	}
 
 	logger_query_active_wall_start();
-	PerfControlEnableIfNeeded();
 	QueryTimingPrintPending = true;
 	QueryTimingSkipPrint = false;
 }
@@ -768,7 +615,6 @@ FinishQueryTimingCycle(void)
 	}
 
 	logger_query_active_wall_stop();
-	PerfControlDisableIfNeeded();
 	latency_trace_finish_query_cycle(QueryTimingSkipPrint);
 
 	if (QueryTimingSkipPrint)
@@ -4650,13 +4496,6 @@ PostgresMain(const char *dbname, const char *username)
 	if (IsUnderPostmaster && Log_disconnections)
 		on_proc_exit(log_disconnections, 0);
 
-	/*
-	 * Best-effort cleanup for FIFO-controlled perf capture. This protects the
-	 * one-backend-per-node workflow from leaving perf enabled after an abnormal
-	 * backend exit.
-	 */
-	on_proc_exit(PerfControlOnProcExit, 0);
-
 	pgstat_report_connect(MyDatabaseId);
 
 	/* Perform initialization specific to a WAL sender process. */
@@ -4996,13 +4835,6 @@ PostgresMain(const char *dbname, const char *username)
 			ReadyForQuery(whereToSendOutput);
 
 			/*
-			 * Original code disabled perf directly here. FinishQueryTimingCycle()
-			 * now owns that transition so the perf window follows the same
-			 * logical query-cycle boundary as QUERY_ACTIVE_WALL.
-			 */
-			/* PerfControlDisableIfNeeded(); */
-
-			/*
 			 * Emit the logical query-cycle report only after the matching
 			 * ReadyForQuery() flush completes. This aligns the printed timing
 			 * block with the real client-visible end of the query.
@@ -5121,13 +4953,6 @@ PostgresMain(const char *dbname, const char *username)
 								skip_query_str_print = false;
 						}
 						SetCurrentQueryTimingSkipPrint(skip_query_str_print);
-
-						/*
-						 * Original code enabled perf only for simple protocol
-						 * here. BeginQueryTimingCycle() now owns that transition
-						 * so extended-protocol query cycles are covered too.
-						 */
-						/* PerfControlEnableIfNeeded(); */
 
 						// jason: timing the execution of a query (coordinator side should be full query time)
 						timing_start(ExecSimpleQuery);

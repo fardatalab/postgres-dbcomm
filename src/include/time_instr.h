@@ -154,27 +154,6 @@ void logger_query_active_wall_resume_wait(void);
  */
 bool logger_query_active_wall_is_running(void);
 
-#ifndef FRONTEND
-/**
- * @brief Register that this backend entered a logical query cycle for node-wide perf control.
- *
- * The perf FIFO controls a node-wide recorder, so backends coordinate through
- * shared memory. The caller should issue the external "enable" command only
- * when this helper returns true, which corresponds to the first active query
- * cycle on the node.
- */
-bool logger_perf_query_cycle_enter(void);
-
-/**
- * @brief Register that this backend left a logical query cycle for node-wide perf control.
- *
- * The caller should issue the external "disable" command only when this helper
- * returns true, which corresponds to the last active query cycle on the node
- * finishing.
- */
-bool logger_perf_query_cycle_exit(void);
-#endif
-
 /**
  * @brief Marks whether the logger is inside a distributed transaction.
  *

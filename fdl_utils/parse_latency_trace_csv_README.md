@@ -73,6 +73,9 @@ not:
 - `preceding_query`: latest `Query executed:` text seen on that backend before the trace flushed. For explicit transactions this is often `COMMIT;`.
 - `dropped_entries`: count of ordered trace entries dropped because the fixed trace buffer filled.
 - `trace_total_ns`: covered span from earliest recorded trace start to latest recorded trace end.
+  This is the traced server-side transaction span, not a perfect client-side
+  stopwatch, because `client_command_receive_ns` starts after the message type
+  byte is already available on the backend.
 
 ### Raw Stage Totals
 
@@ -80,16 +83,19 @@ These columns come directly from the coordinator ordered trace and are always in
 
 - `client_session_establish_ns`: traced client-to-coordinator backend startup/auth cost recorded on that backend. Present when the row includes session establishment.
 - `backend_spawn_ns`: traced postmaster accept/fork/backend-handoff span before `BackendInitialize()` starts on that backend.
+- `client_command_receive_ns`: traced backend-side frontend message ingress after the message type byte is available. This captures body framing and protocol receive work for Query / Parse / Bind / Execute / Describe / Sync / FunctionCall messages. It intentionally does not include arbitrary client-idle time before the first byte arrives.
 - `backend_parse_plan_ns`: traced coarse coordinator-local parse / analyze / rewrite / planning work. This is backend execution, not communication stack, but it is now counted toward the covered trace span.
 - `worker_session_acquire_ns`: coordinator-side span for acquiring a worker SQL session. This may include cache lookup, connection establishment, startup/auth wait, and related control-path bookkeeping.
 - `placement_bind_ns`: coordinator control-plane bookkeeping that pins the placement to a worker session.
 - `remote_tx_attach_ns`: coordinator span for worker transaction attach/bootstrap (`BEGIN` + tx-state replay + distributed tx id assignment).
 - `remote_command_dispatch_ns`: coordinator send/control span for dispatching the remote work command.
+- `remote_command_flush_ns`: coordinator post-dispatch socket-flush span for task-query bytes that were queued in libpq but not yet fully flushed to the worker socket.
 - `remote_command_wait_ns`: coordinator-observed remote work round before result drain. This is the main composite remote span.
 - `remote_result_drain_ns`: coordinator drain/materialization tail after the remote work becomes ready.
 - `remote_tx_commit_ns`: coordinator span for remote commit.
 - `remote_tx_abort_ns`: coordinator span for remote abort.
 - `remote_tx_prepare_ns`: coordinator span for remote prepare.
+- `worker_session_release_ns`: coordinator end-of-transaction worker-session reset/release/close bookkeeping after remote commit/abort/prepare has finished.
 - `client_command_complete_ns`: coordinator tail for `CommandComplete`.
 - `client_ready_for_query_ns`: coordinator tail for `ReadyForQuery`.
 
@@ -161,12 +167,18 @@ full raw stage list:
 
 - `Client Session Setup`
   Uses `backend_spawn_ns + client_session_establish_ns`.
+- `Client Protocol`
+  Uses `client_command_receive_ns + client_command_complete_ns +
+  client_ready_for_query_ns`.
 - `Coordinator Backend Work`
   Uses `backend_parse_plan_ns`.
-- `Worker Session Setup`
-  Uses only `worker_session_acquire_comm_ns` when worker joins are available.
-  This is the communication/control residual of worker session acquisition.
-  If worker joins are unavailable, it falls back to `worker_session_acquire_ns`.
+- `Worker Session Control`
+  Uses `worker_session_release_ns` plus only
+  `worker_session_acquire_comm_ns` when worker joins are available.
+  This is the communication/control residual of worker session acquisition plus
+  the coordinator-side end-of-transaction worker-session cleanup.
+  If worker joins are unavailable, it falls back to
+  `worker_session_acquire_ns + worker_session_release_ns`.
 - `Worker Lifecycle Work`
   Uses `worker_session_acquire_actual_ns + remote_tx_attach_actual_ns +
   remote_tx_commit_actual_ns + remote_tx_abort_actual_ns +
@@ -178,15 +190,14 @@ full raw stage list:
   when worker joins are available, and otherwise falls back to the raw
   coordinator stage totals.
 - `Remote Execution Control`
-  Uses placement bind, remote dispatch, and the residual/control parts of remote
-  wait and drain. Without worker joins it falls back to the raw coordinator
-  `remote_command_wait_ns + remote_result_drain_ns`.
+  Uses placement bind, remote dispatch, remote flush, and the
+  residual/control parts of remote wait and drain. Without worker joins it
+  falls back to the raw coordinator `remote_command_flush_ns +
+  remote_command_wait_ns + remote_result_drain_ns`.
 - `Worker Backend Work`
   Uses `remote_command_wait_actual_ns + remote_result_drain_actual_ns`.
   This is worker-side actual query execution and result production work, and is
   only nonzero when worker joins are available.
-- `Client Response`
-  Uses `client_command_complete_ns + client_ready_for_query_ns`.
 
 The x-axis is now percentage share of the traced mean transaction latency, not
 absolute milliseconds. That makes scenario-level composition easier to compare
@@ -194,7 +205,8 @@ when the absolute mean latency differs significantly across scenarios.
 
 The main diagnostic split is now:
 
-- `Worker Session Setup`, `Distributed TX Management`, and `Remote Execution Control`
+- `Client Protocol`, `Worker Session Control`, `Distributed TX Management`,
+  and `Remote Execution Control`
   are communication/control-path heavy buckets.
 - `Worker Lifecycle Work` and `Worker Backend Work`
   are worker-side backend work buckets.

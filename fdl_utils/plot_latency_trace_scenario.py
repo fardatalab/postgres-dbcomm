@@ -26,13 +26,22 @@ CONSOLIDATED_BUCKETS: Sequence[Tuple[str, Tuple[str, ...]]] = (
         ("backend_spawn_ns", "client_session_establish_ns"),
     ),
     (
+        "Client Protocol",
+        (
+            "client_command_receive_ns",
+            "client_command_complete_ns",
+            "client_ready_for_query_ns",
+        ),
+    ),
+    (
         "Coordinator Backend Work",
         ("backend_parse_plan_ns",),
     ),
     (
-        "Worker Session Setup",
+        "Worker Session Control",
         (
             "worker_session_acquire_comm_ns",
+            "worker_session_release_ns",
         ),
     ),
     (
@@ -59,6 +68,7 @@ CONSOLIDATED_BUCKETS: Sequence[Tuple[str, Tuple[str, ...]]] = (
         (
             "placement_bind_ns",
             "remote_command_dispatch_ns",
+            "remote_command_flush_ns",
             "remote_command_wait_comm_ns",
             "remote_result_drain_comm_ns",
         ),
@@ -145,11 +155,17 @@ def mean_bucket_values(rows: List[Dict[str, str]]) -> List[Tuple[str, float]]:
     for label, columns in CONSOLIDATED_BUCKETS:
         mean_value = 0.0
 
-        if label == "Worker Session Setup":
+        if label == "Worker Session Control":
             if worker_join_available:
-                mean_value = column_mean_ns(rows, "worker_session_acquire_comm_ns")
+                mean_value = (
+                    column_mean_ns(rows, "worker_session_acquire_comm_ns")
+                    + column_mean_ns(rows, "worker_session_release_ns")
+                )
             else:
-                mean_value = column_mean_ns(rows, "worker_session_acquire_ns")
+                mean_value = (
+                    column_mean_ns(rows, "worker_session_acquire_ns")
+                    + column_mean_ns(rows, "worker_session_release_ns")
+                )
         elif label == "Worker Lifecycle Work":
             if worker_join_available:
                 mean_value = sum(column_mean_ns(rows, column_name) for column_name in columns)
@@ -172,6 +188,7 @@ def mean_bucket_values(rows: List[Dict[str, str]]) -> List[Tuple[str, float]]:
                 mean_value = (
                     column_mean_ns(rows, "placement_bind_ns")
                     + column_mean_ns(rows, "remote_command_dispatch_ns")
+                    + column_mean_ns(rows, "remote_command_flush_ns")
                     + column_mean_ns(rows, "remote_command_wait_ns")
                     + column_mean_ns(rows, "remote_result_drain_ns")
                 )
