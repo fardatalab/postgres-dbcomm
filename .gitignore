@@ -48,6 +48,7 @@ lib*.pc
 /portlock/
 
 dumps/*
+!dumps/printtup_binary_dump_sample_200.bin
 pg_scripts/data/*
 pgdata/*
 pginstall/*
