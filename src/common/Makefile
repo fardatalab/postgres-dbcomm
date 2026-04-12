@@ -81,6 +81,7 @@ OBJS_COMMON = \
 	unicode_case.o \
 	unicode_category.o \
 	unicode_norm.o \
+	time_instr.o \
 	username.o \
 	wait_error.o \
 	wchar.o

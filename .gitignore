@@ -46,3 +46,8 @@ lib*.pc
 /Release/
 /tmp_install/
 /portlock/
+
+dumps/*
+pg_scripts/data/*
+pgdata/*
+pginstall/*

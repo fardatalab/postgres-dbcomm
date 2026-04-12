@@ -1,0 +1,1 @@
+/home/ubuntu/denischen/postgres-dbcomm/pginstall/bin/psql -d postgres

@@ -1,0 +1,1 @@
+/home/ubuntu/denischen/postgres-dbcomm/pginstall/bin/initdb -D /home/ubuntu/denischen/postgres-dbcomm/pgdata

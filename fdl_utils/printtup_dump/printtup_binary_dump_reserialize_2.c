@@ -1016,8 +1016,7 @@ main(int argc, char **argv)
 	}
 	printf("Wall start: %" PRIu64 "\n", state.thread_wall_start_ns);
 	printf("Wall end: %" PRIu64 "\n", state.thread_wall_end_ns);
-	printf("Wall elapsed: %.6f\n", (double)(state.thread_wall_end_ns - state.thread_wall_start_ns) / 1000000000.0);
-	printf("Total bytes: %zu\n", state.serialize_proxy_bytes);
+	printf("Wall elapsed: %" PRIu64 "\n", (double)(state.thread_wall_end_ns - state.thread_wall_start_ns) / 1000000000.0);
 
 	free_state(&state);
 	free(data);
