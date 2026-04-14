@@ -153,6 +153,19 @@ static bool xact_started = false;
  */
 static bool QueryTimingPrintPending = false;
 static bool QueryTimingSkipPrint = false;
+static LatencyTraceHandle ClientSessionTeardownHandle = LATENCY_TRACE_INVALID_HANDLE;
+
+/*
+ * Carry the post-ReadyForQuery command-loop handoff only across deferred
+ * ordered-trace row boundaries within the same logical transaction row.
+ *
+ * We cannot leave a normal trace entry open across FinishQueryTimingCycle(),
+ * because rows that do not defer will print/reset there. Instead, remember the
+ * start timestamp here and materialize the closed stage at the next
+ * SocketBackend() read boundary only when the current row is intentionally
+ * staying open across commands.
+ */
+static uint64 PendingCommandTurnaroundStartNs = 0;
 
 /*
  * Flag to indicate that we are doing the outer loop's read-from-client,
@@ -197,6 +210,7 @@ static int	interactive_getc(void);
 static int	SocketBackend(StringInfo inBuf);
 static int	ReadCommand(StringInfo inBuf);
 static bool FrontendMessageStartsQueryTimingCycle(int qtype);
+static bool CurrentQueryCycleWillDeferOrderedLatencyTrace(void);
 static void forbidden_in_wal_sender(char firstchar);
 static bool check_log_statement(List *stmt_list);
 static int	errdetail_execute(List *raw_parsetree_list);
@@ -215,6 +229,11 @@ static void disable_statement_timeout(void);
 static void BeginQueryTimingCycle(void);
 static void SetCurrentQueryTimingSkipPrint(bool skipPrint);
 static void FinishQueryTimingCycle(void);
+static void ClearPendingCommandTurnaround(void);
+static void RecordPendingCommandTurnaroundStart(void);
+static void MaterializePendingCommandTurnaround(uint64 turnaroundEndNs);
+static void BeginClientSessionTeardownIfNeeded(void);
+static void EmitClientSessionTeardownTraceOnExit(int code, Datum arg);
 
 
 /* ----------------------------------------------------------------
@@ -409,13 +428,17 @@ SocketBackend(StringInfo inBuf)
 {
 	int			qtype;
 	int			maxmsglen;
+	uint64		commandWaitStartNs = 0;
 	LatencyTraceHandle latencyHandle = LATENCY_TRACE_INVALID_HANDLE;
+	LatencyTraceHandle commandWaitHandle = LATENCY_TRACE_INVALID_HANDLE;
 
 	/*
 	 * Get message type code from the frontend.
 	 */
 	HOLD_CANCEL_INTERRUPTS();
 	pq_startmsgread();
+	commandWaitStartNs = latency_trace_now_ns();
+	MaterializePendingCommandTurnaround(commandWaitStartNs);
 	qtype = pq_getbyte();
 
 	if (qtype == EOF)			/* frontend disconnected */
@@ -522,10 +545,19 @@ SocketBackend(StringInfo inBuf)
 	if (FrontendMessageStartsQueryTimingCycle(qtype))
 	{
 		/*
-		 * Start after the type byte is already readable so this stage reflects
-		 * backend-side protocol/body ingress without charging the arbitrary
-		 * client-idle gap before the command began arriving.
+		 * The original instrumentation only started after the type byte was
+		 * already readable:
+		 *
+		 *     latencyHandle = latency_trace_begin(...CLIENT_COMMAND_RECEIVE...)
+		 *
+		 * Keep that ingress-only stage, but also record the wait up to the
+		 * first readable byte so the ordered trace no longer leaves large
+		 * frontend idle / network arrival gaps unexplained.
 		 */
+		commandWaitHandle =
+			latency_trace_begin_at(LATENCY_STAGE_CLIENT_COMMAND_WAIT,
+									 0, 0, commandWaitStartNs);
+		latency_trace_end(commandWaitHandle);
 		latencyHandle = latency_trace_begin(LATENCY_STAGE_CLIENT_COMMAND_RECEIVE,
 											0, 0);
 	}
@@ -586,6 +618,17 @@ BeginQueryTimingCycle(void)
 }
 
 /*
+ * CurrentQueryCycleWillDeferOrderedLatencyTrace mirrors the ordered-trace flush
+ * decision so postgres.c can avoid carrying local handoff spans into the next
+ * trace row when the current row is about to print/reset.
+ */
+static bool
+CurrentQueryCycleWillDeferOrderedLatencyTrace(void)
+{
+	return logger_distributed_xact_active() || logger_identity_persist_enabled();
+}
+
+/*
  * SetCurrentQueryTimingSkipPrint lets specific internal probe queries suppress
  * report emission at the eventual ReadyForQuery() boundary while still keeping
  * the timing state coherent.
@@ -609,11 +652,14 @@ SetCurrentQueryTimingSkipPrint(bool skipPrint)
 static void
 FinishQueryTimingCycle(void)
 {
+	bool		deferOrderedTraceFlush = false;
+
 	if (!QueryTimingPrintPending)
 	{
 		return;
 	}
 
+	deferOrderedTraceFlush = CurrentQueryCycleWillDeferOrderedLatencyTrace();
 	logger_query_active_wall_stop();
 	latency_trace_finish_query_cycle(QueryTimingSkipPrint);
 
@@ -626,8 +672,125 @@ FinishQueryTimingCycle(void)
 		logger_print_timings();
 	}
 
+	/*
+	 * A non-deferred row has just printed/reset, so any pending post-command
+	 * handoff bookmark belongs to the row we already closed rather than the next
+	 * command we are about to trace.
+	 */
+	if (!deferOrderedTraceFlush)
+	{
+		ClearPendingCommandTurnaround();
+	}
+
 	QueryTimingPrintPending = false;
 	QueryTimingSkipPrint = false;
+}
+
+/*
+ * ClearPendingCommandTurnaround drops any pending carry-over timestamp.
+ */
+static void
+ClearPendingCommandTurnaround(void)
+{
+	PendingCommandTurnaroundStartNs = 0;
+}
+
+/*
+ * RecordPendingCommandTurnaroundStart bookmarks the post-ReadyForQuery control
+ * path that happens before the backend blocks on the next frontend message.
+ */
+static void
+RecordPendingCommandTurnaroundStart(void)
+{
+	if (!CurrentQueryCycleWillDeferOrderedLatencyTrace())
+	{
+		/*
+		 * This command is about to close its ordered trace row, so do not carry a
+		 * handoff timestamp into the next row.
+		 */
+		ClearPendingCommandTurnaround();
+		return;
+	}
+
+	/*
+	 * If a stale carry-over start somehow survives to the next command, replace
+	 * it instead of stretching two unrelated handoff periods together.
+	 */
+	PendingCommandTurnaroundStartNs = latency_trace_now_ns();
+}
+
+/*
+ * MaterializePendingCommandTurnaround closes the carry-over stage at the next
+ * SocketBackend() read boundary so the ordered trace no longer leaves the
+ * post-ReadyForQuery logging / timeout / loop handoff unexplained.
+ */
+static void
+MaterializePendingCommandTurnaround(uint64 turnaroundEndNs)
+{
+	LatencyTraceHandle turnaroundHandle = LATENCY_TRACE_INVALID_HANDLE;
+
+	if (PendingCommandTurnaroundStartNs == 0)
+	{
+		return;
+	}
+
+	turnaroundHandle =
+		latency_trace_begin_at(LATENCY_STAGE_BACKEND_COMMAND_TURNAROUND,
+								  0, 0, PendingCommandTurnaroundStartNs);
+	latency_trace_end_at(turnaroundHandle, turnaroundEndNs);
+	PendingCommandTurnaroundStartNs = 0;
+}
+
+/*
+ * BeginClientSessionTeardownIfNeeded starts one coarse ordered stage for the
+ * backend-side disconnect path after the frontend has already decided to close
+ * the session.
+ *
+ * This intentionally does not try to split socket close, proc_exit callbacks,
+ * and other generic backend shutdown work into fine-grained buckets. The goal
+ * is a minimal server-side teardown marker that can later be stitched onto a
+ * session-scoped plot when desired.
+ */
+static void
+BeginClientSessionTeardownIfNeeded(void)
+{
+	if (ClientSessionTeardownHandle != LATENCY_TRACE_INVALID_HANDLE)
+	{
+		return;
+	}
+
+	/*
+	 * A disconnect is a session-lifecycle event rather than a new command.
+	 * Tag it explicitly so the emitted row is self-describing even when it has
+	 * no SQL query text attached.
+	 */
+	logger_set_command_tag("session_teardown");
+	ClientSessionTeardownHandle =
+		latency_trace_begin(LATENCY_STAGE_CLIENT_SESSION_TEARDOWN, 0, 0);
+}
+
+/*
+ * EmitClientSessionTeardownTraceOnExit closes and prints the disconnect row
+ * from the proc_exit() callback stack.
+ *
+ * We force-flush here because backend exit bypasses the normal
+ * ReadyForQuery/FinishQueryTimingCycle boundary that would otherwise print the
+ * ordered trace row.
+ */
+static void
+EmitClientSessionTeardownTraceOnExit(int code, Datum arg)
+{
+	(void) code;
+	(void) arg;
+
+	if (ClientSessionTeardownHandle == LATENCY_TRACE_INVALID_HANDLE)
+	{
+		return;
+	}
+
+	latency_trace_end(ClientSessionTeardownHandle);
+	ClientSessionTeardownHandle = LATENCY_TRACE_INVALID_HANDLE;
+	latency_trace_force_flush(false);
 }
 
 /*
@@ -2204,7 +2367,20 @@ exec_bind_message(StringInfo input_message)
 	 * Send BindComplete.
 	 */
 	if (whereToSendOutput == DestRemote)
+	{
+		LatencyTraceHandle latencyHandle = LATENCY_TRACE_INVALID_HANDLE;
+
+		/*
+		 * The original path issued pq_putemptymessage(PqMsg_BindComplete)
+		 * directly. Keep the same response timing, but bracket it so the
+		 * waterfall can distinguish bind-response protocol work from generic
+		 * coordinator-local processing.
+		 */
+		latencyHandle =
+			latency_trace_begin(LATENCY_STAGE_CLIENT_BIND_COMPLETE_SEND, 0, 0);
 		pq_putemptymessage(PqMsg_BindComplete);
+		latency_trace_end(latencyHandle);
+	}
 
 	/*
 	 * Emit duration logging if appropriate.
@@ -2770,6 +2946,7 @@ static void
 exec_describe_statement_message(const char *stmt_name)
 {
 	CachedPlanSource *psrc;
+	LatencyTraceHandle latencyHandle = LATENCY_TRACE_INVALID_HANDLE;
 
 	/*
 	 * Start up a transaction command. (Note that this will normally change
@@ -2822,6 +2999,15 @@ exec_describe_statement_message(const char *stmt_name)
 		return;					/* can't actually do anything... */
 
 	/*
+	 * The original code emitted ParameterDescription plus RowDescription /
+	 * NoData directly. Record the whole metadata response as one ordered stage
+	 * so the coordinator timeline no longer hides this protocol send inside a
+	 * derived residual bucket.
+	 */
+	latencyHandle =
+		latency_trace_begin(LATENCY_STAGE_CLIENT_DESCRIBE_RESPONSE_SEND, 0, 0);
+
+	/*
 	 * First describe the parameters...
 	 */
 	pq_beginmessage_reuse(&row_description_buf, PqMsg_ParameterDescription);
@@ -2852,6 +3038,8 @@ exec_describe_statement_message(const char *stmt_name)
 	}
 	else
 		pq_putemptymessage(PqMsg_NoData);
+
+	latency_trace_end(latencyHandle);
 }
 
 /*
@@ -2863,6 +3051,7 @@ static void
 exec_describe_portal_message(const char *portal_name)
 {
 	Portal		portal;
+	LatencyTraceHandle latencyHandle = LATENCY_TRACE_INVALID_HANDLE;
 
 	/*
 	 * Start up a transaction command. (Note that this will normally change
@@ -2898,6 +3087,14 @@ exec_describe_portal_message(const char *portal_name)
 	if (whereToSendOutput != DestRemote)
 		return;					/* can't actually do anything... */
 
+	/*
+	 * The original code emitted RowDescription / NoData directly. Keep the
+	 * same protocol path but bracket it so the ordered trace can separate
+	 * describe-response communication from coordinator-local executor work.
+	 */
+	latencyHandle =
+		latency_trace_begin(LATENCY_STAGE_CLIENT_DESCRIBE_RESPONSE_SEND, 0, 0);
+
 	if (portal->tupDesc)
 		SendRowDescriptionMessage(&row_description_buf,
 								  portal->tupDesc,
@@ -2905,6 +3102,8 @@ exec_describe_portal_message(const char *portal_name)
 								  portal->formats);
 	else
 		pq_putemptymessage(PqMsg_NoData);
+
+	latency_trace_end(latencyHandle);
 }
 
 
@@ -4496,6 +4695,14 @@ PostgresMain(const char *dbname, const char *username)
 	if (IsUnderPostmaster && Log_disconnections)
 		on_proc_exit(log_disconnections, 0);
 
+	/*
+	 * Register a late proc_exit() callback so frontend disconnect rows can end
+	 * and flush even though the normal ReadyForQuery-driven print path is no
+	 * longer reached.
+	 */
+	if (whereToSendOutput == DestRemote)
+		on_proc_exit(EmitClientSessionTeardownTraceOnExit, 0);
+
 	pgstat_report_connect(MyDatabaseId);
 
 	/* Perform initialization specific to a WAL sender process. */
@@ -4839,6 +5046,16 @@ PostgresMain(const char *dbname, const char *username)
 			 * ReadyForQuery() flush completes. This aligns the printed timing
 			 * block with the real client-visible end of the query.
 			 */
+			if (whereToSendOutput == DestRemote)
+			{
+				/*
+				 * The ordered client_ready_for_query stage ends inside
+				 * ReadyForQuery(). Record the immediately-following local
+				 * handoff here so the next SocketBackend() can close it at the
+				 * precise point where frontend waiting begins.
+				 */
+				RecordPendingCommandTurnaroundStart();
+			}
 			FinishQueryTimingCycle();
 
 			send_ready_for_query = false;
@@ -5223,6 +5440,13 @@ PostgresMain(const char *dbname, const char *username)
 				 */
 				if (whereToSendOutput == DestRemote)
 					whereToSendOutput = DestNone;
+
+				/*
+				 * Record the backend-side disconnect handling as one coarse
+				 * ordered stage. The matching end/flush happens from the
+				 * proc_exit() callback stack.
+				 */
+				BeginClientSessionTeardownIfNeeded();
 
 				/*
 				 * NOTE: if you are tempted to add more code here, DON'T!

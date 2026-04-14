@@ -35,7 +35,7 @@ CONSOLIDATED_BUCKETS: Sequence[Tuple[str, Tuple[str, ...]]] = (
     ),
     (
         "Coordinator Backend Work",
-        ("backend_parse_plan_ns",),
+        ("backend_parse_plan_ns", "backend_command_turnaround_ns"),
     ),
     (
         "Worker Session Control",

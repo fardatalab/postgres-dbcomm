@@ -16,9 +16,8 @@ import pandas as pd
 import seaborn as sns
 
 
-MODE_ORDER = ["off", "local", "on", "remote_write", "remote_apply"]
+MODE_ORDER = ["local", "on", "remote_write", "remote_apply"]
 MODE_LABELS = {
-    "off": "off",
     "local": "local",
     "on": "on",
     "remote_write": "remote_write",

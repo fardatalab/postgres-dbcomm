@@ -133,12 +133,16 @@ def reset_server_logs() -> None:
 
 
 def archive_server_logs(run_dir: Path) -> None:
-    """Copy the current collector logfile from each node into this row's directory."""
+    """Copy the full row-local collector snapshot from each node.
+
+    Network-interference rows can also rotate through multiple collector
+    segments. Keep the entire row-local snapshot so later trace parsing does
+    not silently lose the first part of the row.
+    """
     run_cmd(
         [
             sys.executable,
             str(ARCHIVE_SERVER_LOGS),
-            "--current-only",
             "--output-dir",
             str(run_dir / "server-logs"),
             "--nodes",
@@ -147,10 +151,38 @@ def archive_server_logs(run_dir: Path) -> None:
     )
 
 
-def emit_row_log_marker(*, mode: str, level: int, clients: int, nodes: tuple[str, ...]) -> None:
-    """Emit one explicit LOG line on each node so the row logfile is materialized."""
+def finalize_server_logs_for_archive(nodes: tuple[str, ...]) -> None:
+    """Force collector-visible row boundaries before archiving.
 
-    message = f"pgbench row marker mode={mode} background_level={level} clients={clients}"
+    The end marker leaves a logical fence in the logs, but the collector can
+    still be draining the active segment when we start copying files. Rotating
+    here moves the row tail into a durable segment before the archive snapshot.
+    """
+
+    remote_cmd = (
+        "export PATH=$HOME/pg/bin:$PATH; "
+        "psql -v ON_ERROR_STOP=1 -X -d postgres -c 'SELECT pg_rotate_logfile();'"
+    )
+    for node in nodes:
+        ssh_cmd(node, remote_cmd)
+
+    time.sleep(0.5)
+
+
+def emit_row_log_marker(
+    *, mode: str, level: int, clients: int, phase: str, nodes: tuple[str, ...]
+) -> None:
+    """Emit one explicit LOG line on each node around one interference row.
+
+    The start marker materializes the fresh collector segment before the row
+    begins. The end marker leaves a final collector entry behind before
+    archival.
+    """
+
+    message = (
+        f"pgbench row marker phase={phase} mode={mode} "
+        f"background_level={level} clients={clients}"
+    )
     sql = f"DO $$ BEGIN RAISE LOG {message!r}; END $$;"
     remote_cmd = (
         "export PATH=$HOME/pg/bin:$PATH; "
@@ -502,7 +534,7 @@ def main() -> int:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["off", "local", "on", "remote_write", "remote_apply"],
+        default=["local", "on", "remote_write", "remote_apply"],
         help="synchronous_commit modes to benchmark",
     )
     parser.add_argument("--clients", type=int, default=16)
@@ -682,6 +714,13 @@ def main() -> int:
                         time.sleep(min(0.5, start_at - time.monotonic()))
 
                     run_dir = results_dir / mode / f"b{level:02d}"
+                    emit_row_log_marker(
+                        mode=mode,
+                        level=level,
+                        clients=args.clients,
+                        phase="start",
+                        nodes=SERVER_LOG_NODES,
+                    )
                     metrics = run_pgbench(
                         clients=args.clients,
                         worker_threads=args.pgbench_workers,
@@ -710,9 +749,16 @@ def main() -> int:
                     metrics["reader_batches"] = sum(stat.batches for stat in stats if stat.role == "reader")
                     metrics["writer_batches"] = sum(stat.batches for stat in stats if stat.role == "writer")
                     metrics["server_logs_dir"] = str(run_dir / "server-logs")
-                    emit_row_log_marker(mode=mode, level=level, clients=args.clients, nodes=SERVER_LOG_NODES)
+                    emit_row_log_marker(
+                        mode=mode,
+                        level=level,
+                        clients=args.clients,
+                        phase="end",
+                        nodes=SERVER_LOG_NODES,
+                    )
                     writer.writerow(metrics)
                     csv_file.flush()
+                    finalize_server_logs_for_archive(SERVER_LOG_NODES)
                     archive_server_logs(run_dir)
                     reset_server_logs()
 

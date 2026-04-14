@@ -20,8 +20,12 @@ typedef enum LatencyTraceStage
 {
 	LATENCY_STAGE_BACKEND_SPAWN = 0,
 	LATENCY_STAGE_CLIENT_SESSION_ESTABLISH,
+	LATENCY_STAGE_CLIENT_COMMAND_WAIT,
 	LATENCY_STAGE_CLIENT_COMMAND_RECEIVE,
 	LATENCY_STAGE_BACKEND_PARSE_PLAN,
+	LATENCY_STAGE_CLIENT_BIND_COMPLETE_SEND,
+	LATENCY_STAGE_CLIENT_DESCRIBE_RESPONSE_SEND,
+	LATENCY_STAGE_CLIENT_RESULT_SEND,
 	LATENCY_STAGE_WORKER_SESSION_ACQUIRE,
 	LATENCY_STAGE_PLACEMENT_BIND,
 	LATENCY_STAGE_REMOTE_TX_ATTACH,
@@ -35,6 +39,8 @@ typedef enum LatencyTraceStage
 	LATENCY_STAGE_WORKER_SESSION_RELEASE,
 	LATENCY_STAGE_CLIENT_COMMAND_COMPLETE,
 	LATENCY_STAGE_CLIENT_READY_FOR_QUERY,
+	LATENCY_STAGE_BACKEND_COMMAND_TURNAROUND,
+	LATENCY_STAGE_CLIENT_SESSION_TEARDOWN,
 	LATENCY_STAGE_COUNT
 } LatencyTraceStage;
 
@@ -47,8 +53,10 @@ extern LatencyTraceHandle latency_trace_begin_at(LatencyTraceStage stage,
 												   uint64 remoteCommandSequence,
 												   uint64 startNs);
 extern void latency_trace_end(LatencyTraceHandle handle);
+extern void latency_trace_end_at(LatencyTraceHandle handle, uint64 endNs);
 extern void latency_trace_reset(void);
 extern void latency_trace_finish_query_cycle(bool skipPrint);
+extern void latency_trace_force_flush(bool skipPrint);
 
 /*
  * Client session establishment begins before the normal query loop. The first

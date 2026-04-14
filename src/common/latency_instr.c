@@ -21,8 +21,12 @@ typedef struct LatencyTraceEntry
 static const char *LatencyTraceStageNames[LATENCY_STAGE_COUNT] = {
 	"backend_spawn",
 	"client_session_establish",
+	"client_command_wait",
 	"client_command_receive",
 	"backend_parse_plan",
+	"client_bind_complete_send",
+	"client_describe_response_send",
+	"client_result_send",
 	"worker_session_acquire",
 	"placement_bind",
 	"remote_tx_attach",
@@ -36,6 +40,8 @@ static const char *LatencyTraceStageNames[LATENCY_STAGE_COUNT] = {
 	"worker_session_release",
 	"client_command_complete",
 	"client_ready_for_query",
+	"backend_command_turnaround",
+	"client_session_teardown",
 };
 
 static struct
@@ -123,6 +129,30 @@ latency_trace_end(LatencyTraceHandle handle)
 	}
 
 	entry->endNs = latency_trace_now_ns();
+}
+
+void
+latency_trace_end_at(LatencyTraceHandle handle, uint64 endNs)
+{
+	LatencyTraceEntry *entry = NULL;
+
+	if (!LatencyTraceHandleValid(handle))
+	{
+		return;
+	}
+
+	entry = &latency_state.entries[handle - 1];
+	if (entry->endNs != 0)
+	{
+		return;
+	}
+
+	if (endNs < entry->startNs)
+	{
+		endNs = entry->startNs;
+	}
+
+	entry->endNs = endNs;
 }
 
 void
@@ -299,6 +329,26 @@ latency_trace_finish_query_cycle(bool skipPrint)
 		return;
 	}
 
+	if (skipPrint)
+	{
+		latency_trace_reset();
+		return;
+	}
+
+	LatencyTracePrint();
+	latency_trace_reset();
+}
+
+/*
+ * latency_trace_force_flush prints or drops the current ordered trace row
+ * regardless of the normal defer rules.
+ *
+ * This is used on backend-exit paths such as frontend disconnect handling,
+ * where proc_exit() bypasses the usual ReadyForQuery-driven flush boundary.
+ */
+void
+latency_trace_force_flush(bool skipPrint)
+{
 	if (skipPrint)
 	{
 		latency_trace_reset();

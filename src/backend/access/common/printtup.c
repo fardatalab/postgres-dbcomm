@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/printtup.h"
+#include "latency_instr.h"
 #include "libpq/pqformat.h"
 #include "libpq/protocol.h"
 #include "tcop/pquery.h"
@@ -307,6 +308,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 {
 	TupleDesc	typeinfo = slot->tts_tupleDescriptor;
 	DR_printtup *myState = (DR_printtup *) self;
+	LatencyTraceHandle latencyHandle = LATENCY_TRACE_INVALID_HANDLE;
 	MemoryContext oldcontext;
 	StringInfo	buf = &myState->buf;
 	int			natts = typeinfo->natts;
@@ -333,8 +335,22 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	oldcontext = MemoryContextSwitchTo(myState->tmpcontext);
 
 	/*
+	 * The original row-send path just prepared and emitted the DataRow
+	 * message directly:
+	 *
+	 *     pq_beginmessage_reuse(...)
+	 *     ...
+	 *     pq_endmessage_reuse(...)
+	 *
+	 * Record the whole per-row result-send region so the ordered trace can
+	 * show result serialization / staging instead of leaving row-return
+	 * communication in a generic derived gap. This stage is intentionally
+	 * repeated per row; the trace's dropped-entry counter will surface if a
+	 * future workload returns enough rows that a coarser bucket is needed.
+	 *
 	 * Prepare a DataRow message (note buffer is in per-query context)
 	 */
+	latencyHandle = latency_trace_begin(LATENCY_STAGE_CLIENT_RESULT_SEND, 0, 0);
 	pq_beginmessage_reuse(buf, PqMsg_DataRow);
 
 	pq_sendint16(buf, natts);
@@ -399,6 +415,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
     pq_endmessage_reuse(buf);
 
     timing_end(Printtup_Net);
+	latency_trace_end(latencyHandle);
 
     /* Return to caller's context, and flush row's temporary memory */
 	MemoryContextSwitchTo(oldcontext);

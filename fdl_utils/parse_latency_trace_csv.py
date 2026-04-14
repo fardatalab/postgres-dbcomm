@@ -33,8 +33,12 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 KNOWN_STAGES: Tuple[str, ...] = (
     "backend_spawn",
     "client_session_establish",
+    "client_command_wait",
     "client_command_receive",
     "backend_parse_plan",
+    "client_bind_complete_send",
+    "client_describe_response_send",
+    "client_result_send",
     "worker_session_acquire",
     "placement_bind",
     "remote_tx_attach",
@@ -48,6 +52,8 @@ KNOWN_STAGES: Tuple[str, ...] = (
     "worker_session_release",
     "client_command_complete",
     "client_ready_for_query",
+    "backend_command_turnaround",
+    "client_session_teardown",
 )
 
 
@@ -70,6 +76,7 @@ TIMER_ROW_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\|\s*(.*)$")
 REMOTE_COMMAND_TAG_PAYLOAD_RE = re.compile(
     r"\brsid=(?P<rsid>\d+)\s+rcid=(?P<rcid>\d+\.\d+)\s+kind=(?P<kind>[A-Za-z_]+)\b"
 )
+IDENTITY_DTXID_RE = re.compile(r"\bdtxid=(?P<dtxid>\d+:\d+)\b")
 
 STAGE_KIND_MAP: Dict[str, Tuple[str, ...]] = {
     "task_query": (
@@ -87,6 +94,18 @@ STAGE_KIND_MAP: Dict[str, Tuple[str, ...]] = {
 
 ACTUAL_TIMER_CANDIDATES: Tuple[str, ...] = ("QUERY_ACTIVE_WALL", "ExecSimpleQuery")
 RESULT_TIMER_CANDIDATES: Tuple[str, ...] = ("Printtup",)
+WORKER_WAIT_TIMER_CANDIDATES: Tuple[str, ...] = ("QUERY_WAIT_WALL",)
+WORKER_RECEIVE_PROTOCOL_TIMER_LEAVES: Tuple[str, ...] = (
+    "PG_BE_SOCK_READ",
+    "PQ_getbyte",
+    "PQ_getmessage",
+    "PQ_getbytes",
+)
+WORKER_RESULT_SERDE_TIMER_LEAVES: Tuple[str, ...] = ("Printtup_Ser",)
+WORKER_SEND_PROTOCOL_TIMER_LEAVES: Tuple[str, ...] = (
+    "PQ_putmessage",
+    "PG_BE_SOCK_WRITE",
+)
 
 
 @dataclass
@@ -123,6 +142,20 @@ class WorkerTimingBlock:
     identity: str
     command_tag: str
     parsed_tag: RemoteCommandTag
+    timers: Dict[str, int]
+
+
+@dataclass
+class TimingReportBlock:
+    """One raw timing report, optionally tagged with a RemoteCommandTag."""
+
+    source_file: str
+    timestamp: str
+    timestamp_ns: int
+    pid: int
+    identity: str
+    command_tag: str
+    parsed_tag: Optional[RemoteCommandTag]
     timers: Dict[str, int]
 
 
@@ -234,6 +267,22 @@ def parse_remote_command_tag(tag: str) -> Optional[RemoteCommandTag]:
         rcid=match.group("rcid"),
         kind=match.group("kind"),
     )
+
+
+def extract_distributed_transaction_id(identity: str) -> Optional[str]:
+    """Extract the globally comparable dtxid suffix from one logger identity.
+
+    The latency/timing logs include backend-local connection identity details
+    ahead of the distributed transaction id. Those local pid/sequence fields do
+    not match between coordinator and workers, so worker joins should compare
+    only the shared dtxid portion when it exists.
+    """
+
+    match = IDENTITY_DTXID_RE.search(identity)
+    if match is None:
+        return None
+
+    return match.group("dtxid")
 
 
 def parse_stage_row(line: str) -> Optional[Tuple[str, int, str, int, int, int]]:
@@ -417,10 +466,16 @@ def parse_timer_row(line: str) -> Optional[Tuple[str, int]]:
     return match.group(1), total_time_ns
 
 
-def parse_worker_timing_blocks(logfile: Path) -> List[WorkerTimingBlock]:
-    """Parse worker timing reports that carry a RemoteCommandTag."""
+def parse_timing_report_blocks(logfile: Path) -> List[TimingReportBlock]:
+    """Parse every timing report block in one logfile.
 
-    rows: List[WorkerTimingBlock] = []
+    Worker reports carry a propagated RemoteCommandTag, while coordinator
+    reports usually leave that tag blank. Keeping the raw parser generic lets
+    callers reuse the same timing-report reader for both sides and then decide
+    how to associate those reports with ordered-trace rows.
+    """
+
+    rows: List[TimingReportBlock] = []
 
     with logfile.open("r", encoding="utf-8", errors="replace") as f:
         lines = list(f)
@@ -452,10 +507,6 @@ def parse_worker_timing_blocks(logfile: Path) -> List[WorkerTimingBlock]:
                 break
 
             i += 1
-
-        parsed_tag = parse_remote_command_tag(command_tag)
-        if parsed_tag is None:
-            continue
 
         timers: Dict[str, int] = {}
 
@@ -490,15 +541,40 @@ def parse_worker_timing_blocks(logfile: Path) -> List[WorkerTimingBlock]:
             i += 1
 
         rows.append(
-            WorkerTimingBlock(
+            TimingReportBlock(
                 source_file=str(logfile),
                 timestamp=timestamp,
                 timestamp_ns=parse_log_timestamp_ns(timestamp),
                 pid=pid,
                 identity=identity,
                 command_tag=command_tag,
-                parsed_tag=parsed_tag,
+                parsed_tag=parse_remote_command_tag(command_tag),
                 timers=timers,
+            )
+        )
+
+    return rows
+
+
+def parse_worker_timing_blocks(logfile: Path) -> List[WorkerTimingBlock]:
+    """Parse worker timing reports that carry a RemoteCommandTag."""
+
+    rows: List[WorkerTimingBlock] = []
+
+    for timing_block in parse_timing_report_blocks(logfile):
+        if timing_block.parsed_tag is None:
+            continue
+
+        rows.append(
+            WorkerTimingBlock(
+                source_file=timing_block.source_file,
+                timestamp=timing_block.timestamp,
+                timestamp_ns=timing_block.timestamp_ns,
+                pid=timing_block.pid,
+                identity=timing_block.identity,
+                command_tag=timing_block.command_tag,
+                parsed_tag=timing_block.parsed_tag,
+                timers=timing_block.timers,
             )
         )
 
@@ -513,6 +589,53 @@ def pick_timer_total(timers: Dict[str, int], candidates: Tuple[str, ...]) -> int
             return timers[timer_name]
 
     return 0
+
+
+def sum_timer_totals(timers: Dict[str, int], timer_names: Tuple[str, ...]) -> int:
+    """Sum a group of additive timer leaves defensively."""
+
+    return sum(int(timers.get(timer_name, 0)) for timer_name in timer_names)
+
+
+def worker_wait_total_ns(timers: Dict[str, int]) -> int:
+    """Return the worker-side excluded-wait total for one timing report."""
+
+    return pick_timer_total(timers, WORKER_WAIT_TIMER_CANDIDATES)
+
+
+def worker_receive_protocol_total_ns(timers: Dict[str, int]) -> int:
+    """Return additive worker receive/protocol CPU leaves."""
+
+    return sum_timer_totals(timers, WORKER_RECEIVE_PROTOCOL_TIMER_LEAVES)
+
+
+def worker_result_serde_total_ns(timers: Dict[str, int]) -> int:
+    """Return worker row-serialization CPU leaves for query results."""
+
+    return sum_timer_totals(timers, WORKER_RESULT_SERDE_TIMER_LEAVES)
+
+
+def worker_send_protocol_total_ns(timers: Dict[str, int]) -> int:
+    """Return additive worker send/protocol CPU leaves."""
+
+    return sum_timer_totals(timers, WORKER_SEND_PROTOCOL_TIMER_LEAVES)
+
+
+def worker_local_processing_total_ns(timers: Dict[str, int]) -> int:
+    """Return the worker local-processing remainder within QUERY_ACTIVE_WALL.
+
+    QUERY_ACTIVE_WALL is the best active-cycle denominator we have on the
+    worker. Subtract the additive communication leaves that are already shown
+    explicitly in the waterfall; whatever remains is worker-local backend work.
+    """
+
+    active_total_ns = pick_timer_total(timers, ACTUAL_TIMER_CANDIDATES)
+    communication_cpu_ns = (
+        worker_receive_protocol_total_ns(timers) +
+        worker_result_serde_total_ns(timers) +
+        worker_send_protocol_total_ns(timers)
+    )
+    return clamp_residual(active_total_ns, communication_cpu_ns)
 
 
 def trace_matches_rcid_kind(trace: TraceBlock, rcid: str, kind: str) -> bool:
@@ -564,6 +687,33 @@ def find_best_trace_for_worker_command(
         candidate_traces,
         key=lambda trace: (stage_distance_ns(trace, rcid, kind, timestamp_ns), abs(trace.timestamp_ns - timestamp_ns)),
     )
+
+
+def filter_traces_by_shared_dtxid(
+    candidate_traces: List[TraceBlock], worker_identity: str
+) -> List[TraceBlock]:
+    """Prefer rows whose distributed transaction id matches the worker block.
+
+    rcid values are only unique within one coordinator backend. Under
+    concurrency, different coordinator backends can therefore reuse the same
+    rsid.rcid string in the same millisecond. When both sides logged a dtxid,
+    narrow the candidate set first so the later timestamp heuristic only breaks
+    ties within the same distributed transaction.
+    """
+
+    worker_dtxid = extract_distributed_transaction_id(worker_identity)
+    if worker_dtxid is None:
+        return candidate_traces
+
+    dtxid_matched_traces = [
+        trace
+        for trace in candidate_traces
+        if extract_distributed_transaction_id(trace.identity) == worker_dtxid
+    ]
+    if dtxid_matched_traces:
+        return dtxid_matched_traces
+
+    return candidate_traces
 
 
 def expected_kind_for_stage(stage_name: str) -> Optional[str]:
@@ -636,6 +786,9 @@ def match_worker_artifacts(
             for trace in traces_by_rcid.get(rcid, [])
             if trace_matches_rcid_kind(trace, rcid, kind)
         ]
+        candidate_traces = filter_traces_by_shared_dtxid(
+            candidate_traces, worker_block.identity
+        )
 
         best_trace = find_best_trace_for_worker_command(
             candidate_traces, rcid, kind, worker_block.timestamp_ns
@@ -655,6 +808,9 @@ def match_worker_artifacts(
             for trace in traces_by_rcid.get(parsed_tag.rcid, [])
             if trace_matches_rcid_kind(trace, parsed_tag.rcid, parsed_tag.kind)
         ]
+        candidate_traces = filter_traces_by_shared_dtxid(
+            candidate_traces, worker_trace.identity
+        )
         best_trace = find_best_trace_for_worker_command(
             candidate_traces, parsed_tag.rcid, parsed_tag.kind, worker_trace.timestamp_ns
         )

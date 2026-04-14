@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import json
 import shlex
 import subprocess
 import sys
@@ -111,7 +112,12 @@ def set_system_setting_remote(node: str, setting: str, value: str) -> None:
 
 
 def reset_server_logs() -> None:
-    """Rotate and prune the collector logs before the next benchmark row."""
+    """Rotate the collector logs before the next benchmark row.
+
+    We intentionally do not prune filenames here. Daily logfile naming can
+    reuse the same path across rotations, so filename-based pruning is not a
+    reliable way to decide what belongs to the next row.
+    """
     run_cmd(
         [
             sys.executable,
@@ -123,24 +129,88 @@ def reset_server_logs() -> None:
 
 
 def archive_server_logs(run_dir: Path) -> None:
-    """Copy the current collector logfile from each node into this row's directory."""
+    """Copy the row-local collector suffix from each node."""
+    baseline_path = run_dir / "server-log-baseline.json"
     run_cmd(
         [
             sys.executable,
             str(ARCHIVE_SERVER_LOGS),
-            "--current-only",
             "--output-dir",
             str(run_dir / "server-logs"),
+            "--baseline-json",
+            str(baseline_path),
             "--nodes",
             *SERVER_LOG_NODES,
         ]
     )
 
 
-def emit_row_log_marker(*, mode: str, clients: int, nodes: tuple[str, ...]) -> None:
-    """Emit one explicit LOG line on each node so the row logfile is materialized."""
+def snapshot_server_log_baseline(run_dir: Path, nodes: tuple[str, ...]) -> None:
+    """Record the active collector logfile and byte offset for each node."""
 
-    message = f"pgbench row marker mode={mode} clients={clients}"
+    baseline: list[dict[str, int | str]] = []
+    snapshot_cmd = (
+        "set -e; "
+        "export PATH=$HOME/pg/bin:$PATH; "
+        "logfile=$($HOME/pg/bin/psql -Atq -X -d postgres -c \"SELECT pg_current_logfile();\"); "
+        "if [ -z \"$logfile\" ]; then exit 1; fi; "
+        "abs_path=$HOME/pg/data/$logfile; "
+        "offset=$(stat -c %s \"$abs_path\"); "
+        "printf '%s\\t%s\\n' \"$abs_path\" \"$offset\""
+    )
+
+    for node in nodes:
+        result = ssh_cmd(node, snapshot_cmd)
+        parts = result.stdout.strip().split("\t")
+        if len(parts) != 2:
+            raise RuntimeError(f"could not capture logfile snapshot on {node}: {result.stdout!r}")
+        source_path, size_text = parts
+        baseline.append(
+            {
+                "node": node,
+                "source_path": source_path,
+                "start_offset_bytes": int(size_text),
+            }
+        )
+
+    (run_dir / "server-log-baseline.json").write_text(
+        json.dumps(baseline, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def finalize_server_logs_for_archive(nodes: tuple[str, ...]) -> None:
+    """Force collector-visible row boundaries before archiving.
+
+    The row-end marker guarantees there is a logical fence in the server logs,
+    but the logging collector can still be sitting on the active segment when
+    we start copying files immediately afterwards. Rotating once here makes the
+    row-local segments durable and keeps the archive snapshot from racing the
+    collector's own flush cadence.
+    """
+
+    remote_cmd = (
+        "export PATH=$HOME/pg/bin:$PATH; "
+        "psql -v ON_ERROR_STOP=1 -X -d postgres -c 'SELECT pg_rotate_logfile();'"
+    )
+    for node in nodes:
+        ssh_cmd(node, remote_cmd)
+
+    # Give the collector a brief control-path window to switch segments before
+    # we copy the archived files back to the coordinator.
+    time.sleep(0.5)
+
+
+def emit_row_log_marker(*, mode: str, clients: int, phase: str, nodes: tuple[str, ...]) -> None:
+    """Emit one explicit LOG line on each node around one benchmark row.
+
+    The start marker forces the fresh collector segment to exist before pgbench
+    begins, so the first traced transaction in the row cannot start before the
+    logfile boundary. The end marker leaves a final collector entry behind
+    before archival.
+    """
+
+    message = f"pgbench row marker phase={phase} mode={mode} clients={clients}"
     sql = f"DO $$ BEGIN RAISE LOG {message!r}; END $$;"
     remote_cmd = (
         "export PATH=$HOME/pg/bin:$PATH; "
@@ -220,6 +290,8 @@ def run_pgbench(
     duration_s: int,
     dbname: str,
     sample_rate: float,
+    query_mode: str,
+    connect_mode: bool,
     run_dir: Path,
 ) -> dict[str, float | int]:
     """Execute one pgbench run and return the parsed metrics."""
@@ -245,13 +317,20 @@ def run_pgbench(
         "-j",
         str(threads),
         "-M",
-        "prepared",
+        query_mode,
+    ]
+    if connect_mode:
+        # `pgbench -C` intentionally makes each transaction pay a fresh
+        # client/session connect cost. We keep it as an opt-in mode so the
+        # default sweep still measures the persistent-session benchmark.
+        cmd.append("-C")
+    cmd.extend([
         "-T",
         str(duration_s),
         "-l",
         "--log-prefix",
         str(log_prefix),
-    ]
+    ])
     if sample_rate != 1.0:
         cmd.extend(["--sampling-rate", str(sample_rate)])
     cmd.append(dbname)
@@ -318,8 +397,27 @@ def main() -> int:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["off", "local", "on", "remote_write", "remote_apply"],
+        default=["local", "on", "remote_write", "remote_apply"],
         help="synchronous_commit modes to benchmark",
+    )
+    parser.add_argument(
+        "--query-mode",
+        choices=["prepared", "extended", "simple"],
+        default="prepared",
+        help=(
+            "pgbench protocol mode to use. 'prepared' keeps the existing "
+            "prepared-statement sweep, 'extended' removes prepared statements "
+            "while preserving Parse/Bind/Execute protocol structure, and "
+            "'simple' issues plain Query messages."
+        ),
+    )
+    parser.add_argument(
+        "--connect",
+        action="store_true",
+        help=(
+            "Run pgbench in connect-per-transaction mode (-C) so each "
+            "transaction includes a fresh client/backend session setup."
+        ),
     )
     parser.add_argument("--sampling-rate", type=float, default=1.0)
     parser.add_argument(
@@ -387,6 +485,14 @@ def main() -> int:
 
                 for clients in build_client_counts(args.max_clients):
                     run_dir = results_dir / mode / f"c{clients:02d}"
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    snapshot_server_log_baseline(run_dir, SERVER_LOG_NODES)
+                    emit_row_log_marker(
+                        mode=mode,
+                        clients=clients,
+                        phase="start",
+                        nodes=SERVER_LOG_NODES,
+                    )
                     metrics = run_pgbench(
                         mode=mode,
                         clients=clients,
@@ -394,11 +500,19 @@ def main() -> int:
                         duration_s=args.duration,
                         dbname=args.dbname,
                         sample_rate=args.sampling_rate,
+                        query_mode=args.query_mode,
+                        connect_mode=args.connect,
                         run_dir=run_dir,
                     )
                     writer.writerow(metrics)
                     csv_file.flush()
-                    emit_row_log_marker(mode=mode, clients=clients, nodes=SERVER_LOG_NODES)
+                    emit_row_log_marker(
+                        mode=mode,
+                        clients=clients,
+                        phase="end",
+                        nodes=SERVER_LOG_NODES,
+                    )
+                    finalize_server_logs_for_archive(SERVER_LOG_NODES)
                     archive_server_logs(run_dir)
 
                     # Keep the source collector logs bounded between rows.

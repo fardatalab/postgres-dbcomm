@@ -117,12 +117,16 @@ def reset_server_logs() -> None:
 
 
 def archive_server_logs(run_dir: Path) -> None:
-    """Copy the current collector logfile from each node into this row's directory."""
+    """Copy the full row-local collector snapshot from each node.
+
+    The benchmark row can span multiple collector segments, so archiving only
+    the newest logfile can truncate the earliest traced transactions in the
+    row and break coordinator/worker matching later.
+    """
     run_cmd(
         [
             sys.executable,
             str(ARCHIVE_SERVER_LOGS),
-            "--current-only",
             "--output-dir",
             str(run_dir / "server-logs"),
             "--nodes",
@@ -131,10 +135,34 @@ def archive_server_logs(run_dir: Path) -> None:
     )
 
 
-def emit_row_log_marker(*, mode: str, clients: int, nodes: tuple[str, ...]) -> None:
-    """Emit one explicit LOG line on each node so the row logfile is materialized."""
+def finalize_server_logs_for_archive(nodes: tuple[str, ...]) -> None:
+    """Force collector-visible row boundaries before archiving.
 
-    message = f"pgbench row marker mode={mode} clients={clients}"
+    The row-end marker gives parsing a logical fence, but the logging
+    collector may still be writing into the current segment when we snapshot
+    the files. Rotating once here makes the row-local contents durable before
+    we copy them into the benchmark archive.
+    """
+
+    remote_cmd = (
+        "export PATH=$HOME/pg/bin:$PATH; "
+        "psql -v ON_ERROR_STOP=1 -X -d postgres -c 'SELECT pg_rotate_logfile();'"
+    )
+    for node in nodes:
+        ssh_cmd(node, remote_cmd)
+
+    time.sleep(0.5)
+
+
+def emit_row_log_marker(*, mode: str, clients: int, phase: str, nodes: tuple[str, ...]) -> None:
+    """Emit one explicit LOG line on each node around one benchmark row.
+
+    The start marker forces the fresh collector segment to exist before pgbench
+    begins, while the end marker leaves a terminal collector entry before the
+    archival step.
+    """
+
+    message = f"pgbench row marker phase={phase} mode={mode} clients={clients}"
     sql = f"DO $$ BEGIN RAISE LOG {message!r}; END $$;"
     remote_cmd = (
         "export PATH=$HOME/pg/bin:$PATH; "
@@ -352,7 +380,7 @@ def main() -> int:
     parser.add_argument(
         "--modes",
         nargs="+",
-        default=["off", "local", "on", "remote_write", "remote_apply"],
+        default=["local", "on", "remote_write", "remote_apply"],
         help="synchronous_commit modes to benchmark",
     )
     parser.add_argument("--sampling-rate", type=float, default=0.05)
@@ -422,6 +450,12 @@ def main() -> int:
 
                 for clients in build_client_counts(args.max_clients):
                     run_dir = results_dir / mode / f"c{clients:02d}"
+                    emit_row_log_marker(
+                        mode=mode,
+                        clients=clients,
+                        phase="start",
+                        nodes=SERVER_LOG_NODES,
+                    )
                     metrics = run_pgbench(
                         mode=mode,
                         clients=clients,
@@ -433,7 +467,13 @@ def main() -> int:
                     )
                     writer.writerow(metrics)
                     csv_file.flush()
-                    emit_row_log_marker(mode=mode, clients=clients, nodes=SERVER_LOG_NODES)
+                    emit_row_log_marker(
+                        mode=mode,
+                        clients=clients,
+                        phase="end",
+                        nodes=SERVER_LOG_NODES,
+                    )
+                    finalize_server_logs_for_archive(SERVER_LOG_NODES)
                     archive_server_logs(run_dir)
                     reset_server_logs()
 
