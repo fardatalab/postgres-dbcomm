@@ -37,7 +37,7 @@ Before running any benchmark, make sure these prerequisites are already true:
 3. The `10.10.1.0/24` fabric is allowed in `pg_hba.conf` for normal connections and replication connections.
 4. Collector-backed logging is enabled on all nodes (`logging_collector = on`) so the latency-trace parser can read the server logs for each run.
 5. The cluster nodes can SSH to each other with `BatchMode=yes`.
-6. For Citus runs, node-0 must currently preload `citus` and node-3/node-4 must be the worker standbys.
+6. For Citus runs, node-0 must currently preload `citus` and node-3/node-4 must be the worker standbys. On a fresh cluster, bootstrap those standbys from node-1/node-2 and register them as secondaries in the Citus metadata before the first benchmark run.
 7. For vanilla runs, node-0 must be a plain PostgreSQL primary and node-3 must be its standby.
 
 ### Build And Install Prerequisites
@@ -48,6 +48,16 @@ The setup scripts assume the binaries are already available under `~/pg`. The cl
 - Citus: work from the copied `timings-jason` tree, clean out stale copied build artifacts if needed, rerun `./configure PG_CONFIG=$HOME/pg/bin/pg_config`, rebuild, and reinstall so the generated makefiles and cached metadata point at the current cluster.
 
 If the tree came from another cluster, a clean rebuild is important for the Citus preload path to work reliably on this one.
+
+For a fresh Citus bring-up, the manual metadata order matters:
+
+- start node-0, node-1, and node-2 with Citus preloaded
+- run `SELECT citus_set_coordinator_host('10.10.1.2', 5432);` on node-0
+- add node-1 and node-2 with `citus_add_node(...)`
+- bootstrap node-3 from node-1 and node-4 from node-2 with `pg_basebackup -R -X stream -C -S ...`
+- register node-3 and node-4 with `citus_add_secondary_node(...)`
+
+`citus_update_node()` is for later address moves or failover-style updates; it does not create the initial metadata rows.
 
 ## Recommended Reproduction Order
 
@@ -82,16 +92,19 @@ The latency-instrumented branch writes ordered trace blocks into the collector-b
 Use:
 
 ```bash
-python3 scripts/archive_server_logs.py --current-only --output-dir bench-results-tuned/<run-name>/server-logs
+python3 scripts/archive_server_logs.py --output-dir bench-results-tuned/<run-name>/server-logs
 ```
 
 The benchmark runners now use a row-by-row log workflow:
 
 1. rotate/prune the collector logs on the participating nodes before the row starts
-2. run the benchmark row
-3. archive the current collector logfile from each participating node into that row's `server-logs/` subdirectory
+2. emit an explicit row-start marker so the fresh collector segment exists before the workload begins
+3. run the benchmark row
+4. emit a row-end marker
+5. force one `pg_rotate_logfile()` on each archived node so the collector flushes the row tail into durable segments before copy
+6. archive every collector segment created during that row, and stitch them into `node-X.log` snapshots in that row's `server-logs/` subdirectory
 
-That keeps each CSV row paired with its own text logfile snapshot and avoids the huge multi-row collector directories we had earlier.
+That keeps each CSV row paired with its own text logfile snapshot, avoids the huge multi-row collector directories we had earlier, prevents the earliest traced transactions in the row from losing worker `tx_begin` / `task_query` records when the collector rotates mid-row, and avoids racing the logging collector while it is still draining the active segment after the row-end marker.
 
 For Citus benchmark families, archive node-0 plus the worker primaries `node-1` and `node-2`.
 For vanilla benchmark families, archive node-0 plus the standby node-3 if it has useful trace output; the primary log is the most important one.
@@ -106,7 +119,85 @@ python3 fdl_utils/parse_latency_trace_csv.py \
   -o bench-results-tuned/<run-name>/latency-trace.csv
 ```
 
-The scenario plotter and waterfall plotter then consume that latency CSV and the archived per-row log snapshots, respectively.
+The scenario plotter and waterfall plotter then consume that latency CSV and the archived per-row log snapshots, respectively. The waterfall plotter now defaults to the coordinator row whose traced span (`trace_total_ns`) is the median of that archived sample, and `--row-index` still lets you inspect a specific traced transaction when you want a targeted debug view. The updated waterfall now does three important things:
+
+- synthesizes coordinator command envelopes and coordinator-side remote round-trip parent envelopes so the coordinator lane shows the full worker round trip rather than only child dispatch/wait/drain slices spread across lanes
+- requires the newer ordered stages such as `client_command_wait`, bind/describe response send, row send, and the post-`ReadyForQuery` coordinator turnaround/logging stage that regenerated traces now emit
+- decomposes worker timing reports into wait, protocol/transport CPU, row serialization, and worker-local processing instead of one centered opaque worker "actual" bar
+
+The waterfall is meant to separate:
+
+- communication-stack-facing work:
+  client/coordinator protocol receive and replies, coordinator remote dispatch control, coordinator-observed remote round envelopes, worker protocol / transport CPU, and worker-side wait inside those envelopes
+- local backend / DB work:
+  coordinator-local parse / execute / distributed-control work and worker-local execution / transaction work
+
+`backend_command_turnaround` is intentionally not part of the communication stack buckets. It is the coordinator's post-`ReadyForQuery` handoff window after the command is already complete, covering [`FinishQueryTimingCycle()`](/users/JasonHu/postgres-dbcomm/src/backend/tcop/postgres.c#L649), the ordered-trace/timing report flush via [`latency_trace_finish_query_cycle()`](/users/JasonHu/postgres-dbcomm/src/backend/tcop/postgres.c#L661) and [`logger_print_timings()`](/users/JasonHu/postgres-dbcomm/src/backend/tcop/postgres.c#L669), plus the tiny outer-loop handoff back to the next frontend read. It should not include Citus distributed execution work, worker round trips, or frontend socket wait.
+
+#### Waterfall Legend Semantics
+
+- `Coordinator Command Envelope`
+  One full SQL command lifecycle on the coordinator, from the first `client_command_wait` / `client_command_receive` until the matching `client_ready_for_query`.
+- `Coordinator Remote Round Envelope`
+  One coordinator-observed worker round trip for a specific `(rsid, rcid)` across `placement_bind`, `remote_command_dispatch`, `remote_command_flush`, `remote_command_wait`, and `remote_result_drain`.
+- `Coordinator Local DB / Control (Derived)`
+  Coordinator-local time inside one command envelope that is not already covered by explicit measured ordered stages. In current plots this is mostly backend execution / Citus control work, but it remains a derived complement until coordinator timing leaves are aggregated into the waterfall.
+- `Coordinator Post-Command Handoff`
+  The post-`ReadyForQuery` local handoff before the backend blocks on the next frontend message. This is mostly local timing/logging / loop bookkeeping, not communication-stack work.
+- `Client Wait`
+  Wait from entering the frontend read boundary until the first message byte is readable on the coordinator.
+- `Coordinator Comm / Control`
+  Explicit coordinator child stages such as `placement_bind` and `remote_command_dispatch`.
+- `Frontend Protocol / Replies`
+  Coordinator/frontend protocol receive and reply stages such as `client_command_receive`, bind/describe response send, row send, `client_command_complete`, and `client_ready_for_query`.
+- `Coordinator Session Setup Envelope`
+  Synthetic parent envelope from `backend_spawn` through the first startup `ReadyForQuery` when a stitched or raw connection-start row is present.
+- `Coordinator Session Setup Actual`
+  The measured `backend_spawn` and `client_session_establish` stages nested inside that envelope.
+- `Coordinator Session Teardown`
+  The measured coarse `client_session_teardown` stage emitted on backend exit and optionally stitched onto the selected transaction row.
+- `Worker Envelope`
+  The coordinator-observed parent window on a worker lane, such as worker transaction attach, query round, prepare, commit, or session release.
+- `Worker Wait`
+  Worker-side wait time inside the worker envelope from matched worker timing reports.
+- `Worker Protocol / Transport`
+  Worker-side socket/protocol CPU and transport-adjacent work from matched worker timing reports.
+- `Worker Row Serde`
+  Worker-side row/result serialization work before sending rows back.
+- `Worker Session Setup Actual`
+  Worker backend spawn / startup/auth work nested inside `worker_session_acquire` when a matched worker ordered trace is available.
+- `Worker Local Processing`
+  Worker-local DB execution / transaction work after subtracting the measured protocol / transport / serde leaves.
+
+Use `--annotate-pgbench-tpcb` with [`plot_latency_trace_waterfall.py`](./fdl_utils/plot_latency_trace_waterfall.py) when you want the bracketed numbered overlay that labels the 7 built-in prepared `pgbench` commands directly on top of the representative transaction figure. The annotator supports both the steady-state 7-cycle row shape and the stitched 14-cycle first-transaction shape by collapsing each cold first-use prepare+execute pair back into one semantic pgbench command. There are now three pgbench-specific selectors:
+
+- `--first-pgbench-transaction`
+  Picks the first real pgbench client transaction after the explicit row-start marker. This is the right selector for the cold-ish first transaction. For the cold first prepared-session transaction, the helper also stitches in the detached one-time `BEGIN` prepare prelude when that cycle was logged in the immediately preceding startup/empty-identity block, so the plotted first transaction reflects the full first-use command semantic rather than only the later non-empty row.
+- `--first-pgbench-tpcb`
+  Picks the first clean steady-state 7-command prepared pgbench transaction after the row-start marker. This deliberately skips the earlier first session transaction when it is still paying the one-time lazy `PQprepare()` setup cost.
+- `--median-pgbench-session-transaction`
+  Picks a representative real pgbench transaction after the row-start marker by first grouping real `conn_txn=...` rows by transaction shape and then taking the median traced span within the dominant shape class. The helper also stitches adjacent startup/teardown rows automatically. This is the right selector for `pgbench --connect`, where a raw file-wide median can land on a startup-only or teardown-only row instead of a meaningful session-scoped transaction lifecycle.
+
+Use `--stitch-session-startup` when you want to merge adjacent session-lifecycle rows around the selected transaction row. Today that means:
+
+- the immediately preceding coordinator startup/auth row, and
+- the immediately following `client_session_teardown` row when present
+
+This is the right view for cold session + first transaction analysis, and it is also the shape we will want for future `pgbench -C` per-transaction connection plots.
+
+#### Why One `pgbench` Transaction Shows Multiple Command Envelopes
+
+The benchmark runner uses `pgbench -M prepared`, not one single multi-statement SQL string. The built-in `tpcb-like` script in [`pgbench.c`](/users/JasonHu/postgres-dbcomm/src/bin/pgbench/pgbench.c#L780) contains 7 separate commands:
+
+1. `BEGIN`
+2. `UPDATE pgbench_accounts`
+3. `SELECT pgbench_accounts`
+4. `UPDATE pgbench_tellers`
+5. `UPDATE pgbench_branches`
+6. `INSERT pgbench_history`
+7. `END`
+
+[`sendCommand()`](/users/JasonHu/postgres-dbcomm/src/bin/pgbench/pgbench.c#L3155) sends each command separately, and in prepared mode [`sendCommand()`](/users/JasonHu/postgres-dbcomm/src/bin/pgbench/pgbench.c#L3155) first calls [`prepareCommand()`](/users/JasonHu/postgres-dbcomm/src/bin/pgbench/pgbench.c#L3089). On the first use of each command in one client session, [`prepareCommand()`](/users/JasonHu/postgres-dbcomm/src/bin/pgbench/pgbench.c#L3089) issues [`PQprepare()`](/users/JasonHu/postgres-dbcomm/src/bin/pgbench/pgbench.c#L3105) before the actual execution path later calls [`PQsendQueryPrepared()`](/users/JasonHu/postgres-dbcomm/src/bin/pgbench/pgbench.c#L3189). The libpq execution path in [`PQsendQueryGuts()`](/users/JasonHu/postgres-dbcomm/src/interfaces/libpq/fe-exec.c#L1787) emits `Bind`, `Describe`, `Execute`, and `Sync` for each command. That is why a single logical `pgbench` transaction appears as multiple coordinator command envelopes, why worker 1 can show two separate remote rounds for the account `UPDATE` and later account `SELECT`, and why the very first real transaction can legitimately have more than the steady-state 7 command cycles.
 
 ### Citus Synchronous-Commit Sweep
 
@@ -137,7 +228,7 @@ Useful notes:
 - `-c` is the actual session concurrency; the runner sweeps it from 1 to `--max-clients`.
 - `-j` is capped separately with `--pgbench-workers` so client-side worker threads do not overwhelm the benchmark driver.
 - The runner uses `-M prepared`.
-- The default modes are `off`, `local`, `on`, `remote_write`, and `remote_apply`.
+- The default modes are `local`, `on`, `remote_write`, and `remote_apply`.
 - The default result directory is `bench-results`, but for the canonical tuned run we keep the output under `bench-results-tuned`.
 
 Plot the CSV afterward with:
@@ -218,6 +309,7 @@ Useful notes:
 - Background writers stream `COPY` batches into a distributed sink table.
 - The background loops run until a shared stop time so the overlap with `pgbench` is guaranteed.
 - The default result directory is `bench-results-network-interference`.
+- The Citus helper currently refreshes the worker-1 standby on `node-3`; if `node-4` is missing or stale on a fresh cluster, reclone it from node-2 before running the Citus benchmark family.
 
 To plot one Citus interference CSV:
 
@@ -303,8 +395,9 @@ python3 scripts/setup_citus_network_interference.py \
   --dbname postgres
 ```
 
-3. If you only need the distributed pgbench tables and not the interference sink table, pass `--skip-pgbench-setup` to avoid reinitializing the tables.
-4. If you are starting from a fresh Citus topology, run `scripts/setup_pgbench_citus.sh 32 postgres` afterward when you specifically want to refresh the distributed pgbench tables.
+3. If `node-4` is missing or stale on a fresh cluster, bootstrap it from node-2 and register it as the worker-2 standby before running Citus benchmarks.
+4. If you only need the distributed pgbench tables and not the interference sink table, pass `--skip-pgbench-setup` to avoid reinitializing the tables.
+5. If you are starting from a fresh Citus topology, run `scripts/setup_pgbench_citus.sh 32 postgres` afterward when you specifically want to refresh the distributed pgbench tables.
 
 This explicit switch order matters because the vanilla setup disables the Citus preload on node-0, while the Citus setup expects that preload and the worker standbys to be in place.
 

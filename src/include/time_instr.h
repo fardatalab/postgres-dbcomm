@@ -213,4 +213,23 @@ void log_message_internal(const char *file, int line, const char *format, ...);
  */
 #define log_message(format, ...) log_message_internal(__FILE__, __LINE__, format, ##__VA_ARGS__)
 
+/**
+ * @brief Backend-only debug log helper that also marks instrumentation overhead.
+ *
+ * The waterfall compresses these spans out of the displayed transaction
+ * timeline so our own debug logging does not inflate command lifecycles.
+ */
+#ifndef FRONTEND
+#define log_message_traced(format, ...)                                         \
+	do                                                                          \
+	{                                                                           \
+		LatencyTraceHandle _backend_logging_handle =                            \
+			latency_trace_begin(LATENCY_STAGE_BACKEND_LOGGING, 0, 0);            \
+		log_message(format, ##__VA_ARGS__);                                     \
+		latency_trace_end(_backend_logging_handle);                             \
+	} while (0)
+#else
+#define log_message_traced(format, ...) log_message(format, ##__VA_ARGS__)
+#endif
+
 #endif // LOGGER_H

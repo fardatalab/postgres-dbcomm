@@ -4,6 +4,14 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "miscadmin.h"
+
+/*
+ * PostgreSQL sets redirection_done once backend stderr is redirected to the
+ * syslogger pipe. In that configuration elog() already uses chunked,
+ * pipe-atomic writes, so extra serialization is unnecessary.
+ */
+extern bool redirection_done;
 #else
 #include <pthread.h>
 #endif
@@ -531,19 +539,24 @@ void logger_print_timings(void)
  */
 void logger_print_timings(void)
 {
-    /* Acquire mutex to ensure logger_print_timings is not called concurrently. */
 #ifndef FRONTEND
-    if (logger_shared == NULL)
-    {
-        return;
-    }
+    bool need_backend_log_lock = (!redirection_done && MyBackendType != B_LOGGER);
 
     if (logger_state.stats == NULL)
     {
-        /* Protect the elog() call so concurrent processes don't mix messages. */
-        LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE);
+        /*
+         * Original code serialized this elog() with logger_shared->lock.
+         * Keep that fallback only when stderr is not redirected to the
+         * syslogger pipe, because the syslogger path already preserves one
+         * whole message without a second lock.
+         */
+        /* LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE); */
+        if (need_backend_log_lock && logger_shared != NULL)
+            LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE);
         elog(LOG, "Logger not initialized");
-        LWLockRelease(&logger_shared->lock);
+        if (need_backend_log_lock && logger_shared != NULL)
+            LWLockRelease(&logger_shared->lock);
+        /* LWLockRelease(&logger_shared->lock); */
         return;
     }
 #else
@@ -653,10 +666,20 @@ void logger_print_timings(void)
         "-\n");
 
 #ifndef FRONTEND
-    /* Acquire the LWLock only while emitting the final elog() so output order remains deterministic. */
-    LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE);
+    /*
+     * Original code held logger_shared->lock around this elog() to enforce a
+     * deterministic order between backends. That lock now dominates the
+     * coordinator's post-CommandComplete tail. Keep it only for the unusual
+     * direct-console case; the normal syslogger path already emits each
+     * message intact via the chunked pipe protocol.
+     */
+    /* LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE); */
+    if (need_backend_log_lock && logger_shared != NULL)
+        LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE);
     elog(LOG_SERVER_ONLY, "%s", buf.data);
-    LWLockRelease(&logger_shared->lock);
+    if (need_backend_log_lock && logger_shared != NULL)
+        LWLockRelease(&logger_shared->lock);
+    /* LWLockRelease(&logger_shared->lock); */
 #else
     fprintf(stderr, "%s\n", buf.data);
     fflush(stderr);
@@ -801,14 +824,26 @@ void log_message_internal(const char *file, int line, const char *format, ...)
     va_end(args);
 
 #ifndef FRONTEND
-    if (logger_shared != NULL)
+    bool need_backend_log_lock = (!redirection_done && MyBackendType != B_LOGGER);
+
+    /*
+     * Original code serialized every backend debug log message with
+     * logger_shared->lock. Keep that fallback only when stderr is not using
+     * the syslogger pipe, because the normal syslogger path already keeps a
+     * single message intact.
+     */
+    /* if (logger_shared != NULL)
+        LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE); */
+    if (need_backend_log_lock && logger_shared != NULL)
         LWLockAcquire(&logger_shared->lock, LW_EXCLUSIVE);
 
-    /* elog automatically adds timestamp */
+    /* elog automatically adds timestamp. */
     elog(LOG, "[%s:%d] %s", file, line, buf.data);
 
-    if (logger_shared != NULL)
+    if (need_backend_log_lock && logger_shared != NULL)
         LWLockRelease(&logger_shared->lock);
+    /* if (logger_shared != NULL)
+        LWLockRelease(&logger_shared->lock); */
 #else
     if (pthread_mutex_lock(&logger_print_mutex) == 0)
     {

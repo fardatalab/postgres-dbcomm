@@ -41,6 +41,8 @@ static const char *LatencyTraceStageNames[LATENCY_STAGE_COUNT] = {
 	"client_command_complete",
 	"client_ready_for_query",
 	"backend_command_turnaround",
+	"backend_logging",
+	"backend_reporting",
 	"client_session_teardown",
 };
 

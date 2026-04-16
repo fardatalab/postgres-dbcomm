@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import json
 import shlex
 import subprocess
 import sys
@@ -41,6 +42,8 @@ ARCHIVE_SERVER_LOGS = REPO_ROOT / "scripts" / "archive_server_logs.py"
 RESET_SERVER_LOGS = REPO_ROOT / "scripts" / "reset_server_logs.py"
 
 SERVER_LOG_NODES = ("node-0", "node-1", "node-2")
+BACKGROUND_READ_PREFIX_DEFAULT = "bg_read_src"
+BACKGROUND_WRITE_PREFIX_DEFAULT = "bg_write_sink"
 
 
 def run_cmd(
@@ -59,6 +62,17 @@ def run_cmd(
         stdout=stdout,
         stderr=stderr,
     )
+
+
+def is_too_many_clients_error(exc: subprocess.CalledProcessError) -> bool:
+    """Return True when a subprocess failure is just connection pressure."""
+
+    combined = ""
+    if exc.stdout:
+        combined += exc.stdout
+    if exc.stderr:
+        combined += exc.stderr
+    return "too many clients already" in combined.lower()
 
 
 def ssh_cmd(
@@ -100,7 +114,7 @@ def psql_cmd(host: str, dbname: str, sql: str, *, input_text: str | None = None,
         ],
         input_text=input_text,
         stdout=stdout,
-        stderr=subprocess.PIPE if stdout is None else subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
 
 
@@ -120,6 +134,27 @@ def set_system_setting_remote(node: str, setting: str, value: str) -> None:
     ssh_cmd(node, remote_cmd)
 
 
+def sql_identifier(name: str) -> str:
+    """Quote a SQL identifier for direct embedding in generated SQL."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def sql_literal(value: str) -> str:
+    """Quote a SQL string literal for direct embedding in generated SQL."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def background_table_name(prefix: str, session_id: int, total_sessions: int) -> str:
+    """Return the stable table name for one background session."""
+    width = max(2, len(str(max(total_sessions - 1, 0))))
+    return f"{prefix}_{session_id:0{width}d}"
+
+
+def background_table_names(prefix: str, total_sessions: int) -> list[str]:
+    """Return all per-session table names for a prefix."""
+    return [background_table_name(prefix, session_id, total_sessions) for session_id in range(total_sessions)]
+
+
 def reset_server_logs() -> None:
     """Rotate and prune the collector logs before the next benchmark row."""
     run_cmd(
@@ -133,21 +168,66 @@ def reset_server_logs() -> None:
 
 
 def archive_server_logs(run_dir: Path) -> None:
-    """Copy the full row-local collector snapshot from each node.
+    """Copy the row-local collector suffix from each node.
 
-    Network-interference rows can also rotate through multiple collector
-    segments. Keep the entire row-local snapshot so later trace parsing does
-    not silently lose the first part of the row.
+    The benchmark runner records a row-start snapshot before the workload
+    begins. Use that snapshot here so we only archive the bytes written during
+    the benchmark row, instead of replaying the whole collector directory.
     """
+    baseline_path = run_dir / "server-log-baseline.json"
     run_cmd(
         [
             sys.executable,
             str(ARCHIVE_SERVER_LOGS),
             "--output-dir",
             str(run_dir / "server-logs"),
+            "--baseline-json",
+            str(baseline_path),
             "--nodes",
             *SERVER_LOG_NODES,
         ]
+    )
+
+
+def snapshot_server_log_baseline(run_dir: Path, nodes: tuple[str, ...]) -> None:
+    """Record the active collector logfile and byte offset for each node."""
+
+    baseline: list[dict[str, int | str]] = []
+    snapshot_cmd = (
+        "set -e; "
+        "export PATH=$HOME/pg/bin:$PATH; "
+        "logfile=$($HOME/pg/bin/psql -Atq -X -d postgres -c \"SELECT pg_current_logfile();\"); "
+        "if [ -z \"$logfile\" ]; then exit 1; fi; "
+        "abs_path=$HOME/pg/data/$logfile; "
+        "offset=$(stat -c %s \"$abs_path\"); "
+        "printf '%s\\t%s\\n' \"$abs_path\" \"$offset\""
+    )
+
+    for node in nodes:
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                result = ssh_cmd(node, snapshot_cmd, stdout=subprocess.PIPE)
+                parts = result.stdout.strip().split("\t")
+                if len(parts) != 2:
+                    raise RuntimeError(f"could not capture logfile snapshot on {node}: {result.stdout!r}")
+                source_path, size_text = parts
+                baseline.append(
+                    {
+                        "node": node,
+                        "source_path": source_path,
+                        "start_offset_bytes": int(size_text),
+                    }
+                )
+                break
+            except subprocess.CalledProcessError as exc:
+                if not is_too_many_clients_error(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
+
+    (run_dir / "server-log-baseline.json").write_text(
+        json.dumps(baseline, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
 
 
@@ -248,6 +328,7 @@ def run_pgbench(
     dbname: str,
     sample_rate: float,
     mode: str,
+    query_mode: str,
     run_dir: Path,
 ) -> dict[str, float | int]:
     """Execute one pgbench run and return the parsed metrics."""
@@ -270,7 +351,7 @@ def run_pgbench(
         "-j",
         str(threads),
         "-M",
-        "prepared",
+        query_mode,
         "-T",
         str(duration_s),
         "-l",
@@ -293,6 +374,7 @@ def run_pgbench(
 
     metrics = collect_metrics(summary_path, log_prefix, sample_rate)
     metrics["mode"] = mode
+    metrics["query_mode"] = query_mode
     metrics["clients"] = clients
     metrics["threads"] = threads
     metrics["duration_s"] = duration_s
@@ -310,8 +392,43 @@ def run_pgbench(
     return metrics
 
 
-def ensure_ready(dbname: str, sink_table: str) -> None:
-    """Verify that the Citus benchmark tables and sink table exist."""
+def table_exists(dbname: str, table_name: str) -> bool:
+    """Return True when a table exists in the benchmark database."""
+    result = psql_cmd(
+        "127.0.0.1",
+        dbname,
+        f"SELECT to_regclass({sql_literal(table_name)}) IS NOT NULL;",
+        stdout=subprocess.PIPE,
+    )
+    return result.stdout.strip() == "t"
+
+
+def table_persistence(dbname: str, table_name: str) -> str:
+    """Return the relation persistence flag for a table."""
+    result = psql_cmd(
+        "127.0.0.1",
+        dbname,
+        f"SELECT relpersistence FROM pg_class WHERE oid = {sql_literal(table_name)}::regclass;",
+        stdout=subprocess.PIPE,
+    )
+    return result.stdout.strip()
+
+
+def table_row_count(dbname: str, table_name: str) -> int:
+    """Return the current row count for a table."""
+    result = psql_cmd("127.0.0.1", dbname, f"SELECT count(*) FROM {sql_identifier(table_name)};", stdout=subprocess.PIPE)
+    return int(result.stdout.strip() or "0")
+
+
+def ensure_ready(
+    dbname: str,
+    *,
+    background_read_prefix: str,
+    background_write_prefix: str,
+    background_max_sessions: int,
+    background_tables_logged: bool,
+) -> None:
+    """Verify that the benchmark tables and background tables exist."""
     preload = psql_cmd("127.0.0.1", "postgres", "SHOW shared_preload_libraries;", stdout=subprocess.PIPE)
     if "citus" not in preload.stdout:
         raise RuntimeError(
@@ -330,17 +447,47 @@ def ensure_ready(dbname: str, sink_table: str) -> None:
             "Run scripts/setup_citus_network_interference.py first."
         )
 
-    sink_check = psql_cmd(
-        "127.0.0.1",
-        dbname,
-        f"SELECT count(*) FROM pg_dist_partition WHERE logicalrelid = '{sink_table}'::regclass;",
-        stdout=subprocess.PIPE,
-    )
-    if int(sink_check.stdout.strip() or "0") != 1:
-        raise RuntimeError(
-            f"expected distributed sink table {sink_table} in {dbname}. "
-            "Run scripts/setup_citus_network_interference.py first."
-        )
+    expected_persistence = "p" if background_tables_logged else "u"
+    for session_id in range(background_max_sessions):
+        read_table = background_table_name(background_read_prefix, session_id, background_max_sessions)
+        write_table = background_table_name(background_write_prefix, session_id, background_max_sessions)
+
+        for table_name, expected_rows in ((read_table, 1), (write_table, 0)):
+            if not table_exists(dbname, table_name):
+                raise RuntimeError(
+                    f"expected background table {table_name} in {dbname}. "
+                    "Run scripts/setup_citus_network_interference.py first."
+                )
+
+            distributed = psql_cmd(
+                "127.0.0.1",
+                dbname,
+                f"SELECT count(*) FROM pg_dist_partition WHERE logicalrelid = {sql_literal(table_name)}::regclass;",
+                stdout=subprocess.PIPE,
+            )
+            if int(distributed.stdout.strip() or "0") != 1:
+                raise RuntimeError(
+                    f"expected background table {table_name} to be distributed on node-0. "
+                    "Run scripts/setup_citus_network_interference.py first."
+                )
+
+            persistence = table_persistence(dbname, table_name)
+            if persistence != expected_persistence:
+                raise RuntimeError(
+                    f"expected background table {table_name} to be "
+                    f"{'logged' if background_tables_logged else 'unlogged'} "
+                    f"but relpersistence was {persistence!r}"
+                )
+
+            row_count = table_row_count(dbname, table_name)
+            if expected_rows == 1 and row_count < 1:
+                raise RuntimeError(
+                    f"expected background read table {table_name} to contain data, found {row_count} rows"
+                )
+            if expected_rows == 0 and row_count != 0:
+                raise RuntimeError(
+                    f"expected background write table {table_name} to be empty before the run, found {row_count} rows"
+                )
 
     worker1 = ssh_cmd(
         "node-1",
@@ -416,12 +563,19 @@ def reader_worker(
                 "-d",
                 dbname,
                 "-c",
-                f"COPY (SELECT * FROM {source_table}) TO STDOUT;",
+                f"COPY (SELECT * FROM {sql_identifier(source_table)}) TO STDOUT;",
             ]
-            run_cmd(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            stats.batches += 1
+            try:
+                run_cmd(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                stats.batches += 1
+            except subprocess.CalledProcessError as exc:
+                if not is_too_many_clients_error(exc):
+                    raise
+                # The high-interference case can transiently exhaust server
+                # slots. Back off briefly and retry until the row deadline.
+                time.sleep(0.2)
     except Exception as exc:  # pragma: no cover - benchmark control path
-        stats.errors.append(f"reader-{session_id}: {exc}")
+        stats.errors.append(f"reader-{session_id}({source_table}): {exc}")
         failure_event.set()
 
 
@@ -460,14 +614,22 @@ def writer_worker(
                 "-d",
                 dbname,
                 "-c",
-                f"COPY {sink_table} (id, payload) FROM STDIN WITH (FORMAT csv);",
+                f"COPY {sql_identifier(sink_table)} (id, payload) FROM STDIN WITH (FORMAT csv);",
             ]
-            run_cmd(cmd, input_text=batch_input, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            stats.batches += 1
+            try:
+                run_cmd(cmd, input_text=batch_input, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                stats.batches += 1
+            except subprocess.CalledProcessError as exc:
+                if not is_too_many_clients_error(exc):
+                    raise
+                # Back off instead of failing the whole benchmark when the
+                # cluster briefly has no free client slots.
+                time.sleep(0.2)
+                continue
             batch_id += 1
             batch_input = make_writer_batch(batch_rows, payload_bytes, session_id=session_id, batch_id=batch_id)
     except Exception as exc:  # pragma: no cover - benchmark control path
-        stats.errors.append(f"writer-{session_id}: {exc}")
+        stats.errors.append(f"writer-{session_id}({sink_table}): {exc}")
         failure_event.set()
 
 
@@ -523,9 +685,12 @@ def launch_writer_thread(
     )
 
 
-def truncate_sink(sink_table: str, dbname: str) -> None:
-    """Keep the distributed sink table from growing across levels."""
-    psql_cmd("127.0.0.1", dbname, f"TRUNCATE TABLE {sink_table};")
+def truncate_background_write_tables(dbname: str, table_names: list[str]) -> None:
+    """Reset the current level's write sinks so later levels start clean."""
+    if not table_names:
+        return
+    quoted_tables = ", ".join(sql_identifier(table_name) for table_name in table_names)
+    psql_cmd("127.0.0.1", dbname, f"TRUNCATE TABLE {quoted_tables};")
 
 
 def main() -> int:
@@ -538,6 +703,12 @@ def main() -> int:
         help="synchronous_commit modes to benchmark",
     )
     parser.add_argument("--clients", type=int, default=16)
+    parser.add_argument(
+        "--query-mode",
+        choices=("prepared", "extended", "simple"),
+        default="prepared",
+        help="pgbench protocol mode to use for the foreground workload",
+    )
     parser.add_argument("--duration", type=int, default=12)
     parser.add_argument(
         "--pgbench-workers",
@@ -551,7 +722,28 @@ def main() -> int:
         type=int,
         nargs="+",
         default=[1, 2, 4, 8],
-        help="number of background reader/writer sessions per direction",
+        help="number of background reader/writer sessions per direction; 0 means no background traffic",
+    )
+    parser.add_argument(
+        "--background-max-sessions",
+        type=int,
+        default=None,
+        help="number of per-session background tables precreated by setup; defaults to max(background_levels)",
+    )
+    parser.add_argument(
+        "--background-read-prefix",
+        default=BACKGROUND_READ_PREFIX_DEFAULT,
+        help="prefix for the per-session background read-source tables",
+    )
+    parser.add_argument(
+        "--background-write-prefix",
+        default=BACKGROUND_WRITE_PREFIX_DEFAULT,
+        help="prefix for the per-session background write-sink tables",
+    )
+    parser.add_argument(
+        "--background-tables-logged",
+        action="store_true",
+        help="expect regular logged background tables instead of the default unlogged tables",
     )
     parser.add_argument(
         "--background-start-delay",
@@ -577,8 +769,6 @@ def main() -> int:
         default=256,
         help="payload width per row for background writer COPY batches",
     )
-    parser.add_argument("--source-table", default="pgbench_accounts")
-    parser.add_argument("--sink-table", default="bg_sink")
     parser.add_argument(
         "--results-dir",
         type=Path,
@@ -603,11 +793,29 @@ def main() -> int:
         raise SystemExit("--clients must be at least 1")
     if not args.background_levels:
         raise SystemExit("--background-levels must not be empty")
+    if any(level < 0 for level in args.background_levels):
+        raise SystemExit("--background-levels must contain only non-negative integers")
     if not args.modes:
         raise SystemExit("--modes must not be empty")
 
+    max_background_sessions = args.background_max_sessions
+    if max_background_sessions is None:
+        max_background_sessions = max(args.background_levels)
+    if max_background_sessions < 1:
+        raise SystemExit("--background-max-sessions must be at least 1")
+    if max_background_sessions < max(args.background_levels):
+        raise SystemExit(
+            "--background-max-sessions must be at least as large as the maximum background level"
+        )
+
     if not args.skip_setup_check:
-        ensure_ready(args.dbname, args.sink_table)
+        ensure_ready(
+            args.dbname,
+            background_read_prefix=args.background_read_prefix,
+            background_write_prefix=args.background_write_prefix,
+            background_max_sessions=max_background_sessions,
+            background_tables_logged=args.background_tables_logged,
+        )
 
     configure_synchronous_standbys()
     reset_server_logs()
@@ -621,7 +829,10 @@ def main() -> int:
         "background_level",
         "reader_sessions",
         "writer_sessions",
+        "background_max_sessions",
+        "background_table_persistence",
         "mode",
+        "query_mode",
         "clients",
         "threads",
         "duration_s",
@@ -656,7 +867,10 @@ def main() -> int:
 
                 for level in args.background_levels:
                     print(f"running background level={level}", flush=True)
-                    truncate_sink(args.sink_table, args.dbname)
+                    # Each background session gets its own precreated table pair.
+                    read_tables = background_table_names(args.background_read_prefix, max_background_sessions)[:level]
+                    write_tables = background_table_names(args.background_write_prefix, max_background_sessions)[:level]
+                    truncate_background_write_tables(args.dbname, write_tables)
 
                     start_at = time.monotonic() + args.background_start_delay
                     stop_at = start_at + args.duration + args.background_pad
@@ -679,7 +893,7 @@ def main() -> int:
                                     "start_at": start_at,
                                     "stop_at": stop_at,
                                     "dbname": args.dbname,
-                                    "source_table": args.source_table,
+                                    "source_table": read_tables[idx],
                                     "stats": reader_stats,
                                     "failure_event": failure_event,
                                 },
@@ -695,7 +909,7 @@ def main() -> int:
                                     "start_at": start_at,
                                     "stop_at": stop_at,
                                     "dbname": args.dbname,
-                                    "sink_table": args.sink_table,
+                                    "sink_table": write_tables[idx],
                                     "batch_rows": args.writer_batch_rows,
                                     "payload_bytes": args.writer_payload_bytes,
                                     "stats": writer_stats,
@@ -710,10 +924,13 @@ def main() -> int:
                         thread.start()
                     barrier.wait()
 
+                    run_dir = results_dir / mode / f"b{level:02d}"
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    snapshot_server_log_baseline(run_dir, SERVER_LOG_NODES)
+
                     while time.monotonic() < start_at:
                         time.sleep(min(0.5, start_at - time.monotonic()))
 
-                    run_dir = results_dir / mode / f"b{level:02d}"
                     emit_row_log_marker(
                         mode=mode,
                         level=level,
@@ -728,6 +945,7 @@ def main() -> int:
                         dbname=args.dbname,
                         sample_rate=args.sampling_rate,
                         mode=mode,
+                        query_mode=args.query_mode,
                         run_dir=run_dir,
                     )
 
@@ -746,6 +964,10 @@ def main() -> int:
                     metrics["background_level"] = level
                     metrics["reader_sessions"] = level
                     metrics["writer_sessions"] = level
+                    metrics["background_max_sessions"] = max_background_sessions
+                    metrics["background_table_persistence"] = (
+                        "logged" if args.background_tables_logged else "unlogged"
+                    )
                     metrics["reader_batches"] = sum(stat.batches for stat in stats if stat.role == "reader")
                     metrics["writer_batches"] = sum(stat.batches for stat in stats if stat.role == "writer")
                     metrics["server_logs_dir"] = str(run_dir / "server-logs")
@@ -762,8 +984,8 @@ def main() -> int:
                     archive_server_logs(run_dir)
                     reset_server_logs()
 
-                    # Keep the sink table small between levels; it is only a traffic source.
-                    truncate_sink(args.sink_table, args.dbname)
+                    # Keep only the write tables for the current level small between rows.
+                    truncate_background_write_tables(args.dbname, write_tables)
 
                     # Remove raw logs once the summary metrics have been parsed.
                     for log_file in run_dir.glob("pgbench_log*"):

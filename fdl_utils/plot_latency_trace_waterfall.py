@@ -264,9 +264,9 @@ def parse_args() -> argparse.Namespace:
         "--show-labels",
         action="store_true",
         help=(
-            "Render text labels on all bars. By default the plot labels only the "
-            "envelope bars so the main lifecycle stays readable without re-adding "
-            "the old dense child-bar clutter."
+            "Render text labels on the plot bars. By default the waterfall omits "
+            "bar text entirely so the lifecycle stays readable; numbered pgbench "
+            "brackets remain available through --annotate-pgbench-tpcb."
         ),
     )
     parser.add_argument(
@@ -499,8 +499,9 @@ def compressed_offset_ns(offset_ns: int, ignored_intervals: Sequence[Tuple[int, 
 
     The plot uses this to remove control-path stages that we explicitly do not
     want to treat as part of the transaction lifecycle. Today that means
-    `backend_command_turnaround`: we keep the trace row itself, but collapse
-    those intervals out of the displayed elapsed-time axis.
+    `backend_command_turnaround`, `backend_logging`, and
+    `backend_reporting`: we keep the trace row itself, but collapse those
+    intervals out of the displayed elapsed-time axis.
     """
 
     compressed_ns = offset_ns
@@ -518,8 +519,9 @@ def compressed_offset_ns(offset_ns: int, ignored_intervals: Sequence[Tuple[int, 
 def build_display_trace(trace: TraceBlock) -> TraceBlock:
     """Build a plot-facing trace after removing non-lifecycle overhead.
 
-    `backend_command_turnaround` is real backend CPU time, but it represents
-    our own timing/reporting handoff rather than transaction-semantic work.
+    `backend_command_turnaround`, `backend_logging`, and `backend_reporting`
+    are real backend CPU time, but they represent our own
+    timing/reporting/logging overhead rather than transaction-semantic work.
     For the lifecycle waterfall we therefore remove those intervals entirely
     instead of leaving dead space on the x-axis.
     """
@@ -528,7 +530,11 @@ def build_display_trace(trace: TraceBlock) -> TraceBlock:
         [
             (stage.start_offset_ns, stage.end_offset_ns)
             for stage in trace.stage_instances
-            if stage.stage_name == "backend_command_turnaround"
+            if stage.stage_name in {
+                "backend_command_turnaround",
+                "backend_logging",
+                "backend_reporting",
+            }
         ]
     )
 
@@ -540,7 +546,11 @@ def build_display_trace(trace: TraceBlock) -> TraceBlock:
         trace.stage_instances,
         key=lambda stage: (stage.start_offset_ns, stage.end_offset_ns, stage.stage_name),
     ):
-        if stage.stage_name == "backend_command_turnaround":
+        if stage.stage_name in {
+            "backend_command_turnaround",
+            "backend_logging",
+            "backend_reporting",
+        }:
             continue
 
         display_start_ns = compressed_offset_ns(stage.start_offset_ns, ignored_intervals)
@@ -1478,7 +1488,7 @@ def maybe_label_bar(
     if not segment.label:
         return
 
-    if not show_labels and not segment.default_label:
+    if not show_labels:
         return
 
     duration_ms = segment.duration_ns / 1_000_000.0

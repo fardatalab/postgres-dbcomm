@@ -5005,22 +5005,39 @@ PostgresMain(const char *dbname, const char *username)
 				 * performance impact. That's OK because pgstat_report_stat()
 				 * won't have us wake up sooner than a prior call.
 				 */
-				stats_timeout = pgstat_report_stat(false);
-				if (stats_timeout > 0)
 				{
-					if (!get_timeout_active(IDLE_STATS_UPDATE_TIMEOUT))
-						enable_timeout_after(IDLE_STATS_UPDATE_TIMEOUT,
-											 stats_timeout);
-				}
-				else
-				{
-					/* all stats flushed, no need for the timeout */
-					if (get_timeout_active(IDLE_STATS_UPDATE_TIMEOUT))
-						disable_timeout(IDLE_STATS_UPDATE_TIMEOUT, false);
-				}
+					LatencyTraceHandle reportingLatencyHandle =
+						LATENCY_TRACE_INVALID_HANDLE;
 
-				set_ps_display("idle");
-				pgstat_report_activity(STATE_IDLE, NULL);
+					/*
+					 * Original code performed this post-command reporting and
+					 * idle-status bookkeeping directly in the transaction row.
+					 * Keep measuring it explicitly so the plotter can compress
+					 * it away as PostgreSQL reporting overhead rather than
+					 * transaction-semantic work.
+					 */
+					reportingLatencyHandle =
+						latency_trace_begin(LATENCY_STAGE_BACKEND_REPORTING,
+											 0, 0);
+
+					stats_timeout = pgstat_report_stat(false);
+					if (stats_timeout > 0)
+					{
+						if (!get_timeout_active(IDLE_STATS_UPDATE_TIMEOUT))
+							enable_timeout_after(IDLE_STATS_UPDATE_TIMEOUT,
+												 stats_timeout);
+					}
+					else
+					{
+						/* all stats flushed, no need for the timeout */
+						if (get_timeout_active(IDLE_STATS_UPDATE_TIMEOUT))
+							disable_timeout(IDLE_STATS_UPDATE_TIMEOUT, false);
+					}
+
+					set_ps_display("idle");
+					pgstat_report_activity(STATE_IDLE, NULL);
+					latency_trace_end(reportingLatencyHandle);
+				}
 
 				/* Start the idle-session timer */
 				if (IdleSessionTimeout > 0)
@@ -5031,8 +5048,22 @@ PostgresMain(const char *dbname, const char *username)
 				}
 			}
 
-			/* Report any recently-changed GUC options */
-			ReportChangedGUCOptions();
+			{
+				LatencyTraceHandle reportingLatencyHandle =
+					LATENCY_TRACE_INVALID_HANDLE;
+
+				/*
+				 * Original code reported changed GUC options directly in the
+				 * coordinator row before ReadyForQuery(). Keep it separate from
+				 * transaction-semantic work so the waterfall can collapse it.
+				 */
+				reportingLatencyHandle =
+					latency_trace_begin(LATENCY_STAGE_BACKEND_REPORTING, 0, 0);
+
+				/* Report any recently-changed GUC options */
+				ReportChangedGUCOptions();
+				latency_trace_end(reportingLatencyHandle);
+			}
 
 			/*
 			 * Legacy PG_WAIT_DONT_COUNT timing used to toggle here. The new
@@ -5184,7 +5215,16 @@ PostgresMain(const char *dbname, const char *username)
 						// jason: end timing
 						timing_end(ExecSimpleQuery);
 						if (!skip_query_str_print)
-							log_message("Query executed: %s", query_string);
+						{
+							/*
+							 * Original code logged directly inside the traced
+							 * command envelope. Keep the debug message, but
+							 * tag it as instrumentation overhead so the
+							 * waterfall can compress it away.
+							 */
+							/* log_message("Query executed: %s", query_string); */
+							log_message_traced("Query executed: %s", query_string);
+						}
 
 						valgrind_report_error_query(query_string);
 
@@ -5231,8 +5271,11 @@ PostgresMain(const char *dbname, const char *username)
 
                     // jason: log the prepared statement, Citus adaptive scan seems to go this path, using
                     // StartPlacementExecutionOnSession which calls SendNextQuery
-                    log_message("PqMsg_Parse stmt_name: %s", stmt_name);
-                    log_message("PqMsg_Parse query: %s", query_string);
+                    /* Original code used untraced log_message() calls here. */
+                    /* log_message("PqMsg_Parse stmt_name: %s", stmt_name); */
+                    log_message_traced("PqMsg_Parse stmt_name: %s", stmt_name);
+                    /* log_message("PqMsg_Parse query: %s", query_string); */
+                    log_message_traced("PqMsg_Parse query: %s", query_string);
 
                     exec_parse_message(query_string, stmt_name, paramTypes, numParams);
 
@@ -5274,7 +5317,9 @@ PostgresMain(const char *dbname, const char *username)
 					pq_getmsgend(&input_message);
 
                     // jason: log PqMsg_Execute too
-                    log_message("PqMsg_Execute portal_name: %s", portal_name);
+                    /* Original code used an untraced log_message() call here. */
+                    /* log_message("PqMsg_Execute portal_name: %s", portal_name); */
+                    log_message_traced("PqMsg_Execute portal_name: %s", portal_name);
                     // log_message("PqMsg_Execute max_rows: %d", max_rows);
 
                     // jason: timing the execution of a query, TODO: don't call it simple query
@@ -5314,7 +5359,9 @@ PostgresMain(const char *dbname, const char *username)
 				MemoryContextSwitchTo(MessageContext);
 
                 // jason: log PqMsg_FunctionCall too
-                log_message("PqMsg_FunctionCall received: %s\n", input_message.data);
+                /* Original code used an untraced log_message() call here. */
+                /* log_message("PqMsg_FunctionCall received: %s\n", input_message.data); */
+                log_message_traced("PqMsg_FunctionCall received: %s\n", input_message.data);
                 HandleFunctionRequest(&input_message);
 
 				/* commit the function-invocation transaction */
