@@ -44,6 +44,7 @@ RESET_SERVER_LOGS = REPO_ROOT / "scripts" / "reset_server_logs.py"
 SERVER_LOG_NODES = ("node-0", "node-1", "node-2")
 BACKGROUND_READ_PREFIX_DEFAULT = "bg_read_src"
 BACKGROUND_WRITE_PREFIX_DEFAULT = "bg_write_sink"
+PRIVATE_TABLE_PREFIX_DEFAULT = "pgbench_private_accounts"
 
 
 def run_cmd(
@@ -250,7 +251,7 @@ def finalize_server_logs_for_archive(nodes: tuple[str, ...]) -> None:
 
 
 def emit_row_log_marker(
-    *, mode: str, level: int, clients: int, phase: str, nodes: tuple[str, ...]
+    *, mode: str, level: int, clients: int, repeat: int, phase: str, nodes: tuple[str, ...]
 ) -> None:
     """Emit one explicit LOG line on each node around one interference row.
 
@@ -261,7 +262,7 @@ def emit_row_log_marker(
 
     message = (
         f"pgbench row marker phase={phase} mode={mode} "
-        f"background_level={level} clients={clients}"
+        f"background_level={level} clients={clients} repeat={repeat}"
     )
     sql = f"DO $$ BEGIN RAISE LOG {message!r}; END $$;"
     remote_cmd = (
@@ -288,22 +289,55 @@ def configure_synchronous_standbys() -> None:
     set_system_setting_remote("node-2", "synchronous_standby_names", "FIRST 1 (worker2_stby)")
 
 
-def collect_metrics(summary_path: Path, log_prefix: Path, sampling_rate: float) -> dict[str, float | int]:
-    """Parse pgbench summary text and transaction logs into one metrics dict."""
-    summary_text = summary_path.read_text(encoding="utf-8", errors="replace")
-    summary = REPORT.parse_summary(summary_text)
+def collect_metrics(
+    summary_paths: list[Path],
+    log_prefixes: list[Path],
+    sampling_rate: float,
+) -> dict[str, float | int]:
+    """Parse one or more pgbench summaries and logs into one metrics dict."""
+    summaries = [
+        REPORT.parse_summary(path.read_text(encoding="utf-8", errors="replace"))
+        for path in summary_paths
+    ]
 
-    log_paths = sorted(log_prefix.parent.glob(f"{log_prefix.name}*"))
+    log_paths: list[Path] = []
+    for log_prefix in log_prefixes:
+        log_paths.extend(sorted(log_prefix.parent.glob(f"{log_prefix.name}*")))
     times_us, non_numeric, total_lines = REPORT.load_log_times(log_paths)
     if not times_us:
-        raise RuntimeError(f"no transaction samples were found for {log_prefix}")
+        prefixes = ", ".join(str(prefix) for prefix in log_prefixes)
+        raise RuntimeError(f"no transaction samples were found for {prefixes}")
+
+    processed_values = [summary.processed for summary in summaries if summary.processed is not None]
+    failed_values = [summary.failed for summary in summaries if summary.failed is not None]
+    tps_values = [summary.tps for summary in summaries if summary.tps is not None]
+    latency_inputs = [
+        (summary.processed, summary.latency_avg_ms)
+        for summary in summaries
+        if summary.processed is not None and summary.latency_avg_ms is not None
+    ]
+    stddev_inputs = [
+        (summary.processed, summary.latency_stddev_ms)
+        for summary in summaries
+        if summary.processed is not None and summary.latency_stddev_ms is not None
+    ]
+    latency_weight = sum(processed for processed, _ in latency_inputs)
+    stddev_weight = sum(processed for processed, _ in stddev_inputs)
 
     metrics: dict[str, float | int] = {
-        "transactions_processed": summary.processed if summary.processed is not None else -1,
-        "failed_transactions": summary.failed if summary.failed is not None else -1,
-        "latency_avg_ms": summary.latency_avg_ms if summary.latency_avg_ms is not None else -1.0,
-        "latency_stddev_ms": summary.latency_stddev_ms if summary.latency_stddev_ms is not None else -1.0,
-        "throughput_tps": summary.tps if summary.tps is not None else -1.0,
+        "transactions_processed": sum(processed_values) if processed_values else -1,
+        "failed_transactions": sum(failed_values) if failed_values else -1,
+        "latency_avg_ms": (
+            sum(processed * latency for processed, latency in latency_inputs) / latency_weight
+            if latency_weight
+            else -1.0
+        ),
+        "latency_stddev_ms": (
+            sum(processed * stddev for processed, stddev in stddev_inputs) / stddev_weight
+            if stddev_weight
+            else -1.0
+        ),
+        "throughput_tps": sum(tps_values) if tps_values else -1.0,
         "sampled_transactions": len(times_us),
         "total_log_lines": total_lines,
         "non_numeric_log_entries": non_numeric,
@@ -320,6 +354,37 @@ def collect_metrics(summary_path: Path, log_prefix: Path, sampling_rate: float) 
     return metrics
 
 
+def write_client_private_script(script_path: Path, table_name: str) -> None:
+    """Write a pgbench script that only touches one client's private table."""
+    quoted_table = sql_identifier(table_name)
+    script_path.write_text(
+        "\n".join(
+            [
+                "\\set aid random(1, :client_private_rows)",
+                "\\set delta random(-5000, 5000)",
+                "BEGIN;",
+                f"UPDATE {quoted_table} SET abalance = abalance + :delta WHERE aid = :aid;",
+                f"SELECT abalance FROM {quoted_table} WHERE aid = :aid;",
+                "END;",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def workload_run_dir(
+    base_dir: Path,
+    workload: str,
+    mode: str,
+    clients: int,
+    level: int,
+    repeat: int,
+) -> Path:
+    """Return a stable per-row result directory."""
+    return base_dir / workload / mode / f"c{clients:02d}" / f"b{level:02d}" / f"r{repeat:02d}"
+
+
 def run_pgbench(
     *,
     clients: int,
@@ -329,52 +394,127 @@ def run_pgbench(
     sample_rate: float,
     mode: str,
     query_mode: str,
+    workload: str,
+    private_table_prefix: str,
+    client_private_rows: int,
     run_dir: Path,
 ) -> dict[str, float | int]:
     """Execute one pgbench run and return the parsed metrics."""
     run_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = run_dir / "pgbench.out"
-    log_prefix = run_dir / "pgbench_log"
-
     pgbench_bin = Path.home() / "pg" / "bin" / "pgbench"
-    threads = min(worker_threads, clients)
-    cmd = [
-        str(pgbench_bin),
-        "-U",
-        "JasonHu",
-        "-h",
-        "127.0.0.1",
-        "-p",
-        "5432",
-        "-c",
-        str(clients),
-        "-j",
-        str(threads),
-        "-M",
-        query_mode,
-        "-T",
-        str(duration_s),
-        "-l",
-        "--log-prefix",
-        str(log_prefix),
-    ]
-    if sample_rate != 1.0:
-        cmd.extend(["--sampling-rate", str(sample_rate)])
-    cmd.append(dbname)
+    summary_paths: list[Path] = []
+    log_prefixes: list[Path] = []
 
-    print(f"running mode={mode} clients={clients} threads={threads} duration={duration_s}s", flush=True)
-    with summary_path.open("w", encoding="utf-8") as summary_file:
-        subprocess.run(
-            cmd,
-            stdout=summary_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True,
+    if workload == "tpcb":
+        summary_path = run_dir / "pgbench.out"
+        log_prefix = run_dir / "pgbench_log"
+        threads = min(worker_threads, clients)
+        cmd = [
+            str(pgbench_bin),
+            "-U",
+            "JasonHu",
+            "-h",
+            "127.0.0.1",
+            "-p",
+            "5432",
+            "-c",
+            str(clients),
+            "-j",
+            str(threads),
+            "-M",
+            query_mode,
+            "-T",
+            str(duration_s),
+            "-l",
+            "--log-prefix",
+            str(log_prefix),
+        ]
+        if sample_rate != 1.0:
+            cmd.extend(["--sampling-rate", str(sample_rate)])
+        cmd.append(dbname)
+
+        print(
+            f"running workload={workload} mode={mode} clients={clients} "
+            f"threads={threads} duration={duration_s}s",
+            flush=True,
         )
+        with summary_path.open("w", encoding="utf-8") as summary_file:
+            subprocess.run(
+                cmd,
+                stdout=summary_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+            )
+        summary_paths.append(summary_path)
+        log_prefixes.append(log_prefix)
+    elif workload == "client-private-table":
+        threads = clients
+        processes: list[tuple[int, subprocess.Popen[str], object]] = []
+        print(
+            f"running workload={workload} mode={mode} clients={clients} "
+            f"processes={clients} duration={duration_s}s",
+            flush=True,
+        )
+        for client_id in range(clients):
+            table_name = f"{private_table_prefix}_{client_id:02d}"
+            script_path = run_dir / f"client_{client_id:02d}.sql"
+            summary_path = run_dir / f"pgbench_client_{client_id:02d}.out"
+            log_prefix = run_dir / f"pgbench_log_client_{client_id:02d}"
+            write_client_private_script(script_path, table_name)
+            cmd = [
+                str(pgbench_bin),
+                "-U",
+                "JasonHu",
+                "-h",
+                "127.0.0.1",
+                "-p",
+                "5432",
+                "-c",
+                "1",
+                "-j",
+                "1",
+                "-M",
+                query_mode,
+                "-T",
+                str(duration_s),
+                "-D",
+                f"client_private_rows={client_private_rows}",
+                "-f",
+                str(script_path),
+                "-l",
+                "--log-prefix",
+                str(log_prefix),
+            ]
+            if sample_rate != 1.0:
+                cmd.extend(["--sampling-rate", str(sample_rate)])
+            cmd.append(dbname)
+            summary_file = summary_path.open("w", encoding="utf-8")
+            process = subprocess.Popen(
+                cmd,
+                stdout=summary_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            processes.append((client_id, process, summary_file))
+            summary_paths.append(summary_path)
+            log_prefixes.append(log_prefix)
 
-    metrics = collect_metrics(summary_path, log_prefix, sample_rate)
+        failures: list[str] = []
+        for client_id, process, summary_file in processes:
+            return_code = process.wait()
+            summary_file.close()
+            if return_code != 0:
+                failures.append(f"client {client_id} exited with status {return_code}")
+        if failures:
+            raise RuntimeError("; ".join(failures))
+    else:
+        raise ValueError(f"unsupported workload: {workload}")
+
+    metrics = collect_metrics(summary_paths, log_prefixes, sample_rate)
     metrics["mode"] = mode
     metrics["query_mode"] = query_mode
+    metrics["workload"] = workload
     metrics["clients"] = clients
     metrics["threads"] = threads
     metrics["duration_s"] = duration_s
@@ -686,11 +826,103 @@ def launch_writer_thread(
 
 
 def truncate_background_write_tables(dbname: str, table_names: list[str]) -> None:
-    """Reset the current level's write sinks so later levels start clean."""
+    """Reset background write sinks so each measured row starts clean."""
     if not table_names:
         return
     quoted_tables = ", ".join(sql_identifier(table_name) for table_name in table_names)
     psql_cmd("127.0.0.1", dbname, f"TRUNCATE TABLE {quoted_tables};")
+
+
+def reset_pgbench_state(dbname: str, reset_mode: str) -> None:
+    """Restore pgbench's logical table state before a measured row.
+
+    pgbench's built-in TPC-B transaction mutates account, branch, and teller
+    balances and appends to pgbench_history. Reset those effects before each
+    row so background-level/client comparisons do not inherit state from the
+    previous row. This is intentionally a logical reset, not a physical
+    reinitialization, so the benchmark matrix remains practical to run.
+    """
+    if reset_mode == "none":
+        return
+    if reset_mode != "logical":
+        raise ValueError(f"unsupported pgbench reset mode: {reset_mode}")
+
+    reset_statements = [
+        "TRUNCATE TABLE pgbench_history;",
+        "UPDATE pgbench_accounts SET abalance = 0;",
+        "UPDATE pgbench_branches SET bbalance = 0;",
+        "UPDATE pgbench_tellers SET tbalance = 0;",
+    ]
+    for statement in reset_statements:
+        psql_cmd("127.0.0.1", dbname, statement)
+
+    # Keep planner statistics comparable after the table-wide reset.
+    for table_name in (
+        "pgbench_accounts",
+        "pgbench_branches",
+        "pgbench_tellers",
+        "pgbench_history",
+    ):
+        psql_cmd("127.0.0.1", dbname, f"ANALYZE {table_name};")
+
+
+def private_table_names(prefix: str, clients: int) -> list[str]:
+    """Return the client-private foreground table names needed by one row."""
+    return [f"{prefix}_{client_id:02d}" for client_id in range(clients)]
+
+
+def ensure_client_private_tables(dbname: str, table_prefix: str, max_clients: int) -> None:
+    """Verify that the client-private foreground tables exist and are distributed."""
+    for table_name in private_table_names(table_prefix, max_clients):
+        quoted = sql_literal(table_name)
+        exists = psql_cmd(
+            "127.0.0.1",
+            dbname,
+            f"SELECT to_regclass({quoted}) IS NOT NULL;",
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        if exists != "t":
+            raise RuntimeError(
+                f"expected client-private table {table_name} to exist. "
+                "Run setup_citus_network_interference.py with enough --private-client-count first."
+            )
+
+        distributed = psql_cmd(
+            "127.0.0.1",
+            dbname,
+            "SELECT count(*) FROM pg_dist_partition "
+            f"WHERE logicalrelid = {quoted}::regclass;",
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        if int(distributed or "0") != 1:
+            raise RuntimeError(f"expected client-private table {table_name} to be distributed")
+
+
+def reset_client_private_tables(
+    dbname: str,
+    table_prefix: str,
+    clients: int,
+    client_private_rows: int,
+    reset_mode: str,
+) -> None:
+    """Restore the private foreground tables touched by the low-contention workload."""
+    if reset_mode == "none":
+        return
+    if reset_mode != "logical":
+        raise ValueError(f"unsupported pgbench reset mode: {reset_mode}")
+
+    for table_name in private_table_names(table_prefix, clients):
+        quoted_table = sql_identifier(table_name)
+        psql_cmd(
+            "127.0.0.1",
+            dbname,
+            (
+                f"TRUNCATE TABLE {quoted_table}; "
+                f"INSERT INTO {quoted_table} (aid, abalance) "
+                f"SELECT series_id, 0 FROM generate_series(1, {client_private_rows}) AS rows(series_id);"
+            ),
+        )
+        psql_cmd("127.0.0.1", dbname, f"ANALYZE {quoted_table};")
 
 
 def main() -> int:
@@ -702,12 +934,44 @@ def main() -> int:
         default=["local", "on", "remote_write", "remote_apply"],
         help="synchronous_commit modes to benchmark",
     )
-    parser.add_argument("--clients", type=int, default=16)
+    parser.add_argument(
+        "--clients",
+        type=int,
+        nargs="+",
+        default=[16],
+        help="foreground pgbench client counts to benchmark",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="number of independent repetitions for each mode/client/background row",
+    )
     parser.add_argument(
         "--query-mode",
         choices=("prepared", "extended", "simple"),
         default="prepared",
         help="pgbench protocol mode to use for the foreground workload",
+    )
+    parser.add_argument(
+        "--workload",
+        choices=("client-private-table", "tpcb"),
+        default="client-private-table",
+        help=(
+            "foreground transaction workload; client-private-table uses one "
+            "single-client pgbench process per private account table"
+        ),
+    )
+    parser.add_argument(
+        "--private-table-prefix",
+        default=PRIVATE_TABLE_PREFIX_DEFAULT,
+        help="table prefix for the client-private-table foreground workload",
+    )
+    parser.add_argument(
+        "--client-private-rows",
+        type=int,
+        default=100000,
+        help="number of account rows in each client-private foreground table",
     )
     parser.add_argument("--duration", type=int, default=12)
     parser.add_argument(
@@ -721,7 +985,7 @@ def main() -> int:
         "--background-levels",
         type=int,
         nargs="+",
-        default=[1, 2, 4, 8],
+        default=[0, 1, 2, 4, 8],
         help="number of background reader/writer sessions per direction; 0 means no background traffic",
     )
     parser.add_argument(
@@ -785,12 +1049,25 @@ def main() -> int:
         action="store_true",
         help="skip validation that the pgbench tables and sink table exist",
     )
+    parser.add_argument(
+        "--reset-pgbench-between-runs",
+        choices=("logical", "none"),
+        default="logical",
+        help=(
+            "reset foreground table side effects before each measured row; "
+            "'logical' restores the selected workload's account tables"
+        ),
+    )
     args = parser.parse_args()
 
     if args.pgbench_workers < 1:
         raise SystemExit("--pgbench-workers must be at least 1")
-    if args.clients < 1:
-        raise SystemExit("--clients must be at least 1")
+    if any(clients < 1 for clients in args.clients):
+        raise SystemExit("--clients must contain only positive integers")
+    if args.repeats < 1:
+        raise SystemExit("--repeats must be at least 1")
+    if args.client_private_rows < 1:
+        raise SystemExit("--client-private-rows must be at least 1")
     if not args.background_levels:
         raise SystemExit("--background-levels must not be empty")
     if any(level < 0 for level in args.background_levels):
@@ -816,6 +1093,8 @@ def main() -> int:
             background_max_sessions=max_background_sessions,
             background_tables_logged=args.background_tables_logged,
         )
+        if args.workload == "client-private-table":
+            ensure_client_private_tables(args.dbname, args.private_table_prefix, max(args.clients))
 
     configure_synchronous_standbys()
     reset_server_logs()
@@ -831,9 +1110,13 @@ def main() -> int:
         "writer_sessions",
         "background_max_sessions",
         "background_table_persistence",
+        "workload",
+        "private_table_prefix",
+        "client_private_rows",
         "mode",
         "query_mode",
         "clients",
+        "repeat",
         "threads",
         "duration_s",
         "sampling_rate",
@@ -865,132 +1148,162 @@ def main() -> int:
                 print(f"configuring synchronous_commit={mode}", flush=True)
                 set_synchronous_commit(mode)
 
-                for level in args.background_levels:
-                    print(f"running background level={level}", flush=True)
-                    # Each background session gets its own precreated table pair.
-                    read_tables = background_table_names(args.background_read_prefix, max_background_sessions)[:level]
-                    write_tables = background_table_names(args.background_write_prefix, max_background_sessions)[:level]
-                    truncate_background_write_tables(args.dbname, write_tables)
-
-                    start_at = time.monotonic() + args.background_start_delay
-                    stop_at = start_at + args.duration + args.background_pad
-                    barrier = threading.Barrier(level * 2 + 1)
-                    failure_event = threading.Event()
-
-                    stats: list[BackgroundStats] = []
-                    threads: list[threading.Thread] = []
-
-                    for idx in range(level):
-                        reader_stats = BackgroundStats(role="reader", sessions=1)
-                        writer_stats = BackgroundStats(role="writer", sessions=1)
-                        stats.extend([reader_stats, writer_stats])
-                        threads.append(
-                            threading.Thread(
-                                target=launch_reader_thread,
-                                kwargs={
-                                    "barrier": barrier,
-                                    "session_id": idx,
-                                    "start_at": start_at,
-                                    "stop_at": stop_at,
-                                    "dbname": args.dbname,
-                                    "source_table": read_tables[idx],
-                                    "stats": reader_stats,
-                                    "failure_event": failure_event,
-                                },
-                                daemon=True,
+                for clients in args.clients:
+                    for level in args.background_levels:
+                        for repeat in range(1, args.repeats + 1):
+                            print(
+                                f"running clients={clients} background level={level} repeat={repeat}",
+                                flush=True,
                             )
-                        )
-                        threads.append(
-                            threading.Thread(
-                                target=launch_writer_thread,
-                                kwargs={
-                                    "barrier": barrier,
-                                    "session_id": idx,
-                                    "start_at": start_at,
-                                    "stop_at": stop_at,
-                                    "dbname": args.dbname,
-                                    "sink_table": write_tables[idx],
-                                    "batch_rows": args.writer_batch_rows,
-                                    "payload_bytes": args.writer_payload_bytes,
-                                    "stats": writer_stats,
-                                    "failure_event": failure_event,
-                                },
-                                daemon=True,
+                            # Each background session gets its own precreated table pair.
+                            read_tables = background_table_names(args.background_read_prefix, max_background_sessions)[
+                                :level
+                            ]
+                            write_tables = background_table_names(args.background_write_prefix, max_background_sessions)[
+                                :level
+                            ]
+                            all_write_tables = background_table_names(
+                                args.background_write_prefix, max_background_sessions
                             )
-                        )
 
-                    # Start all background worker threads and wait for them to be ready.
-                    for thread in threads:
-                        thread.start()
-                    barrier.wait()
+                            if args.workload == "tpcb":
+                                reset_pgbench_state(args.dbname, args.reset_pgbench_between_runs)
+                            else:
+                                reset_client_private_tables(
+                                    args.dbname,
+                                    args.private_table_prefix,
+                                    clients,
+                                    args.client_private_rows,
+                                    args.reset_pgbench_between_runs,
+                                )
+                            truncate_background_write_tables(args.dbname, all_write_tables)
 
-                    run_dir = results_dir / mode / f"b{level:02d}"
-                    run_dir.mkdir(parents=True, exist_ok=True)
-                    snapshot_server_log_baseline(run_dir, SERVER_LOG_NODES)
+                            start_at = time.monotonic() + args.background_start_delay
+                            stop_at = start_at + args.duration + args.background_pad
+                            barrier = threading.Barrier(level * 2 + 1)
+                            failure_event = threading.Event()
 
-                    while time.monotonic() < start_at:
-                        time.sleep(min(0.5, start_at - time.monotonic()))
+                            stats: list[BackgroundStats] = []
+                            threads: list[threading.Thread] = []
 
-                    emit_row_log_marker(
-                        mode=mode,
-                        level=level,
-                        clients=args.clients,
-                        phase="start",
-                        nodes=SERVER_LOG_NODES,
-                    )
-                    metrics = run_pgbench(
-                        clients=args.clients,
-                        worker_threads=args.pgbench_workers,
-                        duration_s=args.duration,
-                        dbname=args.dbname,
-                        sample_rate=args.sampling_rate,
-                        mode=mode,
-                        query_mode=args.query_mode,
-                        run_dir=run_dir,
-                    )
+                            for idx in range(level):
+                                reader_stats = BackgroundStats(role="reader", sessions=1)
+                                writer_stats = BackgroundStats(role="writer", sessions=1)
+                                stats.extend([reader_stats, writer_stats])
+                                threads.append(
+                                    threading.Thread(
+                                        target=launch_reader_thread,
+                                        kwargs={
+                                            "barrier": barrier,
+                                            "session_id": idx,
+                                            "start_at": start_at,
+                                            "stop_at": stop_at,
+                                            "dbname": args.dbname,
+                                            "source_table": read_tables[idx],
+                                            "stats": reader_stats,
+                                            "failure_event": failure_event,
+                                        },
+                                        daemon=True,
+                                    )
+                                )
+                                threads.append(
+                                    threading.Thread(
+                                        target=launch_writer_thread,
+                                        kwargs={
+                                            "barrier": barrier,
+                                            "session_id": idx,
+                                            "start_at": start_at,
+                                            "stop_at": stop_at,
+                                            "dbname": args.dbname,
+                                            "sink_table": write_tables[idx],
+                                            "batch_rows": args.writer_batch_rows,
+                                            "payload_bytes": args.writer_payload_bytes,
+                                            "stats": writer_stats,
+                                            "failure_event": failure_event,
+                                        },
+                                        daemon=True,
+                                    )
+                                )
 
-                    for thread in threads:
-                        thread.join()
+                            # Start all background worker threads and wait for them to be ready.
+                            for thread in threads:
+                                thread.start()
+                            barrier.wait()
 
-                    if failure_event.is_set():
-                        detail = "; ".join(
-                            err
-                            for stat in stats
-                            for err in stat.errors
-                            if err
-                        )
-                        raise RuntimeError(f"background traffic worker failed at level {level}: {detail}")
+                            run_dir = workload_run_dir(results_dir, args.workload, mode, clients, level, repeat)
+                            run_dir.mkdir(parents=True, exist_ok=True)
+                            snapshot_server_log_baseline(run_dir, SERVER_LOG_NODES)
 
-                    metrics["background_level"] = level
-                    metrics["reader_sessions"] = level
-                    metrics["writer_sessions"] = level
-                    metrics["background_max_sessions"] = max_background_sessions
-                    metrics["background_table_persistence"] = (
-                        "logged" if args.background_tables_logged else "unlogged"
-                    )
-                    metrics["reader_batches"] = sum(stat.batches for stat in stats if stat.role == "reader")
-                    metrics["writer_batches"] = sum(stat.batches for stat in stats if stat.role == "writer")
-                    metrics["server_logs_dir"] = str(run_dir / "server-logs")
-                    emit_row_log_marker(
-                        mode=mode,
-                        level=level,
-                        clients=args.clients,
-                        phase="end",
-                        nodes=SERVER_LOG_NODES,
-                    )
-                    writer.writerow(metrics)
-                    csv_file.flush()
-                    finalize_server_logs_for_archive(SERVER_LOG_NODES)
-                    archive_server_logs(run_dir)
-                    reset_server_logs()
+                            while time.monotonic() < start_at:
+                                time.sleep(min(0.5, start_at - time.monotonic()))
 
-                    # Keep only the write tables for the current level small between rows.
-                    truncate_background_write_tables(args.dbname, write_tables)
+                            emit_row_log_marker(
+                                mode=mode,
+                                level=level,
+                                clients=clients,
+                                repeat=repeat,
+                                phase="start",
+                                nodes=SERVER_LOG_NODES,
+                            )
+                            metrics = run_pgbench(
+                                clients=clients,
+                                worker_threads=args.pgbench_workers,
+                                duration_s=args.duration,
+                                dbname=args.dbname,
+                                sample_rate=args.sampling_rate,
+                                mode=mode,
+                                query_mode=args.query_mode,
+                                workload=args.workload,
+                                private_table_prefix=args.private_table_prefix,
+                                client_private_rows=args.client_private_rows,
+                                run_dir=run_dir,
+                            )
 
-                    # Remove raw logs once the summary metrics have been parsed.
-                    for log_file in run_dir.glob("pgbench_log*"):
-                        if log_file.is_file():
-                            log_file.unlink()
+                            for thread in threads:
+                                thread.join()
+
+                            if failure_event.is_set():
+                                detail = "; ".join(
+                                    err
+                                    for stat in stats
+                                    for err in stat.errors
+                                    if err
+                                )
+                                raise RuntimeError(f"background traffic worker failed at level {level}: {detail}")
+
+                            metrics["background_level"] = level
+                            metrics["reader_sessions"] = level
+                            metrics["writer_sessions"] = level
+                            metrics["background_max_sessions"] = max_background_sessions
+                            metrics["background_table_persistence"] = (
+                                "logged" if args.background_tables_logged else "unlogged"
+                            )
+                            metrics["repeat"] = repeat
+                            metrics["private_table_prefix"] = args.private_table_prefix
+                            metrics["client_private_rows"] = args.client_private_rows
+                            metrics["reader_batches"] = sum(stat.batches for stat in stats if stat.role == "reader")
+                            metrics["writer_batches"] = sum(stat.batches for stat in stats if stat.role == "writer")
+                            metrics["server_logs_dir"] = str(run_dir / "server-logs")
+                            emit_row_log_marker(
+                                mode=mode,
+                                level=level,
+                                clients=clients,
+                                repeat=repeat,
+                                phase="end",
+                                nodes=SERVER_LOG_NODES,
+                            )
+                            writer.writerow(metrics)
+                            csv_file.flush()
+                            finalize_server_logs_for_archive(SERVER_LOG_NODES)
+                            archive_server_logs(run_dir)
+                            reset_server_logs()
+
+                            truncate_background_write_tables(args.dbname, all_write_tables)
+
+                            # Remove raw logs once the summary metrics have been parsed.
+                            for log_file in run_dir.glob("pgbench_log*"):
+                                if log_file.is_file():
+                                    log_file.unlink()
     finally:
         try:
             set_synchronous_commit("on")

@@ -19,7 +19,7 @@ The scripts in this tree assume the following layout and install paths:
 - `node-2`: Citus worker primary
 - `node-3`: standby for `node-1`, or vanilla standby when the vanilla setup scripts repurpose it
 - `node-4`: standby for `node-2`
-- fast fabric: `enp23s0f0` on `10.10.1.0/24`
+- fast fabric: `enp23s0f0` on `10.10.2.0/24`
 - install prefix on every node: `~/pg`
 - SSH user: `JasonHu`
 
@@ -34,7 +34,7 @@ Before running any benchmark, make sure these prerequisites are already true:
 
 1. PostgreSQL and Citus are built and installed under `~/pg` on every node.
 2. If a build tree was copied in with `scp`, it was reconfigured for this cluster before installation so generated paths point at `~/pg`.
-3. The `10.10.1.0/24` fabric is allowed in `pg_hba.conf` for normal connections and replication connections.
+3. The `10.10.2.0/24` fabric is allowed in `pg_hba.conf` for normal connections and replication connections.
 4. Collector-backed logging is enabled on all nodes (`logging_collector = on`) so the latency-trace parser can read the server logs for each run.
 5. The cluster nodes can SSH to each other with `BatchMode=yes`.
 6. For Citus runs, node-0 must currently preload `citus` and node-3/node-4 must be the worker standbys. On a fresh cluster, bootstrap those standbys from node-1/node-2 and register them as secondaries in the Citus metadata before the first benchmark run.
@@ -52,7 +52,7 @@ If the tree came from another cluster, a clean rebuild is important for the Citu
 For a fresh Citus bring-up, the manual metadata order matters:
 
 - start node-0, node-1, and node-2 with Citus preloaded
-- run `SELECT citus_set_coordinator_host('10.10.1.2', 5432);` on node-0
+- run `SELECT citus_set_coordinator_host('10.10.2.1', 5432);` on node-0
 - add node-1 and node-2 with `citus_add_node(...)`
 - bootstrap node-3 from node-1 and node-4 from node-2 with `pg_basebackup -R -X stream -C -S ...`
 - register node-3 and node-4 with `citus_add_secondary_node(...)`
@@ -64,7 +64,7 @@ For a fresh Citus bring-up, the manual metadata order matters:
 A full end-to-end reproduction usually goes in this order:
 
 1. Build and install PostgreSQL and Citus under `~/pg` on all five nodes.
-2. Make sure `pg_hba.conf` allows the `10.10.1.0/24` fabric on all nodes, for both normal connections and replication.
+2. Make sure `pg_hba.conf` allows the `10.10.2.0/24` fabric on all nodes, for both normal connections and replication.
 3. Restore the Citus topology and verify `CREATE EXTENSION citus;` succeeds on node-0.
 4. Run the Citus synchronous-commit sweep.
 5. Run the Citus network-interference sweep.
@@ -286,7 +286,9 @@ If you are coming back from vanilla experiments, restore the Citus topology firs
 ```bash
 python3 scripts/setup_citus_network_interference.py \
   --pgbench-scale 32 \
-  --dbname postgres
+  --dbname postgres \
+  --private-client-count 16 \
+  --client-private-rows 100000
 ```
 
 Then run the interference sweep:
@@ -294,17 +296,25 @@ Then run the interference sweep:
 ```bash
 python3 scripts/run_citus_network_interference_bench.py \
   --dbname postgres \
-  --clients 16 \
+  --clients 1 8 16 \
+  --repeats 3 \
   --duration 12 \
   --pgbench-workers 8 \
   --sampling-rate 0.05 \
-  --background-levels 1 2 4 8 \
+  --workload client-private-table \
+  --background-levels 0 1 2 4 8 \
+  --reset-pgbench-between-runs logical \
   --results-dir bench-results-network-interference
 ```
 
 Useful notes:
 
-- The foreground workload stays the same; only the background SQL traffic changes.
+- `--clients 1 8 16` gives low, medium, and high foreground transaction concurrency in one CSV.
+- `--repeats 3` runs each exact mode/client/background row three times. The plotters aggregate repeats and show standard-deviation error bars.
+- `--workload client-private-table` is the low-contention foreground workload. The setup helper creates one logged account table per logical client, and the runner starts one single-client `pgbench` process per table, then aggregates the per-client logs into one row.
+- Use `--workload tpcb` only for the realistic built-in pgbench comparison; that path still has branch/teller hot-row contention.
+- `background_level = 0` is the no-background baseline.
+- For each measured row, the runner restores the foreground tables touched by the selected workload and truncates all background write-sink tables. Use `--reset-pgbench-between-runs none` only when you explicitly want the older cumulative-state behavior.
 - Background readers stream `SELECT *`-style traffic from a large distributed source table.
 - Background writers stream `COPY` batches into a distributed sink table.
 - The background loops run until a shared stop time so the overlap with `pgbench` is guaranteed.
@@ -330,12 +340,14 @@ Archive node-0, node-1, and node-2 from the Citus interference run before parsin
 
 ### Vanilla PostgreSQL Network-Interference Sweep
 
-Switch node-0/node-3 into the vanilla primary/standby topology and create the local background sink table:
+Switch node-0/node-3 into the vanilla primary/standby topology and create the local background source/sink tables:
 
 ```bash
 python3 scripts/setup_pgbench_vanilla_interference.py \
   --scale 32 \
-  --dbname pgbench_vanilla
+  --dbname pgbench_vanilla \
+  --private-client-count 16 \
+  --client-private-rows 100000
 ```
 
 Then run the interference sweep:
@@ -343,11 +355,14 @@ Then run the interference sweep:
 ```bash
 python3 scripts/run_pgbench_network_interference_vanilla.py \
   --dbname pgbench_vanilla \
-  --clients 16 \
+  --clients 1 8 16 \
+  --repeats 3 \
   --duration 16 \
   --pgbench-workers 8 \
   --sampling-rate 0.2 \
+  --workload client-private-table \
   --background-levels 0 1 2 4 8 \
+  --reset-pgbench-between-runs logical \
   --results-dir bench-results-network-interference
 ```
 
@@ -356,9 +371,72 @@ Useful notes:
 - `node-1` is used as the generator host for the background traffic.
 - The foreground benchmark is still `pgbench` on node-0.
 - `background_level = 0` is the no-background baseline.
+- `--clients 1 8 16` gives low, medium, and high foreground transaction concurrency in one CSV.
+- `--repeats 3` runs each exact mode/client/background row three times. The plotters aggregate repeats and show standard-deviation error bars.
+- `--workload client-private-table` is the low-contention foreground workload. Use `--workload tpcb` only for the realistic built-in pgbench comparison.
+- The setup helper creates background `COPY`/`SELECT` sink/source tables as `UNLOGGED`. That avoids turning the background writer into a WAL/replication benchmark.
+- For each measured row, the runner restores the foreground tables touched by the selected workload and truncates the background sink tables. Use `--reset-pgbench-between-runs none` only when you explicitly want the older cumulative-state behavior.
 - The default result directory is `bench-results-network-interference`.
 
 Archive node-0 and node-3 after the vanilla interference run if you want to parse the collector logs for the trace-level view.
+
+The important negative result from this family is that logged SQL sink tables
+created an apparent replicated-commit latency signal, but the signal mostly
+disappeared when the sinks were changed to `UNLOGGED`. That means the earlier
+large SQL `COPY`/`SELECT` effect was mostly WAL/replication pressure from the
+logged background sinks, not clean network interference. The comparison plot is
+under:
+
+```text
+bench-results-network-interference/sql-unlogged-negative-vs-basebackup-20260505/
+```
+
+### Vanilla Physical-Basebackup Interference Sweep
+
+For the current positive network-interference motivation, use the physical
+backup harness instead of the SQL `COPY`/`SELECT` background generator:
+
+```bash
+python3 scripts/run_pgbench_basebackup_interference_vanilla.py \
+  --dbname pgbench_vanilla \
+  --duration 16 \
+  --clients 1 8 16 \
+  --repeats 5 \
+  --modes local remote_write remote_apply \
+  --basebackup-streams 0 1 4 8 \
+  --sampling-rate 0.2 \
+  --pgbench-workers 8 \
+  --results-dir bench-results-network-interference
+```
+
+Useful notes:
+
+- `node-0` is the vanilla primary and `node-3` is its synchronous standby.
+- `node-1` runs looping `pg_basebackup` clients against node-0.
+- Foreground `pgbench` still runs on node-0 against node-0.
+- Replication traffic is node-0 to node-3; physical backup traffic is node-0 to node-1.
+- `basebackup_streams = 0` is the no-background baseline.
+- `local` at the same backup-stream count is the primary-side control: same foreground work and same backup traffic, but commits do not wait for standby acknowledgement.
+- The local-normalized latency plots are unitless ratios: remote-mode slowdown divided by local-mode slowdown.
+
+Best current result:
+
+```text
+bench-results-network-interference/vanilla-basebackup-interference-20260505-merged-5repeats/
+```
+
+At 8 `pg_basebackup` streams, the 5-repeat merged run measured roughly 65-85 Gbps
+of node-0 TX and showed local-normalized extra average-latency slowdown of about
+2.0-3.0x for `remote_write` and 2.9-3.9x for `remote_apply`. The p99 effect was
+much larger, about 10-64x over local for `remote_write` and 25-82x over local
+for `remote_apply`.
+
+Plot it with:
+
+```bash
+python3 scripts/plot_basebackup_interference.py \
+  bench-results-network-interference/vanilla-basebackup-interference-<timestamp>/results.csv
+```
 
 
 ## Switching Between Citus And Vanilla

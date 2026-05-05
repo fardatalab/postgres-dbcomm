@@ -39,7 +39,7 @@ def main() -> int:
     parser.add_argument("--dbname", default="pgbench_vanilla")
     parser.add_argument("--primary-node", default="node-0")
     parser.add_argument("--standby-node", default="node-3")
-    parser.add_argument("--primary-host", default="10.10.1.2")
+    parser.add_argument("--primary-host", default="10.10.2.1")
     parser.add_argument("--primary-port", default="5432")
     parser.add_argument("--primary-db", default="postgres")
     parser.add_argument("--pguser", default="JasonHu")
@@ -66,8 +66,8 @@ sed -i -E "s/^shared_preload_libraries *= *'citus'/# shared_preload_libraries='c
   -c "ALTER SYSTEM SET max_wal_senders = '10';" \
   -c "ALTER SYSTEM SET max_replication_slots = '10';" \
   -c "ALTER SYSTEM SET wal_keep_size = '1GB';" \
-  -c "ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 ({args.standby_name})';" \
-  -c "ALTER SYSTEM SET synchronous_commit = 'on';"
+  -c "ALTER SYSTEM RESET synchronous_standby_names;" \
+  -c "ALTER SYSTEM SET synchronous_commit = 'local';"
 {psql_bin} -v ON_ERROR_STOP=1 -X -d {args.primary_db} <<'SQL'
 DROP ROLE IF EXISTS {args.repl_user};
 CREATE ROLE {args.repl_user} WITH REPLICATION LOGIN PASSWORD '{args.repl_password}';
@@ -79,7 +79,7 @@ BEGIN
 END
 $$;
 SQL
-{pg_ctl_bin} restart -D {data_dir} -m fast
+{pg_ctl_bin} restart -D {data_dir} -m fast -w -t 30 -l {Path.home() / 'pg' / 'startup.log'}
 """
     print(f"configuring primary {args.primary_node}")
     ssh_cmd(args.primary_node, primary_setup)
@@ -104,10 +104,19 @@ PGPASSWORD='{args.repl_password}' {Path.home() / 'pg' / 'bin' / 'pg_basebackup'}
   -S {args.slot_name}
 sed -i -E "s|^primary_conninfo = .*|primary_conninfo = '{primary_conninfo_value}'|" "{standby_conf}"
 sed -i -E "s|^primary_slot_name = .*|primary_slot_name = '{args.slot_name}'|" "{standby_conf}"
-{pg_ctl_bin} start -D {data_dir}
+{pg_ctl_bin} start -D {data_dir} -w -t 30 -l {Path.home() / 'pg' / 'startup.log'}
 """
     print(f"recloning standby {args.standby_node}")
     ssh_cmd(args.standby_node, standby_setup)
+
+    sync_setup = f"""set -e
+{psql_bin} -v ON_ERROR_STOP=1 -X -d {args.primary_db} \
+  -c "ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 ({args.standby_name})';" \
+  -c "ALTER SYSTEM SET synchronous_commit = 'on';"
+{pg_ctl_bin} reload -D {data_dir}
+"""
+    print("enabling vanilla synchronous standby")
+    ssh_cmd(args.primary_node, sync_setup)
 
     init_db = f"""set -e
 {dropdb_bin} --if-exists -U {args.pguser} -h 127.0.0.1 -p {args.primary_port} {args.dbname}

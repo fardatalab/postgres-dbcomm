@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 PRIMARY_NODE = "node-0"
-PRIMARY_HOST = "10.10.1.2"
+PRIMARY_HOST = "10.10.2.1"
 PGUSER = "JasonHu"
 PGPORT = "5432"
 DBNAME = "postgres"
@@ -29,6 +29,9 @@ BACKGROUND_MAX_SESSIONS_DEFAULT = 8
 BACKGROUND_TABLE_SHARD_COUNT_DEFAULT = 2
 BACKGROUND_READ_ROW_COUNT_DEFAULT = 50000
 BACKGROUND_READ_PAYLOAD_BYTES_DEFAULT = 256
+PRIVATE_TABLE_PREFIX_DEFAULT = "pgbench_private_accounts"
+PRIVATE_CLIENT_COUNT_DEFAULT = 16
+CLIENT_PRIVATE_ROWS_DEFAULT = 100000
 
 
 def run_cmd(
@@ -220,6 +223,69 @@ def verify_background_table(
             )
 
 
+def create_client_private_table(
+    node: str,
+    dbname: str,
+    table_name: str,
+    *,
+    row_count: int,
+    shard_count: int,
+) -> None:
+    """Create one logged, distributed foreground table for one pgbench client."""
+    table_ident = sql_identifier(table_name)
+    sql = (
+        f"DROP TABLE IF EXISTS {table_ident} CASCADE; "
+        f"CREATE TABLE {table_ident} (aid integer PRIMARY KEY, abalance integer NOT NULL DEFAULT 0); "
+        f"SELECT create_distributed_table({sql_literal(table_name)}, 'aid', "
+        f"shard_count => {shard_count}, colocate_with => 'none'); "
+        f"INSERT INTO {table_ident} (aid, abalance) "
+        f"SELECT series_id, 0 FROM generate_series(1, {row_count}) AS rows(series_id); "
+        f"ANALYZE {table_ident};"
+    )
+    remote_psql(node, dbname, sql)
+
+
+def verify_client_private_table(node: str, dbname: str, table_name: str, *, expected_rows: int) -> None:
+    """Fail fast if a client-private foreground table is missing or not distributed."""
+    exists = fetch_scalar(node, dbname, f"SELECT to_regclass({sql_literal(table_name)}) IS NOT NULL;")
+    if exists != "t":
+        raise RuntimeError(f"expected client-private table {table_name} to exist in {dbname}")
+
+    distributed = count_rows(
+        node,
+        dbname,
+        f"SELECT count(*) FROM pg_dist_partition WHERE logicalrelid = {sql_literal(table_name)}::regclass;",
+    )
+    if distributed != 1:
+        raise RuntimeError(f"expected client-private table {table_name} to be distributed on node-0")
+
+    row_count = count_rows(node, dbname, f"SELECT count(*) FROM {sql_identifier(table_name)};")
+    if row_count != expected_rows:
+        raise RuntimeError(
+            f"expected client-private table {table_name} to contain {expected_rows} rows, found {row_count}"
+        )
+
+
+def configure_citus_fast_fabric_metadata(dbname: str) -> None:
+    """Point Citus node metadata at the 100G 10.10.2.x fabric."""
+    sql = """
+SELECT citus_set_coordinator_host('10.10.2.1', 5432);
+WITH target_nodes(groupid, noderole, nodename) AS (
+    VALUES
+        (0, 'primary'::noderole, '10.10.2.1'),
+        (1, 'primary'::noderole, '10.10.2.2'),
+        (1, 'secondary'::noderole, '10.10.2.4'),
+        (2, 'primary'::noderole, '10.10.2.3'),
+        (2, 'secondary'::noderole, '10.10.2.5')
+)
+SELECT citus_update_node(pg_dist_node.nodeid, target_nodes.nodename, pg_dist_node.nodeport)
+FROM pg_dist_node
+JOIN target_nodes USING (groupid, noderole)
+WHERE pg_dist_node.nodename <> target_nodes.nodename;
+"""
+    remote_psql(PRIMARY_NODE, dbname, sql)
+
+
 def restore_worker1_standby() -> None:
     """Re-clone node-3 from node-1 so the Citus worker standby topology is restored."""
     pg_root = Path.home() / "pg"
@@ -229,15 +295,17 @@ def restore_worker1_standby() -> None:
     psql_bin = pg_root / "bin" / "psql"
 
     primary_conninfo_value = (
-        "host=10.10.1.3 port=5432 user=replicator "
+        "host=10.10.2.2 port=5432 user=replicator "
         "application_name=worker1_stby"
     )
     remote_cmd = f"""set -e
 {pg_ctl_bin} stop -D {data_dir} -m fast || true
+{psql_bin} -v ON_ERROR_STOP=1 -X -h 10.10.2.2 -p 5432 -U {PGUSER} -d postgres -c "SELECT pg_drop_replication_slot('worker1_slot') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'worker1_slot');"
 rm -rf {data_dir}/*
-{pg_basebackup} -h 10.10.1.3 -p 5432 -U replicator -D {data_dir} -R -X stream -C -S worker1_slot
+{pg_basebackup} -h 10.10.2.2 -p 5432 -U replicator -D {data_dir} -R -X stream -C -S worker1_slot
 sed -i -E "s|^primary_conninfo = .*|primary_conninfo = '{primary_conninfo_value}'|" {data_dir}/postgresql.auto.conf
 sed -i -E "s|^primary_slot_name = .*|primary_slot_name = 'worker1_slot'|" {data_dir}/postgresql.auto.conf
+chmod 700 {data_dir}
 {pg_ctl_bin} start -D {data_dir} -w -t 20 -l {pg_root}/startup.log
 """
     ssh_cmd("node-3", remote_cmd)
@@ -304,6 +372,28 @@ def main() -> int:
         help="create background read/write tables as regular logged tables instead of unlogged tables",
     )
     parser.add_argument("--skip-pgbench-setup", action="store_true", help="skip pgbench table verification / setup")
+    parser.add_argument(
+        "--private-table-prefix",
+        default=PRIVATE_TABLE_PREFIX_DEFAULT,
+        help="prefix for client-private foreground account tables",
+    )
+    parser.add_argument(
+        "--private-client-count",
+        type=int,
+        default=PRIVATE_CLIENT_COUNT_DEFAULT,
+        help="number of client-private foreground account tables to create",
+    )
+    parser.add_argument(
+        "--client-private-rows",
+        type=int,
+        default=CLIENT_PRIVATE_ROWS_DEFAULT,
+        help="rows in each client-private foreground account table",
+    )
+    parser.add_argument(
+        "--skip-private-table-setup",
+        action="store_true",
+        help="skip creating/verifying client-private foreground tables",
+    )
     args = parser.parse_args()
 
     if args.background_max_sessions < 1:
@@ -314,6 +404,10 @@ def main() -> int:
         raise SystemExit("--background-read-row-count must be at least 1")
     if args.background_read_payload_bytes < 1:
         raise SystemExit("--background-read-payload-bytes must be at least 1")
+    if args.private_client_count < 1:
+        raise SystemExit("--private-client-count must be at least 1")
+    if args.client_private_rows < 1:
+        raise SystemExit("--client-private-rows must be at least 1")
 
     pg_root = Path.home() / "pg"
     psql_bin = pg_root / "bin" / "psql"
@@ -347,6 +441,13 @@ def main() -> int:
         f"{psql_bin} -v ON_ERROR_STOP=1 -X -h 127.0.0.1 -p {PGPORT} -U {PGUSER} -d {args.dbname} -c \"CREATE EXTENSION IF NOT EXISTS citus;\"",
     )
 
+    print("clearing stale worker synchronous standby targets", flush=True)
+    set_system_setting_remote("node-1", "synchronous_standby_names", "")
+    set_system_setting_remote("node-2", "synchronous_standby_names", "")
+
+    print("pointing Citus metadata at the 100G fabric", flush=True)
+    configure_citus_fast_fabric_metadata(args.dbname)
+
     print("ensuring the replication role exists on the worker primaries", flush=True)
     ensure_replication_role("node-1")
     ensure_replication_role("node-2")
@@ -362,16 +463,44 @@ def main() -> int:
         PRIMARY_NODE,
         args.dbname,
         "SELECT count(*) FROM pg_dist_partition "
-        "WHERE logicalrelid IN ('pgbench_accounts'::regclass, 'pgbench_branches'::regclass, "
-        "'pgbench_tellers'::regclass, 'pgbench_history'::regclass);",
+        "WHERE logicalrelid IN ("
+        "SELECT to_regclass(table_name)::oid "
+        "FROM (VALUES ('pgbench_accounts'), ('pgbench_branches'), "
+        "('pgbench_tellers'), ('pgbench_history')) AS names(table_name) "
+        "WHERE to_regclass(table_name) IS NOT NULL"
+        ");",
     )
     if not args.skip_pgbench_setup and pgbench_count != 4:
         print(f"ensuring pgbench tables exist at scale {args.pgbench_scale}", flush=True)
-        run_cmd([str(setup_pgbench), str(args.pgbench_scale), args.dbname])
+        run_cmd(["bash", str(setup_pgbench), str(args.pgbench_scale), args.dbname])
     elif pgbench_count == 4:
         print("pgbench tables already present; skipping reinitialization", flush=True)
     else:
         print("skipping pgbench table setup by request", flush=True)
+
+    if not args.skip_private_table_setup:
+        print(
+            f"creating {args.private_client_count} client-private foreground tables "
+            f"with {args.client_private_rows} rows each",
+            flush=True,
+        )
+        for client_id in range(args.private_client_count):
+            table_name = f"{args.private_table_prefix}_{client_id:02d}"
+            create_client_private_table(
+                PRIMARY_NODE,
+                args.dbname,
+                table_name,
+                row_count=args.client_private_rows,
+                shard_count=args.background_table_shard_count,
+            )
+            verify_client_private_table(
+                PRIMARY_NODE,
+                args.dbname,
+                table_name,
+                expected_rows=args.client_private_rows,
+            )
+    else:
+        print("skipping client-private foreground table setup by request", flush=True)
 
     print(
         f"creating per-session {background_persistence} background tables "
