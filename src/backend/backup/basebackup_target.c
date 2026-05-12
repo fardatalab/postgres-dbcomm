@@ -33,7 +33,9 @@ struct BaseBackupTargetHandle
 
 static void initialize_target_list(void);
 static bbsink *blackhole_get_sink(bbsink *next_sink, void *detail_arg);
+static bbsink *homer_get_sink(bbsink *next_sink, void *detail_arg);
 static bbsink *server_get_sink(bbsink *next_sink, void *detail_arg);
+static void *homer_check_detail(char *target, char *target_detail);
 static void *reject_target_detail(char *target, char *target_detail);
 static void *server_check_detail(char *target, char *target_detail);
 
@@ -41,6 +43,9 @@ static BaseBackupTargetType builtin_backup_targets[] =
 {
 	{
 		"blackhole", reject_target_detail, blackhole_get_sink
+	},
+	{
+		"homer", homer_check_detail, homer_get_sink
 	},
 	{
 		"server", server_check_detail, server_get_sink
@@ -165,6 +170,13 @@ BaseBackupGetSink(BaseBackupTargetHandle *handle, bbsink *next_sink)
 	return handle->type->get_sink(next_sink, handle->detail_arg);
 }
 
+bool
+BaseBackupTargetIs(BaseBackupTargetHandle *handle, const char *target)
+{
+	return handle != NULL && target != NULL &&
+		strcmp(handle->type->name, target) == 0;
+}
+
 /*
  * Load predefined target types into BaseBackupTargetTypeList.
  */
@@ -196,6 +208,12 @@ blackhole_get_sink(bbsink *next_sink, void *detail_arg)
 	return next_sink;
 }
 
+static bbsink *
+homer_get_sink(bbsink *next_sink, void *detail_arg)
+{
+	return bbsink_homer_new(next_sink, detail_arg);
+}
+
 /*
  * Create a bbsink implementing a server-side backup.
  */
@@ -219,6 +237,15 @@ reject_target_detail(char *target, char *target_detail)
 						target)));
 
 	return NULL;
+}
+
+static void *
+homer_check_detail(char *target, char *target_detail)
+{
+	if (target_detail == NULL)
+		return NULL;
+
+	return pstrdup(target_detail);
 }
 
 /*

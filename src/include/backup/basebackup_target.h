@@ -62,5 +62,7 @@ extern BaseBackupTargetHandle *BaseBackupGetTargetHandle(char *target,
 														 char *target_detail);
 extern bbsink *BaseBackupGetSink(BaseBackupTargetHandle *handle,
 								 bbsink *next_sink);
+extern bool BaseBackupTargetIs(BaseBackupTargetHandle *handle,
+							   const char *target);
 
 #endif

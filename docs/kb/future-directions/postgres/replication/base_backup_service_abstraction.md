@@ -11,6 +11,8 @@
 
 Current behavior is documented in [base_backup_archive_stream.md](../../../postgres/replication/base_backup_archive_stream.md).
 
+Implementation progress is now tracked in [homer_base_backup_target_checkpoint.md](../../../implementations/postgres/replication/homer_base_backup_target_checkpoint.md).
+
 The important current-code facts are:
 
 - [`SendBaseBackup()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup.c:988) builds a server-side `bbsink` chain.
@@ -230,11 +232,19 @@ The first implementation pass should treat these choices as settled prototype
 constraints:
 
 1. **Progress wrapper**: skip or patch the upstream progress wrapper for
-   `TARGET 'homer'`. The Homer sink should fold in the minimal local
+   `TARGET 'homer'`, but keep the local correctness bookkeeping. The Homer sink should fold in the minimal local
    `bbsink_state` updates done by
    [`bbsink_progress_archive_contents()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_progress.c:150)
    and [`bbsink_progress_end_archive()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_progress.c:114),
-   but should not preserve UI-oriented progress as a data-plane concern.
+   but should not preserve UI-oriented progress as a data-plane concern. In
+   particular, update `bytes_done += len` for archive chunks and increment
+   `tablespace_num` at archive end so
+   [`bbsink_end_backup()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/include/backup/basebackup_sink.h:255)
+   remains a useful archive-lifecycle sanity check. Manifest chunks do not
+   advance `tablespace_num`. Prefer preserving this assertion over removing it:
+   the update is simple, control-path-local, and catches exactly the kind of
+   archive lifecycle mismatch that can otherwise be hidden by the first
+   blackhole receiver.
 2. **Manifest**: implement `begin_manifest`, `manifest_contents`, and
    `end_manifest` in the same typed stream family rather than forcing manifests
    off. [`SendBackupManifest()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/backup_manifest.c:316)
@@ -412,6 +422,36 @@ typed descriptors, observe ordered boundaries, update byte counters, and release
 payload slots back through the same lifecycle that a later archive-writer or
 extractor sink would use.
 
+## Relationship To Completed Client SQL Session Work
+
+The completed single-client pgbench/client-session milestone is documented in
+[`../../../implementations/postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md`](../../../implementations/postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md).
+It does not directly change the base-backup workload because
+`REMOTE_EXEC_OP_CLIENT_SQL_SESSION` is a frontend-owned command session, while
+`REMOTE_EXEC_OP_BASE_BACKUP` is a finite physical backup archive stream.
+
+It does, however, give useful implementation evidence for this plan:
+
+- [`HomerClientStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:84)
+  and [`HomerClientPollCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:111)
+  validate the command/completion mailbox as a control-plane mechanism for
+  lifecycle state, status, and errors.
+- Sink-backed SQL results in
+  [`RemoteExecSqlDestStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:454)
+  and [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1054)
+  reinforce the split this base-backup plan already uses: command/completion
+  metadata stays in the mailbox, while bulk ordered payloads use typed
+  sink/channel objects.
+- The client-session result path exposed an important sequencing rule: if a
+  payload sink can fill before terminal command completion, the consumer must be
+  able to open and drain the sink before final completion. Base backup should
+  follow the same principle for archive slots: receiver blackhole/counting
+  should release slots continuously, not only after `BASEBACKUP_END`.
+- The client-session path currently routes local frontend-to-backend commands
+  without peer RDMA, while base backup still needs the shared service-to-service
+  RDMA payload channel. Therefore the new client API is not the base-backup data
+  path, but its mailbox and typed-result lessons are directly reusable.
+
 ## Performance Notes
 
 - Avoid per-chunk allocation. The current frontend path allocates per `CopyData` in [`pqGetCopyData3()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/interfaces/libpq/fe-protocol3.c:1784); the service path should use preallocated rings.
@@ -438,9 +478,9 @@ extractor sink would use.
 
 ## Implementation Progress
 
-- **Status**: `not-started`
-- **What exists in code now**: upstream PostgreSQL `bbsink`/`bbstreamer` base-backup path plus the Homer tuple-sink/remote-session/RDMA infrastructure.
-- **Feature gates / switches**: none for base-backup offload yet.
+- **Status**: first sender-to-remote-blackhole prototype implemented and measured; durable receiver materialization remains future work.
+- **What exists in code now**: upstream PostgreSQL `bbsink`/`bbstreamer` base-backup path plus a `TARGET 'homer'` sink, `REMOTE_EXEC_OP_BASE_BACKUP`, typed `CitusRemoteBaseBackupMessageHeader` objects, and service-to-service RDMA publication through the existing payload substrate.
+- **Feature gates / switches**: explicit `TARGET 'homer'`; target detail may set `host=`, `port=`, `node=`, `slots=`, and `bytes=`. The current default is 8 payload slots x 8 MiB, selected after the 1 MiB default proved dominated by per-object RDMA/service overhead.
 - **Assumptions / shortcuts / scaffolding**:
   - first prototype should hook at the `bbsink` layer through explicit `TARGET 'homer'`
   - Homer may use a specialized sink-chain shape and patch/bypass upstream assumptions that are irrelevant to the selected research path
@@ -449,8 +489,13 @@ extractor sink would use.
   - receiver should initially blackhole or count archive and manifest bytes after consuming the real remote payload channel, then later materialize archive bytes or files in a service-owned sink
   - manifest callbacks should be implemented in the same typed stream family rather than disabled for the first run
   - compression and throttling are disabled or ignored for the first prototype
-  - progress is locally inferred from archive chunks and optionally reported sparsely through the command/completion mailbox; minimal local `bbsink_state` updates still need to be preserved or the end-of-backup checks patched for the Homer path
+  - progress is locally inferred from archive chunks and optionally reported sparsely through the command/completion mailbox; the Homer sink should preserve minimal local `bbsink_state` updates so `bbsink_end_backup()` remains a useful lifecycle assertion
   - WAL is out of scope for the first prototype; `STREAM_WAL` remains a separate replication-offload problem
+- **Measured checkpoint**:
+  - two-service RDMA blackhole with 64 x 1 MiB slots completed correctly but took about `31s`
+  - 32 x 4 MiB slots completed in `10.11s`; 8 or 16 x 8 MiB slots completed around `9.2s`
+  - after changing the default to 8 x 8 MiB, `TARGET 'homer'` without explicit geometry completed in `9.28s` versus `10.05s` for libpq tar-to-stdout on the same restarted server
+  - the evidence points to chunk granularity/per-object publication overhead as the first-order performance issue; sender-side publish batching remains a future transport optimization, not a blocker for the current basebackup milestone
 - **Changes from earlier tuple-copy work**:
   - the typed object is an archive/chunk/control stream, not `CitusTupleViewContract`
   - batch lifetime maps to archive payload slots, not tuple slots

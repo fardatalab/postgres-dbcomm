@@ -12,13 +12,16 @@ subdir = src/backend/backup
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
+HOMER_CLIENT_INCLUDE_DIR ?= /data/dbcomm/pg-citus/include/postgresql/server
+
+override CPPFLAGS := -I. -I$(srcdir) -I$(HOMER_CLIENT_INCLUDE_DIR) $(CPPFLAGS)
 
 OBJS = \
 	backup_manifest.o \
 	basebackup.o \
 	basebackup_copy.o \
 	basebackup_gzip.o \
+	basebackup_homer.o \
 	basebackup_incremental.o \
 	basebackup_lz4.o \
 	basebackup_zstd.o \

@@ -25,6 +25,8 @@ SUBDIRS = access archive backup bootstrap catalog parser commands executor \
 
 include $(srcdir)/common.mk
 
+HOMER_CLIENT_LIB ?= /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/libhomer_client.a
+
 # As of 1/2010:
 # The probes.o file is necessary for dtrace support on Solaris, and on recent
 # versions of systemtap.  (Older systemtap releases just produce an empty
@@ -40,6 +42,7 @@ endif
 OBJS = \
 	$(LOCALOBJS) \
 	$(SUBDIROBJS) \
+	$(HOMER_CLIENT_LIB) \
 	$(top_builddir)/src/common/libpgcommon_srv.a \
 	$(top_builddir)/src/port/libpgport_srv.a
 

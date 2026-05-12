@@ -3,6 +3,10 @@
 backend_build_deps = [backend_code]
 backend_sources = []
 backend_link_with = [pgport_srv, common_srv]
+homer_client_dep = declare_dependency(
+  include_directories: include_directories('/data/dbcomm/pg-citus/include/postgresql/server'),
+)
+backend_build_deps += homer_client_dep
 
 generated_backend_sources = []
 post_export_backend_sources = []
@@ -38,7 +42,9 @@ subdir('po', if_found: libintl)
 
 
 backend_link_args = []
-backend_link_depends = []
+homer_client_static = '/data/dbcomm/pg-citus/lib/x86_64-linux-gnu/libhomer_client.a'
+backend_link_args += homer_client_static
+backend_link_depends = [homer_client_static]
 
 
 # On windows when compiling with msvc we need to make postgres export all its

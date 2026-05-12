@@ -188,6 +188,9 @@ mailbox.
 
 This motivates the separate future-direction note [base_backup_service_abstraction.md](../../future-directions/postgres/replication/base_backup_service_abstraction.md).
 
+The current prototype checkpoint for `TARGET 'homer'` is tracked separately in
+[homer_base_backup_target_checkpoint.md](../../implementations/postgres/replication/homer_base_backup_target_checkpoint.md), including the local blackhole smoke mode and the remaining two-node RDMA caveat.
+
 ## Open Questions And Resolved Prototype Choices
 
 Resolved for the first `TARGET 'homer'` prototype:
@@ -207,8 +210,15 @@ Resolved for the first `TARGET 'homer'` prototype:
 - Generalize the currently tuple-named RDMA payload-ring substrate if practical,
   or add temporary generic wrappers over the existing symbols. Do not create a
   base-backup-only RDMA data plane.
+- Preserve the minimal progress-sink state updates inside the Homer sink:
+  archive payload bytes update `bbsink_state.bytes_done`, archive end advances
+  `bbsink_state.tablespace_num`, and manifest chunks do not advance tablespace
+  state. This keeps the `bbsink_end_backup()` lifecycle check useful rather than
+  removing it for the prototype. If the specialized sink later reveals a real
+  ordering mismatch, fix the state transition or callback order first; removing
+  the assertion should be the fallback, not the starting point.
 
-Still open before or during implementation:
+Implementation details to decide while coding:
 
 - Exact control-plane handshake fields in `RemoteExecutionOperationSpec` for a
   base-backup operation.

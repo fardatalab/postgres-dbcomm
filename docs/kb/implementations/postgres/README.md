@@ -8,6 +8,7 @@ Track implementation-progress notes for PostgreSQL-facing prototype work, especi
 
 <!-- kb-subdirs:start -->
 - `client-sql-session/`: Implementation checkpoints for the no-libpq client-to-PostgreSQL transaction workload.
+- `replication/`: Implementation checkpoints for PostgreSQL replication-facing service/RDMA prototype work.
 <!-- kb-subdirs:end -->
 
 ## Documents

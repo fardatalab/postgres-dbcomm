@@ -990,6 +990,7 @@ SendBaseBackup(BaseBackupCmd *cmd, IncrementalBackupInfo *ib)
 	basebackup_options opt;
 	bbsink	   *sink;
 	SessionBackupState status = get_backup_status();
+	bool		homer_target;
 
 	if (status == SESSION_BACKUP_RUNNING)
 		ereport(ERROR,
@@ -1029,24 +1030,33 @@ SendBaseBackup(BaseBackupCmd *cmd, IncrementalBackupInfo *ib)
 	 * be sent to the client. BaseBackupGetSink has the job of setting up a
 	 * sink to send the backup data wherever it needs to go.
 	 */
+	homer_target = BaseBackupTargetIs(opt.target_handle, "homer");
+	if (homer_target &&
+		(opt.maxrate > 0 || opt.compression != PG_COMPRESSION_NONE ||
+		 opt.includewal))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Homer base backup target only supports uncompressed, unthrottled tar backups without WAL in this prototype")));
+
 	sink = bbsink_copystream_new(opt.send_to_client);
 	if (opt.target_handle != NULL)
 		sink = BaseBackupGetSink(opt.target_handle, sink);
 
 	/* Set up network throttling, if client requested it */
-	if (opt.maxrate > 0)
+	if (!homer_target && opt.maxrate > 0)
 		sink = bbsink_throttle_new(sink, opt.maxrate);
 
 	/* Set up server-side compression, if client requested it */
-	if (opt.compression == PG_COMPRESSION_GZIP)
+	if (!homer_target && opt.compression == PG_COMPRESSION_GZIP)
 		sink = bbsink_gzip_new(sink, &opt.compression_specification);
-	else if (opt.compression == PG_COMPRESSION_LZ4)
+	else if (!homer_target && opt.compression == PG_COMPRESSION_LZ4)
 		sink = bbsink_lz4_new(sink, &opt.compression_specification);
-	else if (opt.compression == PG_COMPRESSION_ZSTD)
+	else if (!homer_target && opt.compression == PG_COMPRESSION_ZSTD)
 		sink = bbsink_zstd_new(sink, &opt.compression_specification);
 
 	/* Set up progress reporting. */
-	sink = bbsink_progress_new(sink, opt.progress);
+	if (!homer_target)
+		sink = bbsink_progress_new(sink, opt.progress);
 
 	/*
 	 * Perform the base backup, but make sure we clean up the bbsink even if
