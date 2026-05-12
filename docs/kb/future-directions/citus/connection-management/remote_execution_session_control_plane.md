@@ -473,6 +473,7 @@ The control-plane future direction is now:
 ## Related
 
 - [`../../../citus/connection-management/connection_management_control_plane.md`](../../../citus/connection-management/connection_management_control_plane.md): grounded current Citus semantics this design must preserve
+- [`../../postgres/client-sql-session/client_sql_session_offload_plan.md`](../../postgres/client-sql-session/client_sql_session_offload_plan.md): PostgreSQL client-session extension of the same remote-execution-session abstraction, introducing `REMOTE_EXEC_OP_CLIENT_SQL_SESSION`.
 - [cross_node_service_to_service_control_path.md](cross_node_service_to_service_control_path.md): concrete next-step design for turning the local-only service/session layer into an end-to-end cross-node control path
 - [`../transport/rdma_transport_control_plane_abstraction.md`](../transport/rdma_transport_control_plane_abstraction.md): RDMA and transport-level choices that sit underneath this session abstraction
 - [`../../implementations/citus/tuple-route/local_batch_materialization_checkpoint.md`](../../implementations/citus/tuple-route/local_batch_materialization_checkpoint.md): current implementation-progress checkpoint that should converge toward this design

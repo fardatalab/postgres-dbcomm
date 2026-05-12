@@ -7,13 +7,19 @@ subdir = src/bin/pgbench
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
+# Homer is linked into pgbench for the opt-in --homer transport prototype.
+# These defaults match the farnet/dbcomm install layout; callers can override
+# them to compare the same pgbench source against another Homer build.
+HOMER_CLIENT_INCLUDE_DIR ?= /data/dbcomm/pg-citus/include/postgresql/server
+HOMER_CLIENT_LIB ?= /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/libhomer_client.a
+
 OBJS = \
 	$(WIN32RES) \
 	exprparse.o \
 	exprscan.o \
 	pgbench.o
 
-override CPPFLAGS := -I. -I$(srcdir) -I$(libpq_srcdir) $(CPPFLAGS)
+override CPPFLAGS := -I. -I$(srcdir) -I$(libpq_srcdir) -I$(HOMER_CLIENT_INCLUDE_DIR) $(CPPFLAGS)
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)
 
 ifneq ($(PORTNAME), win32)
@@ -21,7 +27,7 @@ override CFLAGS += $(PTHREAD_CFLAGS)
 else
 override CPPFLAGS += -DFD_SETSIZE=1024
 endif
-LIBS += $(PTHREAD_LIBS)
+LIBS += $(PTHREAD_LIBS) $(HOMER_CLIENT_LIB)
 
 
 all: pgbench

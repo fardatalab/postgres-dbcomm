@@ -8,6 +8,7 @@ Hold implementation-progress notes for prototypes and in-flight changes separate
 
 <!-- kb-subdirs:start -->
 - `citus/`: Implementation-progress notes for Citus-side prototype work.
+- `postgres/`: Implementation-progress notes for PostgreSQL-facing prototype work.
 <!-- kb-subdirs:end -->
 
 ## Documents

@@ -41,6 +41,9 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/resource.h>		/* for getrlimit */
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 /* For testing, PGBENCH_USE_SELECT can be defined to force use of that code */
 #if defined(HAVE_PPOLL) && !defined(PGBENCH_USE_SELECT)
@@ -67,6 +70,7 @@
 #include "pgbench.h"
 #include "port/pg_bitutils.h"
 #include "portability/instr_time.h"
+#include "distributed/homer/remote_execution_client.h"
 
 /* X/Open (XSI) requires <math.h> to provide M_PI, but core POSIX does not */
 #ifndef M_PI
@@ -264,6 +268,17 @@ bool		progress_timestamp = false; /* progress report with Unix time */
 int			nclients = 1;		/* number of clients */
 int			nthreads = 1;		/* number of threads */
 bool		is_connect;			/* establish connection for each transaction */
+static bool latency_percentiles = false;	/* exact p50/p95/p99 summary */
+
+/*
+ * Homer mode is an opt-in frontend transport prototype. The default pgbench
+ * path remains libpq so we can compare stock simple-query pgbench against the
+ * external-service communication stack without changing existing behavior.
+ */
+static bool homer_mode = false;
+static uint32 homer_database_oid = 0;
+static uint32 homer_user_oid = 0;
+static int	client_cpu = -1;
 bool		report_per_command = false; /* report per-command latencies,
 										 * retries after errors and failures
 										 * (errors without retrying) */
@@ -361,6 +376,21 @@ typedef struct SimpleStats
 	double		sum;			/* sum of values */
 	double		sum2;			/* sum of squared values */
 } SimpleStats;
+
+/*
+ * Exact per-transaction latency samples for optional percentile reporting.
+ *
+ * This is deliberately separate from SimpleStats so the default benchmark hot
+ * path does not retain one value per transaction. When --latency-percentiles is
+ * enabled, each successful transaction appends one latency value in
+ * microseconds; final reporting sorts a merged copy once after the run.
+ */
+typedef struct LatencySamples
+{
+	double	   *values;
+	int64		count;
+	int64		capacity;
+} LatencySamples;
 
 /*
  * The instr_time type is expensive when dealing with time arithmetic.  Define
@@ -596,6 +626,11 @@ typedef enum
 typedef struct
 {
 	PGconn	   *con;			/* connection handle to DB */
+	HomerClientSession homer_session;	/* external-service SQL session */
+	HomerClientResultSink homer_result_sink;	/* reusable tuple result mapping */
+	bool		homer_session_open;
+	bool		homer_result_sink_open;
+	bool		homer_transaction_attached;
 	int			id;				/* client No. */
 	ConnectionStateEnum state;	/* state machine's current state. */
 	ConditionalStack cstack;	/* enclosing conditionals state */
@@ -660,6 +695,8 @@ typedef struct
 
 	int64		throttle_trigger;	/* previous/next throttling (us) */
 	FILE	   *logfile;		/* where to log, or NULL */
+	HomerClientControl homer_control;	/* thread-local service control map */
+	bool		homer_control_open;
 
 	/* per thread collected stats in microseconds */
 	pg_time_usec_t create_time; /* thread creation time */
@@ -670,6 +707,7 @@ typedef struct
 
 	StatsData	stats;
 	int64		latency_late;	/* count executed but late transactions */
+	LatencySamples latency_samples;	/* optional exact tail-latency samples */
 } TState;
 
 /*
@@ -831,6 +869,11 @@ static void processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
 static void addScript(const ParsedScript *script);
 static THREAD_FUNC_RETURN_TYPE THREAD_FUNC_CC threadRun(void *arg);
 static void finishCon(CState *st);
+static void finishHomerSession(CState *st);
+static bool openHomerSession(TState *thread, CState *st);
+static bool validateHomerScriptSupport(void);
+static void printLatencyPercentiles(TState *threads);
+static void freeLatencySamples(TState *threads);
 static void setalarm(int seconds);
 static socket_set *alloc_socket_set(int count);
 static void free_socket_set(socket_set *sa);
@@ -865,6 +908,76 @@ pg_time_now_lazy(pg_time_usec_t *now)
 }
 
 #define PG_TIME_GET_DOUBLE(t) (0.000001 * (t))
+
+/*
+ * Parse Homer OID options as unsigned 32-bit values. The first prototype asks
+ * for OIDs explicitly because the external-service client path intentionally
+ * avoids a libpq catalog/auth handshake.
+ */
+static uint32
+parseHomerOidOption(const char *optionName, const char *value)
+{
+	unsigned long parsed;
+	char	   *end = NULL;
+
+	errno = 0;
+	parsed = strtoul(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' || parsed == 0 ||
+		parsed > PG_UINT32_MAX)
+		pg_fatal("invalid %s value: \"%s\"", optionName, value);
+
+	return (uint32) parsed;
+}
+
+/*
+ * parseClientCpuOption parses opt-in benchmark CPU placement. A negative
+ * default means "do not override scheduler affinity"; explicit CPU ids are used
+ * only by benchmark runs that request placement control.
+ */
+static int
+parseClientCpuOption(const char *optionName, const char *value)
+{
+	long		parsed;
+	char	   *end = NULL;
+
+	errno = 0;
+	parsed = strtol(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' ||
+		parsed < 0 || parsed > INT_MAX)
+		pg_fatal("invalid %s value: \"%s\"", optionName, value);
+
+	return (int) parsed;
+}
+
+/*
+ * applyClientCpuAffinity pins the pgbench worker thread before either the libpq
+ * connection setup or Homer control-region setup. This replaces ad-hoc taskset
+ * usage in benchmark runs while leaving default pgbench scheduling untouched.
+ */
+static void
+applyClientCpuAffinity(void)
+{
+	if (client_cpu < 0)
+		return;
+
+#ifndef __linux__
+	pg_fatal("--client-cpu is currently supported only on Linux");
+#else
+	if (client_cpu >= CPU_SETSIZE)
+		pg_fatal("invalid --client-cpu value %d: max supported CPU is %d",
+				 client_cpu, CPU_SETSIZE - 1);
+
+	{
+		cpu_set_t	cpuSet;
+
+		CPU_ZERO(&cpuSet);
+		CPU_SET(client_cpu, &cpuSet);
+		if (sched_setaffinity(0, sizeof(cpuSet), &cpuSet) != 0)
+			pg_fatal("could not pin pgbench worker thread to CPU %d: %m",
+					 client_cpu);
+	}
+#endif
+}
 
 static void
 usage(void)
@@ -924,6 +1037,12 @@ usage(void)
 		   "  --aggregate-interval=NUM aggregate data over NUM seconds\n"
 		   "  --exit-on-abort          exit when any client is aborted\n"
 		   "  --failures-detailed      report the failures grouped by basic types\n"
+		   "  --client-cpu=CPU         pin the pgbench worker thread to CPU\n"
+		   "  --latency-percentiles    report exact p50/p95/p99 transaction latency\n"
+		   "  --homer                  submit simple SQL through the Homer service\n"
+		   "  --homer-client-cpu=CPU   alias for --client-cpu\n"
+		   "  --homer-database-oid=OID database OID for --homer sessions\n"
+		   "  --homer-user-oid=OID     user OID for --homer sessions\n"
 		   "  --log-prefix=PREFIX      prefix for transaction time log file\n"
 		   "                           (default: \"pgbench_log\")\n"
 		   "  --max-tries=NUM          max number of tries to run transaction (default: 1)\n"
@@ -1395,6 +1514,75 @@ initSimpleStats(SimpleStats *ss)
 {
 	memset(ss, 0, sizeof(SimpleStats));
 }
+
+
+/*
+ * initLatencySamples initializes the optional exact percentile sample buffer.
+ * Samples are allocated lazily so the structure is cheap when the benchmark did
+ * not request tail-latency reporting.
+ */
+static void
+initLatencySamples(LatencySamples *samples)
+{
+	memset(samples, 0, sizeof(LatencySamples));
+}
+
+
+/*
+ * reserveLatencySamples allocates the exact per-thread sample budget before
+ * benchmark timing starts when pgbench knows the transaction-count upper bound.
+ * This keeps the measured -t hot path to a plain array append. Duration-based
+ * runs cannot know the final transaction count, so they fall back to geometric
+ * growth in addLatencySample().
+ */
+static void
+reserveLatencySamples(LatencySamples *samples, int64 capacity)
+{
+	if (capacity <= 0)
+		return;
+
+	if (capacity > ((int64) (SIZE_MAX / sizeof(double))))
+		pg_fatal("too many latency samples for exact percentile reporting");
+
+	samples->values = (double *) pg_malloc(sizeof(double) * capacity);
+	samples->capacity = capacity;
+}
+
+
+/*
+ * addLatencySample appends one successful transaction latency in microseconds.
+ * For transaction-count benchmarks, reserveLatencySamples() should already have
+ * allocated enough space before timing starts. The growth path is retained for
+ * duration-based runs where pgbench cannot know the final sample count upfront.
+ */
+static void
+addLatencySample(LatencySamples *samples, double latency)
+{
+	if (samples->count == samples->capacity)
+	{
+		int64		newCapacity = samples->capacity == 0 ?
+			4096 : samples->capacity * 2;
+
+		if (newCapacity < samples->capacity ||
+			newCapacity > ((int64) (SIZE_MAX / sizeof(double))))
+			pg_fatal("too many latency samples for exact percentile reporting");
+
+		samples->values = (double *) pg_realloc(samples->values,
+												sizeof(double) * newCapacity);
+		samples->capacity = newCapacity;
+	}
+
+	samples->values[samples->count++] = latency;
+}
+
+
+static void
+destroyLatencySamples(LatencySamples *samples)
+{
+	free(samples->values);
+	initLatencySamples(samples);
+}
+
 
 /*
  * Accumulate one value into a SimpleStats struct.
@@ -3150,11 +3338,411 @@ prepareCommandsInPipeline(CState *st)
 	st->prepared[st->use_file][st->command] = true;
 }
 
+/*
+ * HomerSqlMatchesLifecycleCommand recognizes only the exact transaction
+ * lifecycle statements that this prototype maps to typed Homer commands. We
+ * intentionally do not parse richer transaction-control SQL here: options such
+ * as BEGIN ISOLATION LEVEL need typed fields in the Homer command contract
+ * before they should be accepted.
+ */
+static bool
+HomerSqlMatchesLifecycleCommand(const char *sql, const char *keyword)
+{
+	const char *start = sql;
+	const char *end = sql + strlen(sql);
+	size_t		keywordBytes = strlen(keyword);
+
+	while (*start != '\0' && isspace((unsigned char) *start))
+		start++;
+	while (end > start && isspace((unsigned char) end[-1]))
+		end--;
+	if (end > start && end[-1] == ';')
+	{
+		end--;
+		while (end > start && isspace((unsigned char) end[-1]))
+			end--;
+	}
+
+	return (size_t) (end - start) == keywordBytes &&
+		pg_strncasecmp(start, keyword, keywordBytes) == 0;
+}
+
+/*
+ * HomerSqlLooksRowProducing is intentionally conservative for the first
+ * sink-backed result checkpoint. The default pgbench transaction has one
+ * row-producing command, SELECT abalance, and the Homer path should request a
+ * tuple result sink for that command instead of discarding the executor output.
+ */
+static bool
+HomerSqlLooksRowProducing(const char *sql)
+{
+	const char *start = sql;
+
+	while (*start != '\0' && isspace((unsigned char) *start))
+		start++;
+
+	return pg_strncasecmp(start, "SELECT", strlen("SELECT")) == 0 ||
+		pg_strncasecmp(start, "WITH", strlen("WITH")) == 0 ||
+		pg_strncasecmp(start, "VALUES", strlen("VALUES")) == 0;
+}
+
+/*
+ * HomerSqlCanWaitForTerminalResult marks the measured builtin pgbench account
+ * lookup as a bounded-result command. For this one-row SELECT, the result sink
+ * cannot fill before the frontend starts draining, so the service can wait for
+ * terminal completion in the START response and avoid a second control request.
+ * Leave arbitrary SELECT/WITH/VALUES streams on the safer STARTED-then-poll path.
+ */
+static bool
+HomerSqlCanWaitForTerminalResult(const char *sql)
+{
+	const char *start = sql;
+	const char *pgbenchAccountLookupPrefix =
+		"SELECT abalance FROM pgbench_accounts WHERE aid =";
+
+	while (*start != '\0' && isspace((unsigned char) *start))
+		start++;
+
+	return pg_strncasecmp(start,
+						  pgbenchAccountLookupPrefix,
+						  strlen(pgbenchAccountLookupPrefix)) == 0;
+}
+
+/*
+ * HomerRunCommandAndWait is the synchronous pgbench adapter over the
+ * frontend-safe Homer client API. The pgbench state machine still owns timing,
+ * script variables, and transaction accounting; this helper only replaces the
+ * libpq send/result wait with one typed external-service command.
+ */
+static bool
+HomerRunCommandAndWait(CState *st, uint32 commandKind, const char *sql,
+					   const char *operationName, uint32 resultMode)
+{
+	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
+	uint64		commandSequence = 0;
+	CitusRemoteExecCommandCompletion completion;
+	HomerClientResultSink *resultSink = &st->homer_result_sink;
+	uint64		drainedRows = 0;
+	uint32		commandFlags = 0;
+	bool		resultSinkBoundForCommand = false;
+
+	if (commandKind == CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE &&
+		resultMode == CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE &&
+		sql != NULL &&
+		HomerSqlCanWaitForTerminalResult(sql))
+		commandFlags |= CITUS_REMOTE_EXEC_COMMAND_FLAG_WAIT_FOR_TERMINAL_COMPLETION;
+
+	if (!HomerClientStartCommandWithCompletionFlags(&st->homer_session,
+													commandKind,
+													commandFlags,
+													NULL,
+													sql,
+													resultMode,
+													&commandSequence,
+													&completion,
+													errorMessage,
+													sizeof(errorMessage)))
+	{
+		pg_log_error("client %d failed to start Homer %s: %s",
+					 st->id, operationName, errorMessage);
+		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		return false;
+	}
+
+	for (;;)
+	{
+		if (completion.commandState ==
+			CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED)
+		{
+			if (!resultSinkBoundForCommand &&
+				(completion.resultFlags &
+				 CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
+			{
+				if (!HomerClientOpenResultSink(&completion, resultSink,
+											   errorMessage, sizeof(errorMessage)))
+				{
+					pg_log_error("client %d failed to open Homer result sink for %s: %s",
+								 st->id, operationName, errorMessage);
+					st->estatus = ESTATUS_OTHER_SQL_ERROR;
+					return false;
+				}
+				st->homer_result_sink_open = true;
+				resultSinkBoundForCommand = true;
+			}
+
+			if (resultSinkBoundForCommand &&
+				!HomerClientDrainResultSink(resultSink, false,
+											&drainedRows,
+											errorMessage,
+											sizeof(errorMessage)))
+			{
+				pg_log_error("client %d failed to drain Homer result sink for %s: %s",
+							 st->id, operationName, errorMessage);
+				st->estatus = ESTATUS_OTHER_SQL_ERROR;
+				HomerClientCloseResultSink(resultSink, true);
+				st->homer_result_sink_open = false;
+				return false;
+			}
+
+			/*
+			 * The START_COMMAND response can already carry a result-sink
+			 * descriptor. After draining currently visible rows, fall through
+			 * to the poll below so we can observe terminal completion/EOS.
+			 */
+		}
+
+		if (completion.commandState ==
+			CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED)
+		{
+			if (!resultSinkBoundForCommand &&
+				(completion.resultFlags &
+				 CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
+			{
+				if (!HomerClientOpenResultSink(&completion, resultSink,
+											   errorMessage, sizeof(errorMessage)))
+				{
+					pg_log_error("client %d failed to open completed Homer result sink for %s: %s",
+								 st->id, operationName, errorMessage);
+					st->estatus = ESTATUS_OTHER_SQL_ERROR;
+					return false;
+				}
+				st->homer_result_sink_open = true;
+				resultSinkBoundForCommand = true;
+			}
+
+			if (resultSinkBoundForCommand)
+			{
+				if (!HomerClientDrainResultSink(resultSink, true,
+												&drainedRows,
+												errorMessage,
+												sizeof(errorMessage)))
+				{
+					pg_log_error("client %d failed to finish draining Homer result sink for %s: %s",
+								 st->id, operationName, errorMessage);
+					st->estatus = ESTATUS_OTHER_SQL_ERROR;
+					HomerClientCloseResultSink(resultSink, true);
+					st->homer_result_sink_open = false;
+					return false;
+				}
+			}
+
+			pg_log_debug("client %d Homer %s completed: rows=%llu",
+						 st->id, operationName,
+						 (unsigned long long) completion.processedRowCount);
+			return true;
+		}
+
+		if (completion.commandState ==
+			CITUS_REMOTE_EXEC_COMMAND_STATE_FAILED)
+		{
+			pg_log_error("client %d Homer %s failed: %s",
+						 st->id, operationName,
+						 completion.detail[0] != '\0' ?
+						 completion.detail : "<backend did not provide details>");
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+			if (st->homer_result_sink_open)
+			{
+				HomerClientCloseResultSink(resultSink, true);
+				st->homer_result_sink_open = false;
+			}
+			return false;
+		}
+
+		if (!HomerClientPollCommand(&st->homer_session,
+									commandKind,
+									commandSequence,
+									&completion,
+									errorMessage,
+									sizeof(errorMessage)))
+		{
+			pg_log_error("client %d failed to poll Homer %s: %s",
+						 st->id, operationName, errorMessage);
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+			return false;
+		}
+	}
+}
+
+/*
+ * sendHomerCommand maps pgbench's simple SQL text into Homer database-semantic
+ * commands. BEGIN/COMMIT/END/ROLLBACK become typed lifecycle commands, while
+ * ordinary SQL remains SQL_EXECUTE payload text. This is intentionally a
+ * semantic command mapping, not a libpq protocol emulation layer.
+ */
+static bool
+sendHomerCommand(CState *st, Command *command)
+{
+	char	   *sql;
+	bool		ok = false;
+
+	Assert(homer_mode);
+	Assert(querymode == QUERY_SIMPLE);
+
+	if (command->meta == META_GSET || command->meta == META_ASET)
+	{
+		pg_log_error("client %d Homer mode does not support \\gset or \\aset yet",
+					 st->id);
+		st->estatus = ESTATUS_META_COMMAND_ERROR;
+		return false;
+	}
+
+	sql = pg_strdup(command->argv[0]);
+	sql = assignVariables(&st->variables, sql);
+	pg_log_debug("client %d sending Homer SQL text %s", st->id, sql);
+
+	if (HomerSqlMatchesLifecycleCommand(sql, "BEGIN"))
+	{
+		if (st->homer_transaction_attached)
+		{
+			pg_log_error("client %d Homer transaction is already attached before BEGIN",
+						 st->id);
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		}
+		else
+		{
+			ok = HomerRunCommandAndWait(st,
+										CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_TX_BEGIN,
+										NULL,
+										"client_sql_tx_begin",
+										CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
+			if (ok)
+				st->homer_transaction_attached = true;
+		}
+	}
+	else if (HomerSqlMatchesLifecycleCommand(sql, "COMMIT") ||
+			 HomerSqlMatchesLifecycleCommand(sql, "END"))
+	{
+		if (!st->homer_transaction_attached)
+		{
+			pg_log_error("client %d Homer COMMIT/END without attached transaction",
+						 st->id);
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		}
+		else
+		{
+			ok = HomerRunCommandAndWait(st,
+										CITUS_REMOTE_EXEC_COMMAND_TX_COMMIT,
+										NULL,
+										"tx_commit",
+										CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
+			if (ok)
+				st->homer_transaction_attached = false;
+		}
+	}
+	else if (HomerSqlMatchesLifecycleCommand(sql, "ROLLBACK"))
+	{
+		if (!st->homer_transaction_attached)
+		{
+			pg_log_error("client %d Homer ROLLBACK without attached transaction",
+						 st->id);
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		}
+		else
+		{
+			ok = HomerRunCommandAndWait(st,
+										CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
+										NULL,
+										"tx_abort",
+										CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
+			if (ok)
+				st->homer_transaction_attached = false;
+		}
+	}
+	else
+	{
+		if (!st->homer_transaction_attached)
+		{
+			pg_log_error("client %d Homer SQL_EXECUTE requires an explicit BEGIN in the script",
+						 st->id);
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		}
+		else
+		{
+			ok = HomerRunCommandAndWait(st,
+										CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE,
+										sql,
+										"sql_execute",
+										HomerSqlLooksRowProducing(sql) ?
+										CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE :
+										CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
+		}
+	}
+
+	free(sql);
+	return ok;
+}
+
+/*
+ * validateHomerScriptSupport rejects pgbench script features whose result and
+ * event-loop semantics are still libpq-specific. This keeps --homer opt-in and
+ * honest: unsupported modes fail before benchmarking rather than accidentally
+ * producing incomparable measurements.
+ */
+static bool
+validateHomerScriptSupport(void)
+{
+	for (int scriptIndex = 0; scriptIndex < num_scripts; scriptIndex++)
+	{
+		Command   **commands = sql_script[scriptIndex].commands;
+		bool		sawBegin = false;
+		bool		sawEnd = false;
+
+		for (int commandIndex = 0; commands[commandIndex] != NULL; commandIndex++)
+		{
+			Command    *command = commands[commandIndex];
+
+			if (command->type == META_COMMAND)
+			{
+				if (command->meta == META_GSET ||
+					command->meta == META_ASET ||
+					command->meta == META_STARTPIPELINE ||
+					command->meta == META_SYNCPIPELINE ||
+					command->meta == META_ENDPIPELINE)
+				{
+					pg_log_error("--homer does not support script \"%s\" command %d meta-command yet",
+								 sql_script[scriptIndex].desc,
+								 commandIndex);
+					return false;
+				}
+				/*
+				 * START_COMMAND may return the initial STARTED completion with a
+				 * result-sink descriptor. After opening/draining what is currently
+				 * available, continue by polling below; reusing the same STARTED
+				 * completion would spin forever and never observe terminal EOS.
+				 */
+			}
+
+			Assert(command->type == SQL_COMMAND);
+			if (HomerSqlMatchesLifecycleCommand(command->argv[0], "BEGIN"))
+				sawBegin = true;
+			else if (HomerSqlMatchesLifecycleCommand(command->argv[0], "COMMIT") ||
+					 HomerSqlMatchesLifecycleCommand(command->argv[0], "END") ||
+					 HomerSqlMatchesLifecycleCommand(command->argv[0], "ROLLBACK"))
+				sawEnd = true;
+		}
+
+		if (!sawBegin || !sawEnd)
+		{
+			pg_log_error("--homer currently requires each script to contain explicit BEGIN and COMMIT/END/ROLLBACK commands");
+			pg_log_error_detail("script \"%s\" has_begin=%s has_end=%s",
+								sql_script[scriptIndex].desc,
+								sawBegin ? "true" : "false",
+								sawEnd ? "true" : "false");
+			return false;
+		}
+	}
+
+	return true;
+}
+
 /* Send a SQL command, using the chosen querymode */
 static bool
 sendCommand(CState *st, Command *command)
 {
 	int			r;
+
+	if (homer_mode)
+		return sendHomerCommand(st, command);
 
 	if (querymode == QUERY_SIMPLE)
 	{
@@ -3652,7 +4240,7 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				pg_time_now_lazy(&now);
 
 				/* establish connection if needed, i.e. under --connect */
-				if (st->con == NULL)
+				if (!homer_mode && st->con == NULL)
 				{
 					pg_time_usec_t start = now;
 
@@ -3789,7 +4377,7 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 */
 				if (command == NULL)
 				{
-					if (PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
+					if (homer_mode || PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
 						st->state = CSTATE_END_TX;
 					else
 					{
@@ -3812,7 +4400,7 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				if (command->type == SQL_COMMAND)
 				{
 					/* disallow \aset and \gset in pipeline mode */
-					if (PQpipelineStatus(st->con) != PQ_PIPELINE_OFF)
+					if (!homer_mode && PQpipelineStatus(st->con) != PQ_PIPELINE_OFF)
 					{
 						if (command->meta == META_GSET)
 						{
@@ -3836,7 +4424,9 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					else
 					{
 						/* Wait for results, unless in pipeline mode */
-						if (PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
+						if (homer_mode)
+							st->state = CSTATE_END_COMMAND;
+						else if (PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
 							st->state = CSTATE_WAIT_RESULT;
 						else
 							st->state = CSTATE_END_COMMAND;
@@ -4056,6 +4646,23 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					/* Clear the conditional stack */
 					conditional_stack_reset(st->cstack);
 
+					if (homer_mode)
+					{
+							if (st->homer_transaction_attached)
+							{
+								(void) HomerRunCommandAndWait(st,
+															  CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
+															  NULL,
+															  "tx_abort_after_error",
+															  CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
+								st->homer_transaction_attached = false;
+							}
+
+						st->state = timer_exceeded ? CSTATE_FINISHED :
+							doRetry(st, &now) ? CSTATE_RETRY : CSTATE_FAILURE;
+						break;
+					}
+
 					/* Read and discard until a sync point in pipeline mode */
 					if (PQpipelineStatus(st->con) != PQ_PIPELINE_OFF)
 					{
@@ -4219,22 +4826,35 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					 * We must complete all the transaction blocks that were
 					 * started in this script.
 					 */
-					tstatus = getTransactionStatus(st->con);
-					if (tstatus == TSTATUS_IN_BLOCK)
+					if (homer_mode)
 					{
-						pg_log_error("client %d aborted: end of script reached without completing the last transaction",
-									 st->id);
-						st->state = CSTATE_ABORTED;
-						break;
+						if (st->homer_transaction_attached)
+						{
+							pg_log_error("client %d aborted: end of Homer script reached without completing the last transaction",
+										 st->id);
+							st->state = CSTATE_ABORTED;
+							break;
+						}
 					}
-					else if (tstatus != TSTATUS_IDLE)
+					else
 					{
-						if (tstatus == TSTATUS_CONN_ERROR)
-							pg_log_error("perhaps the backend died while processing");
+						tstatus = getTransactionStatus(st->con);
+						if (tstatus == TSTATUS_IN_BLOCK)
+						{
+							pg_log_error("client %d aborted: end of script reached without completing the last transaction",
+										 st->id);
+							st->state = CSTATE_ABORTED;
+							break;
+						}
+						else if (tstatus != TSTATUS_IDLE)
+						{
+							if (tstatus == TSTATUS_CONN_ERROR)
+								pg_log_error("perhaps the backend died while processing");
 
-						pg_log_error("client %d aborted while receiving the transaction status", st->id);
-						st->state = CSTATE_ABORTED;
-						break;
+							pg_log_error("client %d aborted while receiving the transaction status", st->id);
+							st->state = CSTATE_ABORTED;
+							break;
+						}
 					}
 
 					if (is_connect)
@@ -4684,7 +5304,7 @@ processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
 	double		latency = 0.0,
 				lag = 0.0;
 	bool		detailed = progress || throttle_delay || latency_limit ||
-		use_log || per_script_stats;
+			use_log || per_script_stats || latency_percentiles;
 
 	if (detailed && !skipped && st->estatus == ESTATUS_NO_ERROR)
 	{
@@ -4697,6 +5317,8 @@ processXactStats(TState *thread, CState *st, pg_time_usec_t *now,
 
 	/* keep detailed thread stats */
 	accumStats(&thread->stats, skipped, latency, lag, st->estatus, st->tries);
+	if (latency_percentiles && !skipped && st->estatus == ESTATUS_NO_ERROR)
+		addLatencySample(&thread->latency_samples, latency);
 
 	/* count transactions over the latency limit, if needed */
 	if (latency_limit && latency > latency_limit)
@@ -6353,6 +6975,102 @@ printSimpleStats(const char *prefix, SimpleStats *ss)
 	}
 }
 
+
+static int
+compareLatencySample(const void *left, const void *right)
+{
+	double		l = *((const double *) left);
+	double		r = *((const double *) right);
+
+	if (l < r)
+		return -1;
+	if (l > r)
+		return 1;
+	return 0;
+}
+
+
+static double
+latencyPercentile(const double *values, int64 count, double percentile)
+{
+	int64		index;
+
+	Assert(count > 0);
+	Assert(percentile > 0.0 && percentile <= 100.0);
+
+	index = (int64) ceil((percentile / 100.0) * (double) count) - 1;
+	if (index < 0)
+		index = 0;
+	if (index >= count)
+		index = count - 1;
+
+	return values[index];
+}
+
+
+/*
+ * printLatencyPercentiles reports exact transaction latency percentiles from
+ * the optional per-thread sample buffers. This intentionally runs after all
+ * workers have stopped: the benchmark hot path only appends raw latency values,
+ * while sorting and percentile extraction are cold-path reporting work.
+ */
+static void
+printLatencyPercentiles(TState *threads)
+{
+	double	   *mergedSamples;
+	int64		totalSamples = 0;
+	int64		writeIndex = 0;
+
+	if (!latency_percentiles)
+		return;
+
+	for (int i = 0; i < nthreads; i++)
+		totalSamples += threads[i].latency_samples.count;
+
+	if (totalSamples <= 0)
+	{
+		printf("latency percentiles: no successful transactions sampled\n");
+		return;
+	}
+
+	mergedSamples = (double *) pg_malloc(sizeof(double) * totalSamples);
+	for (int i = 0; i < nthreads; i++)
+	{
+		LatencySamples *samples = &threads[i].latency_samples;
+
+		memcpy(&mergedSamples[writeIndex],
+			   samples->values,
+			   sizeof(double) * samples->count);
+		writeIndex += samples->count;
+	}
+	Assert(writeIndex == totalSamples);
+
+	qsort(mergedSamples, totalSamples, sizeof(double), compareLatencySample);
+
+	printf("latency p50 = %.3f ms\n",
+		   0.001 * latencyPercentile(mergedSamples, totalSamples, 50.0));
+	printf("latency p95 = %.3f ms\n",
+		   0.001 * latencyPercentile(mergedSamples, totalSamples, 95.0));
+	printf("latency p99 = %.3f ms\n",
+		   0.001 * latencyPercentile(mergedSamples, totalSamples, 99.0));
+	printf("latency max = %.3f ms\n",
+		   0.001 * mergedSamples[totalSamples - 1]);
+
+	free(mergedSamples);
+}
+
+
+static void
+freeLatencySamples(TState *threads)
+{
+	if (!latency_percentiles)
+		return;
+
+	for (int i = 0; i < nthreads; i++)
+		destroyLatencySamples(&threads[i].latency_samples);
+}
+
+
 /* print version banner */
 static void
 printVersion(PGconn *con)
@@ -6406,6 +7124,7 @@ printResults(StatsData *total,
 	if (partition_method != PART_NONE)
 		printf("partition method: %s\npartitions: %d\n",
 			   PARTITION_METHOD[partition_method], partitions);
+	printf("transport: %s\n", homer_mode ? "homer" : "libpq");
 	printf("query mode: %s\n", QUERYMODE[querymode]);
 	printf("number of clients: %d\n", nclients);
 	printf("number of threads: %d\n", nthreads);
@@ -6699,6 +7418,12 @@ main(int argc, char **argv)
 		{"verbose-errors", no_argument, NULL, 15},
 		{"exit-on-abort", no_argument, NULL, 16},
 		{"debug", no_argument, NULL, 17},
+		{"homer", no_argument, NULL, 18},
+		{"homer-database-oid", required_argument, NULL, 19},
+		{"homer-user-oid", required_argument, NULL, 20},
+		{"homer-client-cpu", required_argument, NULL, 21},
+		{"client-cpu", required_argument, NULL, 22},
+		{"latency-percentiles", no_argument, NULL, 23},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -7039,6 +7764,34 @@ main(int argc, char **argv)
 			case 17:			/* debug */
 				pg_logging_increase_verbosity();
 				break;
+			case 18:			/* homer */
+				benchmarking_option_set = true;
+				homer_mode = true;
+				break;
+			case 19:			/* homer-database-oid */
+				benchmarking_option_set = true;
+				homer_database_oid =
+					parseHomerOidOption("--homer-database-oid", optarg);
+				break;
+			case 20:			/* homer-user-oid */
+				benchmarking_option_set = true;
+				homer_user_oid =
+					parseHomerOidOption("--homer-user-oid", optarg);
+				break;
+			case 21:			/* homer-client-cpu */
+				benchmarking_option_set = true;
+				client_cpu =
+					parseClientCpuOption("--homer-client-cpu", optarg);
+				break;
+			case 22:			/* client-cpu */
+				benchmarking_option_set = true;
+				client_cpu =
+					parseClientCpuOption("--client-cpu", optarg);
+				break;
+			case 23:			/* latency-percentiles */
+				benchmarking_option_set = true;
+				latency_percentiles = true;
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -7193,6 +7946,21 @@ main(int argc, char **argv)
 			pg_fatal("an unlimited number of transaction tries can only be used with --latency-limit or a duration (-T)");
 	}
 
+	if (homer_mode)
+	{
+		if (querymode != QUERY_SIMPLE)
+			pg_fatal("--homer currently supports only -M simple");
+		if (is_connect)
+			pg_fatal("--homer currently uses one persistent session and cannot be combined with -C/--connect");
+		if (nclients != 1 || nthreads != 1)
+			pg_fatal("--homer currently supports exactly one client and one thread");
+		if (max_tries != 1)
+			pg_fatal("--homer currently does not support transaction retry (--max-tries must remain 1)");
+		if (homer_database_oid == 0 || homer_user_oid == 0)
+			pg_fatal("--homer requires --homer-database-oid and --homer-user-oid");
+		if (!validateHomerScriptSupport())
+			exit(1);
+	}
 	/*
 	 * save main process id in the global variable because process id will be
 	 * changed after fork.
@@ -7330,8 +8098,22 @@ main(int argc, char **argv)
 		initRandomState(&thread->ts_throttle_rs);
 		initRandomState(&thread->ts_sample_rs);
 		thread->logfile = NULL; /* filled in later */
+		thread->homer_control_open = false;
 		thread->latency_late = 0;
 		initStats(&thread->stats, 0);
+		initLatencySamples(&thread->latency_samples);
+		if (latency_percentiles && duration <= 0)
+		{
+			int64		sampleCapacity = (int64) thread->nstate * nxacts;
+
+			/*
+			 * In transaction-count mode this upper bound is exact for the number
+			 * of attempted transactions owned by this thread. Only successful
+			 * transactions become samples, so the measured path should not need
+			 * to allocate.
+			 */
+			reserveLatencySamples(&thread->latency_samples, sampleCapacity);
+		}
 
 		nclients_dealt += thread->nstate;
 	}
@@ -7418,6 +8200,8 @@ main(int argc, char **argv)
 	 */
 	printResults(&stats, pg_time_now() - bench_start, conn_total_duration,
 				 bench_start - start_time, latency_late);
+	printLatencyPercentiles(threads);
+	freeLatencySamples(threads);
 
 	THREAD_BARRIER_DESTROY(&barrier);
 
@@ -7466,6 +8250,8 @@ threadRun(void *arg)
 	/* READY */
 	THREAD_BARRIER_WAIT(&barrier);
 
+	applyClientCpuAffinity();
+
 	thread_start = pg_time_now();
 	thread->started_time = thread_start;
 	thread->conn_duration = 0;
@@ -7473,7 +8259,25 @@ threadRun(void *arg)
 	next_report = last_report + (int64) 1000000 * progress;
 
 	/* STEADY */
-	if (!is_connect)
+	if (homer_mode)
+	{
+		char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
+
+		if (!HomerClientOpenControl(&thread->homer_control,
+									errorMessage,
+									sizeof(errorMessage)))
+			pg_fatal("could not open Homer control region in thread %d: %s",
+					 thread->tid, errorMessage);
+		thread->homer_control_open = true;
+
+		for (int i = 0; i < nstate; i++)
+		{
+			if (!openHomerSession(thread, &state[i]))
+				pg_fatal("could not create Homer session for client %d",
+						 state[i].id);
+		}
+	}
+	else if (!is_connect)
 	{
 		/* make connections to the database before starting */
 		for (int i = 0; i < nstate; i++)
@@ -7645,7 +8449,6 @@ threadRun(void *arg)
 					 st->state == CSTATE_ABORTED)
 			{
 				/* this client is done, no need to consider it anymore */
-				continue;
 			}
 
 			advanceConnectionState(thread, st, &aggs);
@@ -7712,6 +8515,11 @@ done:
 	}
 
 	disconnect_all(state, nstate);
+	if (thread->homer_control_open)
+	{
+		HomerClientCloseControl(&thread->homer_control);
+		thread->homer_control_open = false;
+	}
 
 	if (thread->logfile)
 	{
@@ -7730,11 +8538,100 @@ done:
 static void
 finishCon(CState *st)
 {
+	finishHomerSession(st);
+
 	if (st->con != NULL)
 	{
 		PQfinish(st->con);
 		st->con = NULL;
 	}
+}
+
+/*
+ * finishHomerSession tears down the persistent external-service SQL session
+ * owned by one pgbench client. It is intentionally separate from thread-local
+ * control-region cleanup, because a client session is the unit that maps to a
+ * remote backend and must be closed before the thread unmaps service control.
+ */
+static void
+finishHomerSession(CState *st)
+{
+	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
+
+	if (!st->homer_session_open)
+		return;
+
+	if (st->homer_transaction_attached)
+	{
+		/*
+	 * A failed transaction path should not leave the backend attached to a
+	 * transaction while the explicit session-close command is being sent.
+	 */
+		if (!HomerRunCommandAndWait(st,
+									CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
+									NULL,
+									"tx_abort_during_session_finish",
+									CITUS_REMOTE_EXEC_SQL_RESULT_NONE))
+			pg_log_error("client %d could not abort Homer transaction during session finish",
+						 st->id);
+		st->homer_transaction_attached = false;
+	}
+
+	if (st->homer_result_sink_open)
+	{
+		/*
+		 * Result sink mappings are reused across commands for performance, so
+		 * close them at the same session boundary that closes the remote backend.
+		 * The backend also unlinks during session close; double-unlink is harmless
+		 * here and keeps stale prototype runs from leaving named shm objects behind.
+		 */
+		HomerClientCloseResultSink(&st->homer_result_sink, true);
+		st->homer_result_sink_open = false;
+	}
+
+	if (!HomerClientCloseSession(&st->homer_session,
+								 errorMessage,
+								 sizeof(errorMessage)))
+		pg_log_error("client %d could not close Homer session: %s",
+					 st->id, errorMessage);
+
+	st->homer_session_open = false;
+}
+
+/*
+ * openHomerSession creates the persistent one-client SQL session used for the
+ * measured run. Session setup is done before the GO barrier reaches
+ * bench_start, mirroring regular pgbench's initial persistent libpq
+ * connections and keeping the per-transaction measurement focused on command
+ * execution.
+ */
+static bool
+openHomerSession(TState *thread, CState *st)
+{
+	HomerClientSessionOptions sessionOptions;
+	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
+
+	HomerClientDefaultSessionOptions(&sessionOptions,
+									 homer_database_oid,
+									 homer_user_oid);
+
+	if (!HomerClientOpenSqlSession(&thread->homer_control,
+								   &sessionOptions,
+								   &st->homer_session,
+								   errorMessage,
+								   sizeof(errorMessage)))
+	{
+		pg_log_error("client %d could not open Homer SQL session: %s",
+					 st->id, errorMessage);
+		return false;
+	}
+
+	st->homer_session_open = true;
+	memset(&st->homer_result_sink, 0, sizeof(st->homer_result_sink));
+	st->homer_result_sink.fileDescriptor = -1;
+	st->homer_result_sink_open = false;
+	st->homer_transaction_attached = false;
+	return true;
 }
 
 /*

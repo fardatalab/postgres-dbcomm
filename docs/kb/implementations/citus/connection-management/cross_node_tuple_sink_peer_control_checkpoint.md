@@ -219,6 +219,16 @@ One operational caveat is now grounded enough to record here: validation must st
 - Non tuple-sink `RemoteExecutionSession` modes are still not implemented.
 - Control-plane generalization is still future. There is still no richer multi-slot control ring, no child-sink open path, and no keepalive protocol beneath the current persistent peer transport.
 - Canonical serialization is still future. The current format still assumes same-ABI tuple layout semantics and still keeps wire row width intentionally equal to the current receive-sink row width.
+- Concurrent SQL-command sessions are explicitly deferred. The pgbench transaction
+  milestone is single-client only for now; multi-client runs need a follow-up
+  design for peer command multiplexing rather than a PostgreSQL advisory lock
+  around the wrapper. The current peer RDMA request path still documents its
+  one-outstanding-request limitation in
+  [`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3198).
+- The farnet pgbench smoke test exposed a peer-control response timeout after
+  worker-side command completion. That is now recorded in
+  [rdma_publication_visibility_and_doorbells.md](../../../future-directions/citus/transport/rdma_publication_visibility_and_doorbells.md#observed-rdma-response-timeout-failure-mode), along with the current tail-observation fallback in
+  [`TupleSinkServiceTryConsumeLocalMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2116).
 
 ## Related
 

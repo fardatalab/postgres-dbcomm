@@ -20,6 +20,22 @@
 #include "postgres.h"
 #include "timing_spots.h"
 
+/*
+ * HOMER_POSTGRES_PERF_DIAGNOSTICS gates the experimental per-query timing and
+ * perf-control trace path. It is compile-time disabled for benchmark builds so
+ * pgbench measurements do not pay log formatting, logger aggregation, or FIFO
+ * open/write overhead on every frontend command.
+ */
+#ifndef HOMER_POSTGRES_PERF_DIAGNOSTICS
+#define HOMER_POSTGRES_PERF_DIAGNOSTICS 0
+#endif
+
+#if HOMER_POSTGRES_PERF_DIAGNOSTICS
+#define HOMER_POSTGRES_PERF_DIAG(...) do { __VA_ARGS__; } while (0)
+#else
+#define HOMER_POSTGRES_PERF_DIAG(...) do { } while (0)
+#endif
+
 #include <ctype.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -155,7 +171,9 @@ static bool xact_started = false;
  * local to decide whether this backend should attempt the matching disable after
  * the corresponding ReadyForQuery() flush completes.
  */
+#if HOMER_POSTGRES_PERF_DIAGNOSTICS
 static bool PerfControlCaptureActive = false;
+#endif
 
 /*
  * Flag to indicate that we are doing the outer loop's read-from-client,
@@ -214,11 +232,13 @@ static void drop_unnamed_stmt(void);
 static void log_disconnections(int code, Datum arg);
 static void enable_statement_timeout(void);
 static void disable_statement_timeout(void);
+#if HOMER_POSTGRES_PERF_DIAGNOSTICS
 static bool PerfControlWriteCommand(const char *command, size_t commandLength,
 									bool logFailures);
 static void PerfControlEnableIfNeeded(void);
 static void PerfControlDisableIfNeeded(void);
 static void PerfControlOnProcExit(int code, Datum arg);
+#endif
 
 
 /* ----------------------------------------------------------------
@@ -530,6 +550,7 @@ ReadCommand(StringInfo inBuf)
  * external tooling. If perf record is not attached to the FIFO, we log the
  * failure and continue query execution rather than stalling the backend.
  */
+#if HOMER_POSTGRES_PERF_DIAGNOSTICS
 static bool
 PerfControlWriteCommand(const char *command, size_t commandLength, bool logFailures)
 {
@@ -651,10 +672,10 @@ PerfControlDisableIfNeeded(void)
 static void
 PerfControlOnProcExit(int code, Datum arg)
 {
+	static const char PerfDisableCommand[] = "disable\n";
+
 	(void) code;
 	(void) arg;
-
-	static const char PerfDisableCommand[] = "disable\n";
 
 	if (!PerfControlCaptureActive)
 	{
@@ -671,6 +692,7 @@ PerfControlOnProcExit(int code, Datum arg)
 								   sizeof(PerfDisableCommand) - 1,
 								   false);
 }
+#endif
 
 /*
  * ProcessClientReadInterrupt() - Process interrupts specific to client reads
@@ -4528,7 +4550,9 @@ PostgresMain(const char *dbname, const char *username)
 	 * one-backend-per-node workflow from leaving perf enabled after an abnormal
 	 * backend exit.
 	 */
+#if HOMER_POSTGRES_PERF_DIAGNOSTICS
 	on_proc_exit(PerfControlOnProcExit, 0);
+#endif
 
 	pgstat_report_connect(MyDatabaseId);
 
@@ -4875,7 +4899,7 @@ PostgresMain(const char *dbname, const char *username)
 			 * Keep perf enabled until after ReadyForQuery() flushes the final
 			 * client-visible output for the simple query.
 			 */
-			PerfControlDisableIfNeeded();
+				HOMER_POSTGRES_PERF_DIAG(PerfControlDisableIfNeeded());
 
 			send_ready_for_query = false;
 		}
@@ -4950,8 +4974,10 @@ PostgresMain(const char *dbname, const char *username)
 		if (ignore_till_sync && firstchar != EOF)
 			continue;
 
-        // don't print certain Citus internal queries
-        bool skip_query_str_print = false;
+	        // don't print certain Citus internal queries
+#if HOMER_POSTGRES_PERF_DIAGNOSTICS
+	        bool skip_query_str_print = false;
+#endif
 
         switch (firstchar)
 		{
@@ -4971,34 +4997,37 @@ PostgresMain(const char *dbname, const char *username)
 						 * then at the end of the loop we should not call
 						 * logger_print_timings(); instead call logger_reset().
 						 */
-						{
-							const char *qs = query_string;
-							while (qs && *qs && isspace((unsigned char) *qs))
-								qs++;
-							if (qs && (strncmp(qs, "SELECT gid", 10) == 0 ||
-									   strncmp(qs, "SELECT waiting_pid", 18) == 0))
-								skip_query_str_print = true;
+#if HOMER_POSTGRES_PERF_DIAGNOSTICS
+							{
+								const char *qs = query_string;
+								while (qs && *qs && isspace((unsigned char) *qs))
+									qs++;
+								if (qs && (strncmp(qs, "SELECT gid", 10) == 0 ||
+										   strncmp(qs, "SELECT waiting_pid", 18) == 0))
+									skip_query_str_print = true;
+								else
+									skip_query_str_print = false;
+							}
+#endif
+
+								/* perf capture starts at backend execution, not at client read. */
+								HOMER_POSTGRES_PERF_DIAG(PerfControlEnableIfNeeded());
+
+							// jason: timing the execution of a query (coordinator side should be full query time)
+							HOMER_POSTGRES_PERF_DIAG(timing_start(ExecSimpleQuery));
+							if (am_walsender)
+							{
+								if (!exec_replication_command(query_string))
+									exec_simple_query(query_string);
+							}
 							else
-								skip_query_str_print = false;
-						}
-
-						/* perf capture starts at backend execution, not at client read. */
-						PerfControlEnableIfNeeded();
-
-						// jason: timing the execution of a query (coordinator side should be full query time)
-						timing_start(ExecSimpleQuery);
-						if (am_walsender)
-						{
-							if (!exec_replication_command(query_string))
 								exec_simple_query(query_string);
-						}
-						else
-							exec_simple_query(query_string);
 
-						// jason: end timing
-						timing_end(ExecSimpleQuery);
-						if (!skip_query_str_print)
-							log_message("Query executed: %s", query_string);
+							// jason: end timing
+							HOMER_POSTGRES_PERF_DIAG(timing_end(ExecSimpleQuery));
+							HOMER_POSTGRES_PERF_DIAG(
+								if (!skip_query_str_print)
+									log_message("Query executed: %s", query_string));
 
 						valgrind_report_error_query(query_string);
 
@@ -5031,8 +5060,10 @@ PostgresMain(const char *dbname, const char *username)
 
                     // jason: log the prepared statement, Citus adaptive scan seems to go this path, using
                     // StartPlacementExecutionOnSession which calls SendNextQuery
-                    log_message("PqMsg_Parse stmt_name: %s", stmt_name);
-                    log_message("PqMsg_Parse query: %s", query_string);
+	                    HOMER_POSTGRES_PERF_DIAG(
+							log_message("PqMsg_Parse stmt_name: %s", stmt_name));
+	                    HOMER_POSTGRES_PERF_DIAG(
+							log_message("PqMsg_Parse query: %s", query_string));
 
                     exec_parse_message(query_string, stmt_name, paramTypes, numParams);
 
@@ -5069,14 +5100,15 @@ PostgresMain(const char *dbname, const char *username)
 					max_rows = pq_getmsgint(&input_message, 4);
 					pq_getmsgend(&input_message);
 
-                    // jason: log PqMsg_Execute too
-                    log_message("PqMsg_Execute portal_name: %s", portal_name);
-                    // log_message("PqMsg_Execute max_rows: %d", max_rows);
+	                    // jason: log PqMsg_Execute too
+	                    HOMER_POSTGRES_PERF_DIAG(
+							log_message("PqMsg_Execute portal_name: %s", portal_name));
+	                    // log_message("PqMsg_Execute max_rows: %d", max_rows);
 
-                    // jason: timing the execution of a query, TODO: don't call it simple query
-                    timing_start(ExecSimpleQuery);
-                    exec_execute_message(portal_name, max_rows);
-                    timing_end(ExecSimpleQuery);
+	                    // jason: timing the execution of a query, TODO: don't call it simple query
+	                    HOMER_POSTGRES_PERF_DIAG(timing_start(ExecSimpleQuery));
+	                    exec_execute_message(portal_name, max_rows);
+	                    HOMER_POSTGRES_PERF_DIAG(timing_end(ExecSimpleQuery));
 
                     /* exec_execute_message does valgrind_report_error_query */
                 }
@@ -5108,7 +5140,8 @@ PostgresMain(const char *dbname, const char *username)
 				MemoryContextSwitchTo(MessageContext);
 
                 // jason: log PqMsg_FunctionCall too
-                log_message("PqMsg_FunctionCall received: %s\n", input_message.data);
+	                HOMER_POSTGRES_PERF_DIAG(
+						log_message("PqMsg_FunctionCall received: %s\n", input_message.data));
                 HandleFunctionRequest(&input_message);
 
 				/* commit the function-invocation transaction */
@@ -5260,16 +5293,17 @@ PostgresMain(const char *dbname, const char *username)
 								firstchar)));
 		}
         // jason: print logger timings here (should be the end of executing a query/command)
-        if (skip_query_str_print)
-        {
-            /* For specific internal queries, reset logger instead of printing */
-            ////jason: well maybe don't reset, this would mess up some timings for citus dist transactions
-            logger_reset();
-        }
-        else
-        {
-            logger_print_timings();
-        }
+	        HOMER_POSTGRES_PERF_DIAG(
+				if (skip_query_str_print)
+				{
+					/* For specific internal queries, reset logger instead of printing */
+					////jason: well maybe don't reset, this would mess up some timings for citus dist transactions
+					logger_reset();
+				}
+				else
+				{
+					logger_print_timings();
+				});
     } /* end of input-reading loop */
 }
 

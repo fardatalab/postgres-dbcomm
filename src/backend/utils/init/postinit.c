@@ -1502,10 +1502,19 @@ ThereIsAtLeastOneRole(void)
  * remote-exec backend. This keeps ordinary backend startup quiet while making
  * it obvious which InitPostgres phase still assumes a frontend Port-backed
  * backend shape.
+ *
+ * The trace is compile-time disabled for performance builds because transaction
+ * benchmarks can create many remote-exec backends while we are still iterating
+ * on process lifecycle behavior.
  */
+#ifndef HOMER_REMOTE_EXEC_STARTUP_TRACE
+#define HOMER_REMOTE_EXEC_STARTUP_TRACE 0
+#endif
+
 static void
 RemoteExecInitPostgresTrace(const char *stage)
 {
+#if HOMER_REMOTE_EXEC_STARTUP_TRACE
 	if (!AmRemoteExecBackendProcess())
 	{
 		return;
@@ -1513,4 +1522,7 @@ RemoteExecInitPostgresTrace(const char *stage)
 
 	fprintf(stderr, "remote exec backend: InitPostgres stage=%s\n", stage);
 	fflush(stderr);
+#else
+	(void) stage;
+#endif
 }

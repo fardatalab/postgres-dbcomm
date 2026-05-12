@@ -28,9 +28,13 @@ endif
 pgbench = executable('pgbench',
   pgbench_sources,
   dependencies: [frontend_code, libpq, thread_dep],
-  include_directories: include_directories('.'),
+  include_directories: [
+    include_directories('.'),
+    include_directories('/data/dbcomm/pg-citus/include/postgresql/server'),
+  ],
   c_pch: pch_postgres_fe_h,
   c_args: host_system == 'windows' ? ['-DFD_SETSIZE=1024'] : [],
+  link_args: ['/data/dbcomm/pg-citus/lib/x86_64-linux-gnu/libhomer_client.a'],
   kwargs: default_bin_args,
 )
 bin_targets += pgbench

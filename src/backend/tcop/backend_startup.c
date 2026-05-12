@@ -42,6 +42,23 @@
 bool		Trace_connection_negotiation = false;
 remote_exec_backend_main_hook_type remote_exec_backend_main_hook = NULL;
 
+/*
+ * HOMER_REMOTE_EXEC_STARTUP_TRACE is a compile-time switch for socketless
+ * backend bootstrap breadcrumbs. Keep it off for benchmark builds; enable it
+ * with -DHOMER_REMOTE_EXEC_STARTUP_TRACE=1 when debugging backend launch.
+ */
+#ifndef HOMER_REMOTE_EXEC_STARTUP_TRACE
+#define HOMER_REMOTE_EXEC_STARTUP_TRACE 0
+#endif
+
+#if HOMER_REMOTE_EXEC_STARTUP_TRACE
+#define HOMER_REMOTE_EXEC_STARTUP_LOG(...) fprintf(stderr, __VA_ARGS__)
+#define HOMER_REMOTE_EXEC_STARTUP_LOG_FLUSH() fflush(stderr)
+#else
+#define HOMER_REMOTE_EXEC_STARTUP_LOG(...) ((void) 0)
+#define HOMER_REMOTE_EXEC_STARTUP_LOG_FLUSH() ((void) 0)
+#endif
+
 static void BackendInitialize(ClientSocket *client_sock, CAC_state cac);
 static int	ProcessSSLStartup(Port *port);
 static int	ProcessStartupPacket(Port *port, bool ssl_done, bool gss_done);
@@ -181,10 +198,10 @@ RemoteExecBackendMain(char *startup_data, size_t startup_data_len)
 	MyBackendType = B_REMOTE_EXEC_BACKEND;
 	init_ps_display("remote exec backend");
 	SetProcessingMode(InitProcessing);
-	fprintf(stderr,
+	HOMER_REMOTE_EXEC_STARTUP_LOG(
 			"remote exec backend: entered child shell startup_bytes=%zu\n",
 			startup_data_len);
-	fflush(stderr);
+	HOMER_REMOTE_EXEC_STARTUP_LOG_FLUSH();
 
 	if (PostAuthDelay > 0)
 		pg_usleep(PostAuthDelay * 1000000L);
@@ -213,8 +230,8 @@ RemoteExecBackendMain(char *startup_data, size_t startup_data_len)
 
 	InitProcess();
 	BaseInit();
-	fprintf(stderr, "remote exec backend: init process/base init complete\n");
-	fflush(stderr);
+	HOMER_REMOTE_EXEC_STARTUP_LOG("remote exec backend: init process/base init complete\n");
+	HOMER_REMOTE_EXEC_STARTUP_LOG_FLUSH();
 
 	if (remote_exec_backend_main_hook == NULL)
 	{
@@ -223,8 +240,8 @@ RemoteExecBackendMain(char *startup_data, size_t startup_data_len)
 				 errmsg("no remote exec backend hook was registered")));
 	}
 
-	fprintf(stderr, "remote exec backend: invoking extension main hook\n");
-	fflush(stderr);
+	HOMER_REMOTE_EXEC_STARTUP_LOG("remote exec backend: invoking extension main hook\n");
+	HOMER_REMOTE_EXEC_STARTUP_LOG_FLUSH();
 	remote_exec_backend_main_hook(startupDataCopy, startup_data_len);
 	proc_exit(0);
 }

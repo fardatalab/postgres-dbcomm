@@ -152,6 +152,41 @@ The current code now reflects that in:
 - The current control mailbox is still one-message-at-a-time. A richer multi-slot control ring is still future work, but it should preserve the same responder-visible publication rule.
 - If later prototypes enable relaxed-ordering MRs or require explicit remote flush semantics, revisit the publication rule explicitly rather than assuming `WRITE_WITH_IMM` alone covers every possible future placement/persistence requirement.
 
+### Observed RDMA response-timeout failure mode
+
+During pgbench transaction smoke testing, a direct single-client transaction
+failed once after the worker-side service had already executed and consumed the
+`TX_BEGIN_ATTACH` completion:
+
+- farnet0 logged `consumed backend command completion session=1 command=tx_begin_attach sequence=1 state=completed`
+- farnet1 then reported `operation=StartRemoteExecutionCommand detail=timed out waiting for RDMA CM event ESTABLISHED`
+- the farnet1 service also logged a best-effort disconnect timeout with
+  `reason=response-timeout`
+
+The most useful interpretation is not “the SQL command failed.” The worker-side
+command completed. The failure was in returning the peer control response to the
+coordinator-side service.
+
+The current code path is:
+
+- worker service handles the peer request in [`TupleSinkServiceProcessIncomingMailboxRequest()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2459)
+- it builds the response and publishes it through [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2166)
+- coordinator service waits for a response in [`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3210)
+- response consumption normally requires [`TupleSinkServiceDrainPeerConnectionEvents()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1938) to observe a `WRITE_WITH_IMM` receive completion before [`TupleSinkServiceTryConsumeLocalMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2116) reads the mailbox
+
+For the current one-message-at-a-time control path, the implementation now has a
+prototype fallback in [`TupleSinkServiceTryConsumeLocalMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2116): if the mailbox tail is visibly newer than the consumed head even though no
+control doorbell has been drained, consume the fixed-width mailbox message by
+tail observation. This relies on same-QP RDMA write ordering: the slot write is
+posted before the tail write, so a visible newer tail implies the slot contents
+are ready for this prototype.
+
+This fallback is not the final concurrency design. It is a narrowly scoped
+single-message control-path robustness measure. The later multi-client/session
+work should revisit whether the command control plane needs a multi-slot ring,
+separate command QPs, explicit service scheduling, or stronger CQ handling
+rather than extending this fallback into a general multiplexing mechanism.
+
 ## Related
 
 - [rdma_transport_control_plane_abstraction.md](rdma_transport_control_plane_abstraction.md): broader transport-layer design space beneath the session/sink abstraction.
