@@ -160,7 +160,7 @@ The important correction is that the final signaled
 wait is not a remote application ACK. It is a local send-completion checkpoint
 for the signaled `RDMA_WRITE_WITH_IMM`. It is still expensive when paid once per
 payload object. The current sender path in
-[`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5153)
+[`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069)
 also uses the local send queue `consumedHead` as both "next object to send" and
 "last object whose source slot may be reused." That is only correct because the
 service waits synchronously before advancing `consumedHead`.
@@ -198,7 +198,7 @@ could overwrite the 64-bit source word before the NIC reads it.
 
 This is a shared substrate improvement. Basebackup and tuple-copy payloads both
 converge in
-[`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5153),
+[`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069),
 so the implementation should not create a basebackup-only fast path.
 
 ### Implementation checkpoint
@@ -206,7 +206,7 @@ so the implementation should not create a basebackup-only fast path.
 The first pipelined checkpoint implementation now batches payload publication in
 the shared sender loop rather than adding basebackup-specific logic:
 
-- [`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5153)
+- [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069)
   computes a bounded batch from backend-published slots, remote receive-ring
   capacity, and `HOMER_SERVICE_PAYLOAD_SEND_COMPLETION_BATCH`.
 - Each object still posts one registered payload write and one
@@ -249,7 +249,7 @@ posting work and learning local source-buffer reuse should become separate
 activities.
 
 The current implementation still has one important serialization point:
-[`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5153)
+[`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069)
 posts at most one bounded batch, waits in
 [`TupleSinkServiceWaitForPeerSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3249),
 then advances `sendQueue.queueControl->consumedHead`. That is much better than
@@ -257,8 +257,8 @@ waiting per object, but the service still stops producing new WRs while it waits
 for the batch checkpoint.
 
 The fuller design should add explicit sender-side frontiers to
-`TupleSinkServiceSinkState` in
-[`tuple_sink_service_process.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:422):
+`HomerServicePayloadStreamEntry` /
+[`HomerPayloadStreamState`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:569):
 
 - `payloadSenderPostedTail`: highest semantic object sequence for which the
   service has posted the payload write and tail doorbell.
@@ -448,7 +448,7 @@ QP limit immediately showed up as too small for the 64-slot basebackup geometry.
 The current payload sender now implements the posted/completed split in the
 shared payload path:
 
-- [`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5199)
+- [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069)
   keeps `payloadSenderPostedTail`, `payloadSenderCompletedHead`, and
   `payloadSenderLastSignaledTail` as sender-side frontiers.
 - `sendQueue.queueControl->consumedHead` remains the backend-visible source-slot
@@ -483,7 +483,7 @@ changed the transport geometry:
   is `63`, intentionally one below the tail-source ring wrap boundary used by
   the current basebackup experiment.
 - When the local source/QP window is full,
-  [`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5405)
+  [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069)
   waits directly for one tagged payload send completion instead of returning
   through the whole service loop. Remote-ring-full still returns to the service
   loop so incoming receiver-head doorbells can be consumed.
@@ -574,7 +574,7 @@ family. It should know only:
 - the semantic sequence range covered by the final tail
 
 The existing sender,
-[`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5199),
+[`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069),
 would still own object-specific validation and transport-header preparation,
 but once it has a contiguous publishable range, it should hand that range to the
 batch RDMA helper instead of posting one object at a time.
@@ -587,7 +587,7 @@ range, then one tail `WRITE_WITH_IMM` for `finalTailSequence`.
 Receiver behavior already mostly matches this model:
 
 - data doorbells are queued by sink id, not by object sequence
-- [`TupleSinkServicePumpIncomingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5726)
+- [`HomerServicePumpIncomingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6576)
   reads the receiver-owned payload-ring tail after consuming a data doorbell
 - it then consumes slots until its local receive head reaches that tail
 
@@ -698,7 +698,7 @@ shared-memory queue rather than RDMA publication itself.
 The batch publication plan has now been implemented in the shared payload
 substrate, without adding a basebackup-specific RDMA data plane:
 
-- [`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5289)
+- [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069)
   still owns semantic-object validation and transport-header preparation. For
   basebackup objects, it validates `CitusRemoteBaseBackupMessageHeader` before
   publication at
@@ -724,7 +724,7 @@ substrate, without adding a basebackup-specific RDMA data plane:
 - The receiver needed no new typed progress or batch object. It already drains
   the receiver-owned payload ring until local consumed head reaches the visible
   published tail in
-  [`TupleSinkServicePumpIncomingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5762),
+  [`HomerServicePumpIncomingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6576),
   and it validates/counts basebackup objects at
   [`tuple_sink_service_process.c:5883`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5883).
 

@@ -14,17 +14,17 @@
 ## Grounding
 
 The current standalone service loop in
-[`main()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8104)
+[`main()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8885)
 hardcodes the order of service progress:
 
 1. local control slots through
-   [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7957)
+   [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8689)
 2. peer-control RDMA mailbox progress through
-   [`TupleSinkServicePumpPeerConnections()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5161)
+   [`TupleSinkServicePumpPeerConnections()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5794)
 3. local socketless-backend completions through
-   [`TupleSinkServiceConsumeAllCompletionMailboxes()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1890)
+   [`TupleSinkServiceConsumeAllCompletionMailboxes()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2429)
 4. every active payload state through
-   [`TupleSinkServicePumpSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6099)
+   [`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6882)
 
 That is a service-progress loop, not yet a scheduler.
 
@@ -35,12 +35,12 @@ The RDMA egress points that need real scheduling are lower:
 - payload range publication through
   [`TupleSinkServicePostPeerRegisteredPayloadBatchWithImmediateRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3486)
 - sender payload batching in
-  [`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5203),
+  [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069),
   especially the open-ended loop at
-  [`tuple_sink_service_process.c:5289`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5289)
+  [`tuple_sink_service_process.c:6288`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6288)
   and the current per-call cap through
   `HOMER_SERVICE_PAYLOAD_SEND_COMPLETION_BATCH` at
-  [`tuple_sink_service_process.c:5506`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5506)
+  [`tuple_sink_service_process.c:6366`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6366)
 
 The current peer transport also shares send-CQ machinery between control writes
 and payload write completions. The payload WR id tagging comment in
@@ -54,11 +54,11 @@ Local control slots are a local control-plane command queue between local actors
 and the Homer service. The actors may be PostgreSQL backends, modified frontend
 clients such as pgbench, or PostgreSQL backend code using the frontend-safe Homer
 client library. The queue is
-[`CitusRemoteExecControlRegion`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:513),
+[`CitusRemoteExecControlRegion`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:549),
 which owns fixed
-[`CitusRemoteExecControlSlot`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:503)
+[`CitusRemoteExecControlSlot`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:539)
 entries. Request kinds are defined in
-[`CitusRemoteExecControlRequestKind`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:54):
+[`CitusRemoteExecControlRequestKind`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:56):
 open session, close session, report post-command state, start command, and poll
 command completion.
 
@@ -68,14 +68,14 @@ peer open, close sink, start command, poll command completion, and open command
 session. The transport implementation currently publishes those fixed-width
 messages over a persistent RDMA control mailbox; the one-message-at-a-time
 mailbox rule is documented in
-[`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2553).
+[`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2563).
 
 Backend completions are the local socketless-backend-to-service completion path.
 The service publishes exactly one command record into a session command mailbox
 through
-[`TupleSinkServicePublishLocalCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2033),
+[`TupleSinkServicePublishLocalCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2576),
 and later consumes the backend's completion mailbox through
-[`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1777).
+[`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2273).
 
 ## Target Peer-Control Substrate
 
@@ -96,7 +96,7 @@ The target substrate should provide:
 
 - multi-slot RDMA-registered peer-control rings, replacing the single fixed
   mailbox slot described by
-  [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2553)
+  [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2563)
 - compact fixed-width control records containing at least request kind,
   session id, request sequence/id, response-routing metadata, and payload length
   or inline payload fields
@@ -156,7 +156,7 @@ completion), so a single slot or two-slot event record is not a safe handoff.
   backend or remote service.
 - if the command completes immediately, the start response may still carry the
   terminal completion as it does today through
-  [`CitusRemoteExecStartCommandResponse.commandCompletion`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:452)
+  [`CitusRemoteExecStartCommandResponse.commandCompletion`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:494)
 - if the command completes later on a local frontend session, the service should
   publish a terminal completion event into a caller-visible per-session
   completion mailbox and signal the waiting side, rather than requiring the
@@ -167,19 +167,19 @@ completion), so a single slot or two-slot event record is not a safe handoff.
 
 The local backend-to-service path is already close to push. The backend writes a
 fixed-width
-[`CitusRemoteExecCommandCompletion`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:412)
+[`CitusRemoteExecCommandCompletion`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:422)
 into
-[`CitusRemoteExecLocalCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_backend_protocol.h:141)
+[`CitusRemoteExecLocalCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_backend_protocol.h:146)
 and bumps `publishedEpoch` in
-[`PublishCompletionToMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1013).
+[`PublishCompletionToMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:271).
 The service then observes that epoch in
-[`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1777).
-That part does not require a caller-submitted poll request. The poll-like
-scaffolding is higher level: local clients call
-[`TupleSinkServiceHandlePollCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7513)
-or peer services call
-[`TupleSinkServiceHandlePeerPollCommandCompletionRequest()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7897)
-to ask the service to serialize the latest terminal state.
+[`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2273).
+That part does not require a caller-submitted poll request. The remaining
+poll-like scaffolding is higher level: local clients can still fall back to
+[`TupleSinkServiceHandlePollCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8237)
+for compatibility/debugging, and peer services still call
+[`TupleSinkServiceHandlePeerPollCommandCompletionRequest()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8620)
+until the peer completion ring exists.
 
 For peer command completion, replacing the peer poll request in
 [`CitusRemoteExecPeerRequestKind`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_peer_control_protocol.h:40)
@@ -192,7 +192,7 @@ Concrete no-poll plan:
 
 1. **Keep one in-flight command per local frontend session.** Preserve the
    single-slot command mailbox invariant documented by
-   [`TupleSinkServicePublishLocalCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2029).
+   [`TupleSinkServicePublishLocalCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2576).
    This keeps the first local push-completion implementation simple and avoids
    adding a local frontend control queue before there is true command
    pipelining.
@@ -206,12 +206,12 @@ Concrete no-poll plan:
    not need a later poll request to discover where terminal state should appear.
 
 3. **On visible local completion, publish to the bound consumer.** After
-   [`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1777)
+   [`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2273)
    observes `STARTED`, `COMPLETED`, or `FAILED`, the service should copy the
    fixed-width `CitusRemoteExecCommandCompletion` into the bound caller-visible
    completion ring and publish it with an epoch/doorbell. This replaces the
    local-client branch in
-   [`TupleSinkServiceHandlePollCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7549).
+   [`TupleSinkServiceHandlePollCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8237).
 
 4. **Use a peer completion ring for service-to-service push completion.** Peer
    completions are responder-initiated events, so they can arrive independently
@@ -250,51 +250,54 @@ push-completion target, not merely as an optional optimization afterthought.
 Implementation progress on the merged client-SQL/basebackup branch:
 
 - local frontend push completion is implemented with the 8-slot
-  [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:441)
+  [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:458)
 - backend-to-service completion is also an 8-slot
-  [`CitusRemoteExecLocalCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_backend_protocol.h:141);
+  [`CitusRemoteExecLocalCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_backend_protocol.h:146);
   the earlier single-slot backend completion mailbox was not correct once SQL
   result materialization could publish `STARTED` and terminal states close
   together
 - the service publishes `STARTED`, `COMPLETED`, and `FAILED` local client
   completions through
-  [`TupleSinkServicePublishClientCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1378)
+  [`TupleSinkServicePublishClientCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1620)
 - frontend clients map and observe the mailbox through
-  [`HomerClientOpenCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:397),
-  [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1473),
-  and [`HomerClientWaitCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1547)
+  [`HomerClientOpenCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:520),
+  [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:2033),
+  and [`HomerClientWaitCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:2148)
 - pgbench now waits for terminal completion through
-  [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1473)
-  at [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3555)
+  [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:2033)
+  at [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3731)
   instead of issuing a `POLL_COMMAND_COMPLETION` request
 - service-to-service peer push completion is still future work and still needs
   the fixed-size peer completion ring described above
 
 ## Client SQL wait-loop fix
 
-Implementation progress: the local client SQL wait no longer consumes only the
-target completion mailbox. The service now has an internal
-[`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8349)
+Implementation progress: the old masked local client SQL wait is now a
+transitional compatibility/debug helper, not the measured pgbench path. The
+service has an internal
+[`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8776)
 progress helper with explicit masks. The main loop calls it with
-[`TUPLE_SINK_SERVICE_PUMP_MAIN_LOOP`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:558)
+[`TUPLE_SINK_SERVICE_PUMP_MAIN_LOOP`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:703)
 at
-[`main()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8512),
+[`main()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8942),
 covering local control, peer control, all backend completions, sink/payload
 progress, and the heartbeat.
 
-[`TupleSinkServiceWaitForLocalCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2485)
-still keeps the command's own completion mailbox check on every spin for the
-single-client pgbench hot path. It now also runs a periodic background
-[`TUPLE_SINK_SERVICE_PUMP_LOCAL_WAIT_BACKGROUND`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:570)
+[`TupleSinkServiceWaitForLocalCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2796)
+is still present in the source, but it is no longer called by the local
+client-SQL `START_COMMAND` branch. If used by an older local synchronous path,
+it keeps the command's own completion mailbox check on every spin and also runs
+a periodic background
+[`TUPLE_SINK_SERVICE_PUMP_LOCAL_WAIT_BACKGROUND`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:715)
 pump at
-[`tuple_sink_service_process.c:2539`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2539).
-That background pump drains all completion mailboxes and active sink/payload
+[`tuple_sink_service_process.c:2850`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2850).
+That background pump drains all completion mailboxes and active payload-stream
 work, including deferred close/reclaim paths reached through
-[`TupleSinkServicePumpSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6335).
-The cadence is controlled by
+[`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6882).
+That fallback cadence is controlled by
 [`HOMER_SERVICE_LOCAL_WAIT_BACKGROUND_PUMP_INTERVAL`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:114),
-currently `64`, so the common pgbench path does not scan all 64 sessions and
-64 sinks on every spin.
+currently `64`, so a synchronous fallback path would not scan all 64 sessions
+and 64 sinks on every spin.
 
 Important scoped limitation: peer-control acceptance is still deliberately
 excluded from the local wait. A peer `START_COMMAND` handler can itself need
@@ -309,8 +312,9 @@ Completed parts of the earlier plan:
 
 1. `TupleSinkServicePumpOnce(mask)` exists.
 2. the main loop uses the full mask.
-3. the local client SQL wait keeps local control disabled and periodically
-   pumps non-control background work.
+3. the local client SQL `START_COMMAND` branch now avoids the wait entirely for
+   the measured pgbench path; the fallback wait keeps local control disabled and
+   periodically pumps non-control background work.
 4. early-child-exit detection remains in the local wait, after normal completion
    checks and the periodic background pump.
 
@@ -322,27 +326,29 @@ Still deferred:
 
 This masked helper is a transitional implementation, not the target
 architecture. The deeper issue is not "which flags are safe in a nested wait";
-it is that local and peer command handlers can block while waiting for backend
-startup or terminal completion. The target design below should remove that
-nested wait from the hot path rather than making the mask policy more complex.
+it is that command handlers should not block while waiting for backend startup
+or terminal completion. The local frontend path now follows that rule; the peer
+path still needs the same treatment.
 
 ## Async command submission and pushed state events
 
 The cleaner next design is to make `START_COMMAND` submission nonblocking for
 both local frontend sessions and service-to-service peer sessions.
 
-Current blocking shape:
+Current shape:
 
-- [`TupleSinkServiceHandleStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7539)
-  publishes a command to a socketless backend and then waits for startup or
-  terminal completion.
-- Local client SQL waits in
-  [`TupleSinkServiceWaitForLocalCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2485).
-- Peer command startup waits in
-  [`TupleSinkServiceWaitForCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2341).
-- The service therefore sometimes needs to make progress while already inside a
-  request handler, which forced the masked `TupleSinkServicePumpOnce()` helper
-  and still leaves peer-control acceptance excluded from local waits.
+- [`TupleSinkServiceHandleStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7997)
+  now has a submit-only local client-SQL branch: it publishes the command to the
+  socketless backend and returns `PENDING`; `STARTED` and terminal states are
+  pushed later through the frontend completion mailbox.
+- [`TupleSinkServiceWaitForLocalCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2796)
+  remains in the source for compatibility/debug paths and older local command
+  shapes, but the measured pgbench path no longer depends on it.
+- Peer command startup still waits in
+  [`TupleSinkServiceWaitForCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2701).
+- The remaining nested-wait issue is therefore mostly the service-to-service
+  peer command path. The local pgbench path has moved to pushed completion, but
+  peer push completion still needs the fixed-size peer completion ring.
 
 Target nonblocking shape:
 
@@ -352,15 +358,15 @@ Target nonblocking shape:
    immediately.
 2. Backend `STARTED`, `COMPLETED`, and `FAILED` state remains authoritative in
    the session-owned completion mailbox consumed by
-   [`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1989).
+   [`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2273).
 3. The normal top-level service loop consumes backend state and pushes events to
    the appropriate caller-visible completion channel:
    - local frontend: the existing small-ring
-     [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:441)
+     [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:458)
    - peer service: the future fixed-size peer completion ring
 4. A row-producing SQL command publishes a `STARTED` event with result-sink
    readiness once
-   [`RemoteExecSqlDestStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:454)
+   [`RemoteExecSqlDestStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:678)
    has created/bound the result sink. The frontend/peer can then drain payload
    while the backend keeps executing.
 5. Terminal `COMPLETED` / `FAILED` events are pushed later, independent of the
@@ -371,7 +377,7 @@ Target nonblocking shape:
 Why this removes the peer-control acceptance issue:
 
 - peer-control requests are accepted only from the normal top-level
-  [`TupleSinkServicePumpPeerConnections()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5394)
+  [`TupleSinkServicePumpPeerConnections()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5786)
   path
 - peer `START_COMMAND` handling returns after publishing work and does not enter
   its own startup wait
@@ -379,12 +385,11 @@ Why this removes the peer-control acceptance issue:
 - there is no nested service-progress context that has to decide whether local
   control, peer control, or sinks are safe to pump
 
-This design means `TupleSinkServiceWaitForLocalCommandStartup()` should
-eventually disappear from the local client SQL path, and
-`TupleSinkServiceWaitForCommandStartup()` should disappear from the peer command
-path. A small synchronous helper may remain only for debug or explicitly
-blocking control operations, not for the normal pgbench/basebackup data-plane
-workload.
+This design means `TupleSinkServiceWaitForLocalCommandStartup()` should stay out
+of the normal local client SQL path, and `TupleSinkServiceWaitForCommandStartup()`
+should disappear from the peer command path. A small synchronous helper may
+remain only for debug or explicitly blocking control operations, not for the
+normal pgbench/basebackup data-plane workload.
 
 Implementation steps:
 
@@ -393,11 +398,12 @@ Implementation steps:
    response with `commandState=PENDING` means accepted-not-started
 2. change local `START_COMMAND` handling to publish the backend command and
    return immediately; do not call `TupleSinkServiceWaitForLocalCommandStartup()`
+   in the measured pgbench path. **Done.**
 3. change peer `START_COMMAND` handling to publish the backend command and return
    immediately; do not call `TupleSinkServiceWaitForCommandStartup()`
 4. make client/pgbench wait exclusively on pushed `STARTED` and terminal events
    via `HomerClientTryCommandCompletion()` /
-   `HomerClientWaitCommandCompletion()`
+   `HomerClientWaitCommandCompletion()`. **Done for local frontend sessions.**
 5. add the peer completion ring and make peer command callers wait on that ring
    instead of issuing `POLL_COMMAND_COMPLETION`
 6. keep result-sink draining driven by `STARTED` readiness metadata, then terminal
@@ -412,52 +418,211 @@ and later scheduling all happen in the top-level service loop.
 
 ## Neutral payload stream state
 
-`TupleSinkServiceSinkState` is overloaded. It currently combines:
+Status as of May 14, 2026: the neutral payload stream abstraction milestone is
+implemented in the service process, and the first internal naming cleanup is
+done. The service table entry and payload pump functions now use neutral
+`HomerServicePayloadStream*` names. Some control-protocol fields and header
+names still say "sink" because the wire protocol started as the tuple-view path,
+but the framework split is in place: generic queue/RDMA stream state is separate
+from tuple-view metadata and basebackup-specific accounting.
+
+Before the May 14, 2026 neutral-stream refactor, `TupleSinkServiceSinkState`
+was overloaded. It combined:
 
 - generic queue/RDMA payload-stream state
-- tuple-specific `CitusTupleViewContract`
+- tuple-specific `CitusTupleSinkKey` and `CitusTupleViewContract`
 - basebackup-specific semantic branch state
 
-The tuple contract field lives in
-[`TupleSinkServiceSinkState.tupleViewContract`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:435).
-Basebackup does not need it. The current implementation works around that by
-detecting `baseBackupOpen` in
-[`TupleSinkServiceHandleOpenSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6387)
-and skipping tuple contract validation at
-[`tuple_sink_service_process.c:6469`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6469).
+The code now has an embedded neutral payload stream in the service table entry
+[`HomerServicePayloadStreamEntry`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:668).
+The generic container is
+[`HomerPayloadStreamState`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:569),
+tuple-family metadata is in
+[`HomerTupleViewPayloadState`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:629),
+and basebackup-family receiver accounting is in
+[`HomerBaseBackupPayloadState`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:652).
+The service derives and caches the payload object family at stream-open time via
+[`TupleSinkServicePayloadFamilyForOpKind()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:795)
+instead of branching directly on the higher-level remote-execution op kind in
+the hot payload path.
 
-That is acceptable scaffolding but not a good framework abstraction.
+"Tuple sink" should describe only the tuple-view object family, while the common
+container should be a neutral Homer payload stream. The remaining future cleanup
+is protocol/API surface: control request fields, protocol/header names, and
+client-facing "serviceSinkId" terminology still need a separate wire/API cleanup.
 
 Target split:
 
 ```c
-HomerPayloadStreamState
+typedef enum HomerPayloadObjectFamily
 {
-    queue geometry;
-    peer binding;
-    RDMA memory handles;
-    sender/receiver frontiers;
-    scheduler metadata;
-}
+    HOMER_PAYLOAD_OBJECT_FAMILY_TUPLE_VIEW_BATCH,
+    HOMER_PAYLOAD_OBJECT_FAMILY_BASE_BACKUP_STREAM,
+    HOMER_PAYLOAD_OBJECT_FAMILY_WAL_STREAM,
+} HomerPayloadObjectFamily;
 
-HomerPayloadObjectFamilyOps
+typedef struct HomerPayloadStreamState
 {
-    validate_local_object();
-    validate_remote_object();
-    object_bytes();
-    describe_for_debug();
-}
+    /* Generic stream/container state, not tuple-specific state. */
+    uint64_t streamId;
+    uint64_t parentServiceSessionId;
+    uint32_t slotCount;
+    uint32_t slotCapacityBytes;
+
+    TupleSinkServiceQueueMapping sendQueue;
+    TupleSinkServiceQueueMapping receiveQueue;
+    TupleSinkServicePayloadRingState localReceivePayloadRing;
+    TupleSinkServicePayloadHeadMirrorState localSenderHeadMirror;
+    TupleSinkServicePeerMemoryRegionHandle *sendQueueMemoryRegionHandle;
+    CitusTupleSinkPayloadRingDescriptor peerReceivePayloadRing;
+    CitusTupleSinkPayloadHeadMirrorDescriptor peerSenderHeadMirror;
+
+    bool peerBindingActive;
+    bool peerBindingLocallyInitiated;
+    bool localPeerClosePending;
+    bool receivedPeerClosePending;
+    bool payloadTransportBroken;
+    bool receivePayloadDoorbellPending;
+
+    uint64_t peerServiceSessionId;
+    uint64_t peerServiceStreamId;
+    int32_t peerNodeId;
+    uint32_t peerControlPort;
+    TupleSinkServicePeerConnectionHandle *peerConnectionHandle;
+    char peerHost[CITUS_REMOTE_EXEC_CONTROL_HOST_BYTES];
+
+    uint64_t senderVisibleRemoteConsumedHead;
+    uint64_t payloadSenderPostedTail;
+    uint64_t payloadSenderCompletedHead;
+    uint64_t payloadSenderLastSignaledTail;
+
+    /* Later scheduler metadata: traffic class, priority, weight, grant caps. */
+} HomerPayloadStreamState;
+```
+
+Family-specific state should sit beside that generic stream state:
+
+```c
+typedef struct HomerTupleViewPayloadState
+{
+    CitusTupleSinkKey sinkKey;
+    CitusTupleViewContract tupleViewContract;
+} HomerTupleViewPayloadState;
+
+typedef struct HomerBaseBackupPayloadState
+{
+    uint64_t receivedObjects;
+    uint64_t receivedPayloadBytes;
+    uint64_t lastArchiveIndex;
+} HomerBaseBackupPayloadState;
 ```
 
 Then object families become:
 
-- `TUPLE_VIEW_BATCH`: owns `CitusTupleViewContract` and tuple batch validation
-- `BASE_BACKUP_STREAM`: owns `CitusRemoteBaseBackupMessageHeader` validation and
-  basebackup byte accounting
+- `TUPLE_VIEW_BATCH`: owns `CitusTupleSinkKey`, `CitusTupleViewContract`, tuple
+  batch validation, and receive-side tuple-view decode
+- `BASE_BACKUP_STREAM`: owns `CitusRemoteBaseBackupMessageHeader` validation,
+  basebackup byte accounting, and later receiver-side materialization
 - later `WAL_STREAM` or other DB-semantic byte/object streams
 
-The common payload stream is still the RDMA/ring container. Tuple sinks become
-one object family on that container, not the name of the container itself.
+The common payload stream remains the RDMA/ring container. Tuple views become
+one object family on that container, not the container abstraction.
+
+Implementation migration:
+
+1. Keep the existing service table entry temporarily, but embed
+   `HomerPayloadStreamState stream` in it. This made the first patch a
+   structural split, not a global rename. **Done**, and the table entry is now
+   named
+   [`HomerServicePayloadStreamEntry`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:668).
+2. Move generic fields from
+   [`HomerServicePayloadStreamEntry`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:668)
+   into `stream`: queue mappings, slot geometry, peer binding, RDMA handles,
+   sender/receiver frontiers, doorbell state, transport-broken state, and future
+   scheduler metadata. **Done, except future scheduler fields are still future.**
+3. Move tuple-only fields into `HomerTupleViewPayloadState`, and move
+   basebackup counters currently at
+   [`HomerBaseBackupPayloadState`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:652).
+   **Done.**
+4. Add a cached `HomerPayloadObjectFamily` field. Do not use
+   `semanticOpKind` as the long-term dispatch primitive; map session op kind to
+   object family at open time. **Done** through
+   [`TupleSinkServicePayloadFamilyForOpKind()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:795).
+5. Refactor sender validation now embedded in
+   [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069)
+   into family-specific helpers that validate the in-place object header and
+   return the exact byte range to RDMA-write. **Done** in
+   [`HomerServiceValidateOutgoingPayloadObject()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5843).
+6. Refactor receiver validation and consumption now embedded in
+   [`HomerServicePumpIncomingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6576)
+   into family-specific helpers. Tuple-view consumption still decodes into the
+   receive queue; basebackup consumption still blackholes/counts until a real
+   materializer lands. **Done** in
+   [`HomerServiceValidateReceivedPayloadObject()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5961).
+7. Refactor local basebackup smoke consumption currently in
+   [`HomerServicePumpLocalBaseBackupBlackhole()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6489)
+   to call the same basebackup object-family validation/counting helper. **Done**
+   with shared accounting in
+   [`HomerServiceRecordBaseBackupPayloadObject()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5942).
+8. Rename the outer table entry and pump functions only after the embedded
+   stream split is stable. **Done** with `HomerServicePayloadStreamEntry`,
+   [`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6882),
+   [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069),
+   and
+   [`HomerServicePumpIncomingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6576).
+9. Leave protocol/header file renames for a later cleanup. The first goal is to
+   fix the framework abstraction without mixing it with broad mechanical churn.
+   **Still future.**
+
+Hot-path dispatch decision:
+
+- Use enum + `switch` dispatch in the payload pump hot path, not a per-object
+  function-pointer ops table.
+- A function-pointer ops table is cleaner for extensibility but adds an
+  indirect call and pointer load, blocks normal inlining, and is harder to reason
+  about for small tuple/result objects.
+- A cached enum branch is highly predictable because a stream's object family is
+  fixed at open time. The switch should be placed once per pump or per batch when
+  practical, not inside per-byte loops.
+- Cold/control paths may still use helper tables or named helper functions for
+  readability, but the normal data path should stay direct and compiler-visible.
+
+Implementation progress on May 14, 2026:
+
+- The neutral-state split is implemented in the service process without changing
+  external control protocol names. Generic stream fields now live under
+  [`HomerPayloadStreamState`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:569);
+  tuple-view state lives under
+  [`HomerTupleViewPayloadState`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:629);
+  basebackup counters live under
+  [`HomerBaseBackupPayloadState`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:652).
+- The hot helpers are `static inline`; the subagent performance review flagged
+  this explicitly to avoid function-pointer-like per-object call overhead.
+- The local basebackup smoke path now uses the same basebackup object-family
+  validator/accounting helper as the RDMA receive path and avoids clearing the
+  full error buffer per object.
+- Follow-up performance investigation showed the apparent pgbench regression was
+  dominated by benchmark state, not the neutral stream abstraction:
+  `pgbench_history` had grown to roughly 5.5M rows. After truncating
+  `pgbench_history` and vacuuming the pgbench tables, single-client Homer
+  pgbench recovered to the previous band with repeats at `6033 TPS`, `7329 TPS`,
+  and `7333 TPS`.
+- A real hot-path cleanup also moved client-SQL result material copying to a
+  session-owned reusable tuple slot in
+  [`RemoteExecEnsureSessionResultCopySlot()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:580),
+  so [`RemoteExecSqlDestStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:678)
+  no longer allocates a fresh copy slot per command. After that cleanup and a
+  benchmark reset, single-client Homer pgbench repeats stayed in the `5.6k` to
+  `6.8k TPS` band after restart variance, and a clean c4/j4 run completed at
+  about `15104 TPS` with p99 `0.460 ms`. Local
+  `TARGET 'homer:mode=blackhole,...'` basebackup remained in the previous local
+  blackhole band.
+- A c4 run with `--client-cpu=3` pinned all pgbench worker threads to one CPU
+  and produced false tail-latency stalls (`595 TPS`, p99 `96 ms`). Do not use
+  that single-CPU frontend pinning mode as the multi-client Homer scaling
+  comparison; use no frontend pinning or pgbench
+  [`--client-cpus=LIST`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:1115)
+  so worker threads are assigned round-robin across separate CPUs.
 
 ## Execution lane removal
 
@@ -668,12 +833,14 @@ granting bytes and WRs in addition to object counts.
 
 ## Implementation sequence
 
-1. **Service progress fix**
+1. **Service progress fix - completed as a transitional primitive**
    - introduce `TupleSinkServicePumpOnce(mask)`
    - use it from the main loop and the client SQL local wait loop
    - keep local control disabled while already handling one local control slot
+   - remaining direction: remove nested waits from normal paths rather than
+     expanding the mask policy
 
-2. **Async command submission**
+2. **Async command submission - local frontend completed, peer still future**
    - make local and peer `START_COMMAND` handlers publish work and return
      immediately
    - push `STARTED`, result-sink readiness, `COMPLETED`, and `FAILED` through
@@ -681,10 +848,14 @@ granting bytes and WRs in addition to object counts.
    - remove local and peer startup waits from normal paths
    - add the peer completion ring before deleting peer completion polling
 
-3. **Neutral payload stream refactor**
+3. **Neutral payload stream refactor - completed May 14, 2026**
    - split generic stream state from tuple object-family state
    - move `CitusTupleViewContract` behind tuple object-family state
    - keep basebackup header validation behind a basebackup object-family callback
+   - internal table/pump names now use `HomerServicePayloadStream*`
+   - remaining naming work is protocol/API cleanup: `serviceSinkId`,
+     `CitusTupleSink*` wire structs, and the service binary/header names still
+     reflect the original tuple-only prototype
 
 4. **Scheduler metadata**
    - add explicit `trafficClass`, `priority`, `weight`, and grant hints to
@@ -702,7 +873,7 @@ granting bytes and WRs in addition to object counts.
    - map scheduler class selection to the appropriate QP
    - preserve the existing WRITE_WITH_IMM publication rule per QP/channel
 
-7. **Push command completions**
+7. **Push command completions - local frontend completed, peer still future**
    - keep one in-flight command per session and use a small completion ring for
      the local frontend no-poll implementation
    - bind the local frontend completion destination during session/open setup

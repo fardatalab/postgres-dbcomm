@@ -349,7 +349,7 @@ the current host-service polling model as the final architecture. Today the
 host-side service maps the same queue control block as the backend through
 [`TupleSinkServiceQueueMapping`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:61)
 and polls queue-control words in paths such as
-[`TupleSinkServicePumpOutgoingTuplePayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4787).
+[`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6069).
 With a DPU, that would become repeated DPU DMA reads of host memory. The target
 DPU shape should be event/range based instead: the backend publishes one or more
 slots, notifies the local communication substrate, the DPU reads the new tail
