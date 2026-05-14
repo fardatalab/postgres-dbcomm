@@ -9,7 +9,7 @@
 
 ## Summary
 
-Current state as of May 12, 2026: the first client-to-PostgreSQL transaction milestone is implemented and benchmarked for a single persistent client session. The pgbench-integrated path runs the full built-in TPC-B-like transaction through Homer, including sink-backed materialization/draining for the `SELECT abalance` tuple result, code-level CPU placement, and optional in-process tail-latency reporting. There are two working frontend entry points:
+Current state as of May 13, 2026: the first client-to-PostgreSQL transaction milestone is implemented and benchmarked for a single persistent client session. The pgbench-integrated path runs the full built-in TPC-B-like transaction through Homer, including sink-backed materialization/draining for the `SELECT abalance` tuple result, code-level CPU placement, async local command submission, pushed completion rings, and optional in-process tail-latency reporting. There are two working frontend entry points:
 
 1. the standalone `homer_pgbench` runner, which proved the no-libpq persistent session path in the Citus/dbcomm tree
 2. the upstream `pgbench` integration in the Postgres tree, which reuses pgbench's real script, timing, and reporting machinery while switching workload traffic to Homer only when `--homer` is passed
@@ -43,13 +43,27 @@ Complete for the current single-client simple-mode milestone:
 
 Current measured status on farnet1:
 
+- After the direct session-local command/completion channel patch on May 14,
+  2026, `pgbench --homer -c 4 -j 4 -t 50000` completed `200000/200000`
+  transactions with zero failures at `15783 TPS` in the first long run and
+  `15572 TPS` after a small hot-path consumed-epoch store cleanup. The same
+  binary/placement over libpq completed `200000/200000` at `8477 TPS`. Raw
+  artifacts are under
+  `/data/dbcomm/postgres-citus-separate-comm-stack/tmp/homer_direct_channels_compare_20260514_064556`
+  and
+  `/data/dbcomm/postgres-citus-separate-comm-stack/tmp/homer_direct_channels_after_opt_20260514_064742`.
+- The same direct-channel run shape reported single-client Homer `5991 TPS`
+  and libpq `3994 TPS` for `50000/50000` transactions. This is below the best
+  warm `~6.6k TPS` single-client run from the earlier command-copy pruning pass,
+  but still above the old `~5.1k TPS` milestone and verifies that removing the
+  service relay did not reintroduce the single-client regression.
+- After async local `START_COMMAND` and pushed completion rings landed, 50k-transaction paired runs on May 13, 2026 reported Homer `5131` and `5068 TPS` with p99 `0.212` / `0.215 ms`; libpq reported `3264` and `3435 TPS` with p99 `0.413` / `0.333 ms`. All four runs completed `50000/50000` transactions with zero failures. Raw artifacts are under `/data/dbcomm/postgres-citus-separate-comm-stack/tmp/homer_async_start_ring_final_20260513_130349`.
 - Three 10k-transaction paired runs with code-level pinning averaged about `5076 TPS` for Homer and `3622 TPS` for libpq. Median TPS was about `5101` for Homer and `3791` for libpq.
 - A logged 10k-transaction tail-latency check showed Homer p99 `0.218 ms` and libpq p99 `0.299 ms`; Homer had a worse single max outlier in that run.
 - A 1000-transaction integrated `--latency-percentiles` smoke showed Homer p99 `0.227 ms` and libpq p99 `0.286 ms`.
 
 Still incomplete or intentionally scoped out:
 
-- concurrent Homer clients / multiple sessions
 - prepared-mode pgbench and typed prepare/bind/execute commands
 - reconnect mode and retry mode in Homer
 - `\gset`, `\aset`, pipeline meta-commands, and broad pgbench script compatibility
@@ -93,17 +107,21 @@ The frontend API has been split out of the standalone runner:
 - [`HomerClientOpenControl()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:136) maps the service control shared memory without `PGconn`, backend memory contexts, or `ereport`.
 - [`HomerClientReserveControlSlot()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:248) reserves one fixed-width control slot with atomics.
 - [`HomerClientSubmitControlRequest()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:374) publishes the request and validates the fixed-width response.
-- [`HomerClientPollCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:659) consumes command completion metadata from the service.
+- [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1485) consumes pushed command completion metadata from the per-session frontend completion ring. [`HomerClientPollCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1612) remains as compatibility scaffolding, but the local frontend path no longer submits a completion-poll control request.
 - [`HomerClientOpenResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:946), [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1054), and [`HomerClientCloseResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1031) map, drain, and close the backend-produced tuple-result sink named by command completion metadata.
 - [`HomerClientCloseSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:496) remains a public control-plane close API; the service translates it into the internal typed `CLIENT_SQL_SESSION_CLOSE` command when a persistent socketless backend is active.
 
 The API still exposes the current one-command-at-a-time semantics. That is intentional for the single-client milestone; command pipelining and concurrent sessions remain separate design work.
 
+Update: multi-client pgbench now works for the local client-SQL path with one
+Homer session per pgbench client. It is still one command in flight per session;
+command pipelining remains future work.
+
 ### Pgbench integration
 
 - [`homer_mode`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:274) is an opt-in transport switch. The default `PGconn` / libpq path remains unchanged unless `--homer` is present.
 - [`CState.homer_session`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:609) and [`TState.homer_control`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:676) add Homer state beside pgbench's original libpq connection state.
-- [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3249) is the synchronous adapter from pgbench's one-command-at-a-time execution to `HomerClientStartCommand()` / `HomerClientPollCommand()`. It opens and drains a result sink when the backend publishes `CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY`.
+- [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3396) is the synchronous adapter from pgbench's one-command-at-a-time execution to `HomerClientStartCommandWithCompletionFlags()` plus pushed completion reads. It opens and drains a result sink when the backend publishes `CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY`.
 - [`sendHomerCommand()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3390) maps exact `BEGIN`, `COMMIT` / `END`, and `ROLLBACK` SQL text to typed Homer lifecycle commands. Ordinary SQL is sent as `CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE`.
 - [`HomerSqlLooksRowProducing()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3230) requests tuple-result mode for `SELECT`, `WITH`, and `VALUES` statements. This covers the built-in pgbench `SELECT abalance` command without hard-coding the `(abalance int8)` shape.
 - [`sendCommand()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3507) branches to Homer only in `--homer` mode; the existing `PQsendQuery()`, `PQsendQueryParams()`, and `PQsendQueryPrepared()` branches remain the normal behavior.
@@ -117,11 +135,11 @@ The pgbench integration intentionally rejects unsupported paths at startup: non-
 
 ### Service-side local client session path
 
-- [`TupleSinkServiceHandleOpenCommandSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5402) accepts `CITUS_REMOTE_EXEC_OP_CLIENT_SQL_SESSION` as a command-session operation without requiring a peer RDMA endpoint.
-- [`TupleSinkServiceHandleStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6226) routes client SQL sessions locally through session-owned command/completion mailboxes instead of peer-control RDMA.
-- [`TupleSinkServiceWaitForLocalCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1898) waits for the spawned socketless backend completion without recursively pumping the same local control slot that is currently being handled.
-- [`TupleSinkServiceSessionShouldRetireWhenIdle()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3320) treats `FORCE_FRESH` as command-session open-time allocation policy. For `CITUS_REMOTE_EXEC_OP_CLIENT_SQL_SESSION`, it no longer retires on `TX_COMMIT` / `TX_ABORT`; it retires on explicit close, failure, or backend-reported non-reuse.
-- [`TupleSinkServiceHandleCloseSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5953) sends `CLIENT_SQL_SESSION_CLOSE` to the socketless backend before unlinking the session mailboxes.
+- [`TupleSinkServiceHandleOpenCommandSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6568) accepts `CITUS_REMOTE_EXEC_OP_CLIENT_SQL_SESSION` as a command-session operation without requiring a peer RDMA endpoint.
+- [`TupleSinkServiceHandleStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7539) routes client SQL sessions locally through session-owned command/completion mailboxes instead of peer-control RDMA.
+- Local client SQL `START_COMMAND` is now submit-only. [`TupleSinkServiceHandleStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7539) publishes the backend command, returns accepted/PENDING state, and relies on the normal service loop to push later `STARTED` / terminal completion events. [`TupleSinkServiceWaitForLocalCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2485) remains only for compatibility close/debug-style blocking paths, not the measured pgbench command path.
+- [`TupleSinkServiceSessionShouldRetireWhenIdle()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3957) treats `FORCE_FRESH` as command-session open-time allocation policy. For `CITUS_REMOTE_EXEC_OP_CLIENT_SQL_SESSION`, it no longer retires on `TX_COMMIT` / `TX_ABORT`; it retires on explicit close, failure, or backend-reported non-reuse.
+- [`TupleSinkServiceHandleCloseSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7152) sends `CLIENT_SQL_SESSION_CLOSE` to the socketless backend before unlinking the session mailboxes.
 
 The startup-wait and retirement fixes are important implementation corrections. Without them, the service could either re-enter the active request slot or retire the fresh session immediately after `CLIENT_SQL_TX_BEGIN`.
 
@@ -174,6 +192,7 @@ Performance build flags to preserve:
 - [`HOMER_REMOTE_EXEC_STARTUP_TRACE`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/tcop/backend_startup.c:50) and [`HOMER_REMOTE_EXEC_STARTUP_TRACE`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/utils/init/postinit.c:1510) default to `0`. Keep them off unless debugging backend launch.
 - [`HOMER_SERVICE_IDLE_PEER_PUMP_INTERVAL`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:77) defaults to `1024`. This keeps the RDMA peer accept pump periodic when no peer session/sink exists, so local client SQL runs do not enter the RDMA CM event path on every service loop.
 - [`HOMER_SERVICE_BACKEND_EXIT_CHECK_INTERVAL`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:90) defaults to `1024`. This keeps the local backend-exit probe periodic rather than calling `kill(pid, 0)` on every command-wait spin.
+- [`HOMER_SERVICE_LOCAL_WAIT_BACKGROUND_PUMP_INTERVAL`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:114) defaults to `64`. The local client-SQL wait checks the target completion mailbox every spin, but only runs the broader all-session completion and sink/payload pump on this cadence.
 
 Runtime placement knobs:
 
@@ -486,12 +505,156 @@ Confirmed and fixed performance issues:
 
 - [`HomerClientStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:720) used to discard command completion metadata already returned by the service's `START_COMMAND` response. [`HomerClientStartCommandWithCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:581) now exposes that completion, and [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3259) uses it, avoiding a redundant `POLL_COMMAND_COMPLETION` request for short terminal commands.
 - The service now clears `terminalCompletionPendingPeerPoll` when a local `START_COMMAND` response itself carries terminal completion in [`TupleSinkServiceHandleStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6655), so the no-result path does not pay a follow-up poll purely for bookkeeping.
-- [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3277) had a result-sink `STARTED` branch that drained visible rows and then continued without polling terminal completion. That could spin forever on the original `STARTED` completion. It now falls through to [`HomerClientPollCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:742).
+- [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:441) is now the local frontend pushed-completion record. [`TupleSinkServiceEnsureClientCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1576) creates one per `CLIENT_SQL_SESSION`, and [`TupleSinkServicePublishClientCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1378) publishes terminal backend completion into it after [`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1777) consumes backend state.
+- [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_control_protocol.h:442) is now an 8-slot SPSC ring, not a single-slot or two-slot record. The implementation originally tried both; long pgbench runs exposed `commandSequence=0` mismatches because row-producing SQL can publish more than two visible states before the frontend has copied them.
+- [`CitusRemoteExecLocalCompletionMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_backend_protocol.h:141) is also an 8-slot SPSC ring. This second ring is required for the same reason on the backend-to-service hop: the socketless backend can publish sink-ready `STARTED` and terminal `COMPLETED` close together, and the service must consume those images in order before forwarding them to the frontend ring.
+- [`PublishCompletionToMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1012) and [`TupleSinkServicePublishClientCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1439) both reserve the next ring epoch, fill the fixed completion image, and only then publish the epoch with release ordering. The normal path is still allocation-free; a full ring spins instead of overwriting unread state.
+- [`HomerClientOpenCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:397) maps that frontend completion record during session open. [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1473) and [`HomerClientWaitCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1547) observe completion epochs directly; [`HomerClientPollCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1612) remains only as a compatibility wrapper and no longer submits a `POLL_COMMAND_COMPLETION` control request for local frontend sessions.
+- [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3404) now calls [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1473) at [`pgbench.c:3555`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3555), so pgbench can keep draining a result sink while waiting for terminal completion without issuing a completion poll request.
 - [`TupleSinkServicePollForCmEvent()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:460) now trusts the nonblocking RDMA CM event channel and does not add a separate `poll()` syscall. Earlier sampling showed lack of local-control progress while inside this path, but that is not evidence that `rdma_get_cm_event()` itself blocks when configured nonblocking.
 - [`TupleSinkServiceHasActivePeerWork()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4827) and [`TupleSinkServicePumpPeerConnections()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4873) make idle peer pumping periodic when there is no peer command endpoint or peer-bound sink.
-- [`TupleSinkServiceWaitForLocalCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1999) no longer calls `kill(pid, 0)` on every mailbox wait spin; it samples the early-backend-exit check using `HOMER_SERVICE_BACKEND_EXIT_CHECK_INTERVAL`.
+- [`TupleSinkServiceWaitForLocalCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2485) no longer calls `kill(pid, 0)` on every mailbox wait spin; it samples the early-backend-exit check using `HOMER_SERVICE_BACKEND_EXIT_CHECK_INTERVAL`.
+- [`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8349) is now the common service-progress primitive. [`main()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8512) uses the full local-control/peer-control/completion/sink/heartbeat mask, while [`TupleSinkServiceWaitForLocalCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2485) uses a restricted local-wait shape: target completion every spin and the [`TUPLE_SINK_SERVICE_PUMP_LOCAL_WAIT_BACKGROUND`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:570) all-completion/sink pump every `64` spins.
+- Peer-control acceptance remains intentionally excluded from the local client-SQL wait. A peer `START_COMMAND` request can require local control-slot progress during its own startup wait, and the current local request slot is still `REQUEST_READY`; accepting such a peer command here would risk a nested wait that cannot safely pump local control. The remaining future work is a nonblocking/deferred peer-control dispatch mode, not simply adding peer control to the local wait mask.
 - [`HomerClientReserveControlSlot()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:248) no longer clears the large response union on the frontend. The service already clears and owns response publication in [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7219).
 - [`HomerClientCopyCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:425), [`PublishCompletionToMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:837), [`TupleSinkServiceFillCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1093), and [`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1550) now avoid clearing/copying the embedded result queue descriptor and tuple-view contract when `resultFlags == NONE`.
+
+After replacing local frontend completion polling with pushed completion, the
+merged client-SQL/basebackup branch was rebuilt and run with the installed
+Homer service restarted from the new binary:
+
+```text
+artifacts: /data/dbcomm/postgres-citus-separate-comm-stack/tmp/homer_push_completion_20260513_111923
+
+pgbench --homer, 10000 tx, run 1:
+latency average = 0.212 ms
+tps = 4718.890947
+latency p50 = 0.198 ms
+latency p95 = 0.307 ms
+latency p99 = 0.376 ms
+latency max = 5.724 ms
+
+pgbench --homer, 10000 tx, run 2:
+latency average = 0.199 ms
+tps = 5014.605037
+latency p50 = 0.197 ms
+latency p95 = 0.209 ms
+latency p99 = 0.221 ms
+latency max = 5.310 ms
+
+pgbench --homer, 10000 tx, run 3:
+latency average = 0.201 ms
+tps = 4985.691067
+latency p50 = 0.198 ms
+latency p95 = 0.210 ms
+latency p99 = 0.221 ms
+latency max = 5.072 ms
+
+pgbench over libpq, same binary/seeds, 10000 tx:
+run 1: latency average = 0.302 ms, tps = 3312.639276, p99 = 0.326 ms
+run 2: latency average = 0.304 ms, tps = 3292.044511, p99 = 0.325 ms
+run 3: latency average = 0.304 ms, tps = 3294.390345, p99 = 0.329 ms
+```
+
+All six runs processed `10000/10000` transactions with zero failures. The
+steady Homer runs are again near the earlier no-sink `~5k TPS` range even with
+sink-backed `SELECT abalance`; the remaining gap from ideal local command cost
+is now more likely result-sink setup/teardown and per-command control-slot work
+than completion polling.
+
+The first pushed-completion implementation still published a frontend completion
+mailbox record even when the service was still building a `START_COMMAND`
+response that already carried the same terminal completion. That was redundant
+for the one-command-at-a-time pgbench path and added an extra fixed completion
+copy plus epoch store on common commands. The service now suppresses that
+mailbox publish while `peerCommandResponsePending` is true in
+[`TupleSinkServicePublishClientCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1378);
+delayed completions that finish after a `STARTED` response still use the pushed
+completion mailbox.
+
+After that hot-path pruning:
+
+```text
+artifacts: /data/dbcomm/postgres-citus-separate-comm-stack/tmp/homer_push_completion_optimized_20260513_120609
+
+pgbench --homer, 10000 tx:
+run 1: latency average = 0.226 ms, tps = 4423.226717, p99 = 0.288 ms
+run 2: latency average = 0.197 ms, tps = 5072.323728, p99 = 0.214 ms
+run 3: latency average = 0.198 ms, tps = 5058.360838, p99 = 0.214 ms
+
+pgbench over libpq, same binary/seeds, 10000 tx:
+run 1: latency average = 0.306 ms, tps = 3272.291998, p99 = 0.333 ms
+run 2: latency average = 0.305 ms, tps = 3280.641851, p99 = 0.329 ms
+run 3: latency average = 0.303 ms, tps = 3296.053865, p99 = 0.329 ms
+
+extra warm Homer-only run, 10000 tx:
+latency average = 0.200 ms
+tps = 4990.891623
+latency p99 = 0.215 ms
+```
+
+The first optimized Homer run appears to be an outlier after service restart.
+The following three Homer samples are `5072`, `5058`, and `4991` TPS, which is
+back in line with the earlier `~5.1k TPS` no-poll/no-sink control-path result.
+
+After the shared service-progress helper and local client-SQL wait fix landed,
+the first implementation pass was correct but slightly below the best prior
+steady-state samples because the local hot wait called the generic helper for
+the target-mailbox check and could run the periodic background scan before
+returning on an already-arrived completion. The final patch restored the direct
+target-mailbox check, moved the terminal-state check ahead of the background
+scan, and marked the common pump helper inline for the main-loop constant mask.
+
+```text
+artifacts: /data/dbcomm/postgres-citus-separate-comm-stack/tmp/homer_wait_pump_opt_20260513_122031
+
+pgbench --homer, 10000 tx:
+run 1: latency average = 0.198 ms, tps = 5056.843983, p99 = 0.217 ms
+run 2: latency average = 0.197 ms, tps = 5063.473168, p99 = 0.214 ms
+run 3: latency average = 0.197 ms, tps = 5083.018398, p99 = 0.214 ms
+
+pgbench over libpq, same binary/seeds, 10000 tx:
+run 1: latency average = 0.303 ms, tps = 3296.001719, p99 = 0.333 ms
+run 2: latency average = 0.304 ms, tps = 3286.075191, p99 = 0.334 ms
+run 3: latency average = 0.305 ms, tps = 3275.858398, p99 = 0.335 ms
+```
+
+All six wait-pump verification runs processed `10000/10000` transactions with
+zero failures. The optimized wait-loop implementation is therefore on par with
+the prior pushed-completion checkpoint while making service-side payload/sink
+progress possible during local client-SQL waits.
+
+Design status note: this wait-loop fix is a transitional progress fix, not the
+target architecture. The better next design is nonblocking command submission:
+local and peer `START_COMMAND` handlers should publish backend work and return
+immediately, while `STARTED`, result-sink readiness, `COMPLETED`, and `FAILED`
+arrive later through pushed completion channels. That removes the nested wait
+that forced the current mask/cadence logic and also addresses the deferred
+peer-control acceptance problem documented in
+[`../../../future-directions/citus/transport/homer_transport_scheduler_and_payload_streams.md`](../../../future-directions/citus/transport/homer_transport_scheduler_and_payload_streams.md).
+
+After local `START_COMMAND` became submit-only and both completion handoffs were
+converted to small rings, the longer validation that exposed the single-slot and
+two-slot races passed:
+
+```text
+artifacts: /data/dbcomm/postgres-citus-separate-comm-stack/tmp/homer_async_start_ring_final_20260513_130349
+
+pgbench --homer, 50000 tx:
+run 1: latency average = 0.195 ms, tps = 5131.106440, p99 = 0.212 ms
+run 2: latency average = 0.197 ms, tps = 5068.486402, p99 = 0.215 ms
+
+pgbench over libpq, same binary/seeds shape, 50000 tx:
+run 1: latency average = 0.306 ms, tps = 3263.546099, p99 = 0.413 ms
+run 2: latency average = 0.291 ms, tps = 3434.869920, p99 = 0.333 ms
+```
+
+All four final runs processed `50000/50000` transactions with zero failures.
+One intermediate 50k run failed before the backend-to-service ring landed; that
+failure showed that fixing only the frontend completion mailbox was insufficient.
+Operationally, backend-bridge changes require a full extension install and a
+postmaster restart, not just `install-service-bin`, because the socketless
+backend runs code from installed `citus.so`.
 
 Remaining likely bottlenecks:
 
@@ -511,14 +674,21 @@ Remaining likely bottlenecks:
 - `scalarInt64` fields still exist in shared completion structs for older/backend wrapper compatibility. They are no longer the client SQL result path and should be removed once the older shortcut is retired.
 - Command completion metadata still lacks SQL command tags, SQLSTATE, and authoritative dynamic session state.
 - Service-owned result sink allocation/binding is still future work; the current backend-created POSIX shm result queue is an interim local-host shortcut.
-- The implementation remains single-client and one-command-at-a-time. It does not solve concurrent clients, peer-control pipelining, cancellation, or prepared statements.
+- The implementation now supports multiple local pgbench client sessions, with
+  one command in flight per session. It does not solve command pipelining,
+  peer-control pipelining, cancellation, or prepared statements.
+- `START_COMMAND` handling is still synchronous/blocking in the service for the
+  normal client-SQL path. The current wait-loop background pump keeps other
+  completion/sink work moving, but the target design is async command submission
+  plus pushed state events.
 
 ## Plan Coverage
 
 Completed from the original client SQL plan:
 
 - distinct `REMOTE_EXEC_OP_CLIENT_SQL_SESSION`
-- local service open/start/poll path for client SQL sessions
+- local service open/start path for client SQL sessions, with local frontend
+  terminal completion now pushed through a per-session completion mailbox
 - typed `CLIENT_SQL_TX_BEGIN` plus typed commit/abort reuse
 - reusable frontend-safe Homer client API in `remote_execution_client.h` / `homer_client.c`
 - fixed-width SQL command execution through the socketless backend
@@ -533,11 +703,15 @@ Completed from the original client SQL plan:
 - repeatable single-client comparison wrapper that records process placement artifacts
 - same-binary baseline comparison against libpq simple mode
 - generic tuple-result sink materialization for row-producing simple SQL, including pgbench's `SELECT abalance`
+- shared service-progress helper plus local client-SQL wait fix for all-completion and sink/payload background progress
 
 Partially completed:
 
 - command completion metadata: processed row count, bounded detail string, and result sink readiness/EOS metadata work; SQL command tags, SQLSTATE, and authoritative dynamic session state remain missing
 - result modes: `TUPLE` is now backed by a tuple sink for client SQL, but service-owned sink binding and richer frontend result accessors remain future work
+- service-progress fairness: local client-SQL waits now pump completion/sink background work, but peer-control progress from inside a local control-slot wait remains deferred pending nonblocking/deferred peer-control dispatch
+- async command submission: documented as the next design step; current local
+  and peer `START_COMMAND` paths still use startup wait helpers
 
 Not completed:
 

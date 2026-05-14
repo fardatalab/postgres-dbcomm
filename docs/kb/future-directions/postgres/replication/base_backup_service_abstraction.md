@@ -480,7 +480,7 @@ It does, however, give useful implementation evidence for this plan:
 
 - **Status**: first sender-to-remote-blackhole prototype implemented and measured; durable receiver materialization remains future work.
 - **What exists in code now**: upstream PostgreSQL `bbsink`/`bbstreamer` base-backup path plus a `TARGET 'homer'` sink, `REMOTE_EXEC_OP_BASE_BACKUP`, typed `CitusRemoteBaseBackupMessageHeader` objects, and service-to-service RDMA publication through the existing payload substrate.
-- **Feature gates / switches**: explicit `TARGET 'homer'`; target detail may set `host=`, `port=`, `node=`, `slots=`, and `bytes=`. The current default is 8 payload slots x 8 MiB, selected after the 1 MiB default proved dominated by per-object RDMA/service overhead.
+- **Feature gates / switches**: explicit `TARGET 'homer'`; target detail may set `mode=rdma|blackhole`, `host=`, `port=`, `node=`, `slots=`, and `bytes=`. `mode=blackhole` is the local Homer smoke receiver; PostgreSQL's separate `TARGET 'blackhole'` is a server-side discard target that does not exercise Homer. The current default is 8 payload slots x 8 MiB, selected after the 1 MiB default proved dominated by per-object RDMA/service overhead.
 - **Assumptions / shortcuts / scaffolding**:
   - first prototype should hook at the `bbsink` layer through explicit `TARGET 'homer'`
   - Homer may use a specialized sink-chain shape and patch/bypass upstream assumptions that are irrelevant to the selected research path

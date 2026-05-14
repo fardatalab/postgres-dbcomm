@@ -91,6 +91,26 @@
 #define MM2_ROT				47
 
 /*
+ * Homer completions usually arrive shortly after START_COMMAND returns. Stay in
+ * the command wait state for a bounded number of mailbox checks before yielding
+ * to pgbench's outer scheduler; this avoids repeatedly rebuilding socket wait
+ * sets on the no-socket Homer path while still letting one pgbench thread
+ * multiplex multiple sessions.
+ */
+#define HOMER_PGBENCH_COMPLETION_SPINS 128U
+
+static inline void
+HomerPgbenchCpuRelax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_pause();
+#else
+	/* The prototype targets Linux; yield only as a portable fallback. */
+	sched_yield();
+#endif
+}
+
+/*
  * Multi-platform socket set implementations
  */
 
@@ -279,6 +299,8 @@ static bool homer_mode = false;
 static uint32 homer_database_oid = 0;
 static uint32 homer_user_oid = 0;
 static int	client_cpu = -1;
+static int	client_cpus[CPU_SETSIZE];
+static int	client_cpu_count = 0;
 bool		report_per_command = false; /* report per-command latencies,
 										 * retries after errors and failures
 										 * (errors without retrying) */
@@ -631,6 +653,13 @@ typedef struct
 	bool		homer_session_open;
 	bool		homer_result_sink_open;
 	bool		homer_transaction_attached;
+	bool		homer_command_pending;
+	bool		homer_pending_result_sink_bound;
+	uint32		homer_pending_command_kind;
+	uint32		homer_pending_result_mode;
+	uint64		homer_pending_command_sequence;
+	uint64		homer_pending_drained_rows;
+	const char *homer_pending_operation_name;
 	int			id;				/* client No. */
 	ConnectionStateEnum state;	/* state machine's current state. */
 	ConditionalStack cstack;	/* enclosing conditionals state */
@@ -950,31 +979,76 @@ parseClientCpuOption(const char *optionName, const char *value)
 }
 
 /*
+ * parseClientCpuListOption parses comma-separated pgbench worker CPUs. The
+ * mapping is thread-id modulo list length, so benchmark scripts can keep
+ * frontend workers off the service/backend cores without per-thread taskset.
+ */
+static void
+parseClientCpuListOption(const char *optionName, const char *value)
+{
+	const char *cursor = value;
+
+	client_cpu_count = 0;
+	while (*cursor != '\0')
+	{
+		char	   *end = NULL;
+		long		parsed;
+
+		if (client_cpu_count >= CPU_SETSIZE)
+			pg_fatal("%s lists too many CPUs; max is %d",
+					 optionName, CPU_SETSIZE);
+
+		errno = 0;
+		parsed = strtol(cursor, &end, 10);
+		if (errno != 0 || end == cursor ||
+			parsed < 0 || parsed >= CPU_SETSIZE)
+			pg_fatal("invalid %s CPU list value: \"%s\"", optionName, value);
+
+		client_cpus[client_cpu_count++] = (int) parsed;
+
+		if (*end == '\0')
+			break;
+		if (*end != ',')
+			pg_fatal("invalid %s CPU list: \"%s\"; expected comma separators",
+					 optionName, value);
+		cursor = end + 1;
+		if (*cursor == '\0')
+			pg_fatal("invalid %s CPU list: \"%s\"; trailing comma",
+					 optionName, value);
+	}
+}
+
+/*
  * applyClientCpuAffinity pins the pgbench worker thread before either the libpq
  * connection setup or Homer control-region setup. This replaces ad-hoc taskset
  * usage in benchmark runs while leaving default pgbench scheduling untouched.
  */
 static void
-applyClientCpuAffinity(void)
+applyClientCpuAffinity(int threadId)
 {
-	if (client_cpu < 0)
+	int			selectedCpu = client_cpu;
+
+	if (client_cpu_count > 0)
+		selectedCpu = client_cpus[threadId % client_cpu_count];
+
+	if (selectedCpu < 0)
 		return;
 
 #ifndef __linux__
-	pg_fatal("--client-cpu is currently supported only on Linux");
+	pg_fatal("--client-cpu/--client-cpus is currently supported only on Linux");
 #else
-	if (client_cpu >= CPU_SETSIZE)
+	if (selectedCpu >= CPU_SETSIZE)
 		pg_fatal("invalid --client-cpu value %d: max supported CPU is %d",
-				 client_cpu, CPU_SETSIZE - 1);
+				 selectedCpu, CPU_SETSIZE - 1);
 
 	{
 		cpu_set_t	cpuSet;
 
 		CPU_ZERO(&cpuSet);
-		CPU_SET(client_cpu, &cpuSet);
+		CPU_SET(selectedCpu, &cpuSet);
 		if (sched_setaffinity(0, sizeof(cpuSet), &cpuSet) != 0)
 			pg_fatal("could not pin pgbench worker thread to CPU %d: %m",
-					 client_cpu);
+					 selectedCpu);
 	}
 #endif
 }
@@ -1037,7 +1111,8 @@ usage(void)
 		   "  --aggregate-interval=NUM aggregate data over NUM seconds\n"
 		   "  --exit-on-abort          exit when any client is aborted\n"
 		   "  --failures-detailed      report the failures grouped by basic types\n"
-		   "  --client-cpu=CPU         pin the pgbench worker thread to CPU\n"
+		   "  --client-cpu=CPU         pin every pgbench worker thread to CPU\n"
+		   "  --client-cpus=LIST       pin pgbench worker threads round-robin to CPU list\n"
 		   "  --latency-percentiles    report exact p50/p95/p99 transaction latency\n"
 		   "  --homer                  submit simple SQL through the Homer service\n"
 		   "  --homer-client-cpu=CPU   alias for --client-cpu\n"
@@ -3387,54 +3462,168 @@ HomerSqlLooksRowProducing(const char *sql)
 }
 
 /*
- * HomerSqlCanWaitForTerminalResult marks the measured builtin pgbench account
- * lookup as a bounded-result command. For this one-row SELECT, the result sink
- * cannot fill before the frontend starts draining, so the service can wait for
- * terminal completion in the START response and avoid a second control request.
- * Leave arbitrary SELECT/WITH/VALUES streams on the safer STARTED-then-poll path.
+ * clearHomerPendingCommand drops the per-client in-flight command metadata
+ * after a terminal completion. The command itself is owned by the external
+ * service and backend; pgbench only keeps enough state to match the pushed
+ * completion and drain any result sink tied to this command.
  */
-static bool
-HomerSqlCanWaitForTerminalResult(const char *sql)
+static void
+clearHomerPendingCommand(CState *st)
 {
-	const char *start = sql;
-	const char *pgbenchAccountLookupPrefix =
-		"SELECT abalance FROM pgbench_accounts WHERE aid =";
-
-	while (*start != '\0' && isspace((unsigned char) *start))
-		start++;
-
-	return pg_strncasecmp(start,
-						  pgbenchAccountLookupPrefix,
-						  strlen(pgbenchAccountLookupPrefix)) == 0;
+	st->homer_command_pending = false;
+	st->homer_pending_result_sink_bound = false;
+	st->homer_pending_command_kind = 0;
+	st->homer_pending_result_mode = CITUS_REMOTE_EXEC_SQL_RESULT_NONE;
+	st->homer_pending_command_sequence = 0;
+	st->homer_pending_drained_rows = 0;
+	st->homer_pending_operation_name = NULL;
 }
 
 /*
- * HomerRunCommandAndWait is the synchronous pgbench adapter over the
- * frontend-safe Homer client API. The pgbench state machine still owns timing,
- * script variables, and transaction accounting; this helper only replaces the
- * libpq send/result wait with one typed external-service command.
+ * HomerApplyCommandCompletion consumes one command completion observed either
+ * as the immediate START_COMMAND response or as a later pushed completion from
+ * the service-to-client mailbox. STARTED means that a command is still in
+ * flight, but it may already expose a tuple sink descriptor. COMPLETED is the
+ * only point where pgbench advances its command state and updates the
+ * transaction attachment flag.
  */
 static bool
-HomerRunCommandAndWait(CState *st, uint32 commandKind, const char *sql,
-					   const char *operationName, uint32 resultMode)
+HomerApplyCommandCompletion(CState *st,
+							const CitusRemoteExecCommandCompletion *completion,
+							bool *commandComplete)
+{
+	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
+	HomerClientResultSink *resultSink = &st->homer_result_sink;
+	const char *operationName = st->homer_pending_operation_name ?
+		st->homer_pending_operation_name : "unknown";
+
+	*commandComplete = false;
+
+	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED ||
+		completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED)
+	{
+		if (!st->homer_pending_result_sink_bound &&
+			(completion->resultFlags &
+			 CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
+		{
+			if (!HomerClientOpenResultSink(completion, resultSink,
+										   errorMessage,
+										   sizeof(errorMessage)))
+			{
+				pg_log_error("client %d failed to open Homer result sink for %s: %s",
+							 st->id, operationName, errorMessage);
+				st->estatus = ESTATUS_OTHER_SQL_ERROR;
+				clearHomerPendingCommand(st);
+				return false;
+			}
+
+			/*
+			 * The mapping is reusable across later result-producing commands
+			 * from the same remote session. Keep the descriptor attached to the
+			 * client until session finish, but track command-local binding so a
+			 * terminal completion is not opened twice.
+			 */
+			st->homer_result_sink_open = true;
+			st->homer_pending_result_sink_bound = true;
+		}
+
+		if (st->homer_pending_result_sink_bound)
+		{
+			bool		requireEos =
+				(completion->commandState ==
+				 CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED);
+
+			if (!HomerClientDrainResultSink(resultSink, requireEos,
+											&st->homer_pending_drained_rows,
+											errorMessage,
+											sizeof(errorMessage)))
+			{
+				pg_log_error("client %d failed to drain Homer result sink for %s: %s",
+							 st->id, operationName, errorMessage);
+				st->estatus = ESTATUS_OTHER_SQL_ERROR;
+				HomerClientCloseResultSink(resultSink, true);
+				st->homer_result_sink_open = false;
+				clearHomerPendingCommand(st);
+				return false;
+			}
+		}
+	}
+
+	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED ||
+		completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_PENDING)
+		return true;
+
+	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED)
+	{
+		if (st->homer_pending_command_kind ==
+			CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_TX_BEGIN)
+			st->homer_transaction_attached = true;
+		else if (st->homer_pending_command_kind ==
+				 CITUS_REMOTE_EXEC_COMMAND_TX_COMMIT ||
+				 st->homer_pending_command_kind ==
+				 CITUS_REMOTE_EXEC_COMMAND_TX_ABORT)
+			st->homer_transaction_attached = false;
+
+		pg_log_debug("client %d Homer %s completed: rows=%llu",
+					 st->id, operationName,
+					 (unsigned long long) completion->processedRowCount);
+		clearHomerPendingCommand(st);
+		*commandComplete = true;
+		return true;
+	}
+
+	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_FAILED)
+	{
+		pg_log_error("client %d Homer %s failed: %s",
+					 st->id, operationName,
+					 completion->detail[0] != '\0' ?
+					 completion->detail : "<backend did not provide details>");
+		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		if (st->homer_result_sink_open)
+		{
+			HomerClientCloseResultSink(resultSink, true);
+			st->homer_result_sink_open = false;
+		}
+		clearHomerPendingCommand(st);
+		return false;
+	}
+
+	pg_log_error("client %d Homer %s returned unexpected command state %u",
+				 st->id, operationName, completion->commandState);
+	st->estatus = ESTATUS_OTHER_SQL_ERROR;
+	clearHomerPendingCommand(st);
+	return false;
+}
+
+/*
+ * HomerStartCommand submits exactly one semantic SQL/lifecycle command. It
+ * does not wait for terminal completion unless the service can complete it
+ * before returning from START_COMMAND. Measured pgbench execution advances
+ * later through receiveHomerCommand(), allowing one thread to multiplex many
+ * Homer client sessions without a blocking client-local wait loop.
+ */
+static bool
+HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
+				  const char *operationName, uint32 resultMode)
 {
 	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
 	uint64		commandSequence = 0;
 	CitusRemoteExecCommandCompletion completion;
-	HomerClientResultSink *resultSink = &st->homer_result_sink;
-	uint64		drainedRows = 0;
-	uint32		commandFlags = 0;
-	bool		resultSinkBoundForCommand = false;
+	bool		commandComplete = false;
 
-	if (commandKind == CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE &&
-		resultMode == CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE &&
-		sql != NULL &&
-		HomerSqlCanWaitForTerminalResult(sql))
-		commandFlags |= CITUS_REMOTE_EXEC_COMMAND_FLAG_WAIT_FOR_TERMINAL_COMPLETION;
+	if (st->homer_command_pending)
+	{
+		pg_log_error("client %d attempted to start Homer %s while %s is still pending",
+					 st->id, operationName,
+					 st->homer_pending_operation_name ?
+					 st->homer_pending_operation_name : "another command");
+		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		return false;
+	}
 
 	if (!HomerClientStartCommandWithCompletionFlags(&st->homer_session,
 													commandKind,
-													commandFlags,
+													0,
 													NULL,
 													sql,
 													resultMode,
@@ -3449,118 +3638,122 @@ HomerRunCommandAndWait(CState *st, uint32 commandKind, const char *sql,
 		return false;
 	}
 
-	for (;;)
-	{
-		if (completion.commandState ==
-			CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED)
-		{
-			if (!resultSinkBoundForCommand &&
-				(completion.resultFlags &
-				 CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
-			{
-				if (!HomerClientOpenResultSink(&completion, resultSink,
-											   errorMessage, sizeof(errorMessage)))
-				{
-					pg_log_error("client %d failed to open Homer result sink for %s: %s",
-								 st->id, operationName, errorMessage);
-					st->estatus = ESTATUS_OTHER_SQL_ERROR;
-					return false;
-				}
-				st->homer_result_sink_open = true;
-				resultSinkBoundForCommand = true;
-			}
+	st->homer_command_pending = true;
+	st->homer_pending_result_sink_bound = false;
+	st->homer_pending_command_kind = commandKind;
+	st->homer_pending_result_mode = resultMode;
+	st->homer_pending_command_sequence = commandSequence;
+	st->homer_pending_drained_rows = 0;
+	st->homer_pending_operation_name = operationName;
 
-			if (resultSinkBoundForCommand &&
-				!HomerClientDrainResultSink(resultSink, false,
-											&drainedRows,
+	return HomerApplyCommandCompletion(st, &completion, &commandComplete);
+}
+
+/*
+ * receiveHomerCommand checks the per-session pushed-completion mailbox for the
+ * currently in-flight command. A false commandComplete return is not an error:
+ * it means the backend has not published terminal completion yet and pgbench
+ * should give other runnable clients a chance before checking again.
+ */
+static bool
+receiveHomerCommand(CState *st, bool *commandComplete)
+{
+	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
+	CitusRemoteExecCommandCompletion completion;
+	bool		completionReady = false;
+
+	if (!st->homer_command_pending)
+	{
+		*commandComplete = true;
+		return true;
+	}
+
+	if (!HomerClientTryCommandCompletion(&st->homer_session,
+										 st->homer_pending_command_kind,
+										 st->homer_pending_command_sequence,
+										 &completion,
+										 &completionReady,
+										 errorMessage,
+										 sizeof(errorMessage)))
+	{
+		pg_log_error("client %d failed to read pushed Homer completion for %s: %s",
+					 st->id,
+					 st->homer_pending_operation_name ?
+					 st->homer_pending_operation_name : "unknown",
+					 errorMessage);
+		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		clearHomerPendingCommand(st);
+		return false;
+	}
+
+	if (!completionReady)
+	{
+		if (st->homer_pending_result_sink_bound)
+		{
+			/*
+			 * Drain producer-visible rows while the command is still running.
+			 * This keeps larger future result streams from filling the sink and
+			 * blocking backend completion behind a frontend that is waiting only
+			 * on the completion mailbox.
+			 */
+			if (!HomerClientDrainResultSink(&st->homer_result_sink, false,
+											&st->homer_pending_drained_rows,
 											errorMessage,
 											sizeof(errorMessage)))
 			{
-				pg_log_error("client %d failed to drain Homer result sink for %s: %s",
-							 st->id, operationName, errorMessage);
+				pg_log_error("client %d failed to drain running Homer result sink for %s: %s",
+							 st->id,
+							 st->homer_pending_operation_name ?
+							 st->homer_pending_operation_name : "unknown",
+							 errorMessage);
 				st->estatus = ESTATUS_OTHER_SQL_ERROR;
-				HomerClientCloseResultSink(resultSink, true);
+				HomerClientCloseResultSink(&st->homer_result_sink, true);
 				st->homer_result_sink_open = false;
+				clearHomerPendingCommand(st);
 				return false;
 			}
-
-			/*
-			 * The START_COMMAND response can already carry a result-sink
-			 * descriptor. After draining currently visible rows, fall through
-			 * to the poll below so we can observe terminal completion/EOS.
-			 */
 		}
 
-		if (completion.commandState ==
-			CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED)
-		{
-			if (!resultSinkBoundForCommand &&
-				(completion.resultFlags &
-				 CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
-			{
-				if (!HomerClientOpenResultSink(&completion, resultSink,
-											   errorMessage, sizeof(errorMessage)))
-				{
-					pg_log_error("client %d failed to open completed Homer result sink for %s: %s",
-								 st->id, operationName, errorMessage);
-					st->estatus = ESTATUS_OTHER_SQL_ERROR;
-					return false;
-				}
-				st->homer_result_sink_open = true;
-				resultSinkBoundForCommand = true;
-			}
-
-			if (resultSinkBoundForCommand)
-			{
-				if (!HomerClientDrainResultSink(resultSink, true,
-												&drainedRows,
-												errorMessage,
-												sizeof(errorMessage)))
-				{
-					pg_log_error("client %d failed to finish draining Homer result sink for %s: %s",
-								 st->id, operationName, errorMessage);
-					st->estatus = ESTATUS_OTHER_SQL_ERROR;
-					HomerClientCloseResultSink(resultSink, true);
-					st->homer_result_sink_open = false;
-					return false;
-				}
-			}
-
-			pg_log_debug("client %d Homer %s completed: rows=%llu",
-						 st->id, operationName,
-						 (unsigned long long) completion.processedRowCount);
-			return true;
-		}
-
-		if (completion.commandState ==
-			CITUS_REMOTE_EXEC_COMMAND_STATE_FAILED)
-		{
-			pg_log_error("client %d Homer %s failed: %s",
-						 st->id, operationName,
-						 completion.detail[0] != '\0' ?
-						 completion.detail : "<backend did not provide details>");
-			st->estatus = ESTATUS_OTHER_SQL_ERROR;
-			if (st->homer_result_sink_open)
-			{
-				HomerClientCloseResultSink(resultSink, true);
-				st->homer_result_sink_open = false;
-			}
-			return false;
-		}
-
-		if (!HomerClientPollCommand(&st->homer_session,
-									commandKind,
-									commandSequence,
-									&completion,
-									errorMessage,
-									sizeof(errorMessage)))
-		{
-			pg_log_error("client %d failed to poll Homer %s: %s",
-						 st->id, operationName, errorMessage);
-			st->estatus = ESTATUS_OTHER_SQL_ERROR;
-			return false;
-		}
+		*commandComplete = false;
+		return true;
 	}
+
+	return HomerApplyCommandCompletion(st, &completion, commandComplete);
+}
+
+/*
+ * HomerRunCommandAndWait is the synchronous adapter retained for setup and
+ * cleanup paths outside the measured pgbench command loop. The hot path uses
+ * HomerStartCommand plus CSTATE_WAIT_RESULT so multiple client sessions can be
+ * progressed by one pgbench thread.
+ */
+static bool
+HomerRunCommandAndWait(CState *st, uint32 commandKind, const char *sql,
+					   const char *operationName, uint32 resultMode)
+{
+	if (!HomerStartCommand(st, commandKind, sql, operationName, resultMode))
+	{
+		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		return false;
+	}
+
+	while (st->homer_command_pending)
+	{
+		bool		commandComplete = false;
+
+		if (!receiveHomerCommand(st, &commandComplete))
+			return false;
+
+		/*
+		 * This helper is used before/after measurement. A zero-length sleep
+		 * avoids fully monopolizing the core during backend spawn or teardown
+		 * without affecting the measured hot path, which does not call here.
+		 */
+		if (!commandComplete)
+			pg_usleep(0);
+	}
+
+	return true;
 }
 
 /*
@@ -3600,13 +3793,11 @@ sendHomerCommand(CState *st, Command *command)
 		}
 		else
 		{
-			ok = HomerRunCommandAndWait(st,
-										CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_TX_BEGIN,
-										NULL,
-										"client_sql_tx_begin",
-										CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
-			if (ok)
-				st->homer_transaction_attached = true;
+			ok = HomerStartCommand(st,
+								   CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_TX_BEGIN,
+								   NULL,
+								   "client_sql_tx_begin",
+								   CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
 		}
 	}
 	else if (HomerSqlMatchesLifecycleCommand(sql, "COMMIT") ||
@@ -3620,13 +3811,11 @@ sendHomerCommand(CState *st, Command *command)
 		}
 		else
 		{
-			ok = HomerRunCommandAndWait(st,
-										CITUS_REMOTE_EXEC_COMMAND_TX_COMMIT,
-										NULL,
-										"tx_commit",
-										CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
-			if (ok)
-				st->homer_transaction_attached = false;
+			ok = HomerStartCommand(st,
+								   CITUS_REMOTE_EXEC_COMMAND_TX_COMMIT,
+								   NULL,
+								   "tx_commit",
+								   CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
 		}
 	}
 	else if (HomerSqlMatchesLifecycleCommand(sql, "ROLLBACK"))
@@ -3639,13 +3828,11 @@ sendHomerCommand(CState *st, Command *command)
 		}
 		else
 		{
-			ok = HomerRunCommandAndWait(st,
-										CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
-										NULL,
-										"tx_abort",
-										CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
-			if (ok)
-				st->homer_transaction_attached = false;
+			ok = HomerStartCommand(st,
+								   CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
+								   NULL,
+								   "tx_abort",
+								   CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
 		}
 	}
 	else
@@ -3658,13 +3845,13 @@ sendHomerCommand(CState *st, Command *command)
 		}
 		else
 		{
-			ok = HomerRunCommandAndWait(st,
-										CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE,
-										sql,
-										"sql_execute",
-										HomerSqlLooksRowProducing(sql) ?
-										CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE :
-										CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
+			ok = HomerStartCommand(st,
+								   CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE,
+								   sql,
+								   "sql_execute",
+								   HomerSqlLooksRowProducing(sql) ?
+								   CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE :
+								   CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
 		}
 	}
 
@@ -4425,7 +4612,8 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 					{
 						/* Wait for results, unless in pipeline mode */
 						if (homer_mode)
-							st->state = CSTATE_END_COMMAND;
+							st->state = st->homer_command_pending ?
+								CSTATE_WAIT_RESULT : CSTATE_END_COMMAND;
 						else if (PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
 							st->state = CSTATE_WAIT_RESULT;
 						else
@@ -4557,6 +4745,36 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 * Wait for the current SQL command to complete
 				 */
 			case CSTATE_WAIT_RESULT:
+				if (homer_mode)
+				{
+					for (uint32 spin = 0;
+						 spin < HOMER_PGBENCH_COMPLETION_SPINS;
+						 spin++)
+					{
+						bool		commandComplete = false;
+
+						if (!receiveHomerCommand(st, &commandComplete))
+						{
+							if (canRetryError(st->estatus))
+								st->state = CSTATE_ERROR;
+							else
+								st->state = CSTATE_ABORTED;
+							break;
+						}
+						else if (commandComplete)
+						{
+							st->state = CSTATE_END_COMMAND;
+							break;
+						}
+
+						HomerPgbenchCpuRelax();
+					}
+
+					if (st->state == CSTATE_WAIT_RESULT)
+						return;
+					break;
+				}
+
 				pg_log_debug("client %d receiving", st->id);
 
 				/*
@@ -7424,6 +7642,7 @@ main(int argc, char **argv)
 		{"homer-client-cpu", required_argument, NULL, 21},
 		{"client-cpu", required_argument, NULL, 22},
 		{"latency-percentiles", no_argument, NULL, 23},
+		{"client-cpus", required_argument, NULL, 24},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -7792,6 +8011,10 @@ main(int argc, char **argv)
 				benchmarking_option_set = true;
 				latency_percentiles = true;
 				break;
+			case 24:			/* client-cpus */
+				benchmarking_option_set = true;
+				parseClientCpuListOption("--client-cpus", optarg);
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -7952,8 +8175,9 @@ main(int argc, char **argv)
 			pg_fatal("--homer currently supports only -M simple");
 		if (is_connect)
 			pg_fatal("--homer currently uses one persistent session and cannot be combined with -C/--connect");
-		if (nclients != 1 || nthreads != 1)
-			pg_fatal("--homer currently supports exactly one client and one thread");
+		if (nclients > CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SESSIONS)
+			pg_fatal("--homer currently supports at most %u clients in one run",
+					 CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SESSIONS);
 		if (max_tries != 1)
 			pg_fatal("--homer currently does not support transaction retry (--max-tries must remain 1)");
 		if (homer_database_oid == 0 || homer_user_oid == 0)
@@ -8250,7 +8474,7 @@ threadRun(void *arg)
 	/* READY */
 	THREAD_BARRIER_WAIT(&barrier);
 
-	applyClientCpuAffinity();
+	applyClientCpuAffinity(thread->tid);
 
 	thread_start = pg_time_now();
 	thread->started_time = thread_start;
@@ -8343,19 +8567,33 @@ threadRun(void *arg)
 			else if (st->state == CSTATE_WAIT_RESULT ||
 					 st->state == CSTATE_WAIT_ROLLBACK_RESULT)
 			{
-				/*
-				 * waiting for result from server - nothing to do unless the
-				 * socket is readable
-				 */
-				int			sock = PQsocket(st->con);
-
-				if (sock < 0)
+				if (homer_mode)
 				{
-					pg_log_error("invalid socket: %s", PQerrorMessage(st->con));
-					goto done;
+					/*
+					 * Homer completions arrive in per-session shared-memory
+					 * mailboxes, not sockets. Keep the thread runnable so it
+					 * can make progress on this client and then continue
+					 * scanning other sessions.
+					 */
+					min_usec = 0;
+					break;
 				}
+				else
+				{
+					/*
+					 * waiting for result from server - nothing to do unless the
+					 * socket is readable
+					 */
+					int			sock = PQsocket(st->con);
 
-				add_socket_to_set(sockets, sock, nsocks++);
+					if (sock < 0)
+					{
+						pg_log_error("invalid socket: %s", PQerrorMessage(st->con));
+						goto done;
+					}
+
+					add_socket_to_set(sockets, sock, nsocks++);
+				}
 			}
 			else if (st->state != CSTATE_ABORTED &&
 					 st->state != CSTATE_FINISHED)
@@ -8429,26 +8667,33 @@ threadRun(void *arg)
 		for (int i = 0; i < nstate; i++)
 		{
 			CState	   *st = &state[i];
+			bool		wasDone =
+				st->state == CSTATE_FINISHED ||
+				st->state == CSTATE_ABORTED;
 
 			if (st->state == CSTATE_WAIT_RESULT ||
 				st->state == CSTATE_WAIT_ROLLBACK_RESULT)
 			{
-				/* don't call advanceConnectionState unless data is available */
-				int			sock = PQsocket(st->con);
-
-				if (sock < 0)
+				if (!homer_mode)
 				{
-					pg_log_error("invalid socket: %s", PQerrorMessage(st->con));
-					goto done;
-				}
+					/* don't call advanceConnectionState unless data is available */
+					int			sock = PQsocket(st->con);
 
-				if (!socket_has_input(sockets, sock, nsocks++))
-					continue;
+					if (sock < 0)
+					{
+						pg_log_error("invalid socket: %s", PQerrorMessage(st->con));
+						goto done;
+					}
+
+					if (!socket_has_input(sockets, sock, nsocks++))
+						continue;
+				}
 			}
 			else if (st->state == CSTATE_FINISHED ||
 					 st->state == CSTATE_ABORTED)
 			{
 				/* this client is done, no need to consider it anymore */
+				continue;
 			}
 
 			advanceConnectionState(thread, st, &aggs);
@@ -8464,8 +8709,9 @@ threadRun(void *arg)
 			 * If advanceConnectionState changed client to finished state,
 			 * that's one fewer client that remains.
 			 */
-			else if (st->state == CSTATE_FINISHED ||
-					 st->state == CSTATE_ABORTED)
+			else if (!wasDone &&
+					 (st->state == CSTATE_FINISHED ||
+					  st->state == CSTATE_ABORTED))
 				remains--;
 		}
 
@@ -8631,6 +8877,35 @@ openHomerSession(TState *thread, CState *st)
 	st->homer_result_sink.fileDescriptor = -1;
 	st->homer_result_sink_open = false;
 	st->homer_transaction_attached = false;
+	clearHomerPendingCommand(st);
+
+	/*
+	 * Regular pgbench creates persistent libpq connections before bench_start.
+	 * Homer backend creation is lazy on the first command, so do a tiny
+	 * begin/abort warmup here to spawn and attach the remote backend before the
+	 * measured transaction loop. The warmup performs no table work and keeps
+	 * startup costs out of throughput/latency numbers.
+	 */
+	if (!HomerRunCommandAndWait(st,
+								CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_TX_BEGIN,
+								NULL,
+								"client_sql_session_warmup_begin",
+								CITUS_REMOTE_EXEC_SQL_RESULT_NONE))
+	{
+		finishHomerSession(st);
+		return false;
+	}
+
+	if (!HomerRunCommandAndWait(st,
+								CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
+								NULL,
+								"client_sql_session_warmup_abort",
+								CITUS_REMOTE_EXEC_SQL_RESULT_NONE))
+	{
+		finishHomerSession(st);
+		return false;
+	}
+
 	return true;
 }
 

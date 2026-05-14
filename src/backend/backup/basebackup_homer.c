@@ -9,6 +9,10 @@
  * The important invariant is that PostgreSQL writes archive/manifest bytes
  * directly into the Homer queue payload slot exposed as bbs_buffer.
  *
+ * Use TARGET 'homer' with mode=blackhole for the local Homer smoke receiver.
+ * PostgreSQL's separate TARGET 'blackhole' is intentionally left as the
+ * upstream server-side discard target and does not exercise Homer.
+ *
  * IDENTIFICATION
  *	  src/backend/backup/basebackup_homer.c
  *
@@ -98,12 +102,32 @@ bbsink_homer_apply_detail(HomerClientBaseBackupStreamOptions *options,
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("invalid Homer target detail token \"%s\"", token),
-					 errhint("Use comma-separated key=value fields such as host=127.0.0.1,port=9717,node=1.")));
+					 errhint("Use comma-separated key=value fields such as mode=blackhole or mode=rdma,host=127.0.0.1,port=9717,node=1.")));
 		*equals = '\0';
 		value = equals + 1;
 
 		if (strcmp(key, "host") == 0)
+		{
+			if (strcmp(value, "blackhole") == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("Homer target detail host=blackhole is no longer accepted"),
+						 errhint("Use mode=blackhole for the local Homer blackhole receiver, or host=<real peer host> for RDMA mode.")));
 			strlcpy(options->peerHost, value, sizeof(options->peerHost));
+		}
+		else if (strcmp(key, "mode") == 0)
+		{
+			if (strcmp(value, "rdma") == 0)
+				options->targetMode = HOMER_CLIENT_BASEBACKUP_MODE_RDMA;
+			else if (strcmp(value, "blackhole") == 0)
+				options->targetMode =
+					HOMER_CLIENT_BASEBACKUP_MODE_LOCAL_BLACKHOLE;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("unrecognized Homer target mode \"%s\"", value),
+						 errhint("Use mode=rdma or mode=blackhole.")));
+		}
 		else if (strcmp(key, "port") == 0)
 			options->peerControlPort = pg_strtoint32(value);
 		else if (strcmp(key, "node") == 0)

@@ -13,7 +13,7 @@ Track the implemented client SQL session prototype that runs a pgbench-like fore
 ## Documents
 
 <!-- kb-docs:start -->
-- [client_sql_session_pgbench_checkpoint.md](client_sql_session_pgbench_checkpoint.md): Current implementation checkpoint for the single-client `pgbench --homer` path, sink-backed results, persistent `REMOTE_EXEC_OP_CLIENT_SQL_SESSION`, and benchmark placement knobs.
+- [client_sql_session_pgbench_checkpoint.md](client_sql_session_pgbench_checkpoint.md) - TODO
 <!-- kb-docs:end -->
 
 ## Related

@@ -54,7 +54,11 @@ The receiver currently coalesces consumed-head publication once per pump pass af
 
 One implementation caveat surfaced during verification: a single service process cannot self-connect through the RDMA path today. With `host=127.0.0.1`, RDMA CM route resolution fails. With the host's RoCE interface address (`10.10.1.101` in this run), route resolution succeeds but the outgoing side times out waiting for `ESTABLISHED` because the same service thread is blocked in outgoing connect and cannot pump the listener/accept path.
 
-To keep local correctness testing useful without pretending to test RDMA, `host=blackhole` is a deliberately narrow local smoke mode for `REMOTE_EXEC_OP_BASE_BACKUP` only. [`TupleSinkServiceSinkIsLocalBaseBackupBlackhole()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:463) identifies that mode. [`TupleSinkServiceHandleOpenSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6011) skips peer-open only for basebackup plus `peerHost == "blackhole"` at [`tuple_sink_service_process.c:6396`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6396). [`TupleSinkServicePumpLocalBaseBackupBlackhole()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5307) then validates the same semantic headers directly from the backend-visible send queue and advances `consumedHead`.
+To keep local correctness testing useful without pretending to test RDMA, `mode=blackhole` is a deliberately narrow local smoke mode for `REMOTE_EXEC_OP_BASE_BACKUP` only. It is selected through `TARGET 'homer:mode=blackhole,...'`, not through PostgreSQL's built-in `TARGET 'blackhole'`. [`bbsink_homer_apply_detail()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_homer.c:78) parses the public `mode=` detail and rejects the old `host=blackhole` spelling with a hint. [`HomerClientOpenBaseBackupStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1168) maps that public mode to a private control-protocol sentinel because the control protocol does not yet have an explicit receiver-mode field.
+
+[`TupleSinkServiceSinkIsLocalBaseBackupBlackhole()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:738) identifies the local Homer blackhole mode. [`TupleSinkServiceHandleOpenSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6948) skips peer-open only for basebackup plus the private blackhole sentinel at [`tuple_sink_service_process.c:7333`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7333). [`TupleSinkServicePumpLocalBaseBackupBlackhole()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6215) then validates the same semantic headers directly from the backend-visible send queue and advances `consumedHead`.
+
+PostgreSQL's separate `TARGET 'blackhole'` remains the upstream server-side discard target registered in [`builtin_backup_targets`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_target.c:42). That path still uses libpq for the `pg_basebackup` replication command/control session, but the bulk archive bytes are discarded inside the PostgreSQL backend; they do not traverse libpq and do not exercise Homer.
 
 This mode proves:
 
@@ -82,7 +86,7 @@ env HOMER_SERVICE_CONTROL_SHM_NAME=/citus_remote_execution_control_v18_remote \
 
 The service runtime reads those knobs in [`main()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7405), passes the configured RDMA listener port into [`TupleSinkServiceCreatePeerTransportState()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3181), and maps the configured control region through [`TupleSinkServiceMapControlRegion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1139).
 
-This mode proves the important path that local `host=blackhole` does not:
+This mode proves the important path that local `mode=blackhole` does not:
 
 - peer-open binds the sender sink to a peer-provisioned receive sink
 - registered local queue slots are published through RDMA write plus immediate notification
@@ -105,15 +109,32 @@ Local smoke command:
 ```sh
 /usr/bin/time -p /data/dbcomm/pg-citus/bin/pg_basebackup \
   -h /tmp -p 5432 -U dbcomm -X none \
-  -t 'homer:host=blackhole,port=9717,node=1,slots=64,bytes=1048576' -v
+  -t 'homer:mode=blackhole,node=1,slots=64,bytes=1048576' -v
 ```
 
 Observed local-smoke result:
 
 - `pg_basebackup` completed successfully; after final reinstall/restart the repeated smoke run completed in `4.43s`.
 - Service log reported `objects=25788`, `payload_bytes=23196101440`, and `last_archive=1` on the repeated run.
-- Upstream `TARGET 'blackhole'` producer-only reference completed in `4.64s`.
+- Upstream `TARGET 'blackhole'` producer-only reference completed in `4.64s`. This is a PostgreSQL server-side discard path, not a Homer path.
 - Normal libpq tar-to-stdout reference (`-D - -F t -X none > /dev/null`) completed in `10.11s` before the later restart and `10.05s` after the default-geometry patch/restart.
+
+May 14, 2026 naming cleanup: the local Homer blackhole receiver was changed
+from the confusing public spelling `host=blackhole` to `mode=blackhole`.
+After rebuilding/reinstalling dbcomm and PostgreSQL and restarting the service,
+the first post-restart local smoke run took `10.93s`, then warmed repeats took
+`4.79s`, `4.59s`, and `4.35s`, matching the previous local blackhole band. The
+old `host=blackhole` spelling now fails with an explicit hint to use
+`mode=blackhole`.
+
+The same rebuild was checked against the foreground pgbench Homer path to make
+sure this basebackup-only naming change did not regress client SQL sessions.
+After one cold/variance run at `12753 TPS`, three c4/j4/t20000 repeats completed
+with zero failures at `15909 TPS`, `15827 TPS`, and `15368 TPS`, with p99 latency
+between `0.416 ms` and `0.453 ms`. After the final formatting rebuild/install
+and PostgreSQL restart, `mode=blackhole` completed in `4.55s`, and two
+c4/j4/t20000 pgbench repeats completed with zero failures at `15271 TPS` and
+`15359 TPS`, with p99 latency around `0.40 ms`.
 
 These timings are only sanity references. The Homer run used local shared-memory blackhole validation, not remote RDMA, so it should not be used as the final performance comparison.
 
@@ -212,7 +233,7 @@ proving that the blackhole transport can carry the stream.
 
 ## Remaining Work
 
-- Decide whether to keep or remove the local `host=blackhole` smoke hook once two-node testing is routine.
+- Decide whether to keep or remove the local `mode=blackhole` smoke hook once two-node testing is routine.
 - Materialize a receiver-side basebackup sink after the blackhole/counting receiver.
 - Add WAL policy support only after the base archive stream path is stable.
 - Generalize tuple-named queue/RDMA symbols into neutral names when practical; the payload substrate is already carrying non-tuple semantic objects.
