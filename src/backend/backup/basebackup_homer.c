@@ -136,6 +136,18 @@ bbsink_homer_apply_detail(HomerClientBaseBackupStreamOptions *options,
 			options->slotCount = pg_strtoint32(value);
 		else if (strcmp(key, "bytes") == 0)
 			options->payloadCapacityBytes = pg_strtoint32(value);
+		else if (strcmp(key, "publish") == 0)
+		{
+			/*
+			 * Producer publication is an experiment knob for balancing pipeline
+			 * overlap against service-side range shape. "auto" preserves the
+			 * Homer default; publish=1 exposes every filled slot immediately.
+			 */
+			if (strcmp(value, "auto") == 0)
+				options->publishBatchSlots = 0;
+			else
+				options->publishBatchSlots = pg_strtoint32(value);
+		}
 		else if (strcmp(key, "dboid") == 0)
 			options->databaseOid = pg_strtoint32(value);
 		else if (strcmp(key, "useroid") == 0)
@@ -152,6 +164,13 @@ bbsink_homer_apply_detail(HomerClientBaseBackupStreamOptions *options,
 				 errmsg("Homer base backup payload bytes must be a multiple of BLCKSZ"),
 				 errdetail("payload_bytes=%u BLCKSZ=%u",
 						   options->payloadCapacityBytes, BLCKSZ)));
+
+	if (options->publishBatchSlots > options->slotCount)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Homer base backup publish batch cannot exceed slot count"),
+				 errdetail("publish=%u slots=%u",
+						   options->publishBatchSlots, options->slotCount)));
 
 	pfree(detail_copy);
 }

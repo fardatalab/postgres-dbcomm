@@ -652,6 +652,42 @@ The scheduler that matters for the research contribution is the RDMA egress
 scheduler. It decides which ready RDMA-sendable work is posted next when several
 traffic classes are active.
 
+Use these terms consistently:
+
+- **Traffic class** is semantic transport treatment, not merely numeric
+  priority. Examples are critical control, normal control, foreground payload,
+  bulk payload, and maintenance. A policy may map traffic class to default
+  priority, weight, or latency sensitivity, but those are scheduler parameters,
+  not the class itself.
+- **Transport lane** is the physical/resource lane used to carry one traffic
+  class or a small class group. A lane owns the relevant RDMA resources: QP/CQ
+  state, registered control/ring structures, doorbell/notification state,
+  completion handling, and any lane-local posted-WR accounting.
+- **Logical channel** is the session/control/payload abstraction above the
+  transport. Examples are service-to-service peer control, peer command
+  completion, a foreground tuple/result payload stream, and a bulk basebackup
+  stream. Logical channels choose traffic classes; the transport maps those
+  classes onto lanes.
+- **Ready item** is the scheduler-visible unit of pending egress work. It names
+  the owner/channel and carries traffic class, priority/weight hints, estimated
+  bytes, estimated WR count, object count, and age.
+- **Grant** is the scheduler decision for one ready item: how many objects, WRs,
+  or bytes it may post in this scheduling step.
+
+There are two scheduling layers and they should stay distinct:
+
+- **Service progress scheduling** decides how the Homer service spends CPU
+  cycles among local control, peer control, backend completions, payload streams,
+  and heartbeat/progress maintenance. The current fixed-order primitive is
+  [`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8889),
+  with active payload-stream scanning at
+  [`tuple_sink_service_process.c:8950`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8950).
+- **Transport egress scheduling** decides which RDMA-sendable work is posted to
+  the NIC next. Today
+  [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6239)
+  still computes and posts its own payload batches directly, so it is not yet a
+  transport scheduler.
+
 Candidate work items should be explicit metadata, not a bit mask:
 
 ```c
@@ -721,7 +757,9 @@ a tiny control message and an 8 MiB basebackup chunk look equally expensive.
 
 ## Multiple QPs from the start
 
-The design should allow multiple QPs per peer transport from the start.
+The design should allow multiple lanes/QPs per peer transport from the start,
+but service code should target a traffic-class transport API rather than
+reaching directly for "the peer connection's QP."
 
 One QP can preserve correctness, but it cannot reorder work already posted to
 that QP. If the service posts a long basebackup WR chain and then a tiny control
@@ -732,25 +770,846 @@ measurement.
 Target peer transport shape:
 
 ```c
-HomerPeerTransport
+typedef struct HomerTransportLane
 {
-    controlCriticalQp;
-    foregroundPayloadQp;
-    bulkPayloadQp;
-    maintenanceQp;          /* optional */
-}
+    HomerTrafficClass trafficClass;
+    /* QP/CQ, control/ring state, doorbells, completion accounting. */
+} HomerTransportLane;
+
+typedef struct HomerPeerTransport
+{
+    HomerTransportLane criticalControl;
+    HomerTransportLane normalControl;       /* optional initially */
+    HomerTransportLane foregroundPayload;
+    HomerTransportLane bulkPayload;
+    HomerTransportLane maintenance;         /* optional */
+
+    /*
+     * Later: lane pools are allowed for high-throughput classes.
+     * The API must not assume exactly one QP per traffic class.
+     */
+} HomerPeerTransport;
 ```
 
 The scheduler chooses a traffic class and grant. The transport maps that class
 to a QP. Link-level contention still exists, but a control write is no longer
 queued behind already-posted bulk WRs in the verbs work queue.
 
+Initial lane policy:
+
+- start with one **critical-control lane** per peer transport
+- that lane carries peer-control requests and peer completion/event records
+- the critical-control lane uses a multi-slot peer-control request ring plus a
+  peer completion/event ring, not many one-slot mailboxes
+- keep this as one lane initially to preserve simple total ordering for critical
+  control events and avoid over-engineering control-plane sharding before there
+  is evidence it is needed
+- keep the abstraction capable of a future critical-control lane pool, but only
+  shard critical control later if records carry explicit request/session
+  ordering and measurements show the single lane is a bottleneck
+
+Payload classes are the first realistic candidates for multiple lanes/QPs within
+one class. Foreground tuple/result payloads may use a foreground QP or QP pool;
+basebackup and future WAL streams may use a bulk QP or QP pool.
+
 The first implementation may keep one QP internally while the scheduler API is
-introduced, but the API must not bake in "one peer == one QP." The right
-abstraction is "one peer has one or more traffic-class transports."
+introduced. That first step is a correctness/performance-preservation
+checkpoint only; it does not claim to reduce posted-WR head-of-line blocking.
+The API must not bake in "one peer == one QP." The right abstraction is "one peer
+has one or more traffic-class transports."
 
 Multiple QPs within a traffic class should also remain possible for throughput
 experiments, especially for bulk basebackup or future WAL streams.
+
+Staged implementation rule:
+
+1. First land the traffic-class metadata and transport API while mapping every
+   traffic class to the existing peer connection lane/QP. This is now complete
+   for the single-lane checkpoint; it preserves behavior and does not claim to
+   reduce posted-WR head-of-line blocking.
+2. Only after that checkpoint passes, split physical resources so critical
+   control, foreground payload, and bulk payload map to distinct lanes/QPs. This
+   second step is the one expected to reduce posted-WR head-of-line blocking.
+3. Scheduler policy experiments come after the physical lane split is measurable.
+   Before that, policy decisions cannot fully express the intended transport
+   priority because all work still enters one QP.
+
+Implementation progress on May 14, 2026: the single-lane checkpoint is in the
+code. [`HomerTransportTrafficClass`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:62)
+and [`HomerTransportSchedulingMetadata`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:82)
+define the internal traffic-class/scheduler metadata. Each payload stream caches
+that metadata in
+[`HomerPayloadStreamState.transportScheduling`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:630),
+initialized by
+[`HomerServiceInitPayloadTransportScheduling()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:844).
+The current mapping is:
+
+- tuple/COPY/result payload -> foreground payload, selected by
+  [`HomerServicePayloadTrafficClassForOpKind()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:826)
+- basebackup payload -> bulk payload, selected by the same helper
+- peer-control requests/responses -> critical control, passed through
+  [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2634)
+
+All classes still resolve to the existing peer connection/QP through the
+single-lane resolver inside
+[`TupleSinkServicePeerConnectionForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2315).
+Payload posting now goes through the traffic-class API at
+[`TupleSinkServicePostPeerRegisteredPayloadBatchWithImmediateRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3571),
+with the call site in
+[`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6534).
+Outgoing peer-connection acquisition also accepts the class at
+[`TupleSinkServiceEnsureOutgoingPeerConnectionHandleRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2267),
+but the connection lookup key is intentionally unchanged for this checkpoint.
+
+Validation on the final single-lane binary:
+
+- `make -j8`, `git diff --check`, and
+  `sudo -n make install-headers install-service-bin install` passed in
+  `/data/dbcomm/citus-dbcomm-separate-comm-stack`.
+- Single-client Homer pgbench, c1/j1/t50000, after clean
+  `pgbench_history` reset: first post-restart run showed the known low
+  cold/variance band at `5170.8 TPS`, repeat recovered to `6049.99 TPS` with
+  p99 `0.183 ms` and zero failures.
+- Multi-client Homer pgbench, c4/j4/t20000, after clean reset: `15044.83 TPS`,
+  p99 `0.462 ms`, zero failures. This remains in the current `~15k TPS`
+  performance band.
+- Local Homer basebackup blackhole with the previously used explicit geometry
+  `slots=64,bytes=1048576` remained in the old local band after the traffic-class
+  patch: `4.44s`, `4.48s`, and `4.44s`.
+- Remote RDMA basebackup blackhole to farnet0 completed successfully after
+  syncing/restarting the farnet0 service binary: `real 6.70s`. This is a
+  different path from local blackhole and should not be used as the local
+  blackhole no-regression baseline. A prior rerun failed during receiver binary
+  replacement/stale service state with a local control timeout, then succeeded
+  immediately after restarting the local service; do not treat that failed run
+  as a traffic-class payload regression.
+
+## Basebackup RDMA performance investigation lessons
+
+This section records what the basebackup performance work taught us before the
+multiple-QP/scheduler milestone. The important correction is that **mixed
+traffic scheduling is not the explanation for a single bulk-stream basebackup
+regression**. The scheduler remains necessary for concurrent foreground SQL plus
+bulk basebackup, but the single-stream basebackup gap should first be explained
+by measurement discipline and the RDMA payload publication path itself.
+
+### Measurement discipline: warm steady state, not first-run timing
+
+Cold first runs on farnet can include setup effects that are not the target
+metric: peer connection establishment, memory registration/page faults, service
+state after restart, PostgreSQL checkpoint timing, and binary replacement
+artifacts. The target measurement is a warmed run that lasts at least about five
+seconds or an aggregate of warmed repeats.
+
+Evidence from May 15, 2026:
+
+- A cold/diagnostic remote RDMA run had previously shown about `9.15s` with
+  `slots=8,bytes=8388608`, which made the transport look much worse than local
+  blackhole.
+- Without restarting either service, warmed remote RDMA repeats on the same
+  farnet1 -> farnet0 setup completed in `4.50s`, `4.69s`, and `4.65s`.
+- Warm local Homer blackhole repeats completed in `4.37s` and `4.37s`.
+
+Those runs are slightly shorter than the desired final measurement window, so
+they are not final experiment numbers. They are still enough to refute the
+earlier interpretation that the steady-state RDMA path has a multi-second
+transport bottleneck. For this workload, final claims should use larger input,
+multiple warmed repeats, or both.
+
+### Successes and reusable patterns
+
+The successful optimizations share a common shape: remove serialized progress
+points from the hot path while preserving the RDMA publication rule that payload
+bytes become responder-visible only after a responder-visible doorbell.
+
+1. **Bigger payload slots removed first-order per-object overhead.**
+
+   The original 64 x 1 MiB default made the service pay validation, header,
+   verbs, and doorbell overhead for about `25k` objects per backup. Moving to
+   larger slots cut the object count to about `6.4k` for 8 MiB chunks and
+   changed two-service RDMA from the `31s` band to roughly the `9s` band before
+   later transport fixes. The code path this helped is the per-object loop in
+   [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6255),
+   especially validation through
+   [`HomerServiceValidateOutgoingPayloadObject()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6029)
+   and descriptor construction before
+   [`TupleSinkServicePostPeerRegisteredPayloadBatchWithImmediateRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3648).
+
+   Reusable pattern: tuple/result/WAL payload streams should choose object sizes
+   that amortize transport metadata, but they should not blindly make semantic
+   objects so large that later foreground traffic cannot interleave. For very
+   large objects, the longer-term answer is substrate-level fragmentation rather
+   than mutating producer-level semantics.
+
+2. **Asynchronous posted/completed frontiers removed a false source-slot
+   serialization point.**
+
+   The sender now distinguishes "posted to the NIC" from "safe to release the
+   backend-visible source slot." That lets
+   [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6255)
+   keep more WRs in flight while local completions advance
+   `payloadSenderCompletedHead`. Earlier measurements recorded the 8 MiB path
+   improving from about `9.28s` to about `6.01s`, and 1 MiB chunks stopped being
+   pathologically slow.
+
+   Reusable pattern: any future payload family should track three frontiers
+   separately: producer-published, NIC-posted, and locally completed/reusable.
+   Collapsing those frontiers serializes the data path even when RDMA ordering
+   would allow more in-flight work.
+
+3. **Range publication reduced responder-visible doorbells and completion
+   checkpoints.**
+
+   The service builds up to
+   `CITUS_REMOTE_EXEC_PEER_PAYLOAD_BATCH_MAX_WRITES` descriptors and publishes
+   one contiguous semantic range through
+   [`TupleSinkServicePostPeerRegisteredPayloadBatchWithImmediateRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3648).
+   Earlier warmed 64 x 1 MiB runs reached the `5.08s` band after range
+   publication, compared with `6.60s` after only the asynchronous frontier split.
+
+   Reusable pattern: keep the object-family abstraction at the stream layer, but
+   let the transport publish ranges when the ring contains adjacent ready
+   objects. This applies to tuple batches, basebackup chunks, and future WAL
+   chunks.
+
+4. **The empty-CQ-poll guard removed wasted progress work without changing
+   semantics.**
+
+   The sender should only call
+   [`TupleSinkServicePollPeerPayloadSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3941)
+   when `payloadSenderCompletedHead < payloadSenderLastSignaledTail`. A
+   diagnostic 8x8MiB run cut empty payload send-CQ polls from about `30M` to
+   about `12.5M`.
+
+   Reusable pattern: the service loop should avoid polling a resource whose
+   outstanding frontier proves there is no possible completion. This is a first
+   layer service-loop optimization, independent of the later RDMA egress
+   scheduler.
+
+5. **Restart discipline matters when PostgreSQL links the Homer client
+   statically.**
+
+   One apparent regression came from reinstalling the Homer client library but
+   not restarting the running postmaster. After PostgreSQL was reinstalled and
+   restarted, batching in
+   [`HomerClientBaseBackupPublishBatchSlots()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1186),
+   [`HomerClientFlushBaseBackupPublishedTail()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1208),
+   and
+   [`HomerClientSubmitBaseBackupSlot()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1550)
+   was actually present in the backend process.
+
+   Reusable pattern: benchmark notes must record whether the running postmaster
+   was restarted after `libhomer_client.a` or PostgreSQL relinks. Otherwise we
+   can benchmark stale code and misattribute the result to transport design.
+
+### Refuted or narrowed hypotheses
+
+1. **Receiver ring credit was not the warmed bottleneck in the measured
+   single-stream run.**
+
+   Diagnostic counters showed `remote_waits=0` in the sender path. That means
+   the branch in
+   [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6551)
+   was not constraining that run. Increasing receive slot count therefore did
+   not help. Receiver credit can still matter in a different scale point or with
+   a slower materializing receiver, but it was not the root cause for the warmed
+   blackhole receiver experiment.
+
+2. **Local source-slot / send-completion credit was not the warmed bottleneck in
+   the same run.**
+
+   Diagnostic counters also showed `local_waits=0`, so the local in-flight
+   check at
+   [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6477)
+   was not blocking normal progress. This narrows the remaining cost toward WR
+   count, doorbell count, validation/header work, service-loop overhead, or cold
+   setup effects rather than hard credit stalls.
+
+3. **Receiver consumed-head ACK frequency is not the first-order issue for the
+   warmed blackhole receiver.**
+
+   Receiver ACKs are already thresholded by
+   [`HomerServiceShouldPublishReceiverHeadAck()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6911),
+   capped by `HOMER_SERVICE_RECEIVER_HEAD_ACK_MAX_GRANULARITY`. The receiver
+   publishes credit through
+   [`HomerServicePostReceiverHeadAck()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6846).
+   Coalescing consumed-head publication by pump pass did not materially improve
+   the earlier basebackup run. With `remote_waits=0`, making ACKs more frequent
+   should not help; making them less frequent only helps if it does not create
+   sender credit stalls.
+
+4. **Forcing full batches can improve counters while hurting elapsed time.**
+
+   Waiting for full 8-object bulk ranges produced clean counters (`810` sender
+   batches and `809` receiver head publishes in one diagnostic), but slowed the
+   run to about `10.3s` because it sacrificed producer/RDMA overlap. This does
+   not mean coalescing is a bad direction. It means coalescing must not be
+   implemented as a blocking wait for a full batch. It should happen
+   opportunistically over the ready set already present in the ring.
+
+5. **Producer-side tar-byte aggregation above the Homer slot boundary is not a
+   safe shortcut.**
+
+   An experiment reduced basebackup object count from about `6481` to `2765`
+   and sender batches from about `1620` to `692`, but it was backed out. It
+   mutated the upstream-visible `bbs_buffer`/`bbs_buffer_length` suffix inside
+   [`bbsink_homer_archive_contents()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_homer.c:277)
+   and
+   [`bbsink_homer_manifest_contents()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_homer.c:331),
+   violated subtle basebackup sink lifetime assumptions, and caused
+   intermittent `BASE_BACKUP` backend segmentation faults after clean restarts.
+   It also did not improve successful elapsed-time runs enough to justify the
+   semantic risk.
+
+   The useful lesson is not "aggregation is bad"; it is "aggregation belongs
+   below the typed object boundary or inside the RDMA substrate, not by
+   rewriting PostgreSQL's active sink buffer contract."
+
+### Implemented May 15 publication and doorbell changes
+
+The current code now implements the two optimizations that survived the warm-run
+A/B checks:
+
+1. **Immediate producer publication is the default.**
+
+   [`HomerClientBaseBackupPublishBatchSlots()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1186)
+   now returns `1` by default, while `publish=N` in the pg_basebackup target
+   detail remains available for diagnostics. This was based on the warmed
+   remote RDMA sweep with `slots=8,bytes=8388608`:
+
+   - old `publish=auto` (`4`): about `5.02-5.09s` warmed
+   - `publish=2`: `4.84-5.08s`, with about `472k-496k` reserve-wait loops
+   - `publish=3`: `4.96-5.08s`, with about `1.15M-1.18M` reserve-wait loops
+   - `publish=1`: about `4.86-4.94s` before doorbell piggybacking, with only
+     about `114k-135k` reserve-wait loops
+
+   This refuted the earlier idea that producer publication batching should be
+   the default way to create larger service ranges. It improves sender-side
+   batch shape, but it hides ready work from the service and costs pipeline
+   overlap. Batching should happen downstream over already-visible work.
+
+2. **The payload doorbell is piggybacked onto the final payload write.**
+
+   [`TupleSinkServicePostPeerRegisteredPayloadBatchWithImmediateRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3648)
+   no longer posts a separate 8-byte tail `RDMA_WRITE_WITH_IMM`. The final
+   payload WR in the batch uses `IBV_WR_RDMA_WRITE_WITH_IMM`, and the sender
+   still tags the signaled completion with the completed semantic frontier for
+   source-slot release.
+
+   On the receiver,
+   [`HomerServicePumpIncomingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7056)
+   derives the local receive-ring frontier from validated in-band
+   `CitusTupleSinkTransportHeader` records before consuming payload objects.
+   A first attempt treated "doorbell arrived but the next header still looks
+   stale" as corruption; farnet showed this can happen at ring wrap
+   (`sequence=65` still showing stale `sequence=57`). The current implementation
+   keeps the pending-doorbell flag set and retries instead of breaking the
+   stream. This preserves correctness while avoiding the explicit tail WR on
+   the hot path.
+
+   With the no-stats measurement build (`CPPFLAGS='-D_GNU_SOURCE'`), warmed
+   remote RDMA runs after the change were:
+
+   - cold first run after restart: `8.29s` (not the steady-state number)
+   - warmed runs: `4.76`, `4.76`, `4.73`, `4.88`, `4.95`, `4.62`, `4.76`,
+     `4.62s`
+   - a later warmed default/`publish=auto` rerun, where `auto` now means the
+     immediate-publication default, produced `4.66`, `4.53`, and `4.48s`
+
+   The stable comparison point is therefore roughly a `4.6-4.9s` warmed band,
+   improved from the previous best `publish=1` explicit-tail band of about
+   `4.86-4.94s` and from the old `publish=auto` band of about `5.0s`.
+
+   After piggybacking, small explicit producer batches are no longer obviously
+   harmful, but they also did not justify changing the default:
+
+   - `publish=2`: `4.67`, `4.79`, `4.53s`
+   - `publish=3`: `4.67`, `4.70`, `4.64s`
+   - `publish=4`: `4.66`, `4.66`, `4.96s`
+   - `publish=8`: `5.79`, `5.62`, `5.97s`
+
+   Keep the default as immediate publication for now. It has the best observed
+   low end and avoids hiding ready work. Treat `publish=2..4` as sensitivity
+   knobs, not as a new default, unless a longer run shows a stable win.
+
+3. **Larger objects did not help this workload.**
+
+   A warmed remote geometry sweep with immediate publication showed:
+
+   - `slots=8,bytes=16777216`: about `5.60-5.77s`
+   - `slots=4,bytes=33554432`: about `6.09-6.11s`
+   - `slots=16,bytes=8388608`: about `5.12-5.22s`
+
+   This refutes "object count alone dominates" for the current basebackup
+   stream. Larger objects reduce object count but hurt overlap/credit
+   granularity enough to lose. The current default geometry should stay at
+   `slots=8,bytes=8388608` until a broader scheduler/fragmentation design
+   changes the tradeoff.
+
+### Remaining plausible optimizations
+
+Current next-step plan after the May 15 publication and piggyback changes:
+
+1. **Coalesce adjacent no-wrap payload slots into fewer RDMA WRs.**
+
+   Piggybacking removes the separate tail WR, but the best path still emits
+   almost one payload WR per object because immediate producer publication makes
+   the service see mostly one-object ready ranges. When local send slots and
+   remote payload slots are contiguous and do not wrap, the sender can publish
+   one larger byte range while the upper layer still sees complete semantic
+   objects through the in-band headers. This should be opportunistic over
+   already-visible objects only; do not wait for a full batch, because the
+   earlier full-batch experiment improved counters but slowed the run to about
+   `10.3s`.
+
+   Keep `WRITE_WITH_IMM` as the data-publish notification. The target transport
+   shape is not memory polling; it is "one responder-visible immediate per
+   coalesced posted range." The immediate should stay on the final payload WR in
+   that range, so the receiver still gets a CQ event and the sender still gets a
+   tagged completion frontier. Coalescing is useful because it reduces how often
+   that notification is needed.
+
+   The coalescing rule must be byte-contiguity, not just sequence adjacency:
+   merge only when the previous descriptor's local end equals the next slot's
+   local start and the previous remote end equals the next slot's remote start.
+   This avoids RDMA-writing unused padding or stale bytes between variable-size
+   objects. Full basebackup archive chunks usually qualify; partial archive,
+   manifest, and END records usually do not.
+
+   This is also the smallest concrete piece of the eventual adaptive scheduler.
+   Long term, the scheduler should keep producers publishing promptly, observe
+   already-ready items, and choose a grant in objects/bytes/WRs based on traffic
+   class, age, and competing work. Small grants preserve foreground latency;
+   larger grants let a lone bulk stream amortize WR and doorbell cost. The
+   scheduler should adapt this transport batching decision instead of making the
+   producer hide ready objects behind a fixed `publish=N` threshold.
+
+   Implementation progress on May 15, 2026: byte-contiguous coalescing is now
+   implemented in
+   [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6260).
+   The sender still validates and headers each semantic object, but it merges
+   adjacent RDMA write descriptors only when the previous descriptor's local end
+   and remote end exactly match the next slot. This keeps the object-family
+   contract unchanged while reducing verbs descriptors when the ring has
+   adjacent full-slot payloads.
+
+   Diagnostic remote RDMA results with stats enabled:
+
+   - default `publish=auto`, which currently means immediate `publish=1`:
+     cold first run `8.41s`, warm repeats `4.54s` and `4.51s`;
+     sender `sender_wrs=6484`, `sender_coalesced_objects=0`,
+     `sender_batches` about `6473-6475`, receiver doorbells about
+     `6440-6452`.
+   - `publish=3`: `4.69s`, `4.79s`, and `4.79s`; sender
+     `sender_batches=2161`, `sender_wrs=4876`,
+     `sender_coalesced_objects=1608`, receiver doorbells about `2135-2141`.
+     Producer reserve-wait loops rose to about `1.13M-1.16M`.
+
+   This confirms that no-wrap coalescing works mechanically: it reduces WRs and
+   receiver-visible doorbells when it is fed adjacent full slots. It also
+   confirms that producer-side batching is the wrong way to feed it for this
+   workload. Hiding ready slots behind `publish=3` improves transport counters
+   but loses enough pipeline overlap to slow elapsed time. The next useful
+   experiment is a bounded service-side/adaptive scheduler microbatch over
+   already-visible or imminently-visible bulk work, not changing the producer
+   default away from immediate publication.
+
+2. **Consider a tiny service-side microbatch window only with evidence.**
+
+   `publish=1` proves early visibility matters, but it also prevents the
+   service from naturally seeing adjacent slots. A very small bounded retry in
+   the service, after seeing one ready object, might let it coalesce work that
+   is already about to become visible. This is risky because it can reintroduce
+   hidden waiting. Only try it with counters that separately show elapsed time,
+   reserve-wait loops, effective batch histogram, and receiver doorbells.
+
+   Experiment result on May 15, 2026: a bulk-only ready-spin build with
+   `HOMER_SERVICE_PAYLOAD_READY_SPIN_LIMIT=32` and target `3` was slower than
+   the no-spin path. Warm runs were `4.76`, `4.72`, and `4.74s`. The sender
+   performed about `206k` ready-spin pause/load loops per backup, gained only
+   about `26-31` additional ready objects, and still recorded
+   `sender_coalesced_objects=0`. This refutes the idea that the next adjacent
+   object is usually only a few pause cycles away. A tiny service-side spin is
+   mostly wasted service CPU for this workload.
+
+   A no-spin shape counter run showed why: each backup has `6484` semantic
+   objects, but only `2746` are full-slot objects while `3738` are partial-slot
+   objects. With immediate `publish=1`, the service almost always sees a
+   one-object range (`sender_batches` about `6471-6475`) and therefore cannot
+   use byte-contiguous no-wrap coalescing. The earlier `publish=3` run created
+   enough adjacency to coalesce `1608` objects, but it did so by hiding producer
+   work and increasing producer reserve-wait loops by roughly an order of
+   magnitude.
+
+   Consequence: keep this ready-spin knob as diagnostic-only and disabled by
+   default. If we want fuller objects, the next design should be a safe
+   object-formation change, not a service spin. The tempting approach is to pack
+   several upstream basebackup callbacks into one Homer object, but the
+   PostgreSQL `bbsink` contract in
+   [`basebackup_sink.h`](/data/dbcomm/postgres-citus-separate-comm-stack/src/include/backup/basebackup_sink.h:82)
+   says `bbs_buffer`/`bbs_buffer_length` are generally stable after creation.
+   The current Homer sink already bends that by swapping to a newly reserved
+   slot at callback boundaries; packing partial callbacks into a single slot by
+   continually exposing suffix pointers would bend it further and can break
+   callers that assert a BLCKSZ-multiple buffer length, such as
+   [`sendFile()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup.c:1617).
+   A safe version needs separate design: either accept an explicit copy into a
+   Homer-owned aggregation slot, add a PostgreSQL-side sink API that supports
+   appendable variable views, or move fragmentation/coalescing lower in the
+   transport without changing `bbsink` semantics.
+
+3. **Compile out redundant hot-path validation for performance runs after
+   correctness is established.**
+
+   Sender-side validation in
+   [`HomerServiceValidateOutgoingPayloadObject()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6029),
+   transport-header setup in
+   [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6620),
+   and receiver-side validation in
+   [`HomerServicePumpIncomingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7094)
+   are valuable during bring-up. For final steady-state experiments, a
+   compile-time performance build can keep only the checks required to avoid
+   silent memory corruption. This should be done with explicit debug/perf macros
+   so the diagnostic path remains easy to re-enable.
+
+4. **Measure service CPU and frontier behavior with narrow counters before
+   blaming the link.**
+
+   The 400 Gbps link/NIC should not be the limiting factor for the observed
+   basebackup rates. When a warm RDMA run remains slower than local blackhole,
+   prefer counters around `publishedTail`, `payloadSenderPostedTail`,
+   `payloadSenderCompletedHead`, `senderVisibleRemoteConsumedHead`, batch size
+   histogram, CQ poll count, and receiver doorbells. Avoid high-volume logging
+   on the hot path; use final-only counters gated by compile-time macros.
+
+5. **Treat send-CQ polling as a narrowed, not solved, hot-path lead.**
+
+   A diagnostic build with
+   `HOMER_SERVICE_PAYLOAD_COMPLETION_POLL_MIN_INFLIGHT=4` cut sender empty-CQ
+   polls from about `8.4M` per backup to about `2.5k`, proving the old path was
+   doing a large amount of empty polling. The first version also exposed a
+   correctness/lifetime problem: if fewer than four objects remained in flight
+   at close, sender-side peer-binding cleanup did not run because the tail
+   completion was never polled. The code now forces completion polling when
+   `localPeerClosePending` is set so deferred close can drain.
+
+   After that fix, warm elapsed time was `4.77` and `4.85s` in the short
+   confirmation run, despite correct cleanup and far fewer empty polls. This
+   means empty CQ polling is real wasted service-loop work, but simply delaying
+   completion polling can also delay source-slot release and does not clearly
+   improve end-to-end basebackup throughput at the current `slots=8` geometry.
+   Keep the default completion-poll threshold at `1`; revisit this as an
+   adaptive scheduler/local-progress policy rather than a fixed threshold.
+
+   The installed tree was restored to the no-stats default build after the
+   diagnostics. A final no-stats remote RDMA sanity check after restarting
+   PostgreSQL and both Homer services produced cold `8.33s`, then warm `4.94`
+   and `4.87s`. That is correct but still above the best earlier warmed
+   `4.5-4.8s` band, so do not claim the remaining performance gap is closed.
+
+6. **Move bulk payloads toward a framed byte-stream ring.**
+
+   The current payload ring is object-slot based: one semantic object sequence
+   maps to one fixed remote payload slot. The sender already RDMA-writes only
+   the valid bytes for a partial object, so the substrate is not restricted to
+   full-slot writes. The problem is coalescing: when object `N` uses only a
+   small prefix of its 8 MiB slot, object `N+1` still lives at the next 8 MiB
+   slot address. A single contiguous RDMA write would include the unused gap, so
+   the sender correctly refuses to merge those descriptors.
+
+   The target design should decouple three granularities:
+
+   - **Semantic record granularity**: basebackup chunk, tuple batch, WAL record
+     group, etc. These should be produced promptly so we keep pipeline overlap
+     and later scheduler fairness.
+   - **Transport framing granularity**: one or more semantic records or record
+     fragments packed into a contiguous byte-ring region.
+   - **RDMA posting granularity**: one scheduler grant that may post one or more
+     RDMA WRs and carry one responder-visible `WRITE_WITH_IMM` publication
+     event for the newly visible byte range.
+
+   The producer rule is deliberately the opposite of "form larger objects by
+   waiting." The database backend should publish each complete semantic record
+   as soon as that record is ready. Waiting in the backend hides ready work from
+   the service and repeats the `publish=N` failure mode: better-looking batches
+   at the cost of worse pipeline overlap and higher producer reserve waits.
+
+   The batching tradeoff belongs after publication. Once records are visible in
+   the Homer substrate, the service/transport scheduler decides how much
+   already-ready work to post in this turn. Posting immediately gives the best
+   overlap and latency but can create too many WRs and doorbells; granting a
+   larger byte range improves software/NIC efficiency but too much delay harms
+   overlap. The framed byte ring is useful because it lets us keep small
+   semantic granularity while granting larger contiguous transport byte ranges.
+
+   Keep the two scheduling layers separate:
+
+   - **Service progress scheduling** decides how the Homer service spends CPU
+     cycles across producer-tail checks, peer-control work, receiver credit,
+     send-CQ completions, and active payload streams. This layer should avoid
+     wasting CPU, but it should not hide producer work.
+   - **Transport egress scheduling** decides the RDMA grant over visible work:
+     bytes, frames, WR count, age, traffic class, and competing streams. This is
+     the right layer for adaptive batching/coalescing policy.
+
+   Proposed data structures:
+
+   ```c
+   typedef struct HomerPayloadProducerFrontier
+   {
+       uint64_t producerReservedTail;     /* local producer owns bytes below this */
+       uint64_t producerPublishedTail;    /* complete frames visible to service */
+   } HomerPayloadProducerFrontier;
+
+   typedef struct HomerPayloadTransportFrontier
+   {
+       uint64_t transportPostedTail;      /* bytes posted to RDMA */
+       uint64_t transportCompletedHead;   /* bytes safe to reuse locally */
+   } HomerPayloadTransportFrontier;
+
+   typedef struct HomerPayloadReceiverFrontier
+   {
+       uint64_t receiverConsumedHead;     /* peer has parsed/delivered bytes */
+       uint64_t receiverAckedHead;        /* sender-visible consumed frontier */
+   } HomerPayloadReceiverFrontier;
+
+   typedef struct HomerPayloadByteRingDescriptor
+   {
+       uint32_t ringBytes;
+       uint32_t flags;
+   } HomerPayloadByteRingDescriptor;
+
+   typedef struct HomerPayloadFrameHeader
+   {
+       uint32_t magic;
+       uint16_t protocolVersion;
+       uint16_t objectFamily;
+       uint32_t headerBytes;
+       uint32_t frameBytes;
+       uint32_t semanticHeaderBytes;
+       uint64_t streamSequence;
+       uint64_t absoluteFrameOffset;
+       uint32_t fragmentOrdinal;
+       uint32_t fragmentCount;
+       uint32_t flags;                    /* begin/end/error/fragmented */
+   } HomerPayloadFrameHeader;
+   ```
+
+   The structs above are conceptual names, not a mandate to put all frontiers in
+   one physical cache line or even one shared-memory object. The current service
+   already has separate local payload-ring state and peer head mirrors in
+   `HomerPayloadStreamState` in
+   `src/backend/distributed/utils/homer/tuple_sink_service_process.c`, and the
+   byte-ring implementation should preserve that ownership split. Source-ring
+   lifetime and remote receive-ring credit are different windows:
+
+   - **Local source reuse** is governed by local NIC send completion. The
+     producer may not reuse bytes until the service has advanced
+     `transportCompletedHead` for the RDMA WRs that referenced those bytes.
+   - **Remote destination credit** is governed by peer receiver consumption. The
+     sender may not post into remote byte-ring space until its sender-visible
+     remote consumed head says those destination bytes are free.
+
+   Owner-written frontiers should be cache-line separated where possible:
+   producer-only fields, service/transport-only fields, and receiver/ACK-mirror
+   fields should not share a hot line. This matters for today's host service and
+   more for the eventual DPU version, where every normal-path host-memory poll or
+   cache-line bounce can become DMA traffic.
+
+   The byte-ring sender rule is: producers may publish only complete frames;
+   the transport may post any contiguous byte range ending at or before
+   `producerPublishedTail`; the receiver may advance `receiverConsumedHead` only
+   after parsing complete frames and delivering complete semantic objects upward.
+   This preserves typed DB semantics while letting the transport batch already
+   ready small/partial records without requiring fixed-slot adjacency.
+
+   RDMA posting options:
+
+   - If ready bytes are contiguous in the local byte ring and contiguous in the
+     remote byte ring, post one RDMA WRITE or WRITE_WITH_IMM over that range.
+   - If local ready bytes wrap but remote space is contiguous, use multiple WRs
+     or scatter/gather if the remote destination is still one contiguous byte
+     range. Scatter/gather is a tool for local buffer gathering; it does not by
+     itself fix the current fixed-slot remote-layout gap.
+   - If either local or remote byte rings wrap, split at the wrap boundary. The
+     receiver must not publish/deliver a partial frame until all fragments of
+     that frame are visible.
+
+   The first byte-ring version should be whole-frame-only. If a complete
+   semantic frame will not fit in the remaining contiguous tail space, publish a
+   padding/wrap frame, advance to offset zero, and write the real semantic frame
+   at the start of the ring. That avoids introducing frame reassembly in the
+   first patch. A semantic object larger than the ring, or larger than the
+   largest contiguous grant we choose to support, should be rejected or forced
+   onto a later explicit fragmentation path. Once fragmentation is implemented,
+   object-family parsing should accept a two-slice or iovec-style view so a
+   wrapped frame is not relinearized into scratch memory.
+
+   Publication and visibility invariants:
+
+   - The backend producer writes the frame header and payload first, then
+     release-stores `producerPublishedTail`.
+   - The Homer service acquire-loads `producerPublishedTail` before building an
+     RDMA grant.
+   - RC QP ordering plus a final `WRITE_WITH_IMM` makes the byte range visible to
+     the peer before the peer observes the publish event.
+   - The receiver parses only up to the byte frontier carried by the publish
+     event or by the corresponding event metadata; it must not infer readiness by
+     scanning stale ring bytes.
+   - `magic`, `streamSequence`, and `absoluteFrameOffset` are defensive checks
+     against stale headers after wrap and against accidental parsing before the
+     intended byte frontier is visible.
+
+   The current `WRITE_WITH_IMM` immediate value is already used to identify the
+   stream, so the byte-ring design still needs a bounded way to tell the receiver
+   where the newly published byte range ends. The preferred first implementation
+   is a receiver-local per-stream `publishedTail/epoch` word written with
+   `RDMA_WRITE_WITH_IMM`: the write payload is the tail metadata, and the
+   immediate value identifies the stream. This is not a round trip and not a
+   separate metadata write before the notification; it is one small final
+   one-way WR after the payload WR chain. It does cost one more WQE than making
+   the final payload write itself carry the immediate, but it keeps the payload
+   byte stream simple and makes the receiver parse exactly from its local cursor
+   up to the published tail.
+
+   A stream-delimited variant is still possible later: put grant-boundary
+   metadata in the byte stream itself, either by mutating a transport-owned bit in
+   the final frame header or by appending a tiny grant-end marker frame. That can
+   remove the separate tail WR, but it makes the receiver parser responsible for
+   grant-boundary metadata as well as semantic frame parsing. The tail/epoch
+   `RDMA_WRITE_WITH_IMM` path is the simpler first step.
+
+   Keep the one-RDMA-op publication design as an explicit future optimization.
+   If the scheduler grant is contiguous in the local byte ring and lands in
+   contiguous free space in the receiver byte ring, the sender can post a single
+   `RDMA_WRITE_WITH_IMM` whose payload is the packed byte-stream grant and whose
+   immediate still identifies the stream. In that design the receiver learns the
+   grant boundary by parsing transport-owned frame metadata already present in
+   the byte stream, for example a `grantEnd` bit in the final frame or a tiny
+   grant-end marker frame. If either ring wraps, the sender still posts a WR
+   chain and puts `WRITE_WITH_IMM` only on the final WR. This path saves the
+   extra tail/epoch WR, but it should wait until the byte-ring substrate is stable
+   because it deliberately couples receiver parsing to transport grant boundaries.
+
+   Scheduler integration:
+
+   - Ready items should be byte ranges, not just object slots. Each ready item
+     carries traffic class, bytes ready, frame count, estimated WR count, age,
+     and whether the first/last frame is fragmented.
+   - Initial policy can grant whole frames only. Later, for very large basebackup
+     or WAL frames, allow frame fragmentation with explicit reassembly metadata.
+   - `WRITE_WITH_IMM` remains the data-publish notification, attached to the
+     final WR in the granted byte range. Coalescing reduces notification count;
+     it should not replace the notification with remote memory polling.
+   - Grants must be clipped by device and implementation limits: send-queue
+     depth, maximum WR count per post call, maximum SGE count, maximum message
+     size, and the preallocated descriptor space used to build the WR chain.
+   - The first policy can be simple and deterministic: grant up to
+     `min(readyBytes, localContiguousBytes, remoteCreditContiguousBytes,
+     maxGrantBytes, maxGrantWrBytes)`, and force a smaller grant once the oldest
+     ready frame exceeds an age threshold. That preserves overlap without
+     reintroducing producer-side waiting.
+
+   Migration plan:
+
+   1. Add a new `HomerPayloadStreamKind`/mode for byte-ring streams alongside
+      the existing fixed-slot stream. Do not rewrite tuple/result sinks in the
+      first patch.
+   2. Implement byte-ring allocation/registration and control descriptors in the
+      service/peer transport, mapping bulk basebackup streams to the byte-ring
+      mode first.
+   3. Keep the producer API semantically object-based, but use a
+      reserve-capacity/commit-length rule:
+      `reserve maximum frame capacity -> fill semantic header/payload -> commit
+      actual frame bytes -> publish frame`. This matches PostgreSQL `bbsink`
+      behavior, where `bbs_buffer` is exposed before the caller knows the final
+      callback length. The active reservation may temporarily cover more bytes
+      than the final frame; on commit, the next reservation starts at the actual
+      frame end rather than leaving fixed-slot slack in the transport layout.
+   4. Change the basebackup sender to write each callback into a byte-ring frame
+      rather than a fixed object slot. Do not pack by waiting; let the transport
+      pack already-published frames.
+   5. Change the RDMA sender pump to build byte-range grants from
+      `producerPublishedTail - transportPostedTail`, split only on byte-ring
+      wrap, and post one immediate on the final WR for the grant.
+   6. Change the receiver pump to parse `HomerPayloadFrameHeader` records from
+      the byte ring, call the existing object-family validator/materializer only
+      for complete frames, and advance receiver credit in bytes.
+   7. After basebackup is stable, decide whether tuple/result payloads should
+      move to byte rings or keep fixed slots. Tuple batches may still prefer
+      fixed slots if their object shape is already dense and latency-sensitive.
+
+   Close/error/cancel handling is lifecycle-path logic, not part of the regular
+   hot path. The steady-state payload path should assume successful reserve,
+   commit, publish, send, parse, and credit return, with debug-only validation
+   where useful. Still, the implementation needs cold-path cleanup rules so a
+   failed setup or teardown does not leak registered memory or publish stale
+   bytes: a producer that reserves but cannot commit cancels the active
+   reservation; a normal close publishes an END frame and drains outstanding byte
+   grants through local send completion before MR deregistration; the receiver
+   delivers the END/error frame, advances byte credit, and forces the final
+   receiver-head ACK so the sender can reclaim the remote-credit window before
+   teardown.
+
+   Open decisions before implementation:
+
+   - Whether basebackup frames should include the existing
+     `CitusRemoteBaseBackupMessageHeader` as the semantic header unchanged, or
+     fold common fields into `HomerPayloadFrameHeader`.
+   - Whether the producer byte ring lives in PostgreSQL shared memory as today or
+     in a DPU-visible DMA allocation abstraction from the start. The control
+     words should be designed as DMA-polled fields even while the current
+     implementation uses host shared memory.
+   - Whether a later optimization should remove the final tail/epoch
+     `RDMA_WRITE_WITH_IMM` by carrying grant-boundary metadata in the byte stream
+     itself. The first implementation should prefer the explicit tail/epoch word
+     unless measurements show that one extra WQE is a dominant cost after
+     byte-ring packing.
+   - Exact default values for `maxGrantBytes`, `maxGrantWrBytes`, and the age
+     threshold. These should be tuned with counters for effective grant size,
+     WRs per grant, completion count, remote-credit wait time, and producer
+     reserve wait time.
+
+   Evidence run on May 15, 2026: a stats-only sender shape run with
+   `slots=8,bytes=8388608` produced three successful remote RDMA basebackup
+   runs at `5.02s`, `4.95s`, and `4.84s`. The object distribution was stable:
+
+   - `6484` total semantic objects
+   - `6477` archive chunk objects
+   - `1` manifest chunk object, about `308 KiB`
+   - `6` zero-payload control objects: begin/archive-begin/archive-end/
+     manifest-begin/manifest-end/end
+   - `2746` full-slot objects
+   - `3738` partial-slot objects
+   - size buckets among all objects: `6` zero, about `2268-2269 <=4 KiB`,
+     about `1353-1354 <=64 KiB`, `93 <=1 MiB`, `17` large partial, and
+     `2746` full
+
+   This strongly supports the byte-ring direction. The partial objects are not
+   just rare terminal records; thousands are small or medium archive chunks.
+   Fixed-slot coalescing cannot collapse those without writing gaps. Producer
+   packing could reduce object count, but if implemented as waiting for larger
+   producer batches it repeats the `publish=N` problem and sacrifices overlap.
+   A framed byte ring keeps small semantic records visible promptly while
+   letting the transport/scheduler pack already-ready bytes into larger RDMA
+   grants.
+
+### How this informs other code paths
+
+- For client SQL result sinks, avoid per-command setup/free in the hot path and
+  keep session-owned result queues reusable, following the same frontier split
+  principle as payload streams.
+- For future WAL replication, do not expose shared WAL pages directly to RDMA
+  without a source-lifetime frontier equivalent to
+  `payloadSenderCompletedHead`. Posted-to-NIC and reusable-by-PostgreSQL are
+  different events.
+- For tuple-view batches, preserve the typed object contract, but let the
+  transport coalesce ready adjacent slots and piggyback publication events below
+  that contract.
+- For the future scheduler, do not use it as a substitute for basic hot-path
+  efficiency. The scheduler should decide between already-efficient traffic
+  classes; it should not have to compensate for extra WRs, avoidable polling, or
+  stale-code benchmark artifacts.
 
 ## Session-local command channels and QP co-design
 
@@ -790,7 +1649,7 @@ physical QPs. Candidate mappings include:
 - local host prototype: one command mailbox and one completion mailbox per
   client SQL session
 - service-to-service control: multi-slot peer-control ring plus peer completion
-  ring on a control-critical QP
+  ring on the critical-control lane
 - foreground tuple/result payloads: foreground-payload QP or QP pool
 - basebackup and future WAL bulk streams: bulk-payload QP or QP pool
 
@@ -857,21 +1716,38 @@ granting bytes and WRs in addition to object counts.
      `CitusTupleSink*` wire structs, and the service binary/header names still
      reflect the original tuple-only prototype
 
-4. **Scheduler metadata**
-   - add explicit `trafficClass`, `priority`, `weight`, and grant hints to
-     sessions/streams/commands
-   - treat `executionLane` as deprecated compatibility input
+4. **Traffic-class metadata and transport API - completed May 14, 2026 for the
+   single-lane checkpoint**
+   - added explicit payload-stream `trafficClass`, `priority`, `weight`,
+     estimated bytes, estimated WR count, object count, and grant metadata
+   - kept `executionLane` as deprecated session-compatibility input rather than
+     turning it into a scheduler primitive
+   - routed control and payload publication through a traffic-class transport
+     API instead of direct service code access to one peer connection QP
+   - intentionally maps all traffic classes to the existing lane/QP to preserve
+     behavior
+   - verified no correctness or measured performance regression on
+     single/multi-client Homer pgbench and remote RDMA basebackup smoke; see the
+     implementation-progress note above for exact numbers
 
-5. **Single-QP scheduler prototype**
+5. **Traffic-class peer transport lanes**
+   - split peer transport resources by traffic class
+   - use one critical-control lane per peer transport initially
+   - replace the one-message peer-control mailbox with a multi-slot
+     peer-control request ring plus peer completion/event ring on that lane
+   - map foreground payload and bulk payload to separate lanes/QPs; keep lane
+     pools possible for high-throughput payload classes
+   - preserve the existing WRITE_WITH_IMM publication rule per QP/channel
+
+6. **Scheduler prototype**
    - implement ready-set construction, policy selection, grants, and progress
      accounting
+   - start with a trivial strict policy: critical control, then foreground
+     payload, then bulk payload
    - cap sender payload publication by scheduler grant instead of only by
      `HOMER_SERVICE_PAYLOAD_SEND_COMPLETION_BATCH`
-
-6. **Multi-QP peer transport**
-   - split peer transport resources by traffic class
-   - map scheduler class selection to the appropriate QP
-   - preserve the existing WRITE_WITH_IMM publication rule per QP/channel
+   - add weighted/deficit/age-aware policies only after traffic-class lanes are
+     measurable
 
 7. **Push command completions - local frontend completed, peer still future**
    - keep one in-flight command per session and use a small completion ring for

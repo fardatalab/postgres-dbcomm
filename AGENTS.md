@@ -57,6 +57,25 @@ make -j8
 sudo -n make install-headers install-service-bin install
 ```
 
+For Homer performance measurements, build the service/client library without
+the stats macros:
+
+```sh
+cd /data/dbcomm/citus-dbcomm-separate-comm-stack
+make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n make install-headers install-service-bin install
+
+cd /data/dbcomm/postgres-citus-separate-comm-stack
+env CCACHE_DISABLE=1 ninja -C build src/backend/postgres src/bin/pg_basebackup/pg_basebackup
+sudo -n meson install -C build --no-rebuild
+```
+
+For counter-based diagnosis, rebuild Citus/Homer with:
+
+```sh
+CPPFLAGS='-D_GNU_SOURCE -DHOMER_SERVICE_PAYLOAD_STATS=1 -DHOMER_CLIENT_BASEBACKUP_STATS=1'
+```
+
 If the install prefix is not writable by the current user, run the Postgres
 install command with the same privilege style used for Citus:
 
@@ -274,6 +293,21 @@ Current basebackup constraints:
 - PostgreSQL's built-in `TARGET 'blackhole'` is not a Homer path.
 - For remote RDMA blackhole, use `TARGET 'homer:mode=rdma,host=...,port=...'`.
 
+Performance measurement rule:
+
+- Treat the first run after a PostgreSQL/service restart, binary sync, queue
+  geometry change, or peer-connection setup as a warmup run. Do not use that
+  cold first run as the regression/performance number.
+- The number we care about is warmed steady state: run the same command
+  repeatedly without restarting PostgreSQL or either Homer service, and compare
+  the stable repeat band.
+- Prefer a workload that lasts at least about 5 seconds, or aggregate several
+  warmed repeats if the individual run is shorter. Record the full repeat set,
+  not only the best run.
+- When comparing local Homer blackhole and remote RDMA blackhole, warm both
+  paths separately before comparing. Local blackhole is the producer/service
+  baseline; remote RDMA adds the peer transport path.
+
 Local Homer blackhole smoke on `farnet1`:
 
 ```sh
@@ -303,6 +337,37 @@ Optional explicit queue geometry for sensitivity runs:
   -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=8388608' \
   -v
 ```
+
+Optional producer-publication sensitivity knob:
+
+- default/current steady-state choice: immediate publication (`publish=1`)
+- diagnostic alternatives: `publish=2`, `publish=3`, or `publish=auto`
+
+Example:
+
+```sh
+/usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
+  -h /tmp -p 5432 -U dbcomm \
+  -X none -c fast \
+  -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=8388608,publish=1' \
+  -v
+```
+
+Warm-run pattern for the remote RDMA path:
+
+```sh
+for run in 1 2 3 4; do
+  echo "remote-rdma-basebackup run=$run"
+  /usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
+    -h /tmp -p 5432 -U dbcomm \
+    -X none -c fast \
+    -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=8388608' \
+    -v
+done
+```
+
+Use `run=1` as warmup unless the experiment explicitly studies cold setup.
+Compare `run=2..4` against local blackhole warm repeats.
 
 ## Run foreground pgbench with background basebackup
 
