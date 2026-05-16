@@ -338,12 +338,15 @@ Optional explicit queue geometry for sensitivity runs:
   -v
 ```
 
-Optional producer-publication sensitivity knob:
+Producer-publication note:
 
-- default/current steady-state choice: immediate publication (`publish=1`)
-- diagnostic alternatives: `publish=2`, `publish=3`, or `publish=auto`
+- basebackup now uses a producer-owned byte ring and publishes each committed
+  record immediately to preserve pipeline overlap.
+- the old `publish=N` target-detail knob is retained for command-line
+  compatibility, but it no longer controls producer batching on the byte-ring
+  basebackup path.
 
-Example:
+Compatibility example:
 
 ```sh
 /usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \

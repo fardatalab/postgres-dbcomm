@@ -7,7 +7,7 @@
  * BASE_BACKUP, no compression, no throttling, no WAL special handling, and a
  * remote service receiver that can initially blackhole/count received bytes.
  * The important invariant is that PostgreSQL writes archive/manifest bytes
- * directly into the Homer queue payload slot exposed as bbs_buffer.
+ * directly into the Homer byte-ring record payload exposed as bbs_buffer.
  *
  * Use TARGET 'homer' with mode=blackhole for the local Homer smoke receiver.
  * PostgreSQL's separate TARGET 'blackhole' is intentionally left as the
@@ -36,7 +36,7 @@ typedef struct bbsink_homer
 	HomerClientBaseBackupStream stream;
 	bool		control_open;
 	bool		stream_open;
-	bool		slot_reserved;
+	bool		record_reserved;
 	uint32		payload_capacity;
 	uint32		archive_index;
 	uint64		archive_offset;
@@ -138,16 +138,16 @@ bbsink_homer_apply_detail(HomerClientBaseBackupStreamOptions *options,
 			options->payloadCapacityBytes = pg_strtoint32(value);
 		else if (strcmp(key, "publish") == 0)
 		{
-			/*
-			 * Producer publication is an experiment knob for balancing pipeline
-			 * overlap against service-side range shape. "auto" preserves the
-			 * Homer default; publish=1 exposes every filled slot immediately.
-			 */
-			if (strcmp(value, "auto") == 0)
-				options->publishBatchSlots = 0;
-			else
-				options->publishBatchSlots = pg_strtoint32(value);
-		}
+				/*
+				 * publish= is retained as a diagnostics knob in target-detail
+				 * strings. The current byte-ring basebackup path publishes each
+				 * submitted record immediately to preserve pipeline overlap.
+				 */
+				if (strcmp(value, "auto") == 0)
+					options->publishBatchRecords = 0;
+				else
+					options->publishBatchRecords = pg_strtoint32(value);
+			}
 		else if (strcmp(key, "dboid") == 0)
 			options->databaseOid = pg_strtoint32(value);
 		else if (strcmp(key, "useroid") == 0)
@@ -165,68 +165,68 @@ bbsink_homer_apply_detail(HomerClientBaseBackupStreamOptions *options,
 				 errdetail("payload_bytes=%u BLCKSZ=%u",
 						   options->payloadCapacityBytes, BLCKSZ)));
 
-	if (options->publishBatchSlots > options->slotCount)
+	if (options->publishBatchRecords > options->slotCount)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("Homer base backup publish batch cannot exceed slot count"),
 				 errdetail("publish=%u slots=%u",
-						   options->publishBatchSlots, options->slotCount)));
+						   options->publishBatchRecords, options->slotCount)));
 
 	pfree(detail_copy);
 }
 
 static void
-bbsink_homer_reserve_slot(bbsink_homer *mysink, const char *operation)
+bbsink_homer_reserve_record(bbsink_homer *mysink, const char *operation)
 {
 	void	   *payload = NULL;
 	uint32		payload_capacity = 0;
 	uint64		stream_sequence = 0;
 	char		error[HOMER_CLIENT_ERROR_BYTES];
 
-	if (!HomerClientReserveBaseBackupSlot(&mysink->stream,
-										  &payload,
-										  &payload_capacity,
-										  &stream_sequence,
-										  error,
-										  sizeof(error)))
+	if (!HomerClientReserveBaseBackupRecord(&mysink->stream,
+											&payload,
+											&payload_capacity,
+											&stream_sequence,
+											error,
+											sizeof(error)))
 		bbsink_homer_error(operation, error);
 
 	mysink->current_payload = payload;
 	mysink->payload_capacity = payload_capacity;
-	mysink->slot_reserved = true;
+	mysink->record_reserved = true;
 	mysink->base.bbs_buffer = payload;
 	mysink->base.bbs_buffer_length = payload_capacity;
 }
 
 static void
-bbsink_homer_submit_reserved_slot(bbsink_homer *mysink, uint32 object_kind,
-								  uint32 archive_index, const char *name,
-								  size_t payload_len, uint64 stream_offset,
-								  const char *operation)
+bbsink_homer_submit_reserved_record(bbsink_homer *mysink, uint32 object_kind,
+									uint32 archive_index, const char *name,
+									size_t payload_len, uint64 stream_offset,
+									const char *operation)
 {
 	char		error[HOMER_CLIENT_ERROR_BYTES];
 
-	if (!mysink->slot_reserved)
-		bbsink_homer_reserve_slot(mysink, operation);
+	if (!mysink->record_reserved)
+		bbsink_homer_reserve_record(mysink, operation);
 
 	if (payload_len > UINT32_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("Homer base backup payload length exceeded uint32")));
 
-	if (!HomerClientSubmitBaseBackupSlot(&mysink->stream,
-										 object_kind,
-										 archive_index,
-										 name,
-										 (uint32) payload_len,
-										 stream_offset,
-										 mysink->total_bytes,
-										 0,
-										 error,
-										 sizeof(error)))
+	if (!HomerClientSubmitBaseBackupRecord(&mysink->stream,
+										   object_kind,
+										   archive_index,
+										   name,
+										   (uint32) payload_len,
+										   stream_offset,
+										   mysink->total_bytes,
+										   0,
+										   error,
+										   sizeof(error)))
 		bbsink_homer_error(operation, error);
 
-	mysink->slot_reserved = false;
+	mysink->record_reserved = false;
 	mysink->current_payload = NULL;
 }
 
@@ -261,15 +261,15 @@ bbsink_homer_begin_backup(bbsink *sink)
 		bbsink_homer_error("open stream", error);
 	mysink->stream_open = true;
 
-	bbsink_homer_reserve_slot(mysink, "reserve begin slot");
-	bbsink_homer_submit_reserved_slot(mysink,
+	bbsink_homer_reserve_record(mysink, "reserve begin record");
+	bbsink_homer_submit_reserved_record(mysink,
 									  CITUS_REMOTE_BASEBACKUP_OBJECT_BEGIN,
 									  0,
 									  "basebackup",
 									  0,
 									  0,
 									  "submit begin");
-	bbsink_homer_reserve_slot(mysink, "reserve first payload slot");
+	bbsink_homer_reserve_record(mysink, "reserve first payload record");
 }
 
 static void
@@ -281,14 +281,14 @@ bbsink_homer_begin_archive(bbsink *sink, const char *archive_name)
 	strlcpy(mysink->current_archive_name,
 			archive_name,
 			sizeof(mysink->current_archive_name));
-	bbsink_homer_submit_reserved_slot(mysink,
+	bbsink_homer_submit_reserved_record(mysink,
 									  CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_BEGIN,
 									  mysink->archive_index,
 									  archive_name,
 									  0,
 									  0,
 									  "submit archive begin");
-	bbsink_homer_reserve_slot(mysink, "reserve archive payload slot");
+	bbsink_homer_reserve_record(mysink, "reserve archive payload record");
 	bbsink_begin_archive(sink->bbs_next, archive_name);
 }
 
@@ -301,14 +301,14 @@ bbsink_homer_archive_contents(bbsink *sink, size_t len)
 	mysink->base.bbs_state->bytes_done += len;
 	mysink->archive_offset += len;
 	mysink->total_bytes += len;
-	bbsink_homer_submit_reserved_slot(mysink,
+	bbsink_homer_submit_reserved_record(mysink,
 									  CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_CHUNK,
 									  mysink->archive_index,
 									  mysink->current_archive_name,
 									  len,
 									  chunk_offset,
 									  "submit archive chunk");
-	bbsink_homer_reserve_slot(mysink, "reserve next archive payload slot");
+	bbsink_homer_reserve_record(mysink, "reserve next archive payload record");
 }
 
 static void
@@ -316,7 +316,7 @@ bbsink_homer_end_archive(bbsink *sink)
 {
 	bbsink_homer *mysink = (bbsink_homer *) sink;
 
-	bbsink_homer_submit_reserved_slot(mysink,
+	bbsink_homer_submit_reserved_record(mysink,
 									  CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_END,
 									  mysink->archive_index,
 									  mysink->current_archive_name,
@@ -325,7 +325,7 @@ bbsink_homer_end_archive(bbsink *sink)
 									  "submit archive end");
 	mysink->base.bbs_state->tablespace_num++;
 	mysink->archive_index++;
-	bbsink_homer_reserve_slot(mysink, "reserve post-archive slot");
+	bbsink_homer_reserve_record(mysink, "reserve post-archive record");
 	bbsink_end_archive(sink->bbs_next);
 }
 
@@ -335,14 +335,14 @@ bbsink_homer_begin_manifest(bbsink *sink)
 	bbsink_homer *mysink = (bbsink_homer *) sink;
 
 	mysink->archive_offset = 0;
-	bbsink_homer_submit_reserved_slot(mysink,
+	bbsink_homer_submit_reserved_record(mysink,
 									  CITUS_REMOTE_BASEBACKUP_OBJECT_MANIFEST_BEGIN,
 									  mysink->archive_index,
 									  "backup_manifest",
 									  0,
 									  0,
 									  "submit manifest begin");
-	bbsink_homer_reserve_slot(mysink, "reserve manifest payload slot");
+	bbsink_homer_reserve_record(mysink, "reserve manifest payload record");
 	bbsink_begin_manifest(sink->bbs_next);
 }
 
@@ -354,14 +354,14 @@ bbsink_homer_manifest_contents(bbsink *sink, size_t len)
 
 	mysink->archive_offset += len;
 	mysink->total_bytes += len;
-	bbsink_homer_submit_reserved_slot(mysink,
+	bbsink_homer_submit_reserved_record(mysink,
 									  CITUS_REMOTE_BASEBACKUP_OBJECT_MANIFEST_CHUNK,
 									  mysink->archive_index,
 									  "backup_manifest",
 									  len,
 									  chunk_offset,
 									  "submit manifest chunk");
-	bbsink_homer_reserve_slot(mysink, "reserve next manifest payload slot");
+	bbsink_homer_reserve_record(mysink, "reserve next manifest payload record");
 }
 
 static void
@@ -369,14 +369,14 @@ bbsink_homer_end_manifest(bbsink *sink)
 {
 	bbsink_homer *mysink = (bbsink_homer *) sink;
 
-	bbsink_homer_submit_reserved_slot(mysink,
+	bbsink_homer_submit_reserved_record(mysink,
 									  CITUS_REMOTE_BASEBACKUP_OBJECT_MANIFEST_END,
 									  mysink->archive_index,
 									  "backup_manifest",
 									  0,
 									  mysink->archive_offset,
 									  "submit manifest end");
-	bbsink_homer_reserve_slot(mysink, "reserve end slot");
+	bbsink_homer_reserve_record(mysink, "reserve end record");
 	bbsink_end_manifest(sink->bbs_next);
 }
 
@@ -386,7 +386,7 @@ bbsink_homer_end_backup(bbsink *sink, XLogRecPtr endptr, TimeLineID endtli)
 	bbsink_homer *mysink = (bbsink_homer *) sink;
 	char		error[HOMER_CLIENT_ERROR_BYTES];
 
-	bbsink_homer_submit_reserved_slot(mysink,
+	bbsink_homer_submit_reserved_record(mysink,
 									  CITUS_REMOTE_BASEBACKUP_OBJECT_END,
 									  mysink->archive_index,
 									  "basebackup",

@@ -992,11 +992,10 @@ bytes become responder-visible only after a responder-visible doorbell.
    One apparent regression came from reinstalling the Homer client library but
    not restarting the running postmaster. After PostgreSQL was reinstalled and
    restarted, batching in
-   [`HomerClientBaseBackupPublishBatchSlots()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1186),
-   [`HomerClientFlushBaseBackupPublishedTail()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1208),
-   and
-   [`HomerClientSubmitBaseBackupSlot()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1550)
-   was actually present in the backend process.
+	   the earlier producer-side publication helpers,
+	   and
+	   [`HomerClientSubmitBaseBackupRecord()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1606)
+	   was actually present in the backend process.
 
    Reusable pattern: benchmark notes must record whether the running postmaster
    was restarted after `libhomer_client.a` or PostgreSQL relinks. Otherwise we
@@ -1072,9 +1071,10 @@ A/B checks:
 
 1. **Immediate producer publication is the default.**
 
-   [`HomerClientBaseBackupPublishBatchSlots()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1186)
-   now returns `1` by default, while `publish=N` in the pg_basebackup target
-   detail remains available for diagnostics. This was based on the warmed
+   [`HomerClientSubmitBaseBackupRecord()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1606)
+   now publishes each byte-ring record immediately, while `publish=N` in the
+   pg_basebackup target detail remains available for diagnostics. This was
+   based on the warmed
    remote RDMA sweep with `slots=8,bytes=8388608`:
 
    - old `publish=auto` (`4`): about `5.02-5.09s` warmed
@@ -1119,6 +1119,17 @@ A/B checks:
    The stable comparison point is therefore roughly a `4.6-4.9s` warmed band,
    improved from the previous best `publish=1` explicit-tail band of about
    `4.86-4.94s` and from the old `publish=auto` band of about `5.0s`.
+
+   Scope correction after the byte-ring checkpoint: this piggyback optimization
+   applies to the fixed-slot payload-ring path where the receiver can derive the
+   visible frontier by validating in-band `CitusTupleSinkTransportHeader` records.
+   The first service-to-service byte-ring checkpoint deliberately uses the
+   separate tail-publish helper
+   [`TupleSinkServicePostPeerRegisteredPayloadBatchWithTailImmediateRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3826),
+   because the receiver needs an explicit absolute byte frontier for the byte
+   ring. A future one-RDMA-op byte-ring optimization may recover piggybacking by
+   carrying grant-boundary metadata inside the byte stream, but that is not the
+   current implementation.
 
    After piggybacking, small explicit producer batches are no longer obviously
    harmful, but they also did not justify changing the default:
@@ -1307,7 +1318,7 @@ Current next-step plan after the May 15 publication and piggyback changes:
    and `4.87s`. That is correct but still above the best earlier warmed
    `4.5-4.8s` band, so do not claim the remaining performance gap is closed.
 
-6. **Move bulk payloads toward a framed byte-stream ring.**
+6. **Move bulk payloads toward a byte-record stream ring.**
 
    The current payload ring is object-slot based: one semantic object sequence
    maps to one fixed remote payload slot. The sender already RDMA-writes only
@@ -1322,7 +1333,7 @@ Current next-step plan after the May 15 publication and piggyback changes:
    - **Semantic record granularity**: basebackup chunk, tuple batch, WAL record
      group, etc. These should be produced promptly so we keep pipeline overlap
      and later scheduler fairness.
-   - **Transport framing granularity**: one or more semantic records or record
+   - **Transport record granularity**: one or more semantic records or record
      fragments packed into a contiguous byte-ring region.
    - **RDMA posting granularity**: one scheduler grant that may post one or more
      RDMA WRs and carry one responder-visible `WRITE_WITH_IMM` publication
@@ -1339,7 +1350,7 @@ Current next-step plan after the May 15 publication and piggyback changes:
    already-ready work to post in this turn. Posting immediately gives the best
    overlap and latency but can create too many WRs and doorbells; granting a
    larger byte range improves software/NIC efficiency but too much delay harms
-   overlap. The framed byte ring is useful because it lets us keep small
+   overlap. The byte-record ring is useful because it lets us keep small
    semantic granularity while granting larger contiguous transport byte ranges.
 
    Keep the two scheduling layers separate:
@@ -1349,7 +1360,7 @@ Current next-step plan after the May 15 publication and piggyback changes:
      send-CQ completions, and active payload streams. This layer should avoid
      wasting CPU, but it should not hide producer work.
    - **Transport egress scheduling** decides the RDMA grant over visible work:
-     bytes, frames, WR count, age, traffic class, and competing streams. This is
+     bytes, records, WR count, age, traffic class, and competing streams. This is
      the right layer for adaptive batching/coalescing policy.
 
    Proposed data structures:
@@ -1358,7 +1369,7 @@ Current next-step plan after the May 15 publication and piggyback changes:
    typedef struct HomerPayloadProducerFrontier
    {
        uint64_t producerReservedTail;     /* local producer owns bytes below this */
-       uint64_t producerPublishedTail;    /* complete frames visible to service */
+       uint64_t producerPublishedTail;    /* complete records visible to service */
    } HomerPayloadProducerFrontier;
 
    typedef struct HomerPayloadTransportFrontier
@@ -1379,20 +1390,20 @@ Current next-step plan after the May 15 publication and piggyback changes:
        uint32_t flags;
    } HomerPayloadByteRingDescriptor;
 
-   typedef struct HomerPayloadFrameHeader
+   typedef struct HomerPayloadRecordHeader
    {
        uint32_t magic;
        uint16_t protocolVersion;
        uint16_t objectFamily;
        uint32_t headerBytes;
-       uint32_t frameBytes;
+       uint32_t recordBytes;
        uint32_t semanticHeaderBytes;
        uint64_t streamSequence;
-       uint64_t absoluteFrameOffset;
+       uint64_t absoluteRecordOffset;
        uint32_t fragmentOrdinal;
        uint32_t fragmentCount;
        uint32_t flags;                    /* begin/end/error/fragmented */
-   } HomerPayloadFrameHeader;
+   } HomerPayloadRecordHeader;
    ```
 
    The structs above are conceptual names, not a mandate to put all frontiers in
@@ -1416,10 +1427,10 @@ Current next-step plan after the May 15 publication and piggyback changes:
    more for the eventual DPU version, where every normal-path host-memory poll or
    cache-line bounce can become DMA traffic.
 
-   The byte-ring sender rule is: producers may publish only complete frames;
+   The byte-ring sender rule is: producers may publish only complete records;
    the transport may post any contiguous byte range ending at or before
    `producerPublishedTail`; the receiver may advance `receiverConsumedHead` only
-   after parsing complete frames and delivering complete semantic objects upward.
+   after parsing complete records and delivering complete semantic objects upward.
    This preserves typed DB semantics while letting the transport batch already
    ready small/partial records without requiring fixed-slot adjacency.
 
@@ -1432,22 +1443,22 @@ Current next-step plan after the May 15 publication and piggyback changes:
      range. Scatter/gather is a tool for local buffer gathering; it does not by
      itself fix the current fixed-slot remote-layout gap.
    - If either local or remote byte rings wrap, split at the wrap boundary. The
-     receiver must not publish/deliver a partial frame until all fragments of
-     that frame are visible.
+     receiver must not publish/deliver a partial record until all fragments of
+     that record are visible.
 
-   The first byte-ring version should be whole-frame-only. If a complete
-   semantic frame will not fit in the remaining contiguous tail space, publish a
-   padding/wrap frame, advance to offset zero, and write the real semantic frame
-   at the start of the ring. That avoids introducing frame reassembly in the
+   The first byte-ring version should be whole-record-only. If a complete
+   semantic record will not fit in the remaining contiguous tail space, publish a
+   padding/wrap record, advance to offset zero, and write the real semantic record
+   at the start of the ring. That avoids introducing record reassembly in the
    first patch. A semantic object larger than the ring, or larger than the
    largest contiguous grant we choose to support, should be rejected or forced
    onto a later explicit fragmentation path. Once fragmentation is implemented,
    object-family parsing should accept a two-slice or iovec-style view so a
-   wrapped frame is not relinearized into scratch memory.
+   wrapped record is not relinearized into scratch memory.
 
    Publication and visibility invariants:
 
-   - The backend producer writes the frame header and payload first, then
+   - The backend producer writes the record header and payload first, then
      release-stores `producerPublishedTail`.
    - The Homer service acquire-loads `producerPublishedTail` before building an
      RDMA grant.
@@ -1456,27 +1467,28 @@ Current next-step plan after the May 15 publication and piggyback changes:
    - The receiver parses only up to the byte frontier carried by the publish
      event or by the corresponding event metadata; it must not infer readiness by
      scanning stale ring bytes.
-   - `magic`, `streamSequence`, and `absoluteFrameOffset` are defensive checks
+   - `magic`, `streamSequence`, and `absoluteRecordOffset` are defensive checks
      against stale headers after wrap and against accidental parsing before the
      intended byte frontier is visible.
 
    The current `WRITE_WITH_IMM` immediate value is already used to identify the
    stream, so the byte-ring design still needs a bounded way to tell the receiver
    where the newly published byte range ends. The preferred first implementation
-   is a receiver-local per-stream `publishedTail/epoch` word written with
-   `RDMA_WRITE_WITH_IMM`: the write payload is the tail metadata, and the
+   is a receiver-local per-stream `publishedTail` word written with
+   `RDMA_WRITE_WITH_IMM`: the write payload is the absolute byte tail, and the
    immediate value identifies the stream. This is not a round trip and not a
    separate metadata write before the notification; it is one small final
    one-way WR after the payload WR chain. It does cost one more WQE than making
    the final payload write itself carry the immediate, but it keeps the payload
    byte stream simple and makes the receiver parse exactly from its local cursor
-   up to the published tail.
+   up to the published tail. Add an epoch only if later wrap/diagnostic evidence
+   shows the absolute byte offset and record checks are insufficient.
 
    A stream-delimited variant is still possible later: put grant-boundary
    metadata in the byte stream itself, either by mutating a transport-owned bit in
-   the final frame header or by appending a tiny grant-end marker frame. That can
+   the final record header or by appending a tiny grant-end marker record. That can
    remove the separate tail WR, but it makes the receiver parser responsible for
-   grant-boundary metadata as well as semantic frame parsing. The tail/epoch
+   grant-boundary metadata as well as semantic record parsing. The tail/epoch
    `RDMA_WRITE_WITH_IMM` path is the simpler first step.
 
    Keep the one-RDMA-op publication design as an explicit future optimization.
@@ -1484,9 +1496,9 @@ Current next-step plan after the May 15 publication and piggyback changes:
    contiguous free space in the receiver byte ring, the sender can post a single
    `RDMA_WRITE_WITH_IMM` whose payload is the packed byte-stream grant and whose
    immediate still identifies the stream. In that design the receiver learns the
-   grant boundary by parsing transport-owned frame metadata already present in
-   the byte stream, for example a `grantEnd` bit in the final frame or a tiny
-   grant-end marker frame. If either ring wraps, the sender still posts a WR
+   grant boundary by parsing transport-owned record metadata already present in
+   the byte stream, for example a `grantEnd` bit in the final record or a tiny
+   grant-end marker record. If either ring wraps, the sender still posts a WR
    chain and puts `WRITE_WITH_IMM` only on the final WR. This path saves the
    extra tail/epoch WR, but it should wait until the byte-ring substrate is stable
    because it deliberately couples receiver parsing to transport grant boundaries.
@@ -1494,10 +1506,10 @@ Current next-step plan after the May 15 publication and piggyback changes:
    Scheduler integration:
 
    - Ready items should be byte ranges, not just object slots. Each ready item
-     carries traffic class, bytes ready, frame count, estimated WR count, age,
-     and whether the first/last frame is fragmented.
-   - Initial policy can grant whole frames only. Later, for very large basebackup
-     or WAL frames, allow frame fragmentation with explicit reassembly metadata.
+     carries traffic class, bytes ready, record count, estimated WR count, age,
+     and whether the first/last record is fragmented.
+   - Initial policy can grant whole records only. Later, for very large basebackup
+     or WAL records, allow record fragmentation with explicit reassembly metadata.
    - `WRITE_WITH_IMM` remains the data-publish notification, attached to the
      final WR in the granted byte range. Coalescing reduces notification count;
      it should not replace the notification with remote memory polling.
@@ -1507,10 +1519,10 @@ Current next-step plan after the May 15 publication and piggyback changes:
    - The first policy can be simple and deterministic: grant up to
      `min(readyBytes, localContiguousBytes, remoteCreditContiguousBytes,
      maxGrantBytes, maxGrantWrBytes)`, and force a smaller grant once the oldest
-     ready frame exceeds an age threshold. That preserves overlap without
+     ready record exceeds an age threshold. That preserves overlap without
      reintroducing producer-side waiting.
 
-   Migration plan:
+   Original basebackup migration plan:
 
    1. Add a new `HomerPayloadStreamKind`/mode for byte-ring streams alongside
       the existing fixed-slot stream. Do not rewrite tuple/result sinks in the
@@ -1520,24 +1532,24 @@ Current next-step plan after the May 15 publication and piggyback changes:
       mode first.
    3. Keep the producer API semantically object-based, but use a
       reserve-capacity/commit-length rule:
-      `reserve maximum frame capacity -> fill semantic header/payload -> commit
-      actual frame bytes -> publish frame`. This matches PostgreSQL `bbsink`
+      `reserve maximum record capacity -> fill semantic header/payload -> commit
+      actual record bytes -> publish record`. This matches PostgreSQL `bbsink`
       behavior, where `bbs_buffer` is exposed before the caller knows the final
       callback length. The active reservation may temporarily cover more bytes
-      than the final frame; on commit, the next reservation starts at the actual
-      frame end rather than leaving fixed-slot slack in the transport layout.
-   4. Change the basebackup sender to write each callback into a byte-ring frame
+      than the final record; on commit, the next reservation starts at the actual
+      record end rather than leaving fixed-slot slack in the transport layout.
+   4. Change the basebackup sender to write each callback into a byte-ring record
       rather than a fixed object slot. Do not pack by waiting; let the transport
-      pack already-published frames.
+      pack already-published records.
    5. Change the RDMA sender pump to build byte-range grants from
       `producerPublishedTail - transportPostedTail`, split only on byte-ring
       wrap, and post one immediate on the final WR for the grant.
-   6. Change the receiver pump to parse `HomerPayloadFrameHeader` records from
+   6. Change the receiver pump to parse `HomerPayloadRecordHeader` records from
       the byte ring, call the existing object-family validator/materializer only
-      for complete frames, and advance receiver credit in bytes.
-   7. After basebackup is stable, decide whether tuple/result payloads should
-      move to byte rings or keep fixed slots. Tuple batches may still prefer
-      fixed slots if their object shape is already dense and latency-sensitive.
+      for complete records, and advance receiver credit in bytes.
+   7. After basebackup is stable, migrate tuple/result payloads too. This is no
+      longer an open question: the fixed-slot tuple/result layout is a temporary
+      compatibility layer, not the target substrate.
 
    Close/error/cancel handling is lifecycle-path logic, not part of the regular
    hot path. The steady-state payload path should assume successful reserve,
@@ -1545,21 +1557,195 @@ Current next-step plan after the May 15 publication and piggyback changes:
    where useful. Still, the implementation needs cold-path cleanup rules so a
    failed setup or teardown does not leak registered memory or publish stale
    bytes: a producer that reserves but cannot commit cancels the active
-   reservation; a normal close publishes an END frame and drains outstanding byte
+   reservation; a normal close publishes an END record and drains outstanding byte
    grants through local send completion before MR deregistration; the receiver
-   delivers the END/error frame, advances byte credit, and forces the final
+   delivers the END/error record, advances byte credit, and forces the final
    receiver-head ACK so the sender can reclaim the remote-credit window before
    teardown.
 
-   Open decisions before implementation:
+   Implementation checkpoint on May 16, 2026:
 
-   - Whether basebackup frames should include the existing
+   - Basebackup streams now use byte rings on both the producer side and the
+     service-to-service RDMA side. PostgreSQL reserves and commits byte-ring
+     records through the Homer client library; the sender service parses those
+     records in place, coalesces adjacent local/remote byte ranges, and
+     publishes the receiver byte tail with a final `RDMA_WRITE_WITH_IMM`.
+   - Tuple/result payload streams still use the fixed-slot payload ring.
+   - The byte-ring checkpoint verifies correctness and warmed remote RDMA
+     basebackup in roughly the `4.17-4.25s` band with
+     `slots=8,bytes=8388608`; local blackhole warmed repeats were about
+     `3.95-4.08s`; see
+     [byte_ring_payload_stream_checkpoint.md](../../../implementations/citus/transport/byte_ring_payload_stream_checkpoint.md)
+     for the current code paths, caveats, and measurements.
+   - The producer-side fixed-slot WR shape is no longer the next blocker for
+     basebackup. The next performance/design steps are transport-side:
+     traffic-class lanes/QPs, RDMA egress scheduling over ready byte ranges,
+     possible one-RDMA-op in-band publication, and later fragmentation for
+     oversized semantic records.
+
+   Two-stage full byte-ring migration plan:
+
+   **Stage 1: make byte rings the common payload substrate without changing
+   upper-level DB semantics.**
+
+   The goal of this stage is representation cleanup and correctness, not final
+   tuning. Tuple/result payloads should keep their DB-semantic object identity:
+   tuple-view batches remain tuple-view batches, basebackup records remain
+   basebackup records, and future WAL streams remain WAL records or record
+   groups. The change is that the neutral payload stream carries those objects
+   as packed byte-ring records instead of fixed slots.
+
+   - Extend the byte-ring mode currently selected by
+     `HomerServicePayloadStreamUsesByteRing()` in
+     `src/backend/distributed/utils/homer/tuple_sink_service_process.c` from
+     `HOMER_PAYLOAD_OBJECT_FAMILY_BASE_BACKUP_STREAM` to
+     `HOMER_PAYLOAD_OBJECT_FAMILY_TUPLE_VIEW_BATCH`, then to every payload
+     object family that needs Homer transport.
+   - Keep `CitusTupleViewContract` as tuple/result semantic metadata. Do not
+     rename tuple-view objects into generic byte streams; the byte ring is the
+     container/substrate, while tuple-view batches are one object family inside
+     it.
+   - Add a tuple-view byte-ring record shape that carries a transport header,
+     the tuple-view batch metadata, and row bytes. Prefer reusing the existing
+     tuple-view batch header and contract ids instead of inventing a new result
+     schema path. The receiver should be able to validate object family,
+     protocol version, stream sequence, record length, and contract id before
+     delivering rows upward.
+   - Replace fixed-slot source reservation for tuple/result send queues. Current
+     backend-facing reservation APIs such as `TryReserveCitusTupleSinkBatch()`
+     in `src/backend/distributed/utils/homer/tuple_sink_service.c` should become
+     wrappers around persistent byte-ring reservation state, or be replaced by a
+     byte-ring reserve/commit API. Avoid per-batch allocation on the measured
+     path.
+   - Replace fixed-slot result-sink draining in the frontend client library.
+     `HomerClientOpenResultSink()` and `HomerClientDrainResultSink()` in
+     `src/bin/homer_client.c` should map the byte-ring descriptor, parse
+     complete tuple-view records, count/materialize rows, and advance byte
+     credit. The integrated `pgbench --homer` path in
+     `src/bin/pgbench/pgbench.c` should not need semantic changes because it
+     already requests `CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE` for row-producing SQL
+     and drains result sinks through the Homer client API.
+   - Replace the service-to-service fixed-slot sender path in
+     `HomerServicePumpOutgoingPayloadStream()` with a byte-ring generic sender.
+     Basebackup's current `HomerServicePumpOutgoingByteRingBaseBackup()` should
+     become the model: parse complete producer records, validate object-family
+     metadata in place, build byte-contiguous RDMA descriptors, and publish the
+     receiver byte tail with the current final `RDMA_WRITE_WITH_IMM` rule.
+   - Replace the fixed-slot receive path in
+     `HomerServicePumpIncomingPayloadStream()` with a byte-ring generic
+     receiver. It should parse byte-ring records, dispatch by object family, and
+     deliver only complete semantic objects upward. It must not expose a partial
+     tuple-view batch to the worker or frontend result sink.
+   - Remove or narrow the tuple-batch rebuild tax in
+     `TupleSinkServiceDecodeIncomingTupleViewBatch()` in
+     `src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+     Because the existing code already checks that the incoming tuple view and
+     local receive-batch layouts match before copying, the byte-ring migration
+     should prefer borrowed/zero-copy views or a direct publish of the received
+     record where lifetime allows. If a rebuild remains necessary for an early
+     checkpoint, keep it behind the object-family materializer so it can be
+     removed without changing the transport substrate again.
+   - Preserve the current byte-ring publication rule from the basebackup
+     checkpoint: payload WRs first, then one final tail
+     `RDMA_WRITE_WITH_IMM`. The one-RDMA-op grant-boundary record design remains
+     a later optimization, not part of the Stage 1 correctness target.
+   - Keep producer publication prompt. Backend producers should commit each
+     complete tuple-view record as soon as it is ready. Do not introduce
+     producer-side waiting merely to form larger tuple batches; batching belongs
+     in the service/transport grant over already-visible records.
+   - Update lifecycle and close handling so fixed-slot drain tests are replaced
+     by byte-frontier drain tests for every payload family. Normal hot-path
+     close/error checks should stay out of the steady-state data path, but setup
+     failure and teardown must still avoid stale bytes, leaked MRs, or missing
+     receiver-head ACKs.
+   - Remove dead benchmark scaffolding after the integrated pgbench path remains
+     correct. The standalone `src/bin/homer_pgbench.c` driver in the Citus tree
+     is older no-libpq scaffolding and should be removed from `client-bin` and
+     install targets once `pgbench --homer` is confirmed as the canonical
+     benchmark path.
+
+   Stage 1 validation criteria:
+
+   - Basebackup remote RDMA warm runs remain in the current checkpoint band, or
+     any movement is explained by counters rather than left as noise.
+   - Integrated `pgbench --homer` still runs simple-mode transactions with tuple
+     result materialization for `SELECT abalance`; no standalone
+     `homer_pgbench` result-discard shortcut is used for claims.
+   - The same byte-ring sender/receiver core handles basebackup and
+     tuple/result streams, with object-family-specific validation/materializing
+     isolated behind dispatch.
+   - No hot-path dynamic allocation, heap wrapper creation, or fixed 1 ms sleep
+     remains in the tuple/result measured path.
+
+   **Stage 2: optimize after the common byte-ring substrate is in place.**
+
+   This stage should avoid polishing the deleted fixed-slot path. The goal is to
+   squeeze overhead out of the byte-ring substrate and make it scheduler-ready.
+
+   - Add low-overhead counters under compile-time macros for each payload
+     family: produced records, produced bytes, ready bytes at service pickup,
+     RDMA grants, WRs per grant, bytes per grant, coalesced ranges, wrap splits,
+     send-CQ completions, empty CQ polls, remote-credit waits, local source
+     completion waits, and receiver doorbells. Keep final summaries cheap and
+     avoid logging inside per-record loops.
+   - Tune transport grants over byte ranges, not object slots. The first policy
+     should grant already-visible contiguous bytes up to the minimum of local
+     contiguous bytes, remote contiguous credit, device/implementation WR caps,
+     and a configurable `maxGrantBytes`. Add an age threshold so a small
+     latency-sensitive record is not held indefinitely behind a desire for a
+     larger batch.
+   - Reuse basebackup lessons across tuple/result and WAL paths: producer
+     publication should stay prompt, service-side batching should operate on
+     already-ready bytes, coalescing should require byte-contiguous local and
+     remote ranges, and send completions should release source bytes in batches
+     without delaying close.
+   - Remove remaining broad copy costs in the tuple/result materializer:
+     full-struct clears, null-bitmap resets for untouched fields, byte copies
+     into identical layouts, and temporary ownership conversions. Use tuple-view
+     contracts to describe existing bytes whenever possible.
+   - Preallocate descriptor arrays, completion trackers, and result-drain state
+     at stream/session setup. Per-grant stack arrays are acceptable for fixed
+     small caps, but there should be no malloc/palloc/free cycle in steady-state
+     tuple/result transport.
+   - Revisit publication style only after counters show the final tail
+     `RDMA_WRITE_WITH_IMM` is material. If it is, evaluate the one-RDMA-op
+     grant-boundary design where the final payload WR carries `WRITE_WITH_IMM`
+     and the receiver learns the grant end from transport-owned metadata in the
+     byte stream. Do not make this part of the correctness migration.
+   - Integrate the scheduler abstraction over ready byte ranges. Ready items
+     should carry traffic class, priority/weight, ready bytes, record count,
+     estimated WR count, age, and lane/QP placement hints. The scheduler returns
+     a byte/record/WR grant; the sender consumes that grant without copying the
+     payload object.
+   - Introduce traffic-class transports and multiple QPs after the common
+     byte-ring path has stable counters. Start with one QP behind the new
+     abstraction only as a correctness checkpoint, then split critical control,
+     foreground tuple/result payload, and bulk basebackup payload so posted-WR
+     head-of-line blocking can actually be reduced.
+   - Measure warmed steady state only. The first run after service restart,
+     rebuild, memory registration change, or Postgres restart is setup/warmup
+     evidence, not the main performance number.
+
+   Stage 2 validation criteria:
+
+   - Basebackup remote RDMA warm runs are no worse than the Stage 1 baseline and
+     should move closer to local blackhole if transport overhead was removed.
+   - Single-client `pgbench --homer` remains at least on par with the pre-migration
+     Homer band once result semantics are matched.
+   - Multi-client `pgbench --homer` scales without reintroducing a shared
+     fixed-slot or peer-control bottleneck.
+   - Counter evidence shows larger effective RDMA grants or fewer WRs/doorbells
+     without increased producer waiting or worse tail latency.
+
+   Remaining open decisions:
+
+   - Whether basebackup records should include the existing
      `CitusRemoteBaseBackupMessageHeader` as the semantic header unchanged, or
-     fold common fields into `HomerPayloadFrameHeader`.
-   - Whether the producer byte ring lives in PostgreSQL shared memory as today or
-     in a DPU-visible DMA allocation abstraction from the start. The control
-     words should be designed as DMA-polled fields even while the current
-     implementation uses host shared memory.
+     fold common fields into `HomerPayloadRecordHeader`.
+   - How to evolve the current PostgreSQL shared-memory producer byte ring into
+     a DPU-visible DMA allocation abstraction. The control words should continue
+     to be designed as DMA-polled fields even while the current implementation
+     uses host shared memory.
    - Whether a later optimization should remove the final tail/epoch
      `RDMA_WRITE_WITH_IMM` by carrying grant-boundary metadata in the byte stream
      itself. The first implementation should prefer the explicit tail/epoch word
@@ -1590,7 +1776,7 @@ Current next-step plan after the May 15 publication and piggyback changes:
    Fixed-slot coalescing cannot collapse those without writing gaps. Producer
    packing could reduce object count, but if implemented as waiting for larger
    producer batches it repeats the `publish=N` problem and sacrifices overlap.
-   A framed byte ring keeps small semantic records visible promptly while
+   A byte-record ring keeps small semantic records visible promptly while
    letting the transport/scheduler pack already-ready bytes into larger RDMA
    grants.
 
@@ -1730,7 +1916,24 @@ granting bytes and WRs in addition to object counts.
      single/multi-client Homer pgbench and remote RDMA basebackup smoke; see the
      implementation-progress note above for exact numbers
 
-5. **Traffic-class peer transport lanes**
+5. **Basebackup byte-ring substrate - producer and service-to-service
+   checkpoint completed May 16, 2026**
+   - implemented receiver-owned `CitusHomerPayloadByteRingControl` and
+     `CitusHomerPayloadByteRingDescriptor`
+   - exchanged the byte-ring descriptor during peer open for basebackup streams
+   - replaced the backend-visible fixed producer queue with a producer-owned
+     byte-ring record reservation/commit API for basebackup
+   - added a basebackup sender that parses producer byte-ring records, coalesces
+     adjacent local/remote byte ranges, and publishes an absolute receiver byte
+     tail with `RDMA_WRITE_WITH_IMM`
+   - added a byte-ring receiver that parses complete records, skips wrap
+     trailers, and returns byte-credit ACKs
+   - verified warm remote RDMA basebackup correctness/performance in the
+     `4.2-4.3s` band after the final producer header-clear cleanup
+   - remaining work: transport lanes/QPs, real egress scheduling, optional
+     one-RDMA-op publication, and future fragmentation/reassembly
+
+6. **Traffic-class peer transport lanes**
    - split peer transport resources by traffic class
    - use one critical-control lane per peer transport initially
    - replace the one-message peer-control mailbox with a multi-slot
@@ -1739,7 +1942,7 @@ granting bytes and WRs in addition to object counts.
      pools possible for high-throughput payload classes
    - preserve the existing WRITE_WITH_IMM publication rule per QP/channel
 
-6. **Scheduler prototype**
+7. **Scheduler prototype**
    - implement ready-set construction, policy selection, grants, and progress
      accounting
    - start with a trivial strict policy: critical control, then foreground
@@ -1749,7 +1952,7 @@ granting bytes and WRs in addition to object counts.
    - add weighted/deficit/age-aware policies only after traffic-class lanes are
      measurable
 
-7. **Push command completions - local frontend completed, peer still future**
+8. **Push command completions - local frontend completed, peer still future**
    - keep one in-flight command per session and use a small completion ring for
      the local frontend no-poll implementation
    - bind the local frontend completion destination during session/open setup
@@ -1761,7 +1964,7 @@ granting bytes and WRs in addition to object counts.
      tied to the push destination instead of a future poll
    - retain poll only as a fallback/debug path until the push path is validated
 
-8. **Optional fragmentation**
+9. **Optional fragmentation**
    - add RDMA-substrate fragmentation only if object-level grants are too coarse
      for latency/throughput goals
 
