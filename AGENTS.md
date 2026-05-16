@@ -243,6 +243,23 @@ done
 
 ## Run pgbench through Homer
 
+Current scope: these `pgbench --homer` commands are **farnet1-local**. The
+modified pgbench frontend maps the local Homer service control shared memory,
+opens a local `CLIENT_SQL_SESSION`, and drives a socketless backend on farnet1.
+This is not yet the final farnet0-client-to-farnet1-Postgres workload. A true
+farnet0 client path needs the farnet0 service to open and drive a peer
+`CLIENT_SQL_SESSION` on the farnet1 service, with peer pushed completions and
+remote result-sink descriptors.
+
+CPU placement matters for the current farnet1-local path because frontend,
+service, and socketless backend busy-poll shared cache lines. On the current
+farnet1 topology, CPUs `2`, `3`, and `4` share one L3 domain
+(`/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list` reports
+`0-5,48-53`), while CPUs `8` and `9` are in another. For single-client local
+microbenchmarks, use service CPU `2`, backend CPU `4`, and client CPU `3` if the
+goal is the best local-control number. Use the multi-client CPU list only for
+the multi-session workload and record it with the result.
+
 Single-client smoke:
 
 ```sh
@@ -252,7 +269,7 @@ sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
   --homer-database-oid "$DBOID" \
   --homer-user-oid "$USEROID" \
   --latency-percentiles \
-  --client-cpu=8 \
+  --client-cpu=3 \
   -n -M simple -c 1 -j 1 -t 1000 postgres
 ```
 

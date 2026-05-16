@@ -3541,7 +3541,7 @@ HomerApplyCommandCompletion(CState *st,
 				pg_log_error("client %d failed to drain Homer result sink for %s: %s",
 							 st->id, operationName, errorMessage);
 				st->estatus = ESTATUS_OTHER_SQL_ERROR;
-				HomerClientCloseResultSink(resultSink, true);
+				HomerClientCloseResultSink(resultSink, false);
 				st->homer_result_sink_open = false;
 				clearHomerPendingCommand(st);
 				return false;
@@ -3581,7 +3581,7 @@ HomerApplyCommandCompletion(CState *st,
 		st->estatus = ESTATUS_OTHER_SQL_ERROR;
 		if (st->homer_result_sink_open)
 		{
-			HomerClientCloseResultSink(resultSink, true);
+			HomerClientCloseResultSink(resultSink, false);
 			st->homer_result_sink_open = false;
 		}
 		clearHomerPendingCommand(st);
@@ -3707,7 +3707,7 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 							 st->homer_pending_operation_name : "unknown",
 							 errorMessage);
 				st->estatus = ESTATUS_OTHER_SQL_ERROR;
-				HomerClientCloseResultSink(&st->homer_result_sink, true);
+				HomerClientCloseResultSink(&st->homer_result_sink, false);
 				st->homer_result_sink_open = false;
 				clearHomerPendingCommand(st);
 				return false;
@@ -8826,12 +8826,12 @@ finishHomerSession(CState *st)
 	if (st->homer_result_sink_open)
 	{
 		/*
-		 * Result sink mappings are reused across commands for performance, so
-		 * close them at the same session boundary that closes the remote backend.
-		 * The backend also unlinks during session close; double-unlink is harmless
-		 * here and keeps stale prototype runs from leaving named shm objects behind.
+		 * Result sink mappings are reused across commands for performance. The
+		 * socketless backend closes the service-owned result sink before the
+		 * session lifecycle close returns, so the frontend only drops its local
+		 * mapping here and never unlinks the queue by name.
 		 */
-		HomerClientCloseResultSink(&st->homer_result_sink, true);
+		HomerClientCloseResultSink(&st->homer_result_sink, false);
 		st->homer_result_sink_open = false;
 	}
 

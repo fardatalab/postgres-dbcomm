@@ -9,30 +9,38 @@
 
 ## Implementation status
 
-The single-client simple-mode milestone is now implemented and smoke-tested with one persistent Homer client SQL session per run. The canonical implementation checkpoint is:
+The simple-mode milestone is now implemented and smoke-tested through the
+integrated `pgbench --homer` path with persistent Homer client SQL sessions. The
+canonical implementation checkpoint is:
 
 - [`../../../implementations/postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md`](../../../implementations/postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md)
 
 Completed pieces:
 
 - `REMOTE_EXEC_OP_CLIENT_SQL_SESSION` exists in the backend-facing enum and fixed-width service protocol.
-- A frontend-safe client API, [`remote_execution_client.h`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:1) plus [`homer_client.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1), opens client SQL sessions, submits typed commands, polls completions, and returns errors through caller-owned buffers.
-- A standalone no-libpq runner, [`homer_pgbench.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_pgbench.c:1), consumes that client API and drives a pgbench-like transaction body.
+- A frontend-safe client API, [`remote_execution_client.h`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:1) plus [`homer_client.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1), opens client SQL sessions, submits typed commands, observes pushed completions, maps/drains result sinks, and returns errors through caller-owned buffers.
+- The earlier standalone no-libpq runner has been removed. Integrated
+  `pgbench --homer` is the client SQL benchmark entry point.
 - Upstream `pgbench` now has an opt-in `--homer` mode in [`pgbench.c`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:274). It reuses pgbench's script/timing/reporting path while preserving the default libpq modes for baseline comparison.
 - The local service accepts client SQL command sessions and routes commands to a local socketless backend without peer RDMA.
 - The socketless backend handles typed client begin, generic SQL execute, typed commit, and typed abort.
-- `homer_pgbench` now opens one client SQL session before the transaction loop, reuses the same socketless backend across transactions, and closes the session with a typed internal `CLIENT_SQL_SESSION_CLOSE`.
+- `pgbench --homer` opens one Homer client SQL session per pgbench client,
+  reuses the socketless backend across transactions, and closes the session with
+  a typed internal `CLIENT_SQL_SESSION_CLOSE`.
 - Runtime smoke testing completed one transaction and then three more transactions against scale-1 pgbench tables. After the client-library split, follow-up one-transaction smoke tests also succeeded. `pgbench_history` reached 6 rows after the combined runs.
 - Persistent-session pinned runs completed 3, 1000, and 5000 transactions. The 5000-transaction run reached about `5259 TPS` / `0.190 ms` average latency while increasing `pgbench_history` by exactly 5000 rows.
 - `pgbench --homer` pinned runs completed 1000 and 5000 transactions from the same binary used for the libpq baseline. The 5000-transaction Homer run reached about `5214 TPS` / `0.192 ms` average latency while increasing `pgbench_history` by exactly 5000 rows.
-- Sink-backed tuple-result delivery for row-producing client SQL is implemented for the pgbench path. The built-in TPC-B-like script now sends `SELECT abalance` with `CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE`, opens/drains the result sink from the frontend, and completes a 30 second single-client run with zero failures.
+- Sink-backed tuple-result delivery for row-producing client SQL is implemented
+  for the pgbench path. The built-in TPC-B-like script now sends
+  `SELECT abalance` with `CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE`, opens/drains the
+  result sink from the frontend, and uses a service-owned byte-ring tuple sink
+  parented under the client SQL service session.
 - Code-level benchmark placement is implemented: pgbench `--client-cpu`, service `HOMER_SERVICE_CPU`, and backend `HOMER_REMOTE_EXEC_BACKEND_CPU` replace ad hoc `taskset` as the canonical benchmark controls.
 - Exact in-process tail-latency reporting is implemented behind pgbench `--latency-percentiles`. For transaction-count runs, the sample vector is preallocated before timing starts.
 - A fresh three-run 10k-transaction single-client comparison with code-level pinning measured Homer around `5076 TPS` average versus libpq around `3622 TPS` average. Treat this as a current prototype checkpoint, not a general performance claim.
 
 Still incomplete:
 
-- service-owned result sink allocation/binding; the current result queue is an interim backend-created local POSIX shm shortcut
 - command completion fields for SQL command tag, SQLSTATE, and explicit dynamic session state
 - event/doorbell-style control wakeups or a DPU-oriented control queue/doorbell design; explicit CPU pinning plus raw `pause` spinning is the current single-client benchmark policy
 - prepared-mode pgbench, concurrent clients, auth/user-name mapping, cancellation, and basebackup/interference workload integration
@@ -76,11 +84,13 @@ The current Homer prototype already has remote-execution semantic operation kind
 
 Historical correction: the first pgbench proof of concept did **not** replace frontend/libpq communication. It sent a normal libpq `SELECT pg_catalog.citus_remote_exec_pgbench_transaction(...)` into the local server, and only that backend-side wrapper opened a Homer SQL command session. That wrapper remains useful as a backend bridge smoke path, but it is no longer the completed client SQL milestone.
 
-The current implementation checkpoint replaces the workload path with a standalone no-libpq runner:
+The current implementation checkpoint replaces the measured workload path with
+integrated `pgbench --homer`; the standalone proof-of-concept runner has been
+removed:
 
 - [`HomerClientOpenSqlSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:408) opens `REMOTE_EXEC_OP_CLIENT_SQL_SESSION` through the fixed-width control protocol.
-- [`HomerClientStartAndWaitCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:737) sends typed commands and polls command completion.
-- [`HomerRunOneTransaction()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_pgbench.c:261) drives the pgbench transaction shape without `PGconn`.
+- [`HomerClientStartAndWaitCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:737) sends typed commands and waits on pushed completion state.
+- [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3731) is the integrated pgbench adapter that sends typed Homer commands, drains result sinks while commands are active, and preserves the normal pgbench timing/reporting path.
 
 The backend bridge still uses:
 
@@ -88,7 +98,10 @@ The backend bridge still uses:
 - `src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:798` `RemoteExecBackendExecuteSqlCommand()` to execute that SQL string in the socketless backend.
 - `src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1070` typed command dispatch for lifecycle commands, COPY ingest, and SQL execute.
 
-The implementation now validates a reusable client-side Homer API shape for the single-client simple-mode milestone. It is still a narrow API for local shared-memory control and one command in flight per session, not the future concurrent/session-multiplexed API, authentication/session-state layer, or service-owned sink-binding design.
+The implementation now validates a reusable client-side Homer API shape for the
+simple-mode milestone. It is still a narrow API for local shared-memory control
+and one command in flight per session, not the future command-pipelined API,
+authentication/session-state layer, or DPU-oriented control transport.
 
 ## Why `REMOTE_EXEC_OP_CLIENT_SQL_SESSION` is separate
 
@@ -238,13 +251,20 @@ This keeps the control path as command/session control and the result path as th
 
 #### Concrete result-sink materialization plan
 
-Status: implemented for the single-client pgbench simple-mode path, with an interim backend-created local result queue.
+Status: implemented for the simple-mode pgbench path with service-owned
+byte-ring tuple-result queues. The client-SQL result path now uses the same
+sink-centered ownership model as Citus backend-backend tuple-copy: the Homer
+service allocates/binds the result sink, the socketless backend opens the
+send-side descriptor, and the frontend maps/drains the receive descriptor named
+by command completion metadata.
 
 The implemented path uses generic sink-backed SQL result materialization and reuses the existing tuple-view contract and tuple-sink mechanics rather than growing the scalar shortcut. The canonical checkpoint is [`../../../implementations/postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md`](../../../implementations/postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md).
 
 Implemented pieces:
 
-- [`RemoteExecSqlDestStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:454) receives the executor `TupleDesc`, builds a tuple-view contract, opens a per-command result queue, and publishes result-sink readiness in command completion metadata.
+- [`RemoteExecOpenServiceOwnedResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:597) requests a service-owned tuple sink under the parent client SQL session once the executor `TupleDesc` is known.
+- [`RemoteExecEnsureSessionResultQueue()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:740) binds or reuses that service-owned result sink when the tuple-view contract is compatible, and reopens it when the result shape changes.
+- [`RemoteExecSqlDestStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:972) receives the executor `TupleDesc`, builds a tuple-view contract, opens the service-owned send-side sink, and publishes result-sink readiness in command completion metadata.
 - [`RemoteExecSqlDestReceiveSlot()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:585) copies executor rows into a receiver-owned virtual slot and appends them to tuple-sink batches.
 - [`RemoteExecSqlDestShutdown()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:640) flushes the final batch, marks peer closed/EOS, and closes the backend-local sink handle before executor memory is reset.
 - [`HomerClientOpenResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:946) and [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1054) let frontend code map and drain the sink named by completion metadata.
@@ -258,30 +278,62 @@ Existing tuple/sink pieces to reuse:
 - [`TryAppendTupleViewToCitusTupleSinkBatch()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/tuple_sink_service.h:96), [`AppendTupleViewToCitusTupleSinkBatch()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/tuple_sink_service.h:99), and [`SubmitCitusTupleSinkBatch()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/tuple_sink_service.h:101) already append executor slots as tuple views.
 - [`BorrowNextTupleViewFromCitusTupleSinkBatch()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/tuple_sink_service.h:108) and [`CopyOutNextTupleViewFromCitusTupleSinkBatch()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/tuple_sink_service.h:115) already decode received tuple-view rows into caller-owned `Datum` / null arrays.
 
-Remaining implementation steps:
+#### Completed follow-up: service-owned client SQL result sinks
 
-1. Move result-sink allocation/binding into the service.
-   - The command path already routes local client SQL sessions in [`TupleSinkServiceHandleStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6416).
-   - The result path still needs a way for the service to allocate or bind an exact result sink under the same client SQL session and return `serviceSinkId`, queue descriptor, tuple-view contract, and readiness state through control metadata.
-   - Prefer a per-command result sink first. A reusable session-level sink is attractive later, but per-command lifetime is easier to reason about when result shapes vary by SQL statement.
+The target design that client-SQL row results are fully sink-backed in the same
+framework sense as Citus backend-backend tuple copy has landed for the local
+pgbench path:
 
-2. Harden the sink-backed receiver.
+1. At row-producing command startup, the backend asks the service to open/bind a
+   result sink under the parent client SQL session using
+   `parentServiceSessionId`.
+2. The service returns byte-ring tuple-view descriptors; descriptors without
+   `CITUS_TUPLE_SINK_QUEUE_DESCRIPTOR_FLAG_BYTE_RING` are rejected by the active
+   tuple/result path.
+3. The backend `DestReceiver` still builds the tuple-view contract from the
+   executor `TupleDesc`, but `RemoteExecEnsureSessionResultQueue()` now binds a
+   service-owned sink instead of creating an ad hoc backend-owned POSIX shm
+   queue.
+4. The frontend `HomerClientOpenResultSink()` opens/drains the
+   service-provided receive sink. For local host this still maps shared memory,
+   but ownership and binding come from the service, not from the backend process.
+5. Normal close follows sink lifecycle. The frontend closes its local mapping
+   without unlinking; service/backend session cleanup owns the sink.
+
+Acceptance criteria for this follow-up:
+
+- command completion metadata references a service-owned sink identity and
+  byte-ring descriptor. **Done.**
+- pgbench `SELECT abalance` drains as a tuple-view result with no scalar or
+  discard shortcut. **Done.**
+- single-client and multi-client `pgbench --homer` performance does not regress
+  against the current byte-ring checkpoint. **Done in the May 16 farnet1
+  validation: c1/j1 `5838 TPS`, c4/j4 `14983` and `14851 TPS` repeats with zero
+  failures.**
+- the implementation remains compatible with the later DPU direction: payload
+  ownership belongs to the Homer service/substrate, not to socketless backend
+  private shm setup. **Done for ownership/binding; the broader control transport
+  is still future work.**
+
+Remaining result-path work:
+
+- Harden the sink-backed receiver.
    - The current receiver validates `CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE`, builds the tuple-view contract from the executor `TupleDesc`, and writes tuple batches.
    - On error unwind, close or mark the result sink failed so the frontend does not wait forever for EOS.
    - Preserve the current lifetime rules: the receiver-owned copy slot must use a copied `TupleDesc`, and the send-side tuple sink handle must close in `rShutdown` before `PortalDrop()` resets executor memory.
 
-3. Extend command completion/control metadata.
+- Extend command completion/control metadata.
    - Completion now carries command state, processed row count, result sink id/descriptor/contract, and result readiness/EOS state.
    - It still needs SQL command tag, SQLSTATE/error summary, and authoritative dynamic session state.
    - Row payload bytes should remain out of the command mailbox.
    - The existing `scalarInt64` fields can remain temporarily for wire compatibility but should not be used by the client SQL result path.
 
-4. Extend frontend-safe result APIs.
+- Extend frontend-safe result APIs.
    - The current frontend API in [`remote_execution_client.h`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:1) can map and drain the result sink enough for pgbench's row payload.
    - Add richer helpers to borrow/copy typed tuple views into caller-owned values instead of only draining/skipping rows.
    - Keep the public frontend API tuple-shaped: one-column one-row scalar results should still be consumed as a tuple view with one attribute.
 
-5. Broaden pgbench result consumption.
+- Broaden pgbench result consumption.
    - Plain TPC-B `SELECT abalance` now drains the tuple-result sink.
    - `\gset` / `\aset` should remain rejected until pgbench can convert borrowed tuple values into variable strings correctly; this requires type output functions or a deliberately narrower first implementation for integer values.
 
@@ -420,9 +472,13 @@ The workload body is:
 9. send typed commit
 10. on local or remote failure, send typed abort if the session may still be transaction-attached
 
-## Completed milestone: persistent single-client session
+## Completed milestone: persistent client sessions
 
-The persistent-session milestone is complete for the standalone `homer_pgbench` path. One frontend Homer SQL session now survives across many pgbench transactions, closing the earlier lifecycle mismatch against normal single-client `pgbench`, where one frontend connection and one backend execution context are reused for the whole run.
+The persistent-session milestone is complete for integrated `pgbench --homer`.
+One frontend Homer SQL session now survives across many pgbench transactions per
+client, closing the earlier lifecycle mismatch against normal `pgbench`, where
+one frontend connection and one backend execution context are reused for the
+whole run.
 
 Target runtime shape:
 
@@ -431,11 +487,15 @@ Target runtime shape:
 3. run every transaction through the same [`HomerClientSession`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:35)
 4. close the session once through [`HomerClientCloseSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:496)
 
-The original blocker was that [`HomerRunOneTransaction()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_pgbench.c:337) opened and closed the Homer session inside every transaction, while the service/backend also treated typed commit/abort as terminal session events. That has been replaced by persistent frontend session ownership in [`main()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_pgbench.c:465), client-session-aware backend reuse, and explicit typed close.
+The original blocker in the deleted proof-of-concept runner was that it opened
+and closed the Homer session inside every transaction, while the service/backend
+also treated typed commit/abort as terminal session events. That has been
+replaced by persistent frontend session ownership in pgbench's thread/client
+lifecycle, client-session-aware backend reuse, and explicit typed close.
 
 Implemented changes:
 
-1. [`HomerRunOneTransaction()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_pgbench.c:337) now accepts an already-open `HomerClientSession *`; [`main()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_pgbench.c:465) owns one [`HomerClientOpenSqlSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:418) before the loop and one [`HomerClientCloseSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:496) after the loop.
+1. [`threadRun()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:8215) opens Homer client SQL sessions before measured work, and [`finishHomerSession()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:8137) closes them after the run.
 2. [`CitusRemoteExecBackendSpawnRequest.sessionOpKind`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_backend_protocol.h:69) and [`CitusRemoteExecBackendStartupData.sessionOpKind`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_backend_protocol.h:59) carry the service session/op kind into the socketless backend. [`TupleSinkServiceSubmitBackendSpawnRequest()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1321) fills it, and [`ProcessSpawnRequestSlot()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1376) copies it into startup data.
 3. [`RemoteExecBackendExecuteTxCommitCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:813) and [`RemoteExecBackendExecuteTxAbortCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:858) reset transaction state but keep the backend command loop alive for `REMOTE_EXEC_OP_CLIENT_SQL_SESSION`. Older backend-to-backend command sessions preserve terminal commit/abort behavior.
 4. [`TupleSinkServiceSessionShouldRetireWhenIdle()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3320) no longer retires `CITUS_REMOTE_EXEC_OP_CLIENT_SQL_SESSION` merely because the current command is `TX_COMMIT` or `TX_ABORT`.
@@ -452,7 +512,13 @@ Acceptance checks passed:
 
 The observed pinned 3-transaction service log had one `opened command session`, one `spawn request completed`, transaction command sequences `1..21`, then `client_sql_session_close sequence=22`. The 1000- and 5000-transaction runs increased `pgbench_history` by exactly the requested transaction count and left no remote-exec backend process behind.
 
-Do not treat the older standalone `homer_pgbench` 5000-transaction `~5259 TPS` number as a final apples-to-apples result against stock pgbench. That run predated full pgbench integration and sink-backed result delivery. The current fairer single-client comparison is `pgbench --homer` versus libpq from the same pgbench binary with `SELECT abalance` flowing through a tuple-result sink; see the implementation checkpoint for the latest repeated measurements and tail-latency numbers.
+Do not treat the older standalone `homer_pgbench` 5000-transaction `~5259 TPS`
+number as a final apples-to-apples result against stock pgbench. That run
+predated full pgbench integration and sink-backed result delivery, and the
+binary is now removed. Current comparisons should use `pgbench --homer` versus
+libpq from the same pgbench binary with `SELECT abalance` flowing through a
+tuple-result sink; see the implementation checkpoint for the latest repeated
+measurements and tail-latency numbers.
 
 ## Wait policy and busy waiting
 
@@ -558,7 +624,7 @@ Do not add a command sink for milestone 1. The first client SQL session is still
 
 ### 4. Add a small frontend Homer client library
 
-Status: partially complete.
+Status: complete for the integrated pgbench milestone.
 
 The current helper that maps the local control region is backend-facing:
 
@@ -586,11 +652,11 @@ int CloseRemoteExecutionClientSession(RemoteExecutionClientSession *session);
 
 The implementation can share protocol structs from `remote_execution_control_protocol.h`, but should not directly depend on Citus backend code.
 
-The current code implements this as [`remote_execution_client.h`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:1) and [`homer_client.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1). [`Makefile`](/data/dbcomm/citus-dbcomm-separate-comm-stack/Makefile:47) builds `libhomer_client.a`, links `homer_pgbench` against it, and installs both the static library and header. The API names are currently `HomerClient*` rather than the sketch names above, and the API uses caller-owned error buffers instead of backend error machinery.
+The current code implements this as [`remote_execution_client.h`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:1) and [`homer_client.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1). [`Makefile`](/data/dbcomm/citus-dbcomm-separate-comm-stack/Makefile:47) builds `libhomer_client.a` and installs both the static library and header. The API names are currently `HomerClient*` rather than the sketch names above, and the API uses caller-owned error buffers instead of backend error machinery.
 
 ### 5. Add a pgbench-compatible Homer frontend
 
-Status: complete for single-client simple-mode smoke testing.
+Status: complete for integrated simple-mode pgbench testing.
 
 For the first milestone, prefer an isolated single-client runner or an explicitly isolated pgbench mode rather than rewriting the whole pgbench script engine.
 
@@ -608,9 +674,9 @@ If this is added inside `src/bin/pgbench/pgbench.c`, the Homer mode must bypass 
 - `src/bin/pgbench/pgbench.c:3178` `PQsendQueryParams(...)`
 - `src/bin/pgbench/pgbench.c:3189` `PQsendQueryPrepared(...)`
 
-For the first milestone, a separate Homer pgbench-style tool may be cleaner because it keeps libpq out of the workload path and avoids accidental fallback to normal pgbench connection state.
-
-This is the path that landed: [`homer_pgbench.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_pgbench.c:1), built by [`Makefile`](/data/dbcomm/citus-dbcomm-separate-comm-stack/Makefile:44) and installed as `/data/dbcomm/pg-citus/bin/homer_pgbench`.
+The first proof of concept used a separate Homer pgbench-style tool, but that
+scaffold has now been deleted. The path that remains is integrated
+`pgbench --homer`: [`sendHomerCommand()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3573) maps SQL text to typed Homer lifecycle/execute commands, and [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3731) waits on pushed completions while draining tuple-result sinks.
 
 ### 6. Dispatch typed client commands in the socketless backend
 

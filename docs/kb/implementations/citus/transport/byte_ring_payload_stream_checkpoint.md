@@ -2,27 +2,31 @@
 
 ## Summary
 
-The current implementation has the first fully byte-ring Homer basebackup
-substrate. PostgreSQL no longer writes basebackup objects into a fixed
-backend-visible producer slot queue. It reserves byte-ring record space through
-the Homer client library, writes the basebackup payload directly into that
-reserved record, and publishes an absolute producer byte tail. The sender packs
-`CitusTupleSinkTransportHeader + CitusRemoteBaseBackupMessageHeader + payload`
-byte-ring records from that producer-owned ring into the receiver-owned RDMA
-byte ring and publishes an absolute receiver byte tail with a final
-`RDMA_WRITE_WITH_IMM`.
+The current implementation has a common byte-ring Homer payload substrate for
+basebackup streams and tuple/result payload streams. PostgreSQL no longer writes
+basebackup objects or client-SQL tuple results into fixed producer slots on the
+hot path. Producers reserve byte-ring record space, write payload bytes directly
+into the reserved record, and publish an absolute producer byte tail. The sender
+packs complete byte-ring records into the receiver-owned RDMA byte ring and
+publishes an absolute receiver byte tail with a final `RDMA_WRITE_WITH_IMM`.
+
+The two current record shapes are:
+
+- basebackup: `CitusTupleSinkTransportHeader +
+  CitusRemoteBaseBackupMessageHeader + payload`
+- tuple/result: `CitusTupleSinkTransportHeader + CitusTupleSinkBatchHeader +
+  tuple-view row bytes`
 
 Terminology note: this current implementation uses **byte-ring records**. It
 does not implement the deferred one-RDMA-op grant-boundary record design. If we
 later introduce `HomerPayloadRecordHeader` or a grant-end marker record, that
 will be a separate follow-up to this checkpoint.
 
-This is intentionally a partial migration. Tuple/result payload streams still
-use the fixed-slot payload ring. Basebackup is now byte-ring-backed on both the
-local producer side and the service-to-service RDMA side. The byte ring is
-enabled by object family in
-[`HomerServicePayloadStreamUsesByteRing()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1284), currently only for
-`HOMER_PAYLOAD_OBJECT_FAMILY_BASE_BACKUP_STREAM`.
+This checkpoint supersedes the earlier partial basebackup-only byte-ring
+migration. The byte ring is enabled by object family in
+[`HomerServicePayloadStreamUsesByteRing()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1284), currently for
+`HOMER_PAYLOAD_OBJECT_FAMILY_BASE_BACKUP_STREAM` and
+`HOMER_PAYLOAD_OBJECT_FAMILY_TUPLE_VIEW_BATCH`.
 
 ## Protocol Objects
 
@@ -37,8 +41,11 @@ RDMA descriptors.
 carries the receiver-local RDMA address, rkey, control size, ring bytes, and
 flags. The peer-open response includes it as
 [`peerReceiveByteRingDescriptor`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_peer_control_protocol.h:117).
-Tuple streams leave that descriptor zeroed and continue to use
-`peerReceivePayloadRingDescriptor`.
+
+[`CitusTupleSinkQueueDescriptor.descriptorFlags`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/tuple_sink_protocol.h:294)
+now carries `CITUS_TUPLE_SINK_QUEUE_DESCRIPTOR_FLAG_BYTE_RING` for backend- and
+frontend-visible tuple/result queues. This keeps tuple-view contracts as the DB
+semantic object description while changing only the queue substrate underneath.
 
 The peer protocol version was bumped because the peer-open response layout
 changed. A sender and receiver service must therefore be rebuilt and restarted
@@ -54,29 +61,33 @@ Do not reuse `CITUS_TUPLE_SINK_QUEUE_FLAG_PEER_CLOSED` for byte-ring flags: bit
 
 On local stream creation,
 [`HomerServiceCreatePayloadStreamEntry()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5361)
-allocates a producer-owned byte ring for basebackup streams through
+allocates a producer-owned byte ring for byte-ring payload streams through
 [`HomerServiceMapProducerByteRingQueue()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4736).
-`slots=` remains a capacity multiplier in the target detail, but for basebackup
-it no longer describes fixed producer slots on the hot path.
+`slots=` remains a capacity multiplier in the target detail, but for byte-ring
+streams it no longer describes fixed producer slots on the hot path.
 
 On the sender service, [`TupleSinkServicePeerOpenSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5994)
-checks whether the stream uses the byte ring. For basebackup it validates the
-peer's byte-ring descriptor and stores it with
+checks whether the stream uses the byte ring. For byte-ring streams it validates
+the peer's byte-ring descriptor and stores it with
 [`HomerServiceRecordPeerReceiveByteRing()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5612).
 
 On the receiver service, [`TupleSinkServiceHandlePeerOpenRequest()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6229)
 allocates and registers the receiver-owned byte ring through
-`HomerServiceEnsureLocalReceiveByteRing()` when the object family is basebackup.
+`HomerServiceEnsureLocalReceiveByteRing()`. Basebackup uses a service-owned
+blackhole receive byte ring; tuple/result streams alias the local receive byte
+ring to the backend-visible receive queue so the peer can RDMA write directly
+into bytes drained by the worker/frontend tuple sink consumer.
 Close/drain checks use [`HomerServiceReceivePayloadTransportIsDrained()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5809),
-which compares byte-ring `publishedTail` and `consumedHead` for byte streams and
-keeps the old fixed-slot test for tuple streams.
+which compares byte-ring `publishedTail` and `consumedHead` for byte streams.
 
 ## Send Path
 
 [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7649)
-still performs common producer-ring registration and then dispatches basebackup
-streams to
+performs common producer-ring registration and dispatches byte-ring streams to
 [`HomerServicePumpOutgoingByteRingBaseBackup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7045).
+The function name is now stale: the code path is generic for basebackup and
+tuple-view batch streams, with object-family validation inside the byte-ring
+sender.
 
 The byte-ring sender keeps two frontier domains:
 
@@ -124,17 +135,26 @@ WRs are still outstanding.
 ## Receive Path
 
 [`HomerServicePumpIncomingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9013)
-dispatches byte-ring basebackup streams to
+dispatches byte-ring streams to
 [`HomerServicePumpIncomingByteRingBaseBackup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8734).
+This function name is also stale after the tuple/result migration.
 
-The receiver consumes data doorbells, reads the byte-ring `publishedTail`, and
-parses complete byte-ring records from its local `consumedHead` up to that byte
-frontier.
+For basebackup, the receiver consumes data doorbells, reads the byte-ring
+`publishedTail`, and parses complete byte-ring records from its local
+`consumedHead` up to that byte frontier.
 When a wrap trailer does not contain the expected object sequence and the
 published tail has crossed the ring boundary, the receiver treats the trailer as
 skipped space and advances to offset zero.
 
-The receive cursor is kept in registers while parsing one doorbelled byte range.
+For tuple/result streams, the service is intentionally passive on payload bytes:
+the peer writes directly into the backend-visible receive byte ring, and
+[`PollCitusTupleSinkBatch()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service.c:1393)
+parses the tuple-view record for the worker/frontend consumer. The service only
+drains data doorbells and returns receiver-head ACKs based on the consumer's byte
+`consumedHead`.
+
+The basebackup receive cursor is kept in registers while parsing one doorbelled
+byte range.
 `consumedHead` is stored back to the receiver-local control block once per
 drain pass in
 [`HomerServicePumpIncomingByteRingBaseBackup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8734).
@@ -155,10 +175,18 @@ path.
   maximum record capacity would not fit there. This preserves simple no-wrap
   record parsing; finer packing would need a reservation API that knows the
   record size before returning payload memory.
-- Tuple/result payload streams remain fixed-slot in this checkpoint. The target
-  direction is to migrate tuple-view batches onto the same byte-ring substrate;
-  see the two-stage full byte-ring migration plan in
-  [homer_transport_scheduler_and_payload_streams.md](../../../future-directions/citus/transport/homer_transport_scheduler_and_payload_streams.md).
+- Some service helper names still say `BaseBackup` even though the functions are
+  now the generic byte-ring path for basebackup and tuple-view batch streams.
+  This is naming debt, not a data-path limitation.
+- Tuple/result queues are byte-ring-only on the active backend/client API path.
+  Descriptors without `CITUS_TUPLE_SINK_QUEUE_DESCRIPTOR_FLAG_BYTE_RING` are
+  rejected at open/validation time. The protocol still contains some
+  fixed-slot-era structs and names for historical/control compatibility, but the
+  measured tuple/result payload hot path no longer dispatches between slot and
+  byte-ring queue implementations.
+- Tuple/result byte-ring receive currently uses whole-record visibility and
+  direct receive-ring aliasing. Fragment/reassembly and the one-RDMA-op
+  grant-boundary publication design remain future work.
 
 ## Verification
 
@@ -210,13 +238,58 @@ single-byte terminators before error-producing calls. The old clears happened on
 the service loop even on successful iterations, so they were unnecessary repeated
 memory traffic rather than useful diagnostics.
 
+After the full tuple/result byte-ring migration and tuple-sink allocation
+cleanup, correctness/performance verification on May 16, 2026 used the
+integrated `pgbench --homer` path and the same installed binary's libpq path:
+
+- Homer c1/j1, `-t 3000`: `5654`, `5679`, `5784 TPS`; p99 about
+  `0.196-0.201 ms`
+- libpq c1/j1, `-t 3000`: `4398`, `4209`, `4344 TPS`; p99 about
+  `0.253-0.286 ms`
+- Homer c4/j4, `-t 3000`: `14656`, `15921`, `15229 TPS`; p99 about
+  `0.405-0.461 ms`
+- libpq c4/j4, `-t 3000`: `10966`, `10852`, `10003 TPS`; p99 about
+  `0.652-0.687 ms`
+
+Basebackup was also rechecked after the tuple/result migration. Local blackhole
+ran at `4.17s` then `3.96s`; remote RDMA ran at `8.25s` for the first cold
+setup/warmup run and `4.21s` for the warmed run.
+
+After the follow-up cleanup that made tuple/result queues byte-ring-only and
+moved client-SQL result sink ownership into the Homer service, farnet1 local
+validation on May 16, 2026 showed:
+
+- local blackhole basebackup: `4.19s`
+- pinned c1/j1 `pgbench --homer -t 10000 --latency-percentiles
+  --client-cpu=8`: `5838 TPS`, p99 `0.188 ms`, zero failures
+- pinned c4/j4 `pgbench --homer -t 20000 --latency-percentiles
+  --client-cpus=8,9,10,11`: `14983` and `14851 TPS` repeats, p99 `0.470` and
+  `0.465 ms`, zero failures
+
+One important rebuild pitfall: the Postgres backend statically links the Homer
+client/control protocol pieces. When `libhomer_client.a`,
+`remote_execution_control_protocol.h`, or shared protocol versions change, force
+a relink of at least `src/backend/postgres`, `src/bin/pgbench/pgbench`, and
+`src/bin/pg_basebackup/pg_basebackup` before installing. A stale backend can map
+an older control shared-memory name while the service uses the newer one; the
+observed failure looked like a timeout waiting for Homer service progress. A
+quick sanity check is:
+
+```sh
+strings /data/dbcomm/pg-citus/bin/postgres \
+  /data/dbcomm/pg-citus/bin/citus_tuple_sink_service |
+  rg 'citus_remote_execution_control_v' | sort -u
+```
+
+The installed binaries should agree on one protocol/control-region version.
+
 ## Future Work
 
-The next performance-relevant substrate step is not another producer-slot
-conversion. Basebackup is already producer-byte-ring-backed. Remaining work is
+The next performance-relevant substrate step is not another fixed-slot
+conversion for basebackup or tuple/result streams. Remaining work is
 transport-side: traffic-class transports, multiple QPs, real RDMA egress
-scheduling, possible one-RDMA-op in-band publication, and optional
-fragment/reassembly for very large semantic objects.
+scheduling, possible one-RDMA-op in-band publication, naming cleanup, and
+optional fragment/reassembly for very large semantic objects.
 
 This checkpoint advances the future design in
 [homer_transport_scheduler_and_payload_streams.md](../../../future-directions/citus/transport/homer_transport_scheduler_and_payload_streams.md).

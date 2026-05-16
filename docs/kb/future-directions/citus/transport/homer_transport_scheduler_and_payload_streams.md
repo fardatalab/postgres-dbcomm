@@ -1565,35 +1565,57 @@ Current next-step plan after the May 15 publication and piggyback changes:
 
    Implementation checkpoint on May 16, 2026:
 
-   - Basebackup streams now use byte rings on both the producer side and the
+   - Stage 1 is complete for the current payload families. Basebackup streams
+     and tuple/result streams now use byte rings on the producer side and the
      service-to-service RDMA side. PostgreSQL reserves and commits byte-ring
-     records through the Homer client library; the sender service parses those
-     records in place, coalesces adjacent local/remote byte ranges, and
-     publishes the receiver byte tail with a final `RDMA_WRITE_WITH_IMM`.
-   - Tuple/result payload streams still use the fixed-slot payload ring.
+     records; the sender service parses complete records in place, coalesces
+     adjacent local/remote byte ranges, and publishes the receiver byte tail
+     with a final `RDMA_WRITE_WITH_IMM`.
+   - Tuple/result payloads remain tuple-view semantic objects. The byte ring is
+     only the neutral payload substrate. `CitusTupleSinkQueueDescriptor` uses
+     `CITUS_TUPLE_SINK_QUEUE_DESCRIPTOR_FLAG_BYTE_RING`, while
+     `CitusTupleViewContract` continues to describe result shape.
+   - `HomerServicePayloadStreamUsesByteRing()` now covers
+     `HOMER_PAYLOAD_OBJECT_FAMILY_BASE_BACKUP_STREAM` and
+     `HOMER_PAYLOAD_OBJECT_FAMILY_TUPLE_VIEW_BATCH`.
+   - Client SQL result queues are byte-ring backed, and the frontend drains them
+     through `HomerClientOpenResultSink()` / `HomerClientDrainResultSink()`.
+   - Tuple-view service receive uses direct RDMA into the backend-visible
+     receive byte ring. The service does not rebuild/copy tuple records on the
+     receive side; it only handles doorbells and receiver-head ACKs while the
+     worker/frontend tuple sink consumer parses complete records.
+   - The old standalone `src/bin/homer_pgbench.c` scaffold has been removed from
+     the Citus client-bin/install targets. Integrated `pgbench --homer` is the
+     benchmark path for client SQL.
    - The byte-ring checkpoint verifies correctness and warmed remote RDMA
      basebackup in roughly the `4.17-4.25s` band with
      `slots=8,bytes=8388608`; local blackhole warmed repeats were about
-     `3.95-4.08s`; see
+     `3.95-4.08s`. After the tuple/result byte-ring migration, a warmed remote
+     run measured `4.21s` and a warmed local blackhole run measured `3.96s`; see
      [byte_ring_payload_stream_checkpoint.md](../../../implementations/citus/transport/byte_ring_payload_stream_checkpoint.md)
      for the current code paths, caveats, and measurements.
-   - The producer-side fixed-slot WR shape is no longer the next blocker for
-     basebackup. The next performance/design steps are transport-side:
-     traffic-class lanes/QPs, RDMA egress scheduling over ready byte ranges,
-     possible one-RDMA-op in-band publication, and later fragmentation for
-     oversized semantic records.
+   - `pgbench --homer` correctness/performance was rechecked after the migration:
+     c1/j1 `-t 3000` ran at `5654`, `5679`, and `5784 TPS`; c4/j4 ran at
+     `14656`, `15921`, and `15229 TPS`. The same installed binary's libpq path
+     ran at `4209-4398 TPS` for c1 and `10003-10966 TPS` for c4.
+   - The producer-side fixed-slot WR shape is no longer the next blocker for the
+     current basebackup or tuple/result paths. The next performance/design steps
+     are transport-side: traffic-class lanes/QPs, RDMA egress scheduling over
+     ready byte ranges, possible one-RDMA-op in-band publication, naming cleanup,
+     and later fragmentation for oversized semantic records.
 
    Two-stage full byte-ring migration plan:
 
    **Stage 1: make byte rings the common payload substrate without changing
-   upper-level DB semantics.**
+   upper-level DB semantics. Status: completed on May 16, 2026 for basebackup
+   and tuple/result streams.**
 
-   The goal of this stage is representation cleanup and correctness, not final
-   tuning. Tuple/result payloads should keep their DB-semantic object identity:
+   The goal of this stage was representation cleanup and correctness, not final
+   tuning. Tuple/result payloads keep their DB-semantic object identity:
    tuple-view batches remain tuple-view batches, basebackup records remain
    basebackup records, and future WAL streams remain WAL records or record
-   groups. The change is that the neutral payload stream carries those objects
-   as packed byte-ring records instead of fixed slots.
+   groups. The neutral payload stream now carries the implemented object
+   families as packed byte-ring records instead of fixed slots.
 
    - Extend the byte-ring mode currently selected by
      `HomerServicePayloadStreamUsesByteRing()` in
@@ -1632,19 +1654,12 @@ Current next-step plan after the May 15 publication and piggyback changes:
      metadata in place, build byte-contiguous RDMA descriptors, and publish the
      receiver byte tail with the current final `RDMA_WRITE_WITH_IMM` rule.
    - Replace the fixed-slot receive path in
-     `HomerServicePumpIncomingPayloadStream()` with a byte-ring generic
-     receiver. It should parse byte-ring records, dispatch by object family, and
-     deliver only complete semantic objects upward. It must not expose a partial
-     tuple-view batch to the worker or frontend result sink.
-   - Remove or narrow the tuple-batch rebuild tax in
-     `TupleSinkServiceDecodeIncomingTupleViewBatch()` in
-     `src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
-     Because the existing code already checks that the incoming tuple view and
-     local receive-batch layouts match before copying, the byte-ring migration
-     should prefer borrowed/zero-copy views or a direct publish of the received
-     record where lifetime allows. If a rebuild remains necessary for an early
-     checkpoint, keep it behind the object-family materializer so it can be
-     removed without changing the transport substrate again.
+     `HomerServicePumpIncomingPayloadStream()` with a byte-ring receiver. This is
+     implemented differently for the two current object families: basebackup is
+     parsed/blackholed by the service, while tuple-view batch receive aliases the
+     receiver byte ring to the backend-visible queue and lets
+     `PollCitusTupleSinkBatch()` parse complete records directly. That removes
+     the old tuple-batch rebuild/copy tax from the service receive path.
    - Preserve the current byte-ring publication rule from the basebackup
      checkpoint: payload WRs first, then one final tail
      `RDMA_WRITE_WITH_IMM`. The one-RDMA-op grant-boundary record design remains
@@ -1659,10 +1674,9 @@ Current next-step plan after the May 15 publication and piggyback changes:
      failure and teardown must still avoid stale bytes, leaked MRs, or missing
      receiver-head ACKs.
    - Remove dead benchmark scaffolding after the integrated pgbench path remains
-     correct. The standalone `src/bin/homer_pgbench.c` driver in the Citus tree
-     is older no-libpq scaffolding and should be removed from `client-bin` and
-     install targets once `pgbench --homer` is confirmed as the canonical
-     benchmark path.
+     correct. This is complete: the standalone `src/bin/homer_pgbench.c` driver
+     was removed from `client-bin` and install targets once `pgbench --homer`
+     was confirmed as the canonical benchmark path.
 
    Stage 1 validation criteria:
 
@@ -1677,11 +1691,45 @@ Current next-step plan after the May 15 publication and piggyback changes:
    - No hot-path dynamic allocation, heap wrapper creation, or fixed 1 ms sleep
      remains in the tuple/result measured path.
 
-   **Stage 2: optimize after the common byte-ring substrate is in place.**
+   **Stage 2: optimize after the common byte-ring substrate is in place. Status:
+   partially completed; transport scheduler and multiple QPs remain future
+   work.**
 
    This stage should avoid polishing the deleted fixed-slot path. The goal is to
    squeeze overhead out of the byte-ring substrate and make it scheduler-ready.
 
+   Completed in the first post-migration optimization pass:
+
+   - tuple-sink send/receive batch handles are embedded in the sink handle, so
+     the measured tuple/result path no longer pays per-batch `palloc`/`pfree`
+   - fixed `pg_usleep(1000L)` sleeps were removed from the Citus Homer
+     backend/worker wait loops and replaced with CPU-relax spinning
+   - the obsolete standalone `homer_pgbench` benchmark scaffold was removed, so
+     performance claims use integrated `pgbench --homer`
+   - result-sink byte-ring draining validates transport sequence and tuple batch
+     headers while advancing byte `consumedHead` directly
+   - tuple-view service receive avoids service-side materialization by RDMA
+     writing directly into the backend-visible receive byte ring
+   - tuple/result queues are now byte-ring-only on the active backend/client API
+     path. `OpenCitusTupleSink()`, `TryReserveCitusTupleSinkBatch()`,
+     `SubmitCitusTupleSinkBatch()`, `PollCitusTupleSinkBatch()`, and
+     `HomerClientDrainResultSink()` no longer carry a measured runtime
+     fixed-slot-vs-byte-ring dispatch path.
+   - client-SQL result sinks are now allocated/bound by the Homer service under
+     the parent client SQL session instead of being backend-created local POSIX
+     shm queues.
+
+   Remaining Stage 2 items:
+
+   - Preserve tuple-view semantics as a continuing invariant. This is not a
+     request to make tuple results generic byte blobs: `CitusTupleViewContract`
+     remains the semantic schema contract, and tuple-view batch records remain
+     the payload object. Only the physical queue backing is unconditional
+     byte-ring storage.
+   - Keep any remaining fixed-slot-era protocol/control structures only if they
+     are genuinely needed for command/control compatibility or historical
+     scaffolding. Payload data structures should not reintroduce a slot-vs-byte
+     runtime branch in the measured path.
    - Add low-overhead counters under compile-time macros for each payload
      family: produced records, produced bytes, ready bytes at service pickup,
      RDMA grants, WRs per grant, bytes per grant, coalesced ranges, wrap splits,
