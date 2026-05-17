@@ -298,6 +298,9 @@ static bool latency_percentiles = false;	/* exact p50/p95/p99 summary */
 static bool homer_mode = false;
 static uint32 homer_database_oid = 0;
 static uint32 homer_user_oid = 0;
+static char homer_peer_host[CITUS_REMOTE_EXEC_CONTROL_HOST_BYTES] = "";
+static uint32 homer_peer_port = 0;
+static int32 homer_peer_node = 1;
 static int	client_cpu = -1;
 static int	client_cpus[CPU_SETSIZE];
 static int	client_cpu_count = 0;
@@ -1117,6 +1120,9 @@ usage(void)
 		   "  --homer                  submit simple SQL through the Homer service\n"
 		   "  --homer-client-cpu=CPU   alias for --client-cpu\n"
 		   "  --homer-database-oid=OID database OID for --homer sessions\n"
+		   "  --homer-peer-host=HOST   remote Homer backend-node service host\n"
+		   "  --homer-peer-node=NODEID remote Homer backend-node id (default: 1)\n"
+		   "  --homer-peer-port=PORT   remote Homer peer-control port\n"
 		   "  --homer-user-oid=OID     user OID for --homer sessions\n"
 		   "  --log-prefix=PREFIX      prefix for transaction time log file\n"
 		   "                           (default: \"pgbench_log\")\n"
@@ -7642,8 +7648,11 @@ main(int argc, char **argv)
 		{"homer-client-cpu", required_argument, NULL, 21},
 		{"client-cpu", required_argument, NULL, 22},
 		{"latency-percentiles", no_argument, NULL, 23},
-		{"client-cpus", required_argument, NULL, 24},
-		{NULL, 0, NULL, 0}
+			{"client-cpus", required_argument, NULL, 24},
+			{"homer-peer-host", required_argument, NULL, 25},
+			{"homer-peer-port", required_argument, NULL, 26},
+			{"homer-peer-node", required_argument, NULL, 27},
+			{NULL, 0, NULL, 0}
 	};
 
 	int			c;
@@ -8011,10 +8020,28 @@ main(int argc, char **argv)
 				benchmarking_option_set = true;
 				latency_percentiles = true;
 				break;
-			case 24:			/* client-cpus */
-				benchmarking_option_set = true;
-				parseClientCpuListOption("--client-cpus", optarg);
-				break;
+				case 24:			/* client-cpus */
+					benchmarking_option_set = true;
+					parseClientCpuListOption("--client-cpus", optarg);
+					break;
+				case 25:			/* homer-peer-host */
+					benchmarking_option_set = true;
+					strlcpy(homer_peer_host, optarg, sizeof(homer_peer_host));
+					break;
+				case 26:			/* homer-peer-port */
+					benchmarking_option_set = true;
+					homer_peer_port =
+						(uint32) atoi(optarg);
+					if (homer_peer_port == 0)
+						pg_fatal("--homer-peer-port must be positive");
+					break;
+				case 27:			/* homer-peer-node */
+					benchmarking_option_set = true;
+					homer_peer_node =
+						(int32) atoi(optarg);
+					if (homer_peer_node <= 0)
+						pg_fatal("--homer-peer-node must be positive");
+					break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -8182,6 +8209,10 @@ main(int argc, char **argv)
 			pg_fatal("--homer currently does not support transaction retry (--max-tries must remain 1)");
 		if (homer_database_oid == 0 || homer_user_oid == 0)
 			pg_fatal("--homer requires --homer-database-oid and --homer-user-oid");
+		if (homer_peer_host[0] != '\0' && homer_peer_port == 0)
+			pg_fatal("--homer-peer-host requires --homer-peer-port");
+		if (homer_peer_host[0] != '\0' && !is_no_vacuum)
+			pg_fatal("remote --homer currently requires -n/--no-vacuum because setup libpq is intentionally skipped");
 		if (!validateHomerScriptSupport())
 			exit(1);
 	}
@@ -8229,21 +8260,35 @@ main(int argc, char **argv)
 		initRandomState(&state[i].cs_func_rs);
 	}
 
-	/* opening connection... */
-	con = doConnect();
-	if (con == NULL)
-		pg_fatal("could not create connection for setup");
+	/*
+	 * Remote Homer pgbench intentionally does not require a local libpq
+	 * connection. The measured foreground client should be able to run on
+	 * farnet0 with no local PostgreSQL socket while the farnet1 Homer service
+	 * opens the socketless backend.
+	 */
+	if (homer_mode && homer_peer_host[0] != '\0')
+	{
+		con = NULL;
+		printf("server version: unavailable (remote Homer setup skips libpq)\n");
+	}
+	else
+	{
+		/* opening connection... */
+		con = doConnect();
+		if (con == NULL)
+			pg_fatal("could not create connection for setup");
 
-	/* report pgbench and server versions */
-	printVersion(con);
+		/* report pgbench and server versions */
+		printVersion(con);
 
-	pg_log_debug("pghost: %s pgport: %s nclients: %d %s: %d dbName: %s",
-				 PQhost(con), PQport(con), nclients,
-				 duration <= 0 ? "nxacts" : "duration",
-				 duration <= 0 ? nxacts : duration, PQdb(con));
+		pg_log_debug("pghost: %s pgport: %s nclients: %d %s: %d dbName: %s",
+					 PQhost(con), PQport(con), nclients,
+					 duration <= 0 ? "nxacts" : "duration",
+					 duration <= 0 ? nxacts : duration, PQdb(con));
 
-	if (internal_script_used)
-		GetTableInfo(con, scale_given);
+		if (internal_script_used)
+			GetTableInfo(con, scale_given);
+	}
 
 	/*
 	 * :scale variables normally get -s or database scale, but don't override
@@ -8289,7 +8334,7 @@ main(int argc, char **argv)
 				exit(1);
 	}
 
-	if (!is_no_vacuum)
+	if (con != NULL && !is_no_vacuum)
 	{
 		fprintf(stderr, "starting vacuum...");
 		tryExecuteStatement(con, "vacuum pgbench_branches");
@@ -8304,7 +8349,8 @@ main(int argc, char **argv)
 			fprintf(stderr, "end.\n");
 		}
 	}
-	PQfinish(con);
+	if (con != NULL)
+		PQfinish(con);
 
 	/* set up thread data structures */
 	threads = (TState *) pg_malloc(sizeof(TState) * nthreads);
@@ -8860,6 +8906,14 @@ openHomerSession(TState *thread, CState *st)
 	HomerClientDefaultSessionOptions(&sessionOptions,
 									 homer_database_oid,
 									 homer_user_oid);
+	if (homer_peer_host[0] != '\0')
+	{
+		sessionOptions.destinationNodeId = homer_peer_node;
+		sessionOptions.peerControlPort = homer_peer_port;
+		strlcpy(sessionOptions.peerHost,
+				homer_peer_host,
+				sizeof(sessionOptions.peerHost));
+	}
 
 	if (!HomerClientOpenSqlSession(&thread->homer_control,
 								   &sessionOptions,

@@ -19,6 +19,15 @@ tail-latency reporting. The older standalone `homer_pgbench` proof-of-concept
 runner has been removed from the Citus/dbcomm tree; it is no longer a benchmark
 entry point.
 
+Important scope update: `pgbench --homer` now supports both the original
+farnet1-local client SQL path and the farnet0-client-to-farnet1-PostgreSQL RDMA
+path. In remote mode, pgbench maps the farnet0 local Homer service, the farnet0
+service opens a peer `CLIENT_SQL_SESSION` on the farnet1 service, commands and
+pushed completions move over service-to-service RDMA, and tuple-result sinks are
+translated back to frontend-visible receive descriptors on farnet0. The
+remaining cross-node gap is multi-client scaling, not basic single-client
+correctness.
+
 The shared Homer client/session pieces are:
 
 - [`remote_execution_client.h`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:1) exposes the frontend-safe Homer client API: control-region open/close, client SQL session open/close, command start, command poll, and start-and-wait helpers.
@@ -34,6 +43,9 @@ The shared Homer client/session pieces are:
 Complete for the current simple-mode milestone:
 
 - `pgbench --homer` runs the built-in TPC-B-like script over the Homer external-service command path instead of libpq workload traffic.
+- `pgbench --homer --homer-peer-host ...` runs the same simple-mode workload
+  from farnet0 against the farnet1 PostgreSQL/socketless backend over the Homer
+  RDMA service path.
 - The default pgbench libpq modes remain available in the same binary. `--homer` is explicit opt-in, and `transport: homer` / `transport: libpq` is printed in the summary.
 - The Homer path opens one frontend control mapping and one persistent client SQL session for the run, then reuses one socketless backend across transactions.
 - Commands are semantic Homer commands: exact `BEGIN`, `COMMIT` / `END`, and `ROLLBACK` become typed lifecycle commands; ordinary SQL is a typed `SQL_EXECUTE` command carrying statement text.
@@ -57,6 +69,80 @@ Complete for the current simple-mode milestone:
   --homer` is the canonical workload path.
 
 Current measured status on farnet1:
+
+- May 16, 2026 real two-node RDMA client-SQL checkpoint: after adding remote
+  Homer pgbench options, peer `CLIENT_SQL_SESSION` open/bind support, direct
+  RDMA command-mailbox forwarding, peer pushed completions, result-sink
+  descriptor translation, explicit peer bind hosts, and receive-side byte-ring
+  EOS propagation, farnet0 `pgbench --homer` completed remote c1/j1
+  `20000/20000` transactions with zero failures. Warmed c1 remote RDMA measured
+  `4246 TPS`, average `0.235 ms`, p50 `0.233 ms`, p95 `0.243 ms`, p99
+  `0.254 ms`, max `4.691 ms`. Same-build local farnet1 Homer c1 measured
+  `5948 TPS`, average `0.168 ms`, p99 `0.185 ms`. The remote c1 path is
+  correct and in the same broad latency band as the earlier remote checkpoint,
+  but not on par with the local shared-memory path.
+- The same real RDMA build does **not** yet scale for multi-client pgbench:
+  farnet0 c4/j4 `-t 10000` repeated at about `4811` and `4838 TPS`, with p95
+  around `4.1-4.5 ms` and p99 around `7.9 ms`. This is a structural
+  multi-session transport bottleneck, not a correctness failure. The likely
+  causes are still the single service loop plus shared per-peer RDMA command and
+  completion publication machinery; this should be handled with the planned
+  traffic-class/multiple-QP/scheduler work rather than hidden as a benchmark
+  variance issue.
+  Follow-up performance investigation recorded three reverted/non-useful
+  optimization attempts in the future-direction note: fully unsignaled command
+  epoch publication filled the send queue because no later signaled WR retired SQ
+  credits; periodic command epoch checkpoints did not improve warmed c1; and a
+  completion scratch ring plus periodic completion checkpoint kept correctness but
+  worsened c1. The current evidence points to service-thread/QP serialization and
+  per-command/per-completion signaled publication waits, not raw RDMA bandwidth,
+  as the next bottleneck to measure and attack.
+  A diagnostic `HOMER_SERVICE_CLIENT_SQL_STATS=1` build then measured that the
+  built-in transaction performs about `7` remote command publications and `8`
+  remote completion publications per transaction, with signaled epoch publish
+  averages around `7-8 us` and per-command/per-completion record writes of about
+  `54184` and `33776` bytes respectively. A c4 no-`SELECT` script improved from
+  `~4.1k TPS` to `~5.8k TPS` and dropped p95 from `~4.2 ms` to `~0.58 ms`, but
+  p99 remained around `9 ms`; this implicates both result-sink interaction and
+  command/completion control-plane serialization.
+
+- May 17, 2026 command-publication A/B: command record
+  `RDMA_WRITE_WITH_IMM` plus receiver-service local epoch publish was correct
+  but slower than direct RDMA epoch publish. With the immediate path enabled,
+  warmed farnet0 -> farnet1 pgbench measured about `4664 TPS` c1 and
+  `9962 TPS` c4. With the direct epoch path restored as the default, the same
+  run shape measured about `4659-4691 TPS` c1, p99 `0.233-0.239 ms`, and
+  `10433-10498 TPS` c4, p99 `0.653-0.654 ms`. The switch is
+  `HOMER_SERVICE_CLIENT_SQL_COMMAND_IMM_PUBLISH=0`; keep it off for performance
+  runs unless explicitly re-testing the one-WR publication hypothesis. The
+  result shows that removing a tiny RDMA epoch write can lose if the backend
+  command wakeup must now pass through the receiver service loop.
+  Follow-up optimization recovered the immediate c1 path but did not make it win:
+  after replacing service-session-id matching with a receiver-local command
+  doorbell token, O(1) pending-doorbell pop, single-CQE repost fast path, command
+  sequence validation, pending-token cleanup on reset, and active-session scan
+  shrink, warmed immediate measured `4647 TPS` c1 / p99 `0.236 ms` and
+  `10084 TPS` c4 / p99 `0.656 ms`. The restored default direct path measured
+  `4735 TPS` c1 / p99 `0.231 ms` and `10632 TPS` c4 / p99 `0.668 ms` in the
+  same follow-up run shape. Keep `HOMER_SERVICE_CLIENT_SQL_COMMAND_IMM_PUBLISH`
+  off unless the next experiment changes the mailbox/ring layout enough to avoid
+  the receiver-service publish hop.
+  The current immediate experiment was then reordered so command CQEs can publish
+  the backend-visible epoch before receive-WQE reposting via
+  [`TupleSinkServiceDrainPeerConnectionCommandDoorbellsRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2583).
+  This is the right ordering for any receiver-service fallback, but warmed remote
+  pgbench was still essentially unchanged (`4636 TPS` c1, p99 `0.236 ms`;
+  `10100 TPS` c4, p99 `0.657 ms`). The next step is therefore not more
+  immediate-token routing; it is a real multi-slot command ring with backend
+  polling of `ready_seq == expected_seq`, followed by a one-RDMA-write
+  self-publishing slot fast path gated by `ibv_query_qp_data_in_order()`.
+  A follow-up direct-source command attempt, where the service registered the
+  frontend command mailbox as the RDMA source to avoid the scratch copy, was
+  reverted after a correctness failure: pgbench received a completion and then
+  found the next command mailbox still busy (`published=248 consumed=247`).
+  That shows remote completion can race ahead of sender-side source retirement;
+  avoiding the scratch copy needs a real multi-slot command source ring, not the
+  current single-slot frontend mailbox as a borrowed RDMA source.
 
 - May 16, 2026 service-owned result sink and byte-ring-only tuple/result
   checkpoint: after forcing the installed Postgres backend, pgbench, and
@@ -127,7 +213,9 @@ Still incomplete or intentionally scoped out:
 - normal frontend authentication and name-to-OID mapping; current prototype still takes database/user OIDs
 - SQL command tags, SQLSTATE, and authoritative dynamic session state in command completion
 - cancellation and robust error propagation
-- basebackup / replication / network-interference benchmark integration
+- multi-client real-RDMA scaling for client SQL sessions
+- WAL/replication-path Homer support needed for the full basebackup /
+  network-interference benchmark
 - DPU-oriented service/control transport; current service still polls host shared memory and uses fixed control slots
 
 The earliest installed smoke test on farnet1 used normal `pgbench -i` only for
@@ -782,6 +870,16 @@ Remaining likely bottlenecks:
 - `SELECT abalance` now uses sink-backed byte-ring tuple-result delivery in
   `pgbench --homer`. The standalone `homer_pgbench` runner has been removed, so
   current performance claims should use the integrated pgbench path.
+- Row-producing result shape is currently validated and carried as a generic
+  tuple-view contract, but frontend mapping reuse is only complete for the
+  stable pgbench result shape. Backend-side
+  [`RemoteExecEnsureSessionResultQueue()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:740)
+  can reopen the service-owned result sink when a later `SELECT` has a different
+  `TupleDesc`; frontend-side
+  [`HomerClientOpenResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:2552)
+  still errors if an already-open result mapping points at a different queue
+  descriptor instead of closing/remapping. Supporting different `SELECT` shapes
+  in one session therefore remains future work.
 - `scalarInt64` fields still exist in shared completion structs for older/backend wrapper compatibility. They are no longer the client SQL result path and should be removed once the older shortcut is retired.
 - Command completion metadata still lacks SQL command tags, SQLSTATE, and authoritative dynamic session state.
 - The implementation now supports multiple local pgbench client sessions, with
@@ -817,7 +915,7 @@ Completed from the original client SQL plan:
 Partially completed:
 
 - command completion metadata: processed row count, bounded detail string, and result sink readiness/EOS metadata work; SQL command tags, SQLSTATE, and authoritative dynamic session state remain missing
-- result modes: `TUPLE` is now backed by a tuple sink for client SQL, but service-owned sink binding and richer frontend result accessors remain future work
+- result modes: `TUPLE` is now backed by a service-owned tuple sink for client SQL, but richer frontend result accessors and frontend remap support for changed tuple shapes remain future work
 - service-progress fairness: local client-SQL waits now pump completion/sink background work, but peer-control progress from inside a local control-slot wait remains deferred pending nonblocking/deferred peer-control dispatch
 - async command submission: documented as the next design step; current local
   and peer `START_COMMAND` paths still use startup wait helpers

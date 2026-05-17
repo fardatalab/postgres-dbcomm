@@ -133,6 +133,124 @@ This design is also the bridge to multiple QPs. Multiple QPs should be treated
 as a physical transport/scheduling policy under the logical queues, not as the
 thing that defines session semantics.
 
+### Client SQL command/completion transport optimization checkpoint
+
+The farnet0-to-farnet1 client SQL path has reached correctness, but the current
+remote command/completion substrate still leaves avoidable work on the
+transaction hot path. The detailed pgbench-facing plan is in
+[`../../../postgres/client-sql-session/client_sql_session_offload_plan.md`](../../../postgres/client-sql-session/client_sql_session_offload_plan.md);
+the transport-level requirements are:
+
+- command and completion mailboxes should become small power-of-two registered
+  rings instead of a single source/scratch record
+- source slot lifetime should be retired by deferred send-CQE checkpoints; an
+  initial policy of 64 slots with a signaled checkpoint every 32 posted slots is
+  sufficient to bound SQ pressure while avoiding per-command CQ waits
+- RDMA writes should use stable registered mailbox slots as source buffers, not
+  intermediate service scratch copies, whenever lifetime allows
+- compact typed layouts should replace the current full-width command and
+  completion records for no-result lifecycle/update commands
+- for backend-polled client SQL command rings, `RDMA_WRITE_WITH_IMM` should not
+  be required on the normal hot path; the backend should poll a per-slot
+  `ready_seq == expected_seq` value instead of waiting for receiver-service CQ
+  progress
+- `RDMA_WRITE_WITH_IMM` remains appropriate for peer-control, payload stream
+  publication, rare wakeup/debug paths, and future DPU scheduler events; if used
+  for commands, the immediate value is only a routing hint and full validation
+  stays in the slot header
+- one-RDMA-write command publication is a fast path gated by receiver-side
+  in-order data placement (`ibv_query_qp_data_in_order(qp, IBV_WR_RDMA_WRITE,
+  0) == 1`) and non-relaxed target MRs; otherwise the multi-slot ring should use
+  a conservative payload/header write plus a small ready write
+- sink-ready result metadata should be pretranslated during stream setup/bind
+  when possible, so publishing a completion event does not rewrite large
+  descriptor/contract state in the hot path
+- sink-ready and terminal completion can be coalesced only when runtime stream
+  state proves the result has already reached EOS; large or still-active streams
+  must continue to publish sink-ready early so payload draining overlaps backend
+  execution
+
+This checkpoint does not replace the multiple-QP/scheduler milestone. It is the
+single-lane cleanup that should happen first, so later scheduler measurements do
+not confuse avoidable command-plane copies and per-event CQ waits with real
+traffic-class policy effects.
+
+May 17, 2026 progress: the first successful single-lane cleanup is prefix-sized
+remote completion publication. The peer service now RDMA-writes only the hot
+prefix for no-result successful completions, and terminal EOS events no longer
+repeat result descriptor/contract bytes after an ordered sink-ready event has
+already delivered that metadata. This improved warmed real-RDMA c4 pgbench from
+the previous `~4.8k TPS` / `~7.9 ms` p99 checkpoint to stable repeats around
+`10.3k TPS` / `0.67 ms` p99. The attempted backend-side sink-ready coalescing
+for one-row pgbench results was reverted because it lost payload-drain overlap
+and regressed c1 to about `4.0k TPS`. The detailed measurements and code
+pointers are in
+[`../../../postgres/client-sql-session/client_sql_session_offload_plan.md`](../../../postgres/client-sql-session/client_sql_session_offload_plan.md).
+
+Follow-up on the same day: the backend command mailbox record was cleaned up so
+typed command payloads live in one hot union before cold result metadata. That
+layout cleanup is kept because it matches the typed-command semantics and avoids
+preserving a structurally bad sequential-spec layout. However, the narrower
+variable-length command RDMA write was left disabled by default through
+`HOMER_SERVICE_COMPACT_CLIENT_SQL_COMMAND_RDMA=0`: it was correct but reduced c4
+from the `~10.3k TPS` band to about `9.6k TPS`. The useful conclusion for the
+transport scheduler work is that command-byte volume is not the current
+bottleneck by itself; the next command-plane optimization should reduce publish
+WR count and source-slot lifetime together, preferably via the planned
+multi-slot mailbox plus deferred send-CQE retirement and one-doorbell publish.
+
+Another same-day A/B tried command-record `RDMA_WRITE_WITH_IMM` as the only
+cross-node command publication WR. The sender wrote the command record and used
+the immediate event to make the receiver service publish the peer-local backend
+mailbox epoch with a host-local store. This was correct, but it lost to the
+direct epoch-publish path: warmed farnet0 -> farnet1 pgbench measured about
+`4664 TPS` c1 and `9962 TPS` c4 with the immediate path, versus about
+`4691 TPS` c1 and `10433 TPS` c4 after returning to direct RDMA epoch publish.
+Optimization pass: the receiver now uses a compact receiver-local
+`peerCommandDoorbellToken`, pops pending command doorbells in O(1), batch-reposts
+notification receive slots only when the recv CQ actually returns a batch,
+publishes `mailbox->record.commandSequence` instead of inferring
+`consumedEpoch + 1`, purges pending command doorbells on session reset, and
+shrinks `ActiveSessionScanLimit` when high slots are reset. That recovered c1 to
+the direct-publish band (`4647 TPS`, p99 `0.236 ms`) but c4 stayed lower
+(`10084 TPS`, p99 `0.656 ms`) than the restored direct path (`10632 TPS`, p99
+`0.668 ms` in the same follow-up run shape). The immediate path is kept as a
+compile-time experiment through
+`HOMER_SERVICE_CLIENT_SQL_COMMAND_IMM_PUBLISH=0`, but the default remains the
+two-WR command publish. A follow-up ordering fix made the immediate drain publish
+the backend-visible epoch before receive-WQE reposting via
+[`TupleSinkServiceDrainPeerConnectionCommandDoorbellsRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2583),
+but warmed remote pgbench remained essentially unchanged (`4636 TPS` c1 and
+`10100 TPS` c4). Keep that better ordering principle for any future
+receiver-service fallback, but it does not remove the receiver-service CQ
+dependency.
+
+The important lesson is that the one-WR idea is still plausible, but this
+implementation shape is not the right proof point. It saves a tiny direct RDMA
+epoch write on the sender, then adds a receiver-service hop: recv CQ polling,
+notification WQE reposting, command-doorbell routing, and a host-local
+`publishedEpoch` store before the backend can observe the command. A future
+one-doorbell design needs a mailbox/ring layout where one RDMA publication makes
+the backend-visible command epoch safe without receiver-service participation,
+or a multi-slot command ring with deferred source-slot retirement so receiver
+software can be amortized across a real batch. The refined plan is to implement
+the multi-slot command ring first, then add a self-publishing slot fast path:
+`[header][payload][ready_seq footer]` in one RDMA write only when whole-message
+in-order placement is reported and the target MR is not relaxed-ordered. In that
+fast path the backend polls memory directly, so command `WRITE_WITH_IMM` is not
+needed for notification.
+
+A direct-source command attempt also failed correctness and was reverted. The
+idea was to register the frontend command mailbox itself as the RDMA source and
+avoid copying the command record into service-owned scratch. The problem is
+lifetime ordering: remote completion can reach pgbench before the sender service
+has observed its local send fence and released the frontend command slot, so the
+next pgbench command sees `published != consumed` and aborts with a busy
+mailbox. This validates the current scratch-copy design despite its copy cost.
+Removing that copy requires a real multi-slot source ring with deferred
+send-CQE retirement, not a single-slot source borrowed directly from the
+frontend command mailbox.
+
 ## Poll completion is a scaffold, not the target command-completion design
 
 The current local and peer protocols expose `POLL_COMMAND_COMPLETION` because
@@ -1989,6 +2107,21 @@ granting bytes and WRs in addition to object counts.
    - map foreground payload and bulk payload to separate lanes/QPs; keep lane
      pools possible for high-throughput payload classes
    - preserve the existing WRITE_WITH_IMM publication rule per QP/channel
+
+   Client-SQL performance evidence from the May 16, 2026 real-RDMA checkpoint
+   strengthens this priority. Remote c1 is correct but below the farnet1-local
+   shared-memory path, and remote c4 correctness does not scale: repeated c4/j4
+   runs were only about `4.8k TPS` with p99 around `7.9 ms`. Code reading points
+   to shared service/QP serialization rather than raw link bandwidth:
+   [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3700)
+   forwards each frontend-visible command with an RDMA record write followed by a
+   signaled epoch write;
+   [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2480)
+   does the same for pushed completions; and
+   [`TupleSinkServicePeerConnectionForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2395)
+   still resolves every traffic class to the same physical connection/QP. The
+   client-SQL plan has the detailed failed-experiment log and measurement plan:
+   [client_sql_session_offload_plan.md](../../postgres/client-sql-session/client_sql_session_offload_plan.md).
 
 7. **Scheduler prototype**
    - implement ready-set construction, policy selection, grants, and progress

@@ -176,6 +176,7 @@ Example `farnet1` service for pgbench and local basebackup sender:
 sudo -n -u dbcomm env \
   HOMER_SERVICE_CPU=2 \
   HOMER_REMOTE_EXEC_BACKEND_CPUS=4,5,6,7 \
+  HOMER_SERVICE_PEER_BIND_HOST=10.10.1.101 \
   HOMER_SERVICE_PEER_PORT=9717 \
   /data/dbcomm/pg-citus/bin/citus_tuple_sink_service \
   > /data/dbcomm/pg-citus/data/homer_service_farnet1.log 2>&1 &
@@ -187,6 +188,7 @@ Example `farnet0` receiver service for RDMA basebackup:
 ssh farnet0 "sudo -n -u dbcomm env \
   HOMER_SERVICE_CPU=2 \
   HOMER_REMOTE_EXEC_BACKEND_CPUS=4,5,6,7 \
+  HOMER_SERVICE_PEER_BIND_HOST=10.10.1.100 \
   HOMER_SERVICE_PEER_PORT=9717 \
   /data/dbcomm/pg-citus/bin/citus_tuple_sink_service \
   > /data/dbcomm/pg-citus/data/homer_service_farnet0.log 2>&1 &"
@@ -243,13 +245,15 @@ done
 
 ## Run pgbench through Homer
 
-Current scope: these `pgbench --homer` commands are **farnet1-local**. The
-modified pgbench frontend maps the local Homer service control shared memory,
-opens a local `CLIENT_SQL_SESSION`, and drives a socketless backend on farnet1.
-This is not yet the final farnet0-client-to-farnet1-Postgres workload. A true
-farnet0 client path needs the farnet0 service to open and drive a peer
-`CLIENT_SQL_SESSION` on the farnet1 service, with peer pushed completions and
-remote result-sink descriptors.
+`pgbench --homer` supports two modes:
+
+- farnet1-local: pgbench maps the farnet1 Homer service control shared memory,
+  opens a local `CLIENT_SQL_SESSION`, and drives a socketless backend on
+  farnet1.
+- farnet0-to-farnet1 RDMA: pgbench maps the farnet0 Homer service, passes
+  `--homer-peer-host 10.10.1.101`, and the two Homer services carry commands,
+  completions, and tuple-result payloads over RDMA to the farnet1 PostgreSQL
+  backend.
 
 CPU placement matters for the current farnet1-local path because frontend,
 service, and socketless backend busy-poll shared cache lines. On the current
@@ -273,6 +277,22 @@ sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
   -n -M simple -c 1 -j 1 -t 1000 postgres
 ```
 
+Remote RDMA single-client smoke from `farnet0` to farnet1:
+
+```sh
+ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
+  -h /tmp -p 5432 -U dbcomm \
+  --homer \
+  --homer-database-oid '$DBOID' \
+  --homer-user-oid '$USEROID' \
+  --homer-peer-host 10.10.1.101 \
+  --homer-peer-port 9717 \
+  --homer-peer-node 1 \
+  --latency-percentiles \
+  --client-cpu=3 \
+  -n -M simple -c 1 -j 1 -t 20000 postgres"
+```
+
 Multi-client foreground run:
 
 ```sh
@@ -286,9 +306,31 @@ sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
   -n -M simple -c 4 -j 4 -t 20000 postgres
 ```
 
+Remote RDMA multi-client run from `farnet0` to farnet1:
+
+```sh
+ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
+  -h /tmp -p 5432 -U dbcomm \
+  --homer \
+  --homer-database-oid '$DBOID' \
+  --homer-user-oid '$USEROID' \
+  --homer-peer-host 10.10.1.101 \
+  --homer-peer-port 9717 \
+  --homer-peer-node 1 \
+  --latency-percentiles \
+  --client-cpus=8,9,10,11 \
+  -n -M simple -c 4 -j 4 -t 10000 postgres"
+```
+
 Use `--client-cpus=LIST` for multi-worker runs. `--client-cpu=CPU` pins every
 pgbench worker to the same CPU and is only appropriate for single-client
 reproducibility.
+
+Current measurement caveat: warmed farnet0-to-farnet1 c1 is correct and has
+been around `4.2k TPS` with p99 about `0.25 ms`. Real-RDMA c4 correctness holds
+but scaling is poor, around `4.8k TPS` with p95 around `4 ms`; treat that as a
+known shared RDMA command/completion transport bottleneck, not as the final
+multi-client result.
 
 Libpq baseline with the same pgbench worker placement:
 
@@ -396,6 +438,11 @@ the foreground workload and one or more basebackup streams are background
 traffic. In the current milestone, foreground pgbench can use Homer end to end
 for its measured transaction commands, while basebackup uses Homer for the
 archive/manifest data plane with `-X none`.
+
+Current caveat: the local foreground example below is useful for same-host
+smoke testing. For the intended farnet0 foreground client shape, use the remote
+RDMA pgbench command above while running the background basebackup streams from
+farnet1 to the farnet0 Homer service.
 
 On `farnet1`:
 
