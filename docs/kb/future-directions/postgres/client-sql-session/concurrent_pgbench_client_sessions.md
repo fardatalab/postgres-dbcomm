@@ -2,16 +2,19 @@
 
 ## Status
 
-Concurrent `pgbench --homer` clients are intentionally unsupported in the
-current milestone. The integrated pgbench frontend rejects Homer mode unless
-`nclients == 1` and `nthreads == 1` in
-[`pgbench.c`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:7926).
-The single-client path opens one persistent Homer client SQL session per
-`CState` in
+Concurrent `pgbench --homer` clients are supported for the current simple-mode
+prototype, with one persistent Homer client SQL session per pgbench `CState`.
+The integrated pgbench frontend still rejects unsupported Homer features such as
+extended/prepared/pipeline mode, reconnect mode, retry mode, and scripts without
+explicit transaction lifecycle commands in
+[`validateHomerScriptSupport()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3875),
+but it no longer has the old one-client/one-thread guard. Each client opens one
+persistent Homer client SQL session in
 [`openHomerSession()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:8585).
 
-This note records the root cause of the previous two-client failure and the
-required design work before lifting that guard.
+This note records the root cause of the previous two-client failure, the fixes
+that are now landed, and the remaining transport/session work before the command
+path can be called generally pipelined or scheduler-ready.
 
 ## Observed Failure Classes
 
@@ -123,39 +126,52 @@ The transport has connection slots, but the peer-control request/response
 mailbox is still serialized per connection and does not yet have a scheduler or
 queue that can safely arbitrate concurrent command-session opens.
 
-## Required Fix Before Lifting The Pgbench Guard
+## Landed Fix For The Pgbench Guard
 
-The next milestone should not add PostgreSQL locks around the backend wrapper.
-That would serialize at the wrong layer and hide the transport/session problem.
+The pgbench guard was lifted without adding PostgreSQL locks around the backend
+wrapper. That matters because locks would serialize at the wrong layer and hide
+the transport/session problem.
 
-The correct fix has two parts:
+The fix has three landed parts:
 
-1. Extend the remote-execution session reuse predicate with explicit
-   service-owned lease/session state. A `CLIENT_SQL_SESSION` should be owned by
-   one frontend client until explicit release/reset/close, while backend/backend
-   SQL command sessions should be reusable only when the service knows they are
-   transaction-idle and unowned/releasable. This extends the existing
-   compatibility abstraction rather than bypassing it.
+1. The integrated pgbench path creates one persistent `CLIENT_SQL_SESSION` per
+   `CState`. That gives every concurrent client its own backend command stream
+   and avoids the old cross-client reuse bug.
 
-2. Make peer control concurrency-safe using the target substrate, not a
-   temporary serialization shim. The desired direction is a multi-slot
-   RDMA-registered peer-control ring/queue with sequence numbers, session ids,
-   response routing, and traffic-class scheduling. See
-   [homer_transport_scheduler_and_payload_streams.md](../../citus/transport/homer_transport_scheduler_and_payload_streams.md).
+2. Local client-SQL command/completion traffic moved off the global control-slot
+   relay. The service owns cold lifecycle setup, while pgbench and the
+   socketless backend exchange hot commands/completions through per-session
+   mailboxes.
 
-Once those are in place, the pgbench frontend guard can be relaxed from exactly
-one client/thread to one Homer session per client, and multi-client correctness
-can be validated before any throughput comparison.
+3. The real farnet0 -> farnet1 RDMA path now uses a 64-slot command mailbox:
+   the frontend publishes slot-local `readySeq`, the service forwards directly
+   from that registered frontend slot, and the remote backend polls
+   `readySeq == expectedCommandSequence`. The checkpoint is documented in
+   [client_sql_session_pgbench_checkpoint.md](../../../../implementations/postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md).
+
+The remaining future work is narrower: explicit service-owned lease/session
+state for global session reuse, remote receiver-credit frontiers before true
+command pipelining, and a multi-slot peer-control request/response substrate for
+backend/backend command-session opens. See
+[homer_transport_scheduler_and_payload_streams.md](../../citus/transport/homer_transport_scheduler_and_payload_streams.md).
 
 ## Multi-Client Scaling Culprit: Shared Local Command Relay
 
 Implementation progress on May 14, 2026: the local `CLIENT_SQL_SESSION`
-multi-client scaling fix has landed for pgbench. The service now creates the
+multi-client scaling fix landed for pgbench. The service now creates the
 session mailboxes and spawns the socketless backend during `OPEN_SESSION`, then
 the frontend writes normal transaction commands directly to the per-session
 backend command mailbox and reads backend completions directly from the
 per-session backend completion mailbox. The service remains the lifecycle owner
 for session open/close and shared-memory cleanup.
+
+Implementation progress on May 17, 2026: the real two-node RDMA path now uses a
+multi-slot command mailbox and direct registered-source forwarding. Warmed
+farnet0 -> farnet1 c4/j4 pgbench repeats completed with zero failures around
+`10.7k TPS`, average latency `0.372-0.373 ms`, and p99 around `0.63-0.64 ms`.
+This fixes the old "all clients serialize through one local control slot"
+failure mode for the measured simple-mode workload, but it is still one command
+in flight per session rather than arbitrary SQL command pipelining.
 
 The notes below remain the design rationale and the guide for later
 service-to-service/DPU transport work.
@@ -166,9 +182,8 @@ scaling problem had a different shape: normal client-SQL commands were
 serialized through one service-owned local control path before reaching their
 per-session backend mailboxes.
 
-For the current pgbench client-SQL path, this is not yet "multiple sessions
-queued before RDMA writes to different remote memory regions." The command path
-is host-local shared memory:
+Before the local direct-mailbox fix, the command path was host-local shared
+memory mediated by one service loop:
 
 ```text
 pgbench frontend
@@ -188,7 +203,7 @@ socketless backend
   -> pgbench frontend
 ```
 
-The current hot serialization points are:
+The old hot serialization points were:
 
 - frontend slot reservation in
   [`HomerClientReserveControlSlot()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:309)
@@ -203,9 +218,9 @@ The current hot serialization points are:
   followed by frontend completion publication in
   [`TupleSinkServicePublishClientCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1552)
 
-The planned fix is to remove the service from the per-command hot path for
+The landed local fix removes the service from the per-command hot path for
 `CLIENT_SQL_SESSION` while keeping it responsible for cold-path lifecycle work.
-The target normal path is:
+The normal local path is:
 
 ```text
 pgbench frontend
@@ -215,11 +230,12 @@ pgbench frontend
   -> pgbench frontend
 ```
 
-In the host prototype this is still shared memory, but the abstraction should be
-a session-local command/completion transport channel. The service should create,
-name, map, and clean up those channels during `OPEN_SESSION` / `CLOSE_SESSION`,
-but it should not scan a global control queue or copy command/completion records
-for every pgbench statement.
+In the host-local prototype this is shared memory. In the real two-node path,
+the frontend-visible command mailbox is a registered RDMA source and the remote
+backend-visible mailbox is the destination. The service still creates, names,
+maps, registers, and cleans up those channels during `OPEN_SESSION` /
+`CLOSE_SESSION`, but it should not route every pgbench statement through a
+global control queue.
 
 This is also the right co-design point for the later multiple-QP milestone. The
 logical abstraction should be a per-session transport-channel descriptor with

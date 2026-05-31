@@ -43,15 +43,28 @@ Completed pieces:
 - A fresh three-run 10k-transaction single-client comparison with code-level pinning measured Homer around `5076 TPS` average versus libpq around `3622 TPS` average. Treat this as a current prototype checkpoint, not a general performance claim.
 - The real two-node RDMA c1 path is correct and warmed at about `4246 TPS`,
   p99 `0.254 ms`, for farnet0 -> farnet1 `pgbench --homer -c 1 -j 1 -t 20000`.
+- The real two-node RDMA command path now uses a 64-slot command mailbox and
+  direct registered-source forwarding. Warmed farnet0 -> farnet1 c4/j4
+  validation completed with zero failed transactions at about `10.7k TPS`, p99
+  around `0.63-0.64 ms`.
+- The normal remote client-SQL path no longer has a peer-control close/EOS
+  exception. Tuple-result EOS is encoded in the tuple payload stream with
+  [`CITUS_TUPLE_SINK_TRANSPORT_FLAG_EOS`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/tuple_sink_protocol.h:37),
+  terminal completion is gated by
+  [`HomerServicePayloadStreamResultEosPosted()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3568),
+  and the frontend records EOS in
+  [`HomerClientResultSink.eosSeen`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:68).
 
 Still incomplete:
 
-- multi-client scaling on the real service-to-service RDMA transport. Current
-  farnet0 -> farnet1 c4/j4 correctness holds, but throughput and tail latency
-  are poor compared with the local shared-memory path.
+- true command pipelining on the real service-to-service RDMA transport. The
+  command ring has multiple slots, but pgbench still runs one command in flight
+  per session; safe arbitrary pipelining needs a remote receiver-credit
+  frontier before senders may wrap remote slots.
 - command completion fields for SQL command tag, SQLSTATE, and explicit dynamic session state
 - event/doorbell-style control wakeups or a DPU-oriented control queue/doorbell design; explicit CPU pinning plus raw `pause` spinning is the current single-client benchmark policy
-- prepared-mode pgbench, concurrent clients, auth/user-name mapping, cancellation, and basebackup/interference workload integration
+- prepared-mode pgbench, auth/user-name mapping, cancellation, full WAL/replication
+  data-path offload, and the complete network-interference benchmark
 
 ## Directional correction
 
@@ -194,8 +207,8 @@ Implementation progress:
    The local fast path can continue to use session-local command mailboxes for
    farnet1-local smoke tests. The remote client SQL session keeps the same fixed
    typed command object, but the farnet0 service now writes it directly into the
-   farnet1 peer command mailbox instead of using the synchronous peer
-   request/response helper. This avoids the old shared peer-control
+   farnet1 peer command mailbox instead of using the blocking peer
+   request/response adapter. This avoids the old shared peer-control
    request-slot serialization for the measured command path.
 
 4. **Done: add peer pushed completion delivery for client SQL.**
@@ -227,7 +240,8 @@ Implementation progress:
    authoritative dynamic session state, result sink id, readiness/EOS, and row
    count. Keep tuple data exclusively in result sinks.
 
-8. **Done for c1 correctness and baseline performance; still poor for c4 scaling.**
+8. **Done for c1 correctness and improved c4 real-RDMA scaling; still not true
+   command pipelining.**
    The acceptance test is `pgbench --homer` running on farnet0 while PostgreSQL
    and the socketless backend run on farnet1, with RDMA peer traffic visible in
    service logs/counters. Compare against a libpq farnet0 -> farnet1 baseline
@@ -278,42 +292,67 @@ WR is still being traded for receiver-side service work. The next one-WR attempt
 should change the command mailbox/ring representation itself instead of only
 changing the publish doorbell.
 
-A direct-source command attempt also failed and was reverted: using the frontend
-command mailbox itself as the registered RDMA source avoids the scratch copy,
-but the single-slot frontend mailbox cannot be released late without racing the
-completion path. In the observed failure, pgbench received a completion and then
-aborted the next SQL command because the session mailbox was still busy
-(`published=248 consumed=247`). This validates the service-owned scratch copy
-for the current one-command-in-flight implementation. The proper replacement is
-a multi-slot command source ring whose slots are retired by send-CQE
-checkpoints, so the frontend can advance to another slot while the old source
-slot remains protected.
+A direct-source command attempt on the old single-slot mailbox failed and was
+reverted: using the frontend command mailbox itself as the registered RDMA
+source avoided the scratch copy, but the single-slot frontend mailbox could not
+be released late without racing the completion path. In the observed failure,
+pgbench received a completion and then aborted the next SQL command because the
+session mailbox was still busy (`published=248 consumed=247`).
 
-Current refined ordering for the next milestone:
+The replacement has now landed for the measured one-command-at-a-time pgbench
+path: a 64-slot command ring with stable sender source slots, receiver command
+slots, full sequence metadata, and backend polling of `readySeq ==
+expectedCommandSequence`. The first implementation intentionally stays
+conservative: it writes the command record and then writes the slot-local
+`readySeq` as the ordered publish word. It also removes the service-owned
+scratch copy by registering the frontend command ring as the RDMA source.
 
-1. Build the real multi-slot command mailbox/ring first. Do not start with the
-   one-WR optimization. The first correctness target is a registered
-   power-of-two command ring with stable sender source slots, receiver command
-   slots, full sequence/generation metadata, and backend polling of
-   `ready_seq == expected_seq`.
-2. Keep the first publication implementation conservative: payload/header write
-   plus separate ready write, with deferred send-CQE checkpoints protecting
-   source-slot reuse. This should already remove the current scratch-copy
-   lifetime problem and prepare the command path for multiple clients without a
-   single-slot bottleneck.
-3. Add connection setup detection for the one-WR fast path:
+Measured result after the multi-slot command-ring checkpoint, using warmed
+farnet0-to-farnet1 `pgbench --homer` with `pgbench_history` truncated before
+each run:
+
+| Run | Result |
+| --- | --- |
+| c1/j1, `-t 20000`, warm repeat 1 | `4872 TPS`, average `0.205 ms`, p99 `0.224 ms` |
+| c1/j1, `-t 20000`, warm repeat 2 | `4296 TPS`, average `0.233 ms`, p99 `0.254 ms` |
+| c4/j4, `-t 10000`, repeat 1 | `10763 TPS`, average `0.372 ms`, p99 `0.629 ms` |
+| c4/j4, `-t 10000`, repeat 2 | `10711 TPS`, average `0.373 ms`, p99 `0.642 ms` |
+| c4/j4, `-t 10000`, repeat 3 | `10767 TPS`, average `0.372 ms`, p99 `0.632 ms` |
+
+The next command-publication steps are now focused on the measured pgbench
+semantics, not arbitrary SQL command pipelining. Simple-mode pgbench still has
+one command in flight per session, so a remote receiver-credit frontier is not
+needed before optimizing the current hot path. Receiver-credit/frontier tracking
+remains future work for true command pipelining, where a sender may have to wrap
+remote command slots while older commands are still executing.
+
+1. Add connection setup detection for the one-WR fast path:
    `ibv_query_qp_data_in_order(qp, IBV_WR_RDMA_WRITE, 0) == 1` on the receiver
    side, normal coherent host memory, no `IBV_ACCESS_RELAXED_ORDERING` on the
    target MR, naturally aligned/cache-line-isolated ready footer, acquire loads
    on the backend, and one writer for each producer sequence.
-4. When those conditions hold, switch command publication for that connection to
-   one RDMA write of `[header][payload][ready_seq footer]`. The backend polls
-   the footer and validates the full header. Do not use the 32-bit immediate as
-   authoritative state.
-5. Keep `RDMA_WRITE_WITH_IMM` out of the normal backend-polled command path once
+2. Switch the first implementation to a fixed-slot self-publishing RDMA write:
+   write the entire `CitusRemoteExecLocalCommandSlot` from the registered
+   frontend command ring into the remote backend-visible slot. This keeps the
+   current `[record][readySeq]` layout and lets the backend keep polling
+   `readySeq == expectedCommandSequence`. It deliberately writes the full fixed
+   command record first; the earlier compact-size experiment showed that command
+   byte volume was not the dominant cost while the path still paid per-command
+   publication/wait overhead.
+3. Post that one RDMA write asynchronously and retire source slots from send CQE
+   progress, not by waiting inside
+   `TupleSinkServicePumpRemoteClientSqlCommands()`. The first correctness step
+   may request one signaled CQE per command but must not synchronously wait for
+   it; the optimization pass should then move to periodic signaled checkpoints
+   once the fixed retirement machinery is correct.
+4. Keep `RDMA_WRITE_WITH_IMM` out of the normal backend-polled command path once
    self-publishing slots are available. It can remain a control/debug/fallback
    tool, but the command hot path should not require receiver-service CQ
    progress to make a command visible.
+5. Revisit compact command wire slots only after the single-WR fixed-slot path
+   is correct and has measured good performance. A compact future layout can
+   become `[fixed header][typed payload][aligned readySeq footer]`, but it
+   should not be mixed into the first self-publish/async-retirement change.
 
 ### Transaction command-plane performance checklist
 
@@ -339,14 +378,12 @@ Optimizations that do **not** automatically carry over:
 
 - SQL command submission is a small typed control object, not a payload stream.
   The basebackup byte-ring sender does not remove per-command peer-control work.
-- The current peer-control transport is explicitly one outstanding request per
-  peer connection:
-  [`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4373)
-  documents the limitation and
-  [`waitingForResponse`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4469)
-  rejects a second concurrent request. A remote pgbench implementation that sends
-  every SQL command through this synchronous request/response helper will be
-  correct but serialized.
+- The historical peer-control transport serialized on one outstanding request
+  per peer connection. That exact limitation has been fixed with the shared
+  multi-slot peer-control ring and explicit async op ids, but the conclusion
+  still applies: steady-state SQL commands should not be carried by a blocking
+  peer-control adapter. The current remote pgbench path instead uses direct
+  command/completion rings after the peer `CLIENT_SQL_SESSION` is opened.
 - Peer START_COMMAND still waits for backend startup visibility through
   [`TupleSinkServiceWaitForCommandStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11417)
   before responding. That is useful for the old request/response command API,
@@ -364,10 +401,11 @@ The two-node pgbench implementation did not stop at "send `START_COMMAND` over
 peer control." The target and current checkpoint use an asynchronous
 service-to-service command/completion path for `CLIENT_SQL_SESSION`:
 
-1. Keep OPEN_SESSION as peer control. It is a cold-path lifecycle operation, so
-   the existing request/response helper is acceptable while we validate routing.
-   Do not delete the helper outright; narrow it to lifecycle/control-plane work
-   instead of using it as the transaction command data plane.
+1. Keep OPEN_SESSION as peer control. It is a cold-path lifecycle operation, and
+   the current local-control continuation drives it through the async peer-control
+   op substrate. Do not move steady-state SQL commands back onto peer control;
+   keep peer control narrowed to lifecycle/control-plane work instead of using it
+   as the transaction command data plane.
 2. For steady-state SQL commands, use per-session command state between the
    farnet0 and farnet1 services. A single command mailbox/slot per session is
    enough for simple-mode pgbench because each logical session has only one
@@ -664,13 +702,19 @@ Planned changes:
    with a signaled checkpoint every 32 slots is the first target policy; treat
    that as a credit watermark rather than a permanent constant.
 
-2. **Retire source slots with deferred send-CQE checkpoints.** On an RC QP, a
-   later signaled send CQE retires earlier unsignaled WRs on that same QP. The
-   sender can therefore post most command/completion slot writes unsignaled and
-   request a local CQE only at the ring/SQ-credit watermark. When the CQE arrives,
-   retire every source slot covered by that checkpoint. This avoids the failed
-   "fully unsignaled" shape, which filled the SQ because no later signaled WR
-   retired WQE credits.
+2. **Retire source slots with fixed-array send-CQE checkpoints.** Do not use a
+   heap/list structure on the command hot path. Add a fixed outstanding-write
+   ring or array per peer connection/command lane, encode the outstanding entry
+   index in `wr_id`, and store only the local service-session index, source
+   command sequence, source slot index, and debug traffic kind needed to release
+   source credit. The first correctness version may post one signaled command WR
+   per command and retire exactly that entry when its CQE arrives, without
+   waiting in the session scan. The later optimization should post most command
+   WRs unsignaled and request a signaled checkpoint at a watermark; because RC
+   send completion order retires earlier WRs on the same QP, the CQE can release
+   all covered fixed-array entries. This avoids both the current per-command
+   synchronous wait and the failed "fully unsignaled" shape, which filled the SQ
+   because no later signaled WR retired WQE credits.
 
 3. **RDMA directly from stable mailbox slots instead of service scratch.** For
    commands, the farnet0 service should post RDMA writes directly from the
@@ -690,13 +734,15 @@ Planned changes:
    per-session/per-slot buffer, not heap allocation or large struct clearing on
    the command hot path.
 
-5. **Add compact typed command/completion layouts.** Keep a compact fixed header
-   at the front of each slot with protocol version, layout kind, flags, payload
-   length, slot generation/low sequence, and the full command sequence needed
-   for validation. The receiver already reads the slot, so reading this header is
-   not a material parsing cost. The important win is avoiding copies and RDMA
-   writes of the old full-width command/completion union when the command only
-   needs a lifecycle kind or a short SQL string.
+5. **Defer compact typed command/completion layouts until after fixed-slot
+   self-publish works.** A previous compact-size command RDMA experiment did not
+   improve the current two-WR path, which suggests command byte volume is not
+   the first-order cost while publication and CQE waits dominate. Keep the first
+   one-WR implementation byte-heavier but structurally cleaner: one fixed
+   `CitusRemoteExecLocalCommandSlot` write, no receiver-service publish, and no
+   synchronous CQE wait. After that is correct and measured, revisit a compact
+   fixed header with protocol version, layout kind, flags, payload length, slot
+   generation/low sequence, and the full command sequence needed for validation.
 
 6. **Make command slots self-describing before optimizing publication.** The
    first multi-slot mailbox should keep enough metadata in every slot for the
@@ -706,24 +752,26 @@ Planned changes:
    is what lets the 32-bit immediate become optional routing metadata instead of
    authoritative state.
 
-7. **Use a conservative two-WR ready fallback first.** Until the one-WR safety
-   predicate is proven on the actual QPs, post the command payload/header into a
-   stable receiver slot, then publish a small ready word or ready footer with a
-   second ordered RDMA write. This still gives the main multi-slot benefits:
-   source-slot lifetime is protected by deferred send-CQE checkpoints, the
-   service no longer needs a single command scratch record, and the backend can
-   poll a per-slot ready sequence instead of a session-global `publishedEpoch`.
+7. **Keep a conservative two-WR fallback, but do not make it the next
+   optimization target.** If the in-order-placement predicate is not available on
+   a connection, fall back to the current record write plus ready-word write.
+   However, for the farnet benchmark path we should first try the one-WR
+   fixed-slot self-publish because it removes one network operation and removes
+   the receiver-service publish dependency without changing command semantics.
 
-8. **Gate one-RDMA-write self-publish on in-order data placement.** The target
-   fast path is one RDMA write containing `[header][payload][ready_seq footer]`.
-   It is enabled only when the receiver-side QP reports whole-message in-order
-   placement via `ibv_query_qp_data_in_order(qp, IBV_WR_RDMA_WRITE, 0) == 1`,
-   the target MR was not registered with `IBV_ACCESS_RELAXED_ORDERING`, the
-   target is normal coherent host memory, and `ready_seq` is naturally aligned
-   and preferably cache-line isolated. If the query reports only
+8. **Gate one-RDMA-write self-publish on in-order data placement.** The first
+   fast path is one RDMA write containing the current fixed
+   `[CitusRemoteExecLocalCommandRecord][readySeq]` slot. It is enabled only when
+   the receiver-side QP reports whole-message in-order placement via
+   `ibv_query_qp_data_in_order(qp, IBV_WR_RDMA_WRITE, 0) == 1`, the target MR
+   was not registered with `IBV_ACCESS_RELAXED_ORDERING`, the target is normal
+   coherent host memory, and `readySeq` is naturally aligned and preferably
+   cache-line isolated. If the query reports only
    `IBV_QUERY_QP_DATA_IN_ORDER_ALIGNED_128_BYTES`, keep the two-WR fallback for
    general command slots because a footer at the end of a larger slot is not
-   guaranteed to become visible after all earlier blocks.
+   guaranteed to become visible after all earlier blocks. A later compact slot
+   can use `[header][typed payload][aligned readySeq footer]` after this fixed
+   slot path is validated.
 
 9. **Poll `ready_seq == expected`, not "changed".** The backend should use an
    acquire-style load of the slot ready word and consume the slot only when it
@@ -1103,7 +1151,8 @@ Remaining result-path work:
 
 A full sink is not intrinsically a deadlock. If the producer and consumer are both running and the consumer is draining, backpressure is the expected behavior.
 
-The deadlock risk is specifically an API sequencing risk in the current synchronous command model:
+The deadlock risk is specifically an API sequencing risk in a blocking command
+model:
 
 ```text
 frontend: StartAndWaitCommand(SQL_EXECUTE)

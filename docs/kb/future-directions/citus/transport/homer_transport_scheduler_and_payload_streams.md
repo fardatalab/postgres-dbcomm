@@ -66,9 +66,14 @@ Peer control is the service-to-service equivalent. Its request vocabulary is
 [`CitusRemoteExecPeerRequestKind`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_peer_control_protocol.h:40):
 peer open, close sink, start command, poll command completion, and open command
 session. The transport implementation currently publishes those fixed-width
-messages over a persistent RDMA control mailbox; the one-message-at-a-time
-mailbox rule is documented in
-[`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2563).
+messages over a persistent RDMA control mailbox. The mailbox is now a shared
+fixed-width multi-slot ring, and normal remote open/start/poll callers use the
+explicit async op substrate. The earlier close-specific peer-control sender has
+been removed; finite tuple-result close/EOS is now represented in-band in the
+payload stream and the local cleanup helper
+[`TupleSinkServicePeerCloseSinkBestEffort()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8076)
+no longer sends a remote close request. The common peer-control publication point is
+[`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3975).
 
 Backend completions are the local socketless-backend-to-service completion path.
 The service publishes exactly one command record into a session command mailbox
@@ -84,13 +89,17 @@ serialization shim around the current one-message mailbox. This is required for
 concurrent client sessions and for later transaction plus base-backup
 interference experiments.
 
-The current limitation is explicit in
-[`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4021):
-the transport assumes at most one outstanding request per peer connection and
-uses `waitingForResponse` in
-[`remote_execution_peer_transport_rdma.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4107)
-to reject overlap. That shape cannot support concurrent command-session opens,
-responder-initiated completions, or independent traffic classes cleanly.
+Historical note: this section was originally written when peer control used a
+one-message waiting latch. That limitation has been removed. The current
+transport has a shared multi-slot control ring, explicit op-id/generation state,
+and async start/poll APIs:
+[`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6928)
+and
+[`TupleSinkServicePollPeerRequestRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6967).
+The close/EOS ordering cleanup is complete for client SQL tuple results. The
+remaining work is scheduler policy plus removing wait/poll scaffolding from the
+older backend/backend peer command path, not rebuilding a generic blocking
+request/response mailbox fallback.
 
 The target substrate should provide:
 
@@ -909,9 +918,13 @@ typedef struct HomerPeerTransport
 } HomerPeerTransport;
 ```
 
-The scheduler chooses a traffic class and grant. The transport maps that class
-to a QP. Link-level contention still exists, but a control write is no longer
-queued behind already-posted bulk WRs in the verbs work queue.
+The scheduler eventually chooses a traffic class and grant. The transport maps
+that class to a lane, and the lane maps to one QP/CQ or to a QP/CQ pool. For the
+next milestone, there is no pluggable scheduler yet: the service loop provides a
+fixed-priority baseline by progressing lanes in class order. Link-level
+contention still exists, but a control write is no longer queued behind
+already-posted bulk WRs in the same verbs work queue once the lanes map to
+different QPs.
 
 Initial lane policy:
 
@@ -945,41 +958,99 @@ Staged implementation rule:
    traffic class to the existing peer connection lane/QP. This is now complete
    for the single-lane checkpoint; it preserves behavior and does not claim to
    reduce posted-WR head-of-line blocking.
-2. Only after that checkpoint passes, split physical resources so critical
-   control, foreground payload, and bulk payload map to distinct lanes/QPs. This
-   second step is the one expected to reduce posted-WR head-of-line blocking.
-3. Scheduler policy experiments come after the physical lane split is measurable.
-   Before that, policy decisions cannot fully express the intended transport
-   priority because all work still enters one QP.
+2. Next, introduce explicit lane/resource ownership and split physical resources
+   into the simple 1:1 baseline: critical control -> one lane/QP/CQ, foreground
+   payload -> one lane/QP/CQ, bulk payload -> one lane/QP/CQ, and optional
+   maintenance later. This step is expected to reduce posted-WR head-of-line
+   blocking and to remove the shared-CQ stashing workaround from the normal path.
+3. During that lane split, keep the scheduling policy hard-coded in the service
+   loop: progress critical control first, foreground payload second, and bulk
+   payload third, with bounded work per lane. This is the baseline scheduling
+   behavior for the multi-resource milestone, not the research scheduler.
+4. Scheduler policy experiments come after the physical lane split is measurable.
+   The pluggable scheduler should replace the hard-coded service-loop order and
+   budgets with policy-selected grants, but should reuse the same lane/resource
+   ownership model.
 
-Implementation progress on May 14, 2026: the single-lane checkpoint is in the
-code. [`HomerTransportTrafficClass`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:62)
-and [`HomerTransportSchedulingMetadata`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:82)
+Implementation progress on May 17, 2026: the simple multi-resource baseline is
+now in the code. [`HomerTransportTrafficClass`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:63)
+and [`HomerTransportSchedulingMetadata`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:83)
 define the internal traffic-class/scheduler metadata. Each payload stream caches
 that metadata in
 [`HomerPayloadStreamState.transportScheduling`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:630),
 initialized by
 [`HomerServiceInitPayloadTransportScheduling()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:844).
-The current mapping is:
+The current semantic-to-traffic-class mapping is:
 
 - tuple/COPY/result payload -> foreground payload, selected by
   [`HomerServicePayloadTrafficClassForOpKind()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:826)
 - basebackup payload -> bulk payload, selected by the same helper
-- peer-control requests/responses -> critical control, passed through
-  [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2634)
+- ordinary peer-control requests/responses -> critical control through the
+  async op pair
+  [`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6928)
+  and
+  [`TupleSinkServicePollPeerRequestRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6967)
+- payload open control -> the payload stream's traffic class through the same
+  async op pair, driven by
+  [`TupleSinkServiceProgressStreamOpenAsyncOp()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13080)
+- payload close/EOS -> in-band payload-stream EOS for tuple results through
+  [`CITUS_TUPLE_SINK_TRANSPORT_FLAG_EOS`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/tuple_sink_protocol.h:37),
+  followed by local sender-side cleanup in
+  [`TupleSinkServicePeerCloseSinkBestEffort()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8076)
 
-All classes still resolve to the existing peer connection/QP through the
-single-lane resolver inside
-[`TupleSinkServicePeerConnectionForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2315).
-Payload posting now goes through the traffic-class API at
-[`TupleSinkServicePostPeerRegisteredPayloadBatchWithImmediateRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3571),
-with the call site in
-[`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6534).
-Outgoing peer-connection acquisition also accepts the class at
-[`TupleSinkServiceEnsureOutgoingPeerConnectionHandleRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2267),
-but the connection lookup key is intentionally unchanged for this checkpoint.
+The transport now uses the traffic class as part of the outgoing connection
+cache key in
+[`TupleSinkServiceFindOutgoingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2599).
+The bootstrap message carries the lane class at
+[`TupleSinkServicePrepareBootstrapMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2011),
+and
+[`TupleSinkServiceApplyPeerBootstrapMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2034)
+rejects invalid or mismatched lane classes. A connection handle is then guarded
+against class mismatch in
+[`TupleSinkServicePeerConnectionForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2786).
+The service loop drains lane-local CQs in fixed priority order using
+[`HomerTransportServiceLoopPriority`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:78):
+critical control, foreground payload, bulk payload, then maintenance. This is a
+baseline policy, not yet the pluggable research scheduler.
 
-Validation on the final single-lane binary:
+Important implementation correction: payload peer-open must ride on the same
+traffic-class lane as the payload writes. The receiver registers its byte
+ring/tuple ring against the accepted connection handle, so if bulk payload
+opened via the critical-control lane but payload bytes arrived on the bulk lane,
+the remote rkey/PD ownership would be wrong. The sender-side open call is
+[`TupleSinkServicePeerOpenSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8065),
+and best-effort close uses the matching class at
+[`TupleSinkServicePeerCloseSinkBestEffort()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8196).
+
+Second correction from validation: remote basebackup blackhole has no
+frontend-visible POSIX receive queue on the responder. The receiver now returns
+only the byte-ring RDMA descriptor for basebackup and leaves
+`peerReceiveQueueDescriptor` zeroed at
+[`TupleSinkServiceHandlePeerOpenRequest()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8597).
+
+Validation on the final multi-resource baseline binary:
+
+- `make -j8`, `sudo -n make install-headers install-service-bin install`, and
+  rsync to farnet0 passed in `/data/dbcomm/citus-dbcomm-separate-comm-stack`.
+- Single-client remote RDMA Homer pgbench, c1/j1/t50000, after clean
+  `pgbench_history` reset: repeat warmed run completed `50000/50000`, zero
+  failures, `4835.21 TPS`, p50 `0.205 ms`, p99 `0.225 ms`, max `5.903 ms`.
+- A c4/j4/t10000 sanity run completed `40000/40000`, zero failures, but still
+  showed only `7598.59 TPS` with p99 `8.136 ms`. Treat this as correctness
+  evidence for multiple sessions, not as a solved scaling result; all client SQL
+  command sessions still share the critical-control traffic class.
+- Remote RDMA basebackup blackhole with
+  `slots=8,bytes=8388608` completed repeatedly: cold/warm `5.35s`, then warmed
+  `4.37s`, `4.34s`, and `4.29s`.
+- Concurrent correctness run completed with one remote RDMA basebackup and one
+  c1/j1/t10000 Homer pgbench run overlapping. Both returned exit code 0;
+  pgbench processed `10000/10000` with zero failures, and basebackup completed
+  in `4.60s`.
+- A second concurrent correctness run used c4/j4/t2500 Homer pgbench while the
+  same remote RDMA basebackup ran. Both returned exit code 0; pgbench processed
+  `10000/10000` with zero failures, and basebackup completed in `4.49s`.
+
+Validation on the earlier final single-lane binary:
 
 - `make -j8`, `git diff --check`, and
   `sudo -n make install-headers install-service-bin install` passed in
@@ -2099,41 +2170,788 @@ granting bytes and WRs in addition to object counts.
    - remaining work: transport lanes/QPs, real egress scheduling, optional
      one-RDMA-op publication, and future fragmentation/reassembly
 
-6. **Traffic-class peer transport lanes**
-   - split peer transport resources by traffic class
+   6. **Traffic-class peer transport lanes - completed May 17, 2026 for the 1:1
+      baseline**
+   - split peer transport resources by traffic class using the simple 1:1
+     baseline topology: one lane/QP/CQ for critical control, one for foreground
+     payload, and one for bulk payload
+   - keep lane pools as a later extension; this milestone should not yet shard
+     one traffic class across multiple QPs
    - use one critical-control lane per peer transport initially
-   - replace the one-message peer-control mailbox with a multi-slot
-     peer-control request ring plus peer completion/event ring on that lane
+   - update after the May 30 cleanup: the peer-control mailbox is now a
+     shared fixed-width multi-slot ring with explicit op-id/generation matching,
+     but some setup/legacy call sites still wait through blocking adapters and
+     RDMA-CM connection setup is still a blocking island
    - map foreground payload and bulk payload to separate lanes/QPs; keep lane
-     pools possible for high-throughput payload classes
+     pools possible for high-throughput payload classes in the API, but do not
+     implement pools before the 1:1 baseline is correct and measured
    - preserve the existing WRITE_WITH_IMM publication rule per QP/channel
+   - use the service loop as the baseline scheduler: progress critical control,
+     then foreground payload, then bulk payload, with bounded work per lane
+   - validation showed pgbench and basebackup standalone correctness/performance
+     in the warmed expected bands and a concurrent pgbench plus remote RDMA
+     basebackup run completed correctly; see the implementation-progress note
+     above for exact numbers
 
-   Client-SQL performance evidence from the May 16, 2026 real-RDMA checkpoint
-   strengthens this priority. Remote c1 is correct but below the farnet1-local
-   shared-memory path, and remote c4 correctness does not scale: repeated c4/j4
-   runs were only about `4.8k TPS` with p99 around `7.9 ms`. Code reading points
-   to shared service/QP serialization rather than raw link bandwidth:
-   [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3700)
-   forwards each frontend-visible command with an RDMA record write followed by a
-   signaled epoch write;
-   [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2480)
-   does the same for pushed completions; and
-   [`TupleSinkServicePeerConnectionForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2395)
-   still resolves every traffic class to the same physical connection/QP. The
-   client-SQL plan has the detailed failed-experiment log and measurement plan:
-   [client_sql_session_offload_plan.md](../../postgres/client-sql-session/client_sql_session_offload_plan.md).
+   Client-SQL performance evidence from the May 17, 2026 real-RDMA command-ring
+   and deferred-CQE checkpoints still strengthens this priority. The command
+   mailbox ABI is a 64-slot ring, frontend commands are forwarded directly from
+   registered ring slots, and the backend consumes by polling slot-local
+   `readySeq`:
+   [`CitusRemoteExecLocalCommandMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_backend_protocol.h:164),
+   [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4870),
+   and
+   [`ExecuteRemoteExecBackendCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2131).
+   Warmed remote c4/j4 runs around the `11k TPS` band, while c1/j1 is around the
+   `4.3k-4.8k TPS` band on the current two-WR fallback path.
 
-7. **Scheduler prototype**
+   The remaining command-transport limitations are now:
+
+   - on the current farnet configuration, the one-WR self-publishing command slot
+     fast path is disabled because
+     [`ibv_query_qp_data_in_order()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1311)
+     reports no whole-message RDMA write ordering support; the measured path
+     therefore posts an unsignaled command-record write plus a tagged `readySeq`
+     write
+   - asynchronous source-slot retirement is implemented: the command sender no
+     longer waits inline for the send CQE before advancing frontend source credit,
+     and
+     [`TupleSinkServicePollRemoteClientSqlCommandWriteCompletions()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1866)
+     retires signaled command send CQEs from the service loop
+   - deferred command CQE experiments with larger signal intervals were correct
+     but did not improve warmed c1/c4 pgbench; the default remains
+     `HOMER_SERVICE_CLIENT_SQL_COMMAND_SIGNAL_INTERVAL=1`
+   - true command pipelining is still separate future work and needs an explicit
+     remote receiver-credit frontier before the sender can safely wrap remote
+     command slots; the current simple-mode pgbench workload still has one
+     command in flight per session
+   - command send-retirement state still needs to move fully into a lane-owned
+     transport resource instead of being managed by mailbox-specific helper state
+   - physical traffic classes are now split in the 1:1 baseline topology: payload
+     streams choose `FOREGROUND_PAYLOAD` or `BULK_PAYLOAD` at stream creation, and
+     [`TupleSinkServicePeerConnectionForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4737)
+     validates that payload writes use the correct traffic-class connection
+
+   Do not revive the old command `RDMA_WRITE_WITH_IMM` experiment as-is. Its
+   useful successor is a backend-polled self-publishing command slot, not a
+   receiver-service CQ path. Compact variable-size command wire slots should also
+   wait until the fixed-slot self-publish path is usable and measured on hardware
+   that reports the required in-order RDMA write capability; the earlier
+   compact-size experiment showed that byte count alone was not the dominant
+   cost in the two-WR publication shape.
+
+   Therefore the next transport-lane step should introduce explicit
+   `HomerTransportLane`/transport-resource ownership, split physical resources by
+   traffic class in the 1:1 baseline topology, and move send-retirement state
+   into each transport resource rather than adding more ad hoc command mailbox
+   special cases. Each transport resource/QP should own:
+
+   - `nextPostOrdinal`
+   - `completedPostOrdinal`
+   - an ordered pending FIFO of minimal posted-command descriptors
+   - `pendingHead` / `pendingTail`
+
+   A signaled send CQE then advances the per-resource completion frontier and
+   pops FIFO entries in order. This replaces the current global outstanding table
+   and scan in
+   [`TupleSinkServiceRetireClientSqlCommandWriteCompletionsThrough()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1684).
+   It also gives the traffic-class QP split a natural owner for per-resource
+   post/completion frontiers.
+
+   The current RDMA layer still has CQ ownership details to clean up within each
+   traffic-class connection: subsystem-specific send-completion helpers such as
+   [`TupleSinkServicePollPeerPayloadSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5204)
+   and
+   [`TupleSinkServicePollPeerCommandSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5361)
+   know how to stash unrelated tagged completions. The target is for each
+   `HomerTransportLane` / transport resource to own its own send-post frontier,
+   completion frontier, and demux policy, so command/payload helpers no longer
+   carry ad hoc CQ ownership rules. The implementation checkpoint has exact
+   measurement details:
+   [client_sql_session_pgbench_checkpoint.md](../../../implementations/postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md).
+
+7. **Nonblocking peer transport/control state machines - next correctness
+   milestone**
+
+   The May 2026 concurrent pgbench plus remote RDMA basebackup validation exposed
+   an important gap in the multi-lane implementation: physical traffic-class
+   lanes avoid posted-WR head-of-line blocking for payload traffic, but the
+   peer-control and connection-management code still contains blocking islands
+   that can stop service-loop progress for other lanes.
+
+   Important current-state distinction:
+
+   - payload lanes already use the desired high-level pattern: shared lane-owned
+     resources with multi-slot / byte-ring stream state, not one physical RDMA
+     resource per DB session. The mapping is established by
+     [`HomerServicePayloadTrafficClassForOpKind()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1262):
+     client SQL / tuple payloads map to `FOREGROUND_PAYLOAD`, while basebackup
+     maps to `BULK_PAYLOAD`.
+   - peer payload open already binds a stream to the class-specific connection in
+     [`TupleSinkServiceOpenPeerSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8040),
+     especially the class-specific connection lookup at
+     [`tuple_sink_service_process.c:8047`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8047)
+     and peer-open send at
+     [`tuple_sink_service_process.c:8096`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8096).
+   - the missing long-term piece is narrower: make the **critical-control lane**
+     follow the same lane-owned, multi-slot, explicit-work-ownership model. Do
+     not create per-session peer-control QPs/mailboxes merely because SQL sessions
+     are per-session; peer-control open/bind/close happens across many sessions
+     and even before a remote DB session exists.
+
+   Current blocking points to remove:
+
+   - outgoing RDMA-CM setup in
+     [`TupleSinkServiceConnectOutgoingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2447)
+     waits synchronously for `ADDR_RESOLVED`, `ROUTE_RESOLVED`, and
+     `ESTABLISHED`
+   - incoming accept in
+     [`TupleSinkServiceAcceptIncomingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2638)
+     waits synchronously for `ESTABLISHED`
+   - peer-control request/response publication in
+     [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3456)
+     currently posts the mailbox write and tail `WRITE_WITH_IMM`, then waits
+     inline for the send CQE before the scratch buffers may be reused
+   - service-to-service peer request submission in
+     [`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5766)
+     owns a stack-frame response wait loop instead of creating an operation that
+     the service loop can advance
+   - teardown in
+     [`TupleSinkServiceBestEffortDisconnectPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2391)
+     waits for `DISCONNECTED` even on best-effort error cleanup
+
+   The target design is not "wait while pumping" from inside these helpers. That
+   risks re-entering the same lane, reusing scratch buffers while an outer stack
+   frame still assumes ownership, or resetting a connection while the caller still
+   treats it as live. The cleaner design is explicit state owned by the lane and
+   progressed only by the service loop.
+
+   Proposed lane connection phases:
+
+   ```c
+   typedef enum HomerPeerLanePhase
+   {
+       HOMER_PEER_LANE_UNUSED = 0,
+       HOMER_PEER_LANE_RESOLVE_ADDR_POSTED,
+       HOMER_PEER_LANE_WAIT_ADDR_RESOLVED,
+       HOMER_PEER_LANE_RESOLVE_ROUTE_POSTED,
+       HOMER_PEER_LANE_WAIT_ROUTE_RESOLVED,
+       HOMER_PEER_LANE_RESOURCES_READY,
+       HOMER_PEER_LANE_CONNECT_POSTED,
+       HOMER_PEER_LANE_ACCEPT_POSTED,
+       HOMER_PEER_LANE_WAIT_ESTABLISHED,
+       HOMER_PEER_LANE_BOOTSTRAP,
+       HOMER_PEER_LANE_READY,
+       HOMER_PEER_LANE_CLOSING,
+       HOMER_PEER_LANE_FAILED
+   } HomerPeerLanePhase;
+   ```
+
+   Proposed peer-control operation phases:
+
+   ```c
+   typedef enum HomerPeerControlOpPhase
+   {
+       HOMER_PEER_CONTROL_OP_UNUSED = 0,
+       HOMER_PEER_CONTROL_OP_NEED_LANE,
+       HOMER_PEER_CONTROL_OP_WAIT_LANE_READY,
+       HOMER_PEER_CONTROL_OP_POST_REQUEST,
+       HOMER_PEER_CONTROL_OP_WAIT_REQUEST_SEND_RETIRE,
+       HOMER_PEER_CONTROL_OP_WAIT_RESPONSE,
+       HOMER_PEER_CONTROL_OP_POST_RESPONSE,
+       HOMER_PEER_CONTROL_OP_WAIT_RESPONSE_SEND_RETIRE,
+       HOMER_PEER_CONTROL_OP_COMPLETE_LOCAL_SLOT,
+       HOMER_PEER_CONTROL_OP_FAILED
+   } HomerPeerControlOpPhase;
+   ```
+
+   Storage and WR lifetime rules:
+
+   - allocate fixed per-lane rings at lane setup time; do **not** heap-allocate
+     one control operation or publish buffer per request
+   - use a small fixed `HomerPeerControlOp` ring for in-flight peer-control
+     requests/responses; `32` or `64` entries is enough for the current concurrent
+     pgbench plus basebackup setup path and keeps the structure cache-friendly
+   - use a separate fixed `HomerPeerControlPublishSlot` ring for RDMA source
+     buffers that must remain stable until the send CQE retires
+   - each publish slot should contain only the fixed control message, the publish
+     tail word, a generation, and compact flags; large or cold metadata belongs in
+     the operation table or setup-time lane state
+   - encode WR ids as tagged values containing at least `{kind, lane index,
+     slot index, generation}`; CQ polling decodes the tag, checks the generation,
+     and frees exactly that publish slot
+   - avoid storing raw pointers in WR ids; pointer WR ids are harder to validate
+     after lane reset/reconnect and make stale-CQE handling less explicit
+   - when the fixed op/publish ring is full, treat it as control-plane
+     backpressure: skip posting new work for that lane on this pass and continue
+     progressing other lanes
+
+   Suggested data shape:
+
+   ```c
+   typedef struct HomerPeerControlPublishSlot
+   {
+       TupleSinkServicePeerControlMessage message;
+       uint64 publishedTail;
+       uint32 generation;
+       uint8 inUse;
+       uint8 reserved[3];
+   } HomerPeerControlPublishSlot;
+
+   typedef struct HomerPeerControlOp
+   {
+       HomerPeerControlOpPhase phase;
+       uint64 sequence;
+       uint32 publishSlotIndex;
+       uint32 generation;
+       CitusRemoteExecPeerRequestUnion request;
+       CitusRemoteExecPeerResponseUnion response;
+       uint32 localControlSlotIndex;
+       uint32 serviceSessionId;
+   } HomerPeerControlOp;
+   ```
+
+   The exact fields should be tightened during implementation. The important
+   invariant is ownership: an async WR borrows a publish slot until its CQE is
+   retired; a peer-control op owns request/response progress until it completes
+   the local control slot or fails affected semantic state.
+
+   Critical-control lane target:
+
+   - introduce an explicit `HomerTransportLane` / `HomerCriticalControlLane`
+     object for `HOMER_TRANSPORT_TRAFFIC_CLASS_CRITICAL_CONTROL`. It should own
+     the RDMA CM id, QP/CQs, protection domain / registered memory ownership,
+     inbound control ring descriptor, outbound pending-op ring, publish-source
+     slots, and send-completion frontier.
+   - replace the one-message
+     [`TupleSinkServicePeerControlMailbox`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:116)
+     with a lane-owned multi-slot peer-control ring. This ring is **shared by
+     all sessions using the lane**, but every slot carries owner/correlation
+     metadata: local control-slot index or waiter, service session id when known,
+     peer session id when known, op id, message sequence, generation, request
+     kind, and response destination.
+   - keep per-session SQL command ordering unchanged. A single DB session still
+     has at most one active simple-mode SQL command; the multi-slot control ring
+     allows multiple session opens/binds/closes and peer-sink setup operations
+     across different sessions to make progress concurrently.
+   - requests and responses should be matched by `{origin lane generation, op id,
+     message sequence}` rather than by "the one response currently being waited
+     on." This removes the stack-frame response ownership in
+     [`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5766).
+   - cancellation and abandonment are first-class op transitions. If a frontend
+     local control request times out or disconnects while an open has already
+     spawned a socketless backend through the spawn path in
+     [`TupleSinkServiceStartRemoteExecBackend()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4168),
+     the op must either complete the local slot, mark the semantic session failed,
+     or send/perform a best-effort close for the spawned backend. It must not leave
+     an unowned remote exec backend spinning on a pinned CPU.
+   - ring-full is control-plane backpressure, not fatal hot-path failure: the
+     service loop should skip posting more critical-control work for that lane on
+     that pass and continue progressing existing control ops and payload lanes.
+
+   Suggested critical-control slot shapes:
+
+   ```c
+   typedef struct HomerPeerControlRingHeader
+   {
+       uint32 protocolVersion;
+       uint32 slotCount;
+       uint32 slotBytes;
+       uint32 flags;
+       uint64 publishedTail;
+       uint64 consumedHead;
+   } HomerPeerControlRingHeader;
+
+   typedef struct HomerPeerControlSlotHeader
+   {
+       uint32 readySeq;
+       uint16 messageKind;
+       uint16 requestKind;
+       uint32 opIndex;
+       uint32 generation;
+       uint64 messageSequence;
+       uint64 ownerServiceSessionId;
+       uint64 peerServiceSessionId;
+       uint32 localControlSlotIndex;
+       uint32 payloadBytes;
+   } HomerPeerControlSlotHeader;
+   ```
+
+   The first implementation can keep fixed-size request/response unions in each
+   slot to avoid variable-size parsing in the control path. Compact variable-size
+   control slots are a later cleanup only if control-ring memory footprint becomes
+   a real issue; it is not a normal-path performance concern at current scale.
+
+   Service-loop integration:
+
+   - add lane progress helpers that each do bounded work and return:
+     `HomerPeerLaneProgressCm()`, `HomerPeerLaneProgressBootstrap()`,
+     `HomerPeerLaneProgressSendCq()`, `HomerPeerLaneProgressRecvCq()`, and
+     `HomerPeerLaneProgressMailbox()`
+   - update
+     [`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6145)
+     so each pass advances connection phases, send-CQ retirement, incoming
+     mailbox consumption, and pending peer-control ops with a small per-lane work
+     budget
+   - keep the baseline order fixed priority for now: critical control, foreground
+     payload, bulk payload; the rule is "bounded work per lane, then return," not
+     "drain one lane until idle"
+   - make peer-control open/send APIs either return `IN_PROGRESS` or bind the
+     pending op to the caller's local control slot; do not block the caller until
+     the remote response arrives
+   - make disconnect/reset best effort and nonblocking in the service loop; a
+     lane may enter `CLOSING`/`FAILED`, but it must not spend a full RDMA timeout
+     waiting for `DISCONNECTED` while other lanes are ready
+
+   Relationship to semantic dynamic session state:
+
+   - this transport state machine is **not** the same as the future authoritative
+     remote-execution session state in
+     [command_dispatch_completion_plane.md](../data-movement/command_dispatch_completion_plane.md#future-fix-explicit-dynamic-session-state)
+   - transport lane state answers whether RDMA resources are connecting, ready,
+     closing, or failed
+   - peer-control op state answers whether a service-to-service request has been
+     posted, sent, answered, and completed to the local control slot
+   - remote-execution session state answers DB semantics: idle, command active,
+     in transaction, failed transaction, closing, failed, and whether reuse is
+     allowed
+   - lane failure should mark affected peer-control ops failed, and those ops then
+     update the relevant remote-execution sessions; do not collapse all three
+     state domains into one enum
+
+   Validation plan:
+
+   1. Preserve standalone c1/c4 pgbench warmed performance before enabling
+      concurrent basebackup.
+   2. Preserve standalone remote RDMA basebackup warmed performance.
+   3. Run concurrent c4 pgbench plus remote RDMA basebackup and verify no class-1
+      peer-control reset occurs while class-3/bulk setup is pending.
+   4. Add compile-time-gated counters for lane phase transitions, op-ring full
+      events, publish-ring full events, async send CQ retirements, stale CQEs by
+      generation, and max bounded-work iterations per pump pass.
+   5. Keep the counters/logging disabled for performance measurements.
+
+   This is a correctness and progress-isolation milestone before the pluggable
+   scheduler. It is performance-relevant because blocking connection/control
+   setup can stall foreground transaction lanes, but it should still keep all
+   per-op storage preallocated and cache-local so the normal service-loop path
+   does not acquire allocator, lock, or scan costs.
+
+   May 29 implementation checkpoint:
+
+   - Historical May 29 state: the code had **not** landed the full async
+     peer-control operation state machine above. The safe landed subset kept
+     peer-control publication
+     blocking in
+     [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3456)
+     and still waits for the signaled tail `WRITE_WITH_IMM` send CQE before
+     reusing the one-slot control scratch buffers.
+   - A partial async-control experiment with preallocated publish slots and
+     tagged WR ids was rejected. It preserved local RDMA source-buffer lifetime,
+     but the current one-slot peer-control mailbox still depends on
+     one-request-at-a-time sequencing and local control-slot progress. Under
+     remote c4 pgbench it caused session-open/sql-execute timeouts and leaked
+     remote exec backends that continued spinning on backend CPUs, which then
+     distorted later warm performance. Do not revive that shape without the real
+     multi-slot peer-control op ring described above.
+   - The safe progress-isolation change that did land is nonblocking best-effort
+     disconnect in
+     [`TupleSinkServiceBestEffortDisconnectPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2391):
+     it calls `rdma_disconnect()` but does not wait inline for
+     `RDMA_CM_EVENT_DISCONNECTED`.
+   - Shared send-CQ demux for unrelated tagged completions remains in
+     [`TupleSinkServiceHandleTaggedSendCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1126),
+     but there is no async peer-control send-CQ drain in the top-level service
+     loop. This avoids polling a mostly-empty send CQ on every pass.
+   - Warm validation after a clean restart and a c1 peer warmup preserved the
+     expected standalone numbers: remote c4 pgbench reached about `11.0k TPS`
+     with p99 about `0.616 ms`; remote RDMA basebackup warmed at `4.28-4.35s`.
+     Concurrent c4 pgbench plus remote RDMA basebackup completed correctly with
+     pgbench around `9.36k TPS` and basebackup `4.45s`.
+   - Cold c4 setup can still time out and leave remote exec backend processes if
+     clients abandon session-open requests while the peer path is still being
+     established. For performance runs, clean up stale `remote exec backend`
+     processes and treat the first post-restart run as warmup. The proper
+     correctness fix is still the multi-slot peer-control op state machine, not
+     a larger timeout.
+
+   May 30 implementation checkpoint and cleanup status:
+
+   - The peer-control request/response correlation state has landed.
+     [`TupleSinkServiceReservePeerControlOp()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4058)
+     and
+     [`TupleSinkServiceCompletePeerControlOp()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4122)
+     replaced the earlier connection-wide "currently waiting for response" shape
+     with explicit op-index/generation/sequence matching.
+   - The public async API also exists now:
+     [`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6456)
+     publishes one request and returns a
+     [`TupleSinkServicePeerControlAsyncOp`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:121),
+     and
+     [`TupleSinkServicePollPeerRequestRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6623)
+     progresses that explicit op until it completes or fails. The old
+     [`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6731)
+     is now a compatibility wrapper that starts an async op and waits on it.
+   - Control publication is no longer locally blocking on the normal
+     peer-control path.
+     [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3786)
+     writes the peer control slot and publishes the tail with a signaled
+     `WRITE_WITH_IMM`, but it does not wait inline for the send CQE. Request
+     publishes borrow op-owned registered source storage; response publishes
+     borrow preallocated lane-owned response publish slots.
+     [`TupleSinkServiceDrainTaggedSendCompletions()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1497)
+     retires those sources later.
+   - Tagged control WR ids carry op generation. This is required because a
+     blocking compatibility adapter can time out or release an op before the
+     local send CQE is drained; stale CQEs are ignored instead of mutating a
+     later op that reused the slot. The hot path does not allocate heap state for
+     this; request buffers, response publish slots, and op states are fixed
+     lane-local arrays.
+   - [`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6919)
+     now drains tagged send completions and peer-control responses as part of
+     normal peer progress. A final optimization removed a redundant per-publish
+     send-CQ drain and unused request-send bookkeeping stores after validation
+     showed the start/poll path already drives completion progress.
+   - Call-site migration should be staged. Peer open/bind/close and peer-sink
+     setup should first bind their pending op to the local control slot or to an
+     explicit continuation state, return `IN_PROGRESS`, and resume when the
+     lane-local completion queue reports the op done. RDMA-CM connect/accept
+     phases should follow the same rule: each pump pass performs bounded work and
+     never waits inline for an RDMA timeout while other lanes have ready work.
+   - Remaining cleanup details: migrate any remaining setup/legacy call sites off
+     blocking adapters;
+     propagate cancellation and lane failure by marking only the affected ops
+     failed; keep debug counters/logs compile-time gated so the measured hot path
+     does not pay for them.
+   - Performance caveat from validation: an earlier concurrent c4 Homer pgbench
+     plus remote RDMA basebackup run in this note measured about `9.36k TPS` for
+     pgbench and `4.45s` for basebackup. A later run measured standalone c4 at
+     about `11.41k TPS` and standalone basebackup at about `4.42s`, but one
+     concurrent c4 plus basebackup artifact dropped to about `4.68k TPS` and
+     `15.38s` basebackup. A May 30 rerun did **not** reproduce that drop:
+     standalone c4/t10000 measured `11429.95 TPS`; concurrent c4/t2500 repeats
+     measured `9545.20`, `9636.47`, and `9473.30 TPS` while basebackup completed
+     in `4.33`, `4.45`, and `4.31s`; and a concurrent c4/t10000 run measured
+     `9733.60 TPS` with basebackup `4.65s`. Treat the `4.68k / 15.38s` artifact
+     as a stale/transient run condition unless it can be reproduced after
+     cleaning stale `remote exec backend` processes and following the warm-run
+     procedure.
+
+   Final May 30 validation after rebuilding, installing, syncing the farnet0
+   service binary, and restarting PostgreSQL plus both Homer services:
+
+   - first post-restart remote c1 pgbench was a cold/warmup outlier because
+     initial setup produced a `1173 ms` max latency; the warmed repeat completed
+     `20000/20000` with zero failures at `4869.43 TPS`, p50 `0.203 ms`, p99
+     `0.224 ms`
+   - warmed remote c4 pgbench completed `40000/40000` with zero failures at
+     `11457.72 TPS`, p50 `0.337 ms`, p99 `0.594 ms`
+   - remote RDMA basebackup warmed at `4.32s`
+   - concurrent remote c4 pgbench plus remote RDMA basebackup completed with
+     both rc=0; pgbench completed `10000/10000` at `9486.10 TPS`, p50
+     `0.383 ms`, p99 `0.772 ms`, while basebackup completed in `4.45s`
+   - artifacts for the final concurrent run are under
+     `/tmp/homer_async_cleanup_final_concurrent_20260530_101222`
+
+   May 30 implementation checkpoint: transport-level async setup is now landed,
+   while service-level local-control continuations are still the remaining
+   nonblocking cleanup.
+
+   - [`TupleSinkServicePeerControlAsyncOp`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:121)
+     now owns the peer endpoint, request copy, traffic class, connection handle,
+     and `requestPublished` flag. This lets `StartPeerRequest...` return with a
+     request still waiting on RDMA-CM/bootstrap setup instead of requiring the
+     peer-control message to have already been written.
+   - Outgoing connect setup was split into
+     [`TupleSinkServiceStartOutgoingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2918)
+     plus
+     [`TupleSinkServiceProgressOutgoingPeerConnectionSetup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3051).
+     The phases now poll `ADDR_RESOLVED`, `ROUTE_RESOLVED`, `ESTABLISHED`, and
+     bootstrap send/recv CQEs without sleeping inside the progress helper.
+   - Incoming accept setup was split into
+     [`TupleSinkServiceStartIncomingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3296)
+     plus
+     [`TupleSinkServiceProgressIncomingPeerConnectionSetup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3065).
+     The passive side no longer treats a listener `CONNECT_REQUEST` as "accept
+     and finish bootstrap right now." A subtle correctness fix was needed here:
+     [`TupleSinkServiceApplyPeerBootstrapMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2519)
+     sets `bootstrapComplete`, but the passive-side async path clears it until
+     its own bootstrap response send retires and
+     [`TupleSinkServiceFinishPeerConnectionSetup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2744)
+     posts notification receives.
+   - Peer-control async start/poll now defers publication until the lane is
+     ready through
+     [`TupleSinkServiceStartOrProgressOutgoingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6817),
+     [`TupleSinkServiceTryPublishPeerControlAsyncOp()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6911),
+     [`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7023),
+     and
+     [`TupleSinkServicePollPeerRequestRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7062).
+   - [`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7370)
+     now progresses active but not-yet-bootstrapped incoming/outgoing lane slots
+     before placing ready lanes into the fixed-priority service-loop lists at
+     [`remote_execution_peer_transport_rdma.c:7422`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7422)
+     and
+     [`remote_execution_peer_transport_rdma.c:7465`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7465).
+   - Validation after rebuild/install/sync on farnet1 and farnet0:
+     remote c1 pgbench warmed at `4830.79 TPS`, p50 `0.204 ms`, p99
+     `0.227 ms`; remote c4 pgbench warmed at `11087.77 TPS`, p50 `0.348 ms`,
+     p99 `0.613 ms`; warmed remote RDMA basebackup completed in `4.26s`; one
+     concurrent remote c4 pgbench plus remote RDMA basebackup run completed with
+     both rc=0, pgbench `9454.57 TPS`, p50 `0.394 ms`, p99 `0.790 ms`, and
+     basebackup `4.65s` (`/tmp/homer_async_impl_20260530_194920`).
+   - Historical remaining cleanup at this checkpoint:
+     [`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7185)
+     was still the blocking compatibility adapter, and service-level callers
+     such as command-session open and peer-sink open still publish their local
+     control response only after that wrapper returns. To satisfy the strict
+     "service loop never waits on remote setup" invariant, the next cleanup must
+     move these callers onto explicit pending local-control/session/stream
+     continuations. The transport substrate is ready for that because async ops
+     can now cover both "lane still connecting" and "peer request published,
+     waiting response."
+
+   Implementation plan for the remaining fully-async/nonblocking critical-control
+   lane:
+
+   1. **Define the no-blocking service-loop invariant.** The top-level progress
+      loop in
+      [`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13791)
+      must never wait for an RDMA-CM event, send CQE, peer response, remote
+      connection establishment, or remote sink/session setup. A pump pass may
+      poll nonblocking readiness, post bounded work, record an in-flight op, and
+      return. Synchronous compatibility wrappers may remain only for cold tools
+      or tests outside the service loop.
+
+   2. **Convert outgoing RDMA-CM connect into lane phases.** The blocking path is
+      currently
+      [`TupleSinkServiceConnectOutgoingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2780):
+      it posts `rdma_resolve_addr()` and waits for `ADDR_RESOLVED` at
+      [`remote_execution_peer_transport_rdma.c:2836`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2836),
+      waits for `ROUTE_RESOLVED` at
+      [`remote_execution_peer_transport_rdma.c:2857`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2857),
+      then waits for `ESTABLISHED` at
+      [`remote_execution_peer_transport_rdma.c:2889`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2889).
+      Replace that with `StartOutgoingPeerConnection(...)` and
+      `ProgressPeerLaneConnect(...)` style helpers. The lane should carry a
+      phase enum such as `IDLE`, `ADDR_RESOLVE_POSTED`, `ADDR_RESOLVED`,
+      `ROUTE_RESOLVE_POSTED`, `ROUTE_RESOLVED`, `CONNECT_POSTED`,
+      `BOOTSTRAP_POSTED`, `READY`, `FAILED`, plus the small amount of
+      preallocated storage needed by the current phase.
+
+   3. **Change ensure-connection callers from "ready or fail" to "pending or
+      ready".** [`TupleSinkServiceEnsureOutgoingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3145)
+      and
+      [`TupleSinkServiceEnsureOutgoingPeerConnectionHandleRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3189)
+      currently return only after the connection is ready. Add an async return
+      shape such as `READY`, `IN_PROGRESS`, `FAILED`. If a peer-control op or
+      payload open needs a lane that is still connecting, bind that waiting work
+      to the lane's pending list and let the service loop resume it after
+      `READY`.
+
+   4. **Convert incoming accept/bootstrap into bounded lane progress.** The
+      listener pump in
+      [`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6919)
+      already polls the listener nonblocking, but
+      [`TupleSinkServiceHandleIncomingConnectRequest()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7033)
+      still needs to be treated as a state transition, not a "finish everything
+      now" helper. Accepted connections should enter incoming-lane phases:
+      allocate slot, init resources, post bootstrap recv, accept, wait for
+      `ESTABLISHED`, exchange mailbox descriptors, then mark `READY`. Each phase
+      should advance only when its nonblocking event/CQE is available.
+
+   5. **Move peer request/response waits out of call stacks.** The async
+      substrate is present:
+      [`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6456)
+      and
+      [`TupleSinkServicePollPeerRequestRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6623)
+      operate on explicit op handles. The remaining blocker is
+      [`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6731),
+      which starts an op and spins on it. Migrate service-loop callers to store
+      `TupleSinkServicePeerControlAsyncOp` in the owning session/stream/control
+      slot and return `IN_PROGRESS` instead of waiting on stack-local response
+      state.
+
+   6. **Add continuations for command-session open.** The remote client-SQL open
+      path blocks today in
+      [`TupleSinkServiceHandleOpenCommandSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11919)
+      when it calls
+      [`TupleSinkServicePeerOpenCommandSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4591)
+      at
+      [`tuple_sink_service_process.c:11866`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11866).
+      Add a pending-open state under the local control slot or session. The
+      handler should create the local session, register command/completion MRs
+      as needed, start connection/open ops, return a pending heartbeat/accepted
+      state to the control slot, and publish the final local open response only
+      after the peer command session is open. If the frontend abandons the slot,
+      cancellation should mark the pending op canceled and reclaim any created
+      session/backend resources.
+
+   7. **Add continuations for peer sink/result open.** Remote result and payload
+      setup block today in
+      [`TupleSinkServicePeerOpenSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8030)
+      and at call sites such as
+      [`tuple_sink_service_process.c:12382`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12382)
+      and
+      [`tuple_sink_service_process.c:12418`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12418).
+      Add a stream state such as `PEER_OPEN_PENDING`; payload pumps must skip or
+      cheaply test streams in that state until the peer-open op completes and
+      installs the peer receive descriptor. This is a setup-path state check, not
+      a per-record payload branch.
+
+   8. **Make close/reset best-effort and lane-owned.** Close operations should
+      enqueue peer close requests when possible but must not block foreground
+      lanes on a remote close response. Reset should mark lane-local ops failed,
+      return response-publish slots/source buffers to their pools when their
+      generation no longer matches, and release semantic sessions/streams owned
+      by those ops. The already-landed generation check in tagged control WR
+      retirement is the model for stale CQE safety.
+
+   9. **Performance constraints for the async design.**
+      - No heap allocation, mutexes, or dynamic list nodes on the service-loop hot
+        path. Op tables, pending open records, response slots, and lane phases
+        should be fixed-size arrays or embedded in existing session/stream
+        entries.
+      - Use active lists or bitsets for lanes/ops needing progress. Do not add a
+        full session/stream/op table scan to every pgbench command iteration.
+      - Keep listener and cold connection progress out of the steady-state remote
+        client-SQL command path. The warmed transaction hot path should still
+        primarily run
+        [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13811)
+        plus result/completion/payload progress.
+      - Poll send/recv CQs only for lanes with outstanding work or recent
+        readiness. Avoid adding empty-CQ polling for idle bulk/basebackup lanes
+        to every foreground transaction loop.
+      - Compile out expensive counters/logging by default. Keep enough
+        `HOMER_SERVICE_*_STATS` hooks to measure empty polls, pending-op counts,
+        phase transitions, stale CQEs, and wait time during investigations.
+      - Separate setup-path improvement from steady-state claims. Fully async
+        connect/open primarily improves cold setup, tail latency, and concurrent
+        interference. It should not be expected to raise warmed c1 TPS unless it
+        also removes work from the already-open command/data path.
+
+   10. **Validation gates before scheduler policy work.**
+       - correctness: cold c4 remote pgbench setup with no leaked `remote exec
+         backend` processes after cancellation/failure
+       - correctness: standalone remote RDMA basebackup and remote client SQL
+         pgbench still pass separately
+       - correctness: concurrent remote c4 pgbench plus remote RDMA basebackup
+         completes with both rc=0
+       - performance: warmed remote c4 pgbench remains in the established
+         `~11k TPS` band with p99 in the same `~0.6 ms` band
+       - performance: warmed remote RDMA basebackup remains around the `4.3s`
+         band
+       - diagnostics: if a regression appears, counters must identify whether it
+         comes from extra empty polling, broader active scans, connection phase
+         churn, or added branches in the warmed transaction path
+
+   May 31 implementation checkpoint: the service-level local-control
+   continuation layer has landed for the remote open paths and the old
+   backend/backend command start/poll paths that were still blocking the service
+   loop.
+
+   - The RDMA transport now exposes
+     [`TupleSinkServiceEnsureOutgoingPeerConnectionHandleRdmaAsync()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6916).
+     It progresses the outgoing lane setup once and returns `readyOut` instead
+     of waiting until RDMA-CM/bootstrap is finished. The old
+     [`TupleSinkServiceEnsureOutgoingPeerConnectionHandleRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3533)
+     remains for compatibility callers outside the newly converted local-control
+     path.
+   - Remote `OPEN_SESSION` requests now use a fixed-size per-control-slot
+     continuation table:
+     [`LocalControlAsyncOps`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12576).
+     The selector
+     [`TupleSinkServiceOpenRequestNeedsAsyncLocalControl()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12582)
+     diverts remote command-session opens and remote send-side payload/result
+     stream opens away from the blocking handler.
+   - Command-session opens progress through
+     [`TupleSinkServiceProgressCommandOpenAsyncOp()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12776):
+     create the local session, asynchronously ensure the critical-control lane
+     when client-SQL mailbox registration needs a PD/QP, register the command
+     and completion mailboxes, start the peer open through the async peer-control
+     op, then publish the local response only after the peer response arrives.
+   - Remote payload/result stream opens progress through
+     [`TupleSinkServiceProgressStreamOpenAsyncOp()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13427):
+     validate and create the local stream, asynchronously ensure the stream's
+     traffic-class lane, register the sender-head mirror, start the peer open,
+     bind peer descriptors, and finally publish the original local control
+     response.
+   - Old backend/backend remote `START_COMMAND` and
+     `POLL_COMMAND_COMPLETION` local-control requests now also use the same
+     continuation table when the session has a peer command endpoint. The
+     selectors
+     [`TupleSinkServiceStartCommandNeedsAsyncLocalControl()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12627)
+     and
+     [`TupleSinkServicePollCompletionNeedsAsyncLocalControl()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12648)
+     divert those requests before the compatibility handlers run; the async
+     phases are driven by
+     [`TupleSinkServiceProgressLocalControlAsyncOp()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13544).
+   - [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15204)
+     now pumps pending local-control continuations before scanning new slots.
+     A pending slot remains in `REQUEST_READY`; the service keeps the heartbeat
+     moving and skips reprocessing until the continuation publishes
+     `RESPONSE_READY`.
+   - Performance cleanup: the pending-op table is guarded by
+     [`LocalControlAsyncActiveCount`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12578),
+     so warmed pgbench/basebackup loops do not scan the setup-only continuation
+     array when no async local-control work is active. A follow-up hot-path
+     cleanup removed the unconditional `memset()` of the large fixed-width
+     peer-control message in
+     [`TupleSinkServiceProgressPeerControlResponses()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6757);
+     the mailbox-empty path no longer clears the embedded request/response
+     union before it knows a response is present.
+   - May 31 follow-up: the peer sink close exception has been removed. The
+     earlier fire-and-forget close experiment was semantically unsafe because
+     terminal command completion could become visible before result-stream EOS.
+     The implemented fix is to make EOS an in-band tuple payload fact:
+     [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service.c:1801)
+     marks the last tuple-view record or emits a zero-row EOS record, and
+     [`HomerServicePayloadStreamResultEosPosted()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3568)
+     gates terminal completion until EOS is posted and the source bytes are
+     retired. `TupleSinkServicePeerCloseSinkBestEffort()` is now local cleanup
+     only.
+   - Validation after rebuild/install/sync/restart on farnet1/farnet0:
+     warmed remote c1 pgbench `4810.71 TPS`, p50 `0.205 ms`, p99 `0.229 ms`;
+     warmed remote c4 pgbench `10979.91 TPS`, p50 `0.349 ms`, p99 `0.620 ms`;
+     standalone remote RDMA basebackup cold/checkpoint run `6.39s` and warmed
+     repeat `4.30s`; concurrent remote c4 pgbench plus remote RDMA basebackup
+     completed with both rc=0, pgbench `9597.32 TPS`, p50 `0.386 ms`, p99
+     `0.764 ms`, and basebackup `4.53s`
+     (`/tmp/homer_async_full_final_20260531_083402`).
+   - Follow-up cleanup: the generic blocking peer-request wrappers and
+     blocking peer-open helpers have been removed. The old local-control
+     handler bodies still exist for local/client-SQL cases, but their remote
+     branches now fail defensively if reached:
+     [`TupleSinkServiceHandleOpenSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11604),
+     [`TupleSinkServiceHandleStartCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14054),
+     and
+     [`TupleSinkServiceHandlePollCommandCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14213).
+     Normal remote open/start/poll therefore has one intended path: the async
+     local-control continuation. Remote pgbench client SQL still uses direct
+     command/completion rings after session open.
+   - Validation after removing the generic blocking wrappers: `make -j8
+     service-bin client-bin`, `git diff --check`, install/sync/restart, warmed
+     remote c4 pgbench `11106.19 TPS`, p50 `0.348 ms`, p99 `0.616 ms`, zero
+     failed transactions, and warmed remote RDMA basebackup `4.36s`. Service
+     logs had no `must use async`, failed, error, mismatch, overrun, invalid, or
+     ran-out diagnostics.
+   - Validation after removing the peer-close/EOS exception: `make -j8
+     service-bin client-bin`, `git diff --check`, rebuild/install/sync/restart,
+     warmed remote c1 pgbench `4820.286 TPS`, p50 `0.205 ms`, p99 `0.228 ms`;
+     warmed remote c4 pgbench `11144.880 TPS`, p50 `0.350 ms`, p99 `0.605 ms`;
+     and warmed remote RDMA basebackup `4.35s`. A final short smoke completed
+     `100/100` transactions with zero failures.
+
+8. **Scheduler prototype**
    - implement ready-set construction, policy selection, grants, and progress
      accounting
-   - start with a trivial strict policy: critical control, then foreground
-     payload, then bulk payload
+   - treat the fixed-priority service loop from the multi-resource milestone as
+     the baseline policy to replace, not as the final scheduler abstraction
    - cap sender payload publication by scheduler grant instead of only by
      `HOMER_SERVICE_PAYLOAD_SEND_COMPLETION_BATCH`
    - add weighted/deficit/age-aware policies only after traffic-class lanes are
      measurable
 
-8. **Push command completions - local frontend completed, peer still future**
+9. **Push command completions - local frontend completed, peer still future**
    - keep one in-flight command per session and use a small completion ring for
      the local frontend no-poll implementation
    - bind the local frontend completion destination during session/open setup
@@ -2145,7 +2963,7 @@ granting bytes and WRs in addition to object counts.
      tied to the push destination instead of a future poll
    - retain poll only as a fallback/debug path until the push path is validated
 
-9. **Optional fragmentation**
+10. **Optional fragmentation**
    - add RDMA-substrate fragmentation only if object-level grants are too coarse
      for latency/throughput goals
 

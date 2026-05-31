@@ -291,5 +291,17 @@ transport-side: traffic-class transports, multiple QPs, real RDMA egress
 scheduling, possible one-RDMA-op in-band publication, naming cleanup, and
 optional fragment/reassembly for very large semantic objects.
 
+May 17, 2026 update: the first traffic-class transport baseline is now landed in
+the Citus/dbcomm worktree. Payload peer-open now uses the same foreground/bulk
+traffic-class lane that later carries payload writes, so responder-side
+byte-ring MRs are registered under the correct lane-local QP/PD. During
+validation we also fixed a basebackup-specific descriptor bug:
+[`TupleSinkServiceHandlePeerOpenRequest()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8597)
+now leaves `peerReceiveQueueDescriptor` zeroed for remote basebackup blackhole,
+because the responder has no frontend-visible POSIX receive queue there and the
+sender only needs the byte-ring RDMA descriptor. Warm remote RDMA basebackup
+after the fix measured `4.37s`, `4.34s`, and `4.29s` after a cold `5.35s` first
+run.
+
 This checkpoint advances the future design in
 [homer_transport_scheduler_and_payload_streams.md](../../../future-directions/citus/transport/homer_transport_scheduler_and_payload_streams.md).

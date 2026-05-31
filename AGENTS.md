@@ -439,37 +439,92 @@ traffic. In the current milestone, foreground pgbench can use Homer end to end
 for its measured transaction commands, while basebackup uses Homer for the
 archive/manifest data plane with `-X none`.
 
-Current caveat: the local foreground example below is useful for same-host
-smoke testing. For the intended farnet0 foreground client shape, use the remote
-RDMA pgbench command above while running the background basebackup streams from
-farnet1 to the farnet0 Homer service.
+Current caveat: the first post-restart run establishes peer lanes, registers
+memory, and warms PostgreSQL/service state. Use it as warmup. For performance,
+compare repeat runs without restarting PostgreSQL or either Homer service.
 
-On `farnet1`:
+Single-client foreground pgbench from `farnet0` while one remote RDMA
+basebackup runs from `farnet1` to the `farnet0` Homer service:
 
 ```sh
-OUT=/data/dbcomm/pg-citus/homer_runs/$(date +%Y%m%d_%H%M%S)
+OUT=/tmp/homer_concurrent_$(date +%s)
 mkdir -p "$OUT"
 
-for stream in 1 2; do
+(
   /usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
     -h /tmp -p 5432 -U dbcomm \
     -X none -c fast \
-    -t "homer:mode=rdma,host=10.10.1.100,port=9717,node=$((20 + stream))" \
-    -v > "$OUT/basebackup_${stream}.log" 2>&1 &
-done
+    -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=8388608' \
+    -v
+) > "$OUT/basebackup.log" 2>&1 &
+BB_PID=$!
 
-sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
-  -h /tmp -p 5432 -U dbcomm \
-  --homer \
-  --homer-database-oid "$DBOID" \
-  --homer-user-oid "$USEROID" \
-  --latency-percentiles \
-  --client-cpus=8,9,10,11 \
-  -n -M simple -c 4 -j 4 -t 20000 postgres \
-  > "$OUT/pgbench_homer.log" 2>&1
+sleep 0.5
 
-wait
-printf 'artifacts: %s\n' "$OUT"
+ssh farnet0 \
+  "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
+     -h /tmp -p 5432 -U dbcomm \
+     --homer \
+     --homer-database-oid 5 \
+     --homer-user-oid 10 \
+     --homer-peer-host 10.10.1.101 \
+     --homer-peer-port 9717 \
+     --homer-peer-node 1 \
+     --latency-percentiles \
+     --client-cpu=3 \
+     -n -M simple -c 1 -j 1 -t 10000 postgres" \
+  > "$OUT/pgbench.log" 2>&1
+PG_RC=$?
+
+wait "$BB_PID"
+BB_RC=$?
+
+printf 'pgbench_rc=%s basebackup_rc=%s artifacts=%s\n' "$PG_RC" "$BB_RC" "$OUT"
+tail -40 "$OUT/pgbench.log"
+tail -40 "$OUT/basebackup.log"
+```
+
+Four-client foreground pgbench uses the same background basebackup command and
+changes only the pgbench client/thread and CPU placement. This is a correctness
+shape for the current milestone; do not treat its throughput as a solved
+scaling result until the command/control scaling issue is addressed.
+
+```sh
+OUT=/tmp/homer_concurrent_c4_$(date +%s)
+mkdir -p "$OUT"
+
+(
+  /usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
+    -h /tmp -p 5432 -U dbcomm \
+    -X none -c fast \
+    -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=8388608' \
+    -v
+) > "$OUT/basebackup.log" 2>&1 &
+BB_PID=$!
+
+sleep 0.5
+
+ssh farnet0 \
+  "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
+     -h /tmp -p 5432 -U dbcomm \
+     --homer \
+     --homer-database-oid 5 \
+     --homer-user-oid 10 \
+     --homer-peer-host 10.10.1.101 \
+     --homer-peer-port 9717 \
+     --homer-peer-node 1 \
+     --latency-percentiles \
+     --client-cpus=3,4,5,6 \
+     -n -M simple -c 4 -j 4 -t 2500 postgres" \
+  > "$OUT/pgbench.log" 2>&1
+PG_RC=$?
+
+wait "$BB_PID"
+BB_RC=$?
+
+printf 'pgbench_rc=%s basebackup_rc=%s artifacts=%s\n' "$PG_RC" "$BB_RC" "$OUT"
+tail -40 "$OUT/pgbench.log"
+tail -40 "$OUT/basebackup.log"
 ```
 
 For a libpq foreground comparison under the same background basebackup load,

@@ -3728,7 +3728,7 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 }
 
 /*
- * HomerRunCommandAndWait is the synchronous adapter retained for setup and
+ * HomerRunCommandAndWait is the blocking adapter retained for setup and
  * cleanup paths outside the measured pgbench command loop. The hot path uses
  * HomerStartCommand plus CSTATE_WAIT_RESULT so multiple client sessions can be
  * progressed by one pgbench thread.
@@ -4872,15 +4872,15 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 
 					if (homer_mode)
 					{
-							if (st->homer_transaction_attached)
-							{
-								(void) HomerRunCommandAndWait(st,
-															  CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
-															  NULL,
-															  "tx_abort_after_error",
-															  CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
-								st->homer_transaction_attached = false;
-							}
+						if (st->homer_transaction_attached)
+						{
+							(void) HomerRunCommandAndWait(st,
+														  CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
+														  NULL,
+														  "tx_abort_after_error",
+														  CITUS_REMOTE_EXEC_SQL_RESULT_NONE);
+							st->homer_transaction_attached = false;
+						}
 
 						st->state = timer_exceeded ? CSTATE_FINISHED :
 							doRetry(st, &now) ? CSTATE_RETRY : CSTATE_FAILURE;
@@ -8856,9 +8856,9 @@ finishHomerSession(CState *st)
 	if (st->homer_transaction_attached)
 	{
 		/*
-	 * A failed transaction path should not leave the backend attached to a
-	 * transaction while the explicit session-close command is being sent.
-	 */
+		 * A failed transaction path should not leave the backend attached to a
+		 * transaction while the explicit session-close command is being sent.
+		 */
 		if (!HomerRunCommandAndWait(st,
 									CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
 									NULL,

@@ -9,15 +9,15 @@
 
 ## Summary
 
-Current state as of May 16, 2026: the client-to-PostgreSQL transaction milestone
+Current state as of May 31, 2026: the client-to-PostgreSQL transaction milestone
 is implemented and benchmarked through the integrated `pgbench --homer` path.
 That path runs the built-in TPC-B-like transaction through Homer, including
 service-owned sink-backed materialization/draining for the `SELECT abalance`
 tuple result, byte-ring result queues, code-level CPU placement, async local
-command submission, pushed completion rings, and optional in-process
-tail-latency reporting. The older standalone `homer_pgbench` proof-of-concept
-runner has been removed from the Citus/dbcomm tree; it is no longer a benchmark
-entry point.
+command submission, pushed completion rings, in-band tuple-result EOS, and
+optional in-process tail-latency reporting. The older standalone
+`homer_pgbench` proof-of-concept runner has been removed from the Citus/dbcomm
+tree; it is no longer a benchmark entry point.
 
 Important scope update: `pgbench --homer` now supports both the original
 farnet1-local client SQL path and the farnet0-client-to-farnet1-PostgreSQL RDMA
@@ -25,8 +25,9 @@ path. In remote mode, pgbench maps the farnet0 local Homer service, the farnet0
 service opens a peer `CLIENT_SQL_SESSION` on the farnet1 service, commands and
 pushed completions move over service-to-service RDMA, and tuple-result sinks are
 translated back to frontend-visible receive descriptors on farnet0. The
-remaining cross-node gap is multi-client scaling, not basic single-client
-correctness.
+remaining cross-node gap is closing the gap with the farnet1-local
+shared-memory path and making transport scheduling policy explicit; basic
+single-client and multi-client remote correctness are both working.
 
 The shared Homer client/session pieces are:
 
@@ -62,6 +63,22 @@ Complete for the current simple-mode milestone:
   maps the byte-ring descriptor, and
   [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1054)
   parses complete tuple-view records and advances byte credit.
+- Finite tuple results no longer close through a peer-control close request.
+  [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service.c:1801)
+  marks the final tuple-view transport record with
+  [`CITUS_TUPLE_SINK_TRANSPORT_FLAG_EOS`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/tuple_sink_protocol.h:37),
+  or publishes a zero-row EOS record through
+  [`SubmitCitusTupleSinkEmptyEosRecord()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service.c:1720)
+  when no payload record is available.
+- Terminal command completion for row-producing client SQL is gated on payload
+  EOS through
+  [`HomerServicePayloadStreamResultEosPosted()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3568).
+  If the backend marks EOS after the service already copied the last record,
+  [`HomerServiceAppendTupleViewEosRecordToProducerByteRing()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8950)
+  appends a synthetic zero-row EOS record. The frontend tracks this with
+  [`HomerClientResultSink.eosSeen`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_client.h:68)
+  while draining in
+  [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:2806).
 - Code-level benchmark placement exists: `--client-cpu` for pgbench, `HOMER_SERVICE_CPU` for the service, and `HOMER_REMOTE_EXEC_BACKEND_CPU` carried through the backend spawn protocol.
 - `--latency-percentiles` prints exact p50/p95/p99/max from in-process pgbench samples. For `-t` runs, sample vectors are preallocated before benchmark timing, so the measured path is a direct append.
 - `src/tools/homer_pgbench_single_client_compare.sh` runs paired Homer/libpq single-client comparisons with the same seeds and records process-placement snapshots.
@@ -70,6 +87,42 @@ Complete for the current simple-mode milestone:
 
 Current measured status on farnet1:
 
+- May 31, 2026 no-peer-close/EOS checkpoint: the earlier close-specific
+  blocking peer-control exception is gone. Tuple-result EOS is an in-band
+  payload-stream fact, and terminal completion is pushed only after the EOS
+  record is posted and its source bytes are retired. Final validation after the
+  rebuild/reinstall/sync cycle: warmed remote c1/j1 `-t 20000` completed
+  `20000/20000` with zero failures at `4820.286 TPS`, p50 `0.205 ms`, p99
+  `0.228 ms`; warmed remote c4/j4 `-t 10000` completed `40000/40000` with zero
+  failures at `11144.880 TPS`, p50 `0.350 ms`, p99 `0.605 ms`; warmed remote
+  RDMA blackhole basebackup completed in `4.35s`. A final short smoke after
+  reinstall/sync completed `100/100` with zero failures at `3111 TPS`; use the
+  warmed longer runs for performance comparisons.
+- May 30, 2026 async peer-control cleanup checkpoint: the service-to-service
+  peer-control path now has explicit async start/poll operations and async
+  control publication underneath the remaining blocking adapters. The
+  key code points are
+  [`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6456),
+  [`TupleSinkServicePollPeerRequestRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6623),
+  [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3786),
+  and
+  [`TupleSinkServiceDrainTaggedSendCompletions()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1497).
+  Request publishes borrow op-owned registered source storage; response
+  publishes borrow preallocated response publish slots; tagged send CQEs retire
+  those sources later. The blocking adapter remains for some cold/setup and
+  legacy call sites, but it now waits on an explicit op handle rather than on an ambient
+  connection-wide response.
+  Final validation after rebuilding, installing, syncing the farnet0 service
+  binary, and restarting PostgreSQL plus both Homer services: warmed remote
+  c1/j1 `-t 20000` completed `20000/20000` with zero failures at
+  `4869.43 TPS`, p50 `0.203 ms`, p99 `0.224 ms`; warmed remote c4/j4
+  `-t 10000` completed `40000/40000` with zero failures at `11457.72 TPS`,
+  p50 `0.337 ms`, p99 `0.594 ms`; warmed remote RDMA blackhole basebackup
+  completed in `4.32s`; concurrent remote c4 pgbench plus remote RDMA
+  basebackup completed with both rc=0, pgbench `9486.10 TPS`, p50 `0.383 ms`,
+  p99 `0.772 ms`, and basebackup `4.45s`. The first post-restart c1 run had a
+  cold/warmup outlier (`1173 ms` max latency), so use the warmed repeat for
+  steady-state comparison.
 - May 16, 2026 real two-node RDMA client-SQL checkpoint: after adding remote
   Homer pgbench options, peer `CLIENT_SQL_SESSION` open/bind support, direct
   RDMA command-mailbox forwarding, peer pushed completions, result-sink
@@ -213,7 +266,10 @@ Still incomplete or intentionally scoped out:
 - normal frontend authentication and name-to-OID mapping; current prototype still takes database/user OIDs
 - SQL command tags, SQLSTATE, and authoritative dynamic session state in command completion
 - cancellation and robust error propagation
-- multi-client real-RDMA scaling for client SQL sessions
+- multi-client real-RDMA scaling is correct, but still below the best farnet1
+  local shared-memory path; future work should separate traffic-class resources
+  and scheduler policy rather than treating the current fixed-priority service
+  loop as final
 - WAL/replication-path Homer support needed for the full basebackup /
   network-interference benchmark
 - DPU-oriented service/control transport; current service still polls host shared memory and uses fixed control slots
@@ -257,7 +313,9 @@ The frontend API has been split out of the standalone runner:
 - [`HomerClientOpenResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:946), [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1054), and [`HomerClientCloseResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1031) map, drain, and close the backend-produced tuple-result sink named by command completion metadata.
 - [`HomerClientCloseSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:496) remains a public control-plane close API; the service translates it into the internal typed `CLIENT_SQL_SESSION_CLOSE` command when a persistent socketless backend is active.
 
-The API still exposes the current one-command-at-a-time semantics. That is intentional for the single-client milestone; command pipelining and concurrent sessions remain separate design work.
+The API still exposes one-command-at-a-time semantics. That is intentional for
+the simple-mode pgbench milestone; command pipelining remains separate design
+work.
 
 Update: multi-client pgbench now works for the local client-SQL path with one
 Homer session per pgbench client. It is still one command in flight per session;
@@ -267,7 +325,7 @@ command pipelining remains future work.
 
 - [`homer_mode`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:274) is an opt-in transport switch. The default `PGconn` / libpq path remains unchanged unless `--homer` is present.
 - [`CState.homer_session`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:609) and [`TState.homer_control`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:676) add Homer state beside pgbench's original libpq connection state.
-- [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3396) is the synchronous adapter from pgbench's one-command-at-a-time execution to `HomerClientStartCommandWithCompletionFlags()` plus pushed completion reads. It opens and drains a result sink when the backend publishes `CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY`.
+- [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3737) is the blocking adapter retained for setup/cleanup paths outside the measured command loop. The measured Homer path uses [`HomerStartCommand()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3612) plus [`CSTATE_WAIT_RESULT`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:4753), so one pgbench thread can keep progressing multiple client sessions.
 - [`sendHomerCommand()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3390) maps exact `BEGIN`, `COMMIT` / `END`, and `ROLLBACK` SQL text to typed Homer lifecycle commands. Ordinary SQL is sent as `CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE`.
 - [`HomerSqlLooksRowProducing()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3230) requests tuple-result mode for `SELECT`, `WITH`, and `VALUES` statements. This covers the built-in pgbench `SELECT abalance` command without hard-coding the `(abalance int8)` shape.
 - [`sendCommand()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3507) branches to Homer only in `--homer` mode; the existing `PQsendQuery()`, `PQsendQueryParams()`, and `PQsendQueryPrepared()` branches remain the normal behavior.
@@ -453,7 +511,9 @@ latency average = 0.327 ms
 tps = 3053.453762 (without initial connection time)
 ```
 
-A closer, but still imperfect, sanity check is stock `pgbench -C`, because the current Homer runner pays a session open/close cost per transaction:
+A closer, but still imperfect, historical sanity check was stock `pgbench -C`,
+because the then-current standalone Homer runner paid a session open/close cost
+per transaction:
 
 ```sh
 sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench -n -C -c 1 -j 1 -t 1000 postgres
@@ -465,7 +525,14 @@ average connection time = 2.031 ms
 tps = 260.925608 (including reconnection times)
 ```
 
-This is not an apples-to-apples final benchmark. The Homer runner currently opens and closes one `REMOTE_EXEC_OP_CLIENT_SQL_SESSION` per transaction, while normal stock pgbench keeps one connection/backend context for the client. Even stock reconnect-per-transaction pgbench is substantially faster than the initial Homer path, so the gap was real, but the persistent-connection pgbench number overstates the direct comparison. The number is useful as a baseline for the implemented prototype, not as a claim about the intended offloaded design.
+This was not an apples-to-apples final benchmark. That early Homer runner opened
+and closed one `REMOTE_EXEC_OP_CLIENT_SQL_SESSION` per transaction, while normal
+stock pgbench keeps one connection/backend context for the client. Even stock
+reconnect-per-transaction pgbench was substantially faster than the initial
+Homer path, so the gap was real, but the persistent-connection pgbench number
+overstated the direct comparison. The number is useful as historical evidence
+for why the persistent-session pgbench integration became the benchmark path,
+not as a current performance claim.
 
 Follow-up performance sanity checks:
 
@@ -476,7 +543,13 @@ Follow-up performance sanity checks:
 homer_pgbench: transactions=1000 completed=1000 failed=0 scale=1 elapsed_ms=3733.753 tps=267.827 latency_avg_ms=3.734 latency_min_ms=3.134 latency_max_ms=5.134 latency_stddev_ms=0.269
 ```
 
-That puts the current Homer prototype in the same rough range as stock `pgbench -C`, confirming that the original ~27 ms result was dominated by sleep-based polling. It also confirms that the remaining order-of-magnitude gap versus persistent stock pgbench is primarily lifecycle/model mismatch: the current Homer runner still creates a service session and socketless backend per transaction instead of keeping one client SQL session/backend alive across many transactions.
+That put the early Homer prototype in the same rough range as stock
+`pgbench -C`, confirming that the original ~27 ms result was dominated by
+sleep-based polling. It also confirmed that the remaining order-of-magnitude gap
+versus persistent stock pgbench was primarily lifecycle/model mismatch: the old
+standalone Homer runner still created a service session and socketless backend
+per transaction instead of keeping one client SQL session/backend alive across
+many transactions.
 
 Later correction after explicit CPU pinning:
 
@@ -855,6 +928,195 @@ Remaining likely bottlenecks:
   model; it is not the current hot path.
 - The backend still uses the normal parse/plan/execute path per SQL string in [`RemoteExecBackendExecuteSqlCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1437). Prepared-mode pgbench is the right future milestone for separating communication-stack overhead from SQL parse/plan overhead.
 
+## May 17, 2026 Remote RDMA Command-Ring Checkpoint
+
+The real two-node pgbench path now uses a multi-slot command mailbox instead of
+one frontend/backend command record per session. The shared ABI is
+`CitusRemoteExecLocalCommandMailbox` with
+`CITUS_REMOTE_EXEC_LOCAL_COMMAND_MAILBOX_SLOTS = 64` and
+`commandSlots[]` in
+[`remote_execution_backend_protocol.h`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/include/distributed/homer/remote_execution_backend_protocol.h:34),
+with the protocol bumped to `v10` to avoid stale shared-memory reuse.
+
+Current command publication behavior:
+
+- [`HomerClientStartDirectCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/bin/homer_client.c:1982)
+  writes the next frontend command into the ring slot selected by
+  `CitusRemoteExecLocalCommandSlotIndex()`, then publishes slot-local
+  `readySeq` and the aggregate `publishedEpoch`.
+- [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4870)
+  forwards remote client-SQL commands directly from that registered frontend
+  slot, instead of copying the full command record into
+  `clientSqlCommandScratch`.
+- On devices/QPs that report whole-message in-order RDMA write placement,
+  [`TupleSinkServicePeerConnectionSupportsWholeMessageWriteRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2751)
+  allows one fixed-slot self-publishing RDMA write of the existing
+  `[CitusRemoteExecLocalCommandRecord][readySeq]` slot. The capability is
+  queried during QP setup in
+  [`TupleSinkServiceInitConnectionResources()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1311).
+- On the current farnet setup, `ibv_query_qp_data_in_order()` reports no
+  whole-message support, likely because PCI write ordering is configured as
+  relaxed. The active measured path therefore falls back to two RDMA writes:
+  an unsignaled command-record write with
+  [`TupleSinkServicePostPeerRegisteredBytesUnsignaledRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4133),
+  followed by a tagged `readySeq` write through
+  [`TupleSinkServicePostPeerRegisteredCommandBytesRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4191).
+- [`ExecuteRemoteExecBackendCommand()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2131)
+  polls `readySeq == expectedCommandSequence` and delays receiver credit
+  (`consumedEpoch`) until after terminal completion publication. This keeps a
+  borrowed command-slot record valid while the backend dispatches it.
+- Receiver-side lifecycle checks in
+  [`TupleSinkServiceCommandMailboxBusy()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5128)
+  use the same `readySeq` predicate for cross-node client-SQL receiver sessions,
+  so the backend no longer writes the mailbox `publishedEpoch` header on every
+  command.
+
+The old `HOMER_SERVICE_CLIENT_SQL_COMMAND_IMM_PUBLISH` experiment is compiled
+out for this milestone because its immediate value carried only a session token,
+not the slot/sequence information needed for a multi-slot command ring:
+[`tuple_sink_service_process.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:222).
+
+Correctness and warmed remote RDMA performance after the first command-ring
+checkpoint:
+
+```text
+remote farnet0 -> farnet1, c1/j1, 20000 tx, pgbench_history truncated before each run:
+run 1: cold/session outlier, 3552 TPS, p99 0.229 ms, max 1460.511 ms
+run 2: 4872 TPS, average 0.205 ms, p99 0.224 ms
+run 3: 4296 TPS, average 0.233 ms, p99 0.254 ms
+
+remote farnet0 -> farnet1, c4/j4, 10000 tx/client, pgbench_history truncated before each run:
+run 1: 10763 TPS, average 0.372 ms, p99 0.629 ms
+run 2: 10711 TPS, average 0.373 ms, p99 0.642 ms
+run 3: 10767 TPS, average 0.372 ms, p99 0.632 ms
+```
+
+All six final runs completed with zero failed transactions. The first c1 run
+after service/Postgres restart still includes a setup-sized transaction outlier;
+use warmed repeats for steady-state comparison. The prepared readySeq helper and
+backend header-store removal improved the best c1 warmed run slightly and kept
+c4 stable, but did not remove the broader c1 run-to-run variance.
+
+The follow-up command-send optimization pass implemented asynchronous
+source-slot retirement. Source `consumedEpoch` now advances immediately after a
+successful post in
+[`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5148),
+and local RNIC send CQEs retire outstanding command writes later through
+[`TupleSinkServicePollRemoteClientSqlCommandWriteCompletions()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1866).
+The default build still signals every command write with
+`HOMER_SERVICE_CLIENT_SQL_COMMAND_SIGNAL_INTERVAL=1` at
+[`tuple_sink_service_process.c`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:185),
+because deferred signaled checkpoints did not improve this workload.
+
+Deferred CQE experiments:
+
+```text
+remote farnet0 -> farnet1, default interval=1 after deferred-CQE code:
+c1/j1, 50000 tx/client:
+run 1: 4845 TPS, average 0.206 ms, p50 0.204 ms, p99 0.226 ms
+run 2: 4294 TPS, average 0.233 ms, p50 0.230 ms, p99 0.258 ms
+run 3: 4302 TPS, average 0.232 ms, p50 0.230 ms, p99 0.254 ms
+
+Earlier interval=8/32 tests were correct but did not improve throughput or
+tail latency. Reducing CQE count is therefore not the current dominant cost.
+```
+
+The current deferred-CQE implementation is intentionally conservative and should
+not be treated as the final transport-resource design. It uses a global
+outstanding table,
+[`TupleSinkServiceClientSqlCommandWriteCompletion`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:687),
+and batched retire-through currently scans that table in
+[`TupleSinkServiceRetireClientSqlCommandWriteCompletionsThrough()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1684).
+A cleaner successor should move this state into each transport resource/QP:
+`nextPostOrdinal`, `completedPostOrdinal`, and an ordered FIFO of minimal pending
+command descriptors. A signaled CQE then advances the per-resource frontier and
+pops FIFO entries in order, with no global table scan.
+
+There is also a temporary CQ ownership shim. Command, payload, and control
+writes currently share some peer send-CQ plumbing. Since `ibv_poll_cq()` consumes
+CQEs, a subsystem-specific poller can see another subsystem's completion first.
+The RDMA layer therefore stashes cross-subsystem CQEs in
+[`TupleSinkServicePollPeerPayloadSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4831)
+and
+[`TupleSinkServicePollPeerCommandSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4983).
+This is correct but not the desired architecture. The next transport-resource
+split should give each traffic class/QP ownership of its own post/completion
+frontiers; a near-term cleanup would be one central CQ demux per connection
+instead of multiple pollers plus stashing.
+
+May 17, 2026 update: the first traffic-class peer-transport split is now
+implemented. The critical-control, foreground-payload, and bulk-payload classes
+resolve to separate RDMA-CM connections/QPs/CQs in
+[`TupleSinkServiceFindOutgoingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2599),
+and payload open/close uses the stream's lane via
+[`TupleSinkServiceSendPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5787).
+This removes command/control and bulk payload from the same posted-WR queue, but
+does not yet shard client-SQL commands across multiple critical-control QPs.
+Validation after a warmed repeat showed c1/j1/t50000 at `4835.21 TPS`, p50
+`0.205 ms`, p99 `0.225 ms`, zero failures. A c4/j4/t10000 run was correct
+(`40000/40000`, zero failures) but only `7598.59 TPS` with p99 `8.136 ms`; treat
+that as remaining multi-client scaling work, not as a solved performance
+result.
+
+May 30, 2026 update: peer-control request/response matching now uses explicit
+op slots, and the transport exposes async start/poll helpers:
+[`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6456)
+and
+[`TupleSinkServicePollPeerRequestRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6623).
+At this checkpoint, some service call sites still used the blocking compatibility
+adapter
+[`TupleSinkServiceSendPeerRequestRdmaInternal()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6731),
+and outgoing RDMA-CM connection setup still waits inside
+[`TupleSinkServiceConnectOutgoingPeerConnection()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2780).
+The future-direction note now records the full nonblocking plan: convert
+RDMA-CM connect/accept into lane phases, bind peer-control ops to
+session/stream/control-slot continuations, and keep the warmed transaction hot
+path free of new allocations, broad scans, or idle-CQ polling.
+
+May 31, 2026 update: the close/EOS exception has been removed rather than made
+into another peer-control operation. [`TupleSinkServicePeerCloseSinkBestEffort()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8076)
+now performs local sender-side cleanup after payload EOS has been represented in
+the stream. Normal remote client SQL commands and completions use the direct
+command/completion rings; the remaining blocking adapters are setup/cleanup or
+legacy backend/backend scaffolding, not the measured pgbench command path.
+
+Validation after the op-slot checkpoint separated standalone and concurrent
+measurements:
+
+```text
+standalone remote c4/j4 Homer pgbench:
+  4000/4000 transactions, zero failures on the cold smoke
+  warmed run: 11410.910599 TPS, p50 0.338 ms, p99 0.575 ms
+
+standalone remote RDMA basebackup:
+  cold run: 8.62s
+  warmed run: 4.42s
+
+concurrent remote c4/j4 Homer pgbench plus remote RDMA basebackup:
+  both processes returned exit code 0
+  pgbench: 4682.272133 TPS, p50 0.832 ms, p99 1.274 ms
+  basebackup: 15.38s
+```
+
+The concurrent result was lower than the earlier May 29 concurrent checkpoint
+recorded in the transport note (`~9.36k TPS` pgbench and `~4.45s` basebackup),
+while standalone c4 pgbench and standalone basebackup remained in the expected
+warm bands. A May 30 rerun did not reproduce the drop. With no stale
+`remote exec backend` processes visible before the run, standalone c4/t10000
+measured `11429.95 TPS`, p50 `0.337 ms`, p99 `0.591 ms`; concurrent c4/t2500
+repeats measured `9545.20`, `9636.47`, and `9473.30 TPS` while basebackup
+completed in `4.33`, `4.45`, and `4.31s`; and a concurrent c4/t10000 run
+measured `9733.60 TPS`, p50 `0.379 ms`, p99 `0.776 ms`, with basebackup
+`4.65s`. Treat the earlier `4.68k / 15.38s` artifact as stale/transient unless
+it can be reproduced under the same warm-run and cleanup procedure.
+
+Remaining caveat: the command ring is multi-slot, but the current correctness
+target is still pgbench's strict one-command-at-a-time session behavior. The
+async source-retirement work removes the inline wait on a single source slot,
+but it is not SQL command pipelining. True command pipelining still needs an
+explicit remote receiver-credit frontier before the sender may safely wrap
+remote command slots, and that belongs with the multi-resource transport work.
+
 ## Deliberate Limitations
 
 - Homer workload clients must currently run as the same OS user that owns the
@@ -882,9 +1144,11 @@ Remaining likely bottlenecks:
   in one session therefore remains future work.
 - `scalarInt64` fields still exist in shared completion structs for older/backend wrapper compatibility. They are no longer the client SQL result path and should be removed once the older shortcut is retired.
 - Command completion metadata still lacks SQL command tags, SQLSTATE, and authoritative dynamic session state.
-- The implementation now supports multiple local pgbench client sessions, with
+- The implementation now supports multiple local pgbench client sessions over
+  real RDMA, with
   one command in flight per session. It does not solve command pipelining,
-  peer-control pipelining, cancellation, or prepared statements.
+  remote receiver-credit tracking for pipelined command rings, transport-class
+  QP separation, peer-control pipelining, cancellation, or prepared statements.
 - `START_COMMAND` completion is asynchronous/pushed for the normal local
   client-SQL path. Command submission still uses fixed control slots and remains
   a future DPU/control-queue design target.
@@ -914,16 +1178,21 @@ Completed from the original client SQL plan:
 
 Partially completed:
 
-- command completion metadata: processed row count, bounded detail string, and result sink readiness/EOS metadata work; SQL command tags, SQLSTATE, and authoritative dynamic session state remain missing
+- command completion metadata: processed row count, bounded detail string, result sink readiness, and result EOS ordering work; SQL command tags, SQLSTATE, and authoritative dynamic session state remain missing
 - result modes: `TUPLE` is now backed by a service-owned tuple sink for client SQL, but richer frontend result accessors and frontend remap support for changed tuple shapes remain future work
-- service-progress fairness: local client-SQL waits now pump completion/sink background work, but peer-control progress from inside a local control-slot wait remains deferred pending nonblocking/deferred peer-control dispatch
-- async command submission: documented as the next design step; current local
-  and peer `START_COMMAND` paths still use startup wait helpers
+- service-progress fairness: the measured local and remote client-SQL paths no
+  longer depend on nested startup/completion waits, but older backend/backend
+  peer command paths still retain wait/poll scaffolding.
+- async command submission: done for the normal client-SQL pgbench path through
+  pushed command completions and direct remote command rings; still future for
+  the older backend/backend peer `START_COMMAND` path.
 
 Not completed:
 
 - prepared-mode pgbench
-- concurrent client/session handling
+- concurrent client/session correctness is implemented for the current
+  one-command-at-a-time pgbench model; scaling and transport-resource isolation
+  remain future work
 - frontend auth/user-name mapping
 - basebackup or network-interference benchmark integration
 
