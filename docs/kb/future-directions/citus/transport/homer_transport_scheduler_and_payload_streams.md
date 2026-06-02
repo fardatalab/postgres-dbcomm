@@ -815,6 +815,447 @@ There are two scheduling layers and they should stay distinct:
   still computes and posts its own payload batches directly, so it is not yet a
   transport scheduler.
 
+June 2, 2026 design checkpoint: the two layers should be implemented through a
+shared scheduling framework, not as two unrelated local mechanisms. There are
+three information flows:
+
+1. **Readiness publication**: payload, command, control, completion, and ACK
+   producers expose that DB-semantic or transport work is visible. This should be
+   frontier-plus-bitset metadata, not heap work items per object. The normal rule
+   remains prompt producer publication: do not hide complete records in the
+   database/backend producer just to form a larger batch.
+2. **Egress grants**: the scheduler grants a ready item a bounded amount of RDMA
+   posting work in bytes, records/objects, fragments, and WRs. The specialized
+   sender still knows how to validate and post its object family; the scheduler
+   controls how much it may post in this pass.
+3. **Feedback/accounting**: lanes and streams report completion pressure,
+   outstanding signaled WRs, remote-credit blockage, empty-CQ polling, and useful
+   progress. This is the information that prevents local shortsightedness between
+   the service-progress layer and the RDMA-egress layer.
+
+The forced-fragmentation implementation exposed an important frontier rule for
+the scheduler interface: **completion progress is not the same as semantic/source
+frontier progress**. The byte-ring sender now tracks signaled payload batches in
+`HomerServiceTrackPayloadCompletion()` at
+`src/backend/distributed/utils/homer/tuple_sink_service_process.c:2210` and
+drains completions while `payloadCompletionCount > 0` in
+`HomerServicePumpOutgoingPayloadStream()` at
+`tuple_sink_service_process.c:9722`. That is necessary because a partial
+fragment's send CQE can retire WRs, generated-header slots, and QP pressure
+without advancing the producer source `consumedHead`; the producer object is only
+safe to release after the `FRAGMENT_LAST` batch retires. Therefore a future
+scheduler-integrated loop should model at least four separate progress frontiers:
+
+- **transport completion/resource frontier**: local NIC send CQEs have retired
+  WRs and any lane-owned temporary publish/header resources
+- **source-release frontier**: source ring bytes/slots may be returned to the DB
+  producer
+- **semantic-object frontier**: complete tuple/basebackup/WAL objects are posted,
+  delivered, or materialized
+- **remote-credit frontier**: receiver-consumed bytes/slots have been published
+  back to the sender
+
+Service-progress grants should be able to make useful progress by draining CQEs
+even when no source bytes become reusable in that pass. Executor feedback should
+therefore report which frontier moved, not just a single `madeProgress` bit. The
+first implementation can keep simple booleans/counters, for example
+`completionEvents`, `resourceCreditsFreed`, `sourceBytesReleased`,
+`semanticObjectsCompleted`, `remoteCreditsReceived`, and `emptyPolls`. This keeps
+the scheduler from under-prioritizing CQ drain work merely because the semantic
+object frontier did not advance, and it preserves the DPU-facing distinction
+between local resource retirement and DB-visible object progress.
+
+The eventual DPU version makes the readiness path especially important. If the
+payload/control rings live on DPU memory, readiness bitsets can be DPU-local and
+cheap, and they do not need host atomics for the normal case. If a producer still
+publishes from host memory, the design should avoid DMA-updating one shared bitset
+or cache line per object. Prefer owner-written frontiers plus idempotent ready
+bits, with notification coalescing only at the metadata level. Coalescing
+readiness metadata is allowed; delaying producer publication of complete semantic
+records is not the default policy.
+
+Commands and control already have traffic classes and lanes, but that is not the
+same as being scheduler-integrated. The current service loop still progresses
+command/control through dedicated pump logic in
+[`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15170).
+The target is that command writes, completion writes, peer-control requests,
+payload writes, and ACK/maintenance work all present scheduler-ready items and
+consume grants. The first implementation may schedule only payload egress, but
+the abstraction must not make command/control a permanent side path.
+
+Service-progress scheduling should use a cheaper view than transport-egress
+scheduling. It should not run a heavy policy calculation per RDMA WR. It should
+decide which source to touch and for how long using small lane/source facts:
+ready bit, traffic class, last useful progress tick, blocked-on-credit flag,
+outstanding CQ work, bounded per-pass quantum, and starvation/debt counters.
+Transport-egress scheduling then decides the RDMA grant using byte/object/WR
+facts. In other words, both layers share readiness and feedback metadata, but
+they do not need identical decision variables.
+
+The service-progress scheduler should produce a **progress plan**, not an egress
+batch. A progress plan is a small fixed array of CPU/progress grants such as
+"poll this lane CQ up to 8 completions," "process this command ring up to 16
+slots," or "pump this payload stream once." This is what "called once per service
+pass or per small batch" means: the policy should be invoked once to select a
+bounded set of progress actions, not once per RDMA WR. The transport-egress
+scheduler is then called by the sender/progress action to decide byte/object/
+fragment/WR grants.
+
+Cheaper service-progress facts:
+
+```c
+typedef enum HomerProgressSourceKind
+{
+    HOMER_PROGRESS_SOURCE_RDMA_CM,
+    HOMER_PROGRESS_SOURCE_PEER_CONTROL,
+    HOMER_PROGRESS_SOURCE_COMMAND_RING,
+    HOMER_PROGRESS_SOURCE_COMPLETION_RING,
+    HOMER_PROGRESS_SOURCE_PAYLOAD_STREAM,
+    HOMER_PROGRESS_SOURCE_CQ_DRAIN
+} HomerProgressSourceKind;
+
+typedef struct HomerProgressSourceId
+{
+    uint16 kind;
+    uint16 index;
+    uint16 generation;
+    uint16 reserved;
+} HomerProgressSourceId;
+
+typedef struct HomerProgressSourceRef
+{
+    HomerProgressSourceId id;
+    void *owner;
+} HomerProgressSourceRef;
+
+typedef struct HomerProgressSourceCore
+{
+    HomerProgressSourceRef source;
+    HomerTransportTrafficClass trafficClass;
+    bool ready;
+    bool creditBlocked;
+    bool signaledWrPending;
+    bool resourcePressure;
+    bool sourceReleaseBlocked;
+    uint16 quantumHint;
+    uint32 outstandingSignaledWrCount;
+} HomerProgressSourceCore;
+
+typedef struct HomerProgressSourceFeedback
+{
+    uint16 emptyPollScore;
+    uint32 outstandingWrCount;
+    uint32 readyObjectCountHint;
+    uint64 readyByteCountHint;
+    uint64 transportCompletionFrontier;
+    uint64 sourceReleaseFrontier;
+    uint64 semanticObjectFrontier;
+    uint64 remoteCreditFrontier;
+    uint64 lastTouchedTick;
+    uint64 lastProgressTick;
+} HomerProgressSourceFeedback;
+```
+
+The facts above are deliberately source/lane level. They do not carry full
+payload byte ranges, tuple contracts, basebackup headers, or per-object work
+records. `kind/index/generation` is a compact typed handle into fixed per-kind
+arrays, not a hash/map lookup key. The hot scheduler ref also carries `owner`, so
+the executor can use a direct pointer after readiness construction validates the
+generation. If measurements show generation checks are too expensive, keep them
+at source registration / ready-list construction or compile them under a debug
+gate; do not add a runtime lookup table to the hot executor path.
+
+Split the source state in implementation for cache locality and policy
+neutrality, not because fixed priority is the only target. `HomerProgressSourceCore`
+is the compact, frequently read routing/control state that every policy needs:
+ready bit, traffic class, blocked flags, quantum hint, outstanding signaled WR
+count, and the direct owner pointer. `HomerProgressSourceFeedback` is the
+canonical executor feedback: counters, byte/object hints, frontiers, empty-poll
+score, and last-touch/progress ticks. It is updated when executors report
+movement, but each policy chooses the subset it reads. A fixed-priority policy
+can read mostly `Core`; DRR can read byte/WR feedback and its own deficit state;
+age/deadline policies can read ready-since or last-progress facts. Policy-private
+mutable state such as round-robin cursors, deficit counters, weights, and
+deadline parameters should live outside both canonical structs in
+policy-specific state.
+
+The four frontier fields are optional per source kind: a CQ-drain source may
+mainly expose `transportCompletionFrontier`, while a payload source exposes all
+four. Keeping them in the same feedback vocabulary prevents the policy from
+treating "CQ drained but source object not yet releasable" as no progress. ACK
+credit is not a separate first-class source in the first scheduler design; it is
+a lane-CQ/transport-resource event kind that updates remote-credit or
+transport-completion facts for the affected owner.
+
+Progress grants should also be small:
+
+```c
+typedef struct HomerProgressGrant
+{
+    HomerProgressSourceRef source;
+    uint16 maxPolls;
+    uint16 maxItems;
+    uint16 maxPumpCalls;
+    uint16 flags;
+} HomerProgressGrant;
+
+typedef struct HomerProgressPlan
+{
+    uint16 grantCount;
+    HomerProgressGrant grants[HOMER_PROGRESS_PLAN_MAX_GRANTS];
+} HomerProgressPlan;
+```
+
+Readiness and planning are two separate data structures:
+
+- **Ready bitsets** are persistent per-kind/per-traffic-class sieves. A set bit
+  means "this source may have useful work"; a clear bit means "do not touch this
+  source in the normal service pass." Bits are set/cleared from authoritative
+  owner-written frontiers, not from per-object heap work items.
+- **Ready arrays / progress plans** are stack-local bounded work orders for one
+  service pass. The fixed-priority policy takes a limited number of set bits,
+  validates generation, resolves the direct owner pointer, checks cheap hot
+  facts such as blocked flags and outstanding signaled WRs, emits grants, and
+  stops when the plan or policy budget is full. It should not build grants for
+  every ready source on every pass.
+
+For the first fixed-priority policy, grant construction should be simple: scan
+priority-class bitsets in order, choose a bounded number of sources, fill
+`HomerProgressGrant` with the hot source ref and small quanta, then execute the
+stable plan. Executors may update readiness while running, but the current pass
+does not recompute policy per RDMA WR or per object.
+
+Scheduler-facing executors should return frontier-specific progress, not a
+`bool madeProgress` result. There is no target compatibility-wrapper layer: the
+scheduler-integrated service loop should consume this rich result directly, and
+any loop-level "did anything happen" decision should be derived locally from the
+result fields rather than exported as an executor API:
+
+```c
+typedef struct HomerProgressResult
+{
+    bool stillReady;
+    bool blockedOnCredit;
+    bool blockedOnLocalResources;
+    uint16 emptyPolls;
+    uint16 cqesDrained;
+    uint16 itemsProcessed;
+    uint16 wrsPosted;
+    uint64 bytesPosted;
+    uint64 transportCompletionFrontier;
+    uint64 sourceReleaseFrontier;
+    uint64 semanticObjectFrontier;
+    uint64 remoteCreditFrontier;
+} HomerProgressResult;
+```
+
+This result is stack-local per executor call. It is not a heap event object and
+does not need to preserve a history. The service loop folds it back into the
+persistent core/feedback state for that source/lane. Do not carry
+`bool madeProgress` into the scheduler source state, policy input, or executor
+API. Executor function return values should instead mean success/failure, with
+all progress facts reported through the result object.
+
+Candidate service-progress policies:
+
+- **fixed priority bounded**: critical control/completion feedback first, then
+  foreground, then bulk, with a hard per-source quantum. This is the first
+  implementation target.
+- **round robin over active sources**: useful as a fairness sanity check when
+  fixed priority over-favors one class.
+- **deficit over CPU quanta**: sources accumulate progress debt in units such as
+  poll calls, command slots, or pump calls rather than bytes.
+- **feedback-aware polling/backoff**: sources with repeated empty polls are
+  skipped for a few passes unless another readiness bit/frontier changes.
+- **foreground-biased progress**: foreground commands/results get lower latency
+  while bulk still receives bounded progress.
+
+This policy surface can be pluggable, but it should remain much narrower and
+cheaper than the egress policy surface. It is a CPU-use strategy, not the primary
+research policy for RDMA byte/WR allocation. The first version should compile to
+simple branches over active bitsets/fixed arrays and should avoid heap
+allocation, broad scans, and per-WR callbacks.
+
+Eventual scheduler-enabled Homer plan:
+
+1. **Define scheduler-facing interfaces and invariants.**
+   Define `HomerProgressSourceId`, `HomerProgressSourceRef`,
+   `HomerProgressSourceCore`, `HomerProgressSourceFeedback`,
+   policy-specific state, `HomerProgressGrant`, `HomerProgressPlan`,
+   `HomerProgressResult`, and later `HomerEgressGrant` before changing pump
+   behavior. Scheduler-facing executor return values mean success/failure only;
+   progress is reported through the result object. The current
+   [`HomerPayloadProgressDelta`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:858)
+   is the payload-specific prototype for the generic result shape, not the final
+   public scheduler type.
+
+2. **Register stable progress sources and ownership.**
+   Source registration happens at lane/session/stream/control setup time and uses
+   fixed tables, not heap work records. Candidate source kinds are:
+   peer-control lane, local control slots, remote client SQL command ring,
+   command/completion ring, payload stream, lane-CQ drain, and RDMA-CM setup.
+   Use per-kind arrays that already match the current ownership model
+   (sessions, streams, lanes, control slots) and compact `kind/index/generation`
+   identifiers. Hot grants carry the already-resolved owner pointer after the
+   ready-plan builder validates the generation; executors should not perform a
+   hash/map lookup.
+
+3. **Derive source readiness from existing frontiers.**
+   Producers should not write scheduler-ready bits. The service derives them:
+   payload ready when producer `publishedTail` exceeds the service
+   scheduled/posted frontier; command ready when command-slot `readySeq` or the
+   command-ring frontier is ahead of consumed/forwarded state; completion ready
+   when a completion ring/mailbox has unconsumed events; peer-control ready when
+   the lane mailbox, CM state, or CQ indicates pending work; local-control ready
+   when a fixed control slot is `REQUEST_READY`; CQ-drain ready when a lane has
+   signaled WRs pending. Persistent ready bitsets are the cheap sieve that avoid
+   broad scans. A bounded stack-local ready array / progress plan is built from
+   those bitsets each service pass by taking only enough sources to fill the
+   fixed-priority plan. This preserves the DPU-facing rule that readiness bits
+   are scheduler-local hints derived from authoritative owner-written frontiers.
+
+4. **Make CQ draining lane-owned, not owner-polled.**
+   This cleanup should happen before or as the first part of the
+   scheduler-integrated service loop. Traffic-class lanes/QPs solved posted-WR
+   head-of-line blocking between classes, but the current send-CQ API is still
+   pull-oriented: a payload stream or command path calls a helper asking "is
+   there a completion for this owner?" When that helper polls the lane's CQ and
+   sees a tagged completion for a different owner, it must stash the unrelated
+   completion so it is not lost. That is why
+   [`TupleSinkServiceStashPayloadSendCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1222),
+   [`TupleSinkServicePopStashedPayloadSendCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1250),
+   and the owner-specific
+   [`TupleSinkServicePollPeerPayloadSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6142)
+   helper still exist.
+
+   The target service-progress model should instead have a lane-CQ progress
+   source. A progress grant such as "drain bulk-payload lane send CQ up to N
+   completions" should call a lane-owned CQ drain helper, decode every CQE's
+   tagged `wr_id`, and dispatch it immediately to the owning fixed state:
+
+   - payload CQE -> `{serviceStreamId, completionToken}` -> payload stream
+     completion tracker / frontier
+   - command CQE -> outstanding command-post slot or command-ring post frontier
+   - peer-control CQE -> lane-owned peer-control op slot / publish slot
+   - unknown generation or owner -> stale event counter, then ignore or mark only
+     the affected owner failed
+
+   The CQ drain should update owner state immediately through small apply
+   functions that only adjust frontiers, counters, and ready bits; those apply
+   functions must not call back into the service pump or post unrelated new
+   work. A small bounded stack-local event array is only a fallback if a concrete
+   layering issue prevents direct dispatch. It should not allocate heap work
+   items or stash unrelated CQEs in side queues. If an event/dispatch budget
+   fills, stop polling and leave remaining CQEs in the verbs CQ for the next
+   lane-CQ grant.
+
+   This changes completion flow from:
+
+   ```text
+   stream pump asks for stream X completion
+     -> lane CQ may return stream Y / command / control CQE
+     -> stash unrelated event
+     -> stream Y later pops from stash
+   ```
+
+   to:
+
+   ```text
+   scheduler grants lane CQ drain
+     -> drain up to N CQEs from that lane
+     -> dispatch each CQE directly to its owner
+     -> owner source facts/frontiers update before egress grants are chosen
+   ```
+
+   With this shape, the scheduler sees completion pressure as lane feedback, not
+   as a hidden side effect of whichever stream happened to poll the CQ. It also
+   removes the `memmove`/linear-search side queues from the normal completion
+   path and makes future DPU/offload placement cleaner: the DPU-side lane owner
+   drains one CQ and updates lane-local/stream-local frontiers without bouncing
+   unrelated completions through host-visible temporary queues.
+
+5. **Turn current dedicated pumps into specialized grant executors.**
+   The unified scheduler should not erase object-specific logic. It should route
+   grants to specialized executors that fill `HomerProgressResult` directly:
+   - command executor adapted from
+     [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4884),
+     scoped to one command-ring source and bounded by `maxItems`
+   - local-control executor adapted from
+     [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14972),
+     bounded by slot count or per-pass item count
+   - peer-control/lane executor adapted from
+     [`TupleSinkServicePumpPeerConnections()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8666)
+     and
+     [`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7084),
+     scoped to a lane/source
+   - completion executor adapted from
+     [`TupleSinkServiceConsumeAllCompletionMailboxes()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4578),
+     scoped to a session/completion source when possible
+   - payload executor adapted from
+     [`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11509),
+     which then calls the egress scheduler before posting RDMA work
+
+   Unification is at the scheduling interface: source facts, progress grants,
+   egress grants, and feedback. It is not a mandate to use one generic object
+   format for commands, peer control, tuple payload, and basebackup payload.
+
+6. **Build the scheduler-integrated service loop.**
+   The current fixed ordering in
+   [`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15170)
+   should become:
+
+   ```text
+   derive source readiness from authoritative frontiers
+   build a ready set over registered sources
+   choose a stack-local progress plan
+   execute bounded grants through specialized executors
+   fold each HomerProgressResult into persistent source/lane facts
+   derive any loop-level idle/backoff decision from those results
+   ```
+
+   This is the milestone where the service loop consumes
+   `HomerProgressResult` directly. There should be no persistent compatibility
+   wrapper layer that converts scheduler results back to `bool madeProgress`.
+   The first policy is still fixed-priority bounded and should intentionally
+   mimic the current ordering so validation isolates loop refactoring from policy
+   changes.
+
+7. **Move egress grants under all send-capable sources.**
+   Payload egress is the first target. The sender path in
+   [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9703)
+   should consume a byte/object/fragment/WR grant instead of choosing the final
+   batch solely from internal caps such as
+   `HOMER_SERVICE_PAYLOAD_SEND_COMPLETION_BATCH`. Later, peer-control publication
+   through
+   [`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3975)
+   and async peer requests through
+   [`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6928)
+   should also become grant-consuming critical-control work rather than
+   open-coded "publish now" side paths.
+
+8. **Add real scheduling policies.**
+   Once the fixed-priority bounded loop is correct and no-regression, add
+   round-robin, weighted/deficit, and age/deadline-aware policies. This is the
+   research scheduler layer. It should come after source facts, lane-owned CQ
+   drain, grant executors, and fixed-priority service-loop integration are
+   measurable.
+
+Initial service-progress policy should be deliberately simple:
+
+```text
+1. drain bounded critical control and command/completion events
+2. drain bounded CQ/credit feedback for lanes that have outstanding work
+3. build or refresh ready items from active ready bits/frontiers
+4. ask the egress scheduler for byte/object/fragment/WR grants
+5. consume grants with specialized senders
+6. clear a ready bit only if frontiers prove no ready work remains
+```
+
+This keeps the one-thread service-loop implementation viable today while leaving
+room to split service-progress and egress scheduling onto separate threads later.
+If split, readiness/frontier metadata, explicit grant records, and lane feedback
+become the inter-thread interface.
+
 Candidate work items should be explicit metadata, not a bit mask:
 
 ```c
@@ -825,15 +1266,24 @@ typedef struct HomerTransportReadyItem
     uint64 serviceSessionId;
     uint64 serviceStreamId;
     uint32 priority;
+    uint32 weight;
     uint32 estimatedWrCount;
+    uint32 estimatedObjectCount;
+    uint32 estimatedFragmentCount;
     uint64 estimatedBytes;
+    uint64 sourceReleaseFrontier;
+    uint64 semanticObjectFrontier;
+    uint64 remoteCreditFrontier;
     uint64 readySinceTick;
     void *owner;
 } HomerTransportReadyItem;
 ```
 
 The ready set is the current fixed-size array of eligible send work. It does not
-encode ordering. The selected policy owns ordering and grants.
+encode ordering. The selected policy owns ordering and grants. Ready-item
+frontiers are hints used to size a grant and avoid selecting work that cannot
+make egress progress; authoritative ownership still remains in the stream/lane
+state.
 
 Candidate traffic classes:
 
@@ -861,26 +1311,79 @@ The scheduler grant should be object-aware:
 typedef struct HomerTransportGrant
 {
     uint32 maxObjects;
+    uint32 maxFragments;
     uint32 maxWrCount;
     uint64 maxBytes;
+    uint32 targetFragmentBytes;
+    uint32 flags;
 } HomerTransportGrant;
 ```
 
-The transport publisher reports actual progress:
+The transport publisher reports actual typed progress. As with
+`HomerProgressResult`, it should not return or store a generic
+`madeProgress` field; any loop-level idle/backoff decision is derived from the
+typed counters/frontiers:
 
 ```c
 typedef struct HomerTransportProgress
 {
-    bool madeProgress;
-    uint32 postedObjects;
-    uint32 postedWrCount;
-    uint64 postedBytes;
     bool stillReady;
+    bool blockedOnRemoteCredit;
+    bool blockedOnLocalCompletion;
+    uint32 postedObjects;
+    uint32 postedFragments;
+    uint32 postedWrCount;
+    uint32 completedCqCount;
+    uint64 postedBytes;
+    uint64 transportCompletionFrontier;
+    uint64 sourceReleaseFrontier;
+    uint64 semanticObjectFrontier;
+    uint64 remoteCreditFrontier;
 } HomerTransportProgress;
 ```
 
 Deficit policies should account bytes or WRs rather than just objects. Otherwise
 a tiny control message and an 8 MiB basebackup chunk look equally expensive.
+
+Fragmentation is part of the scheduler design, even if the first implementation
+does not fragment objects. The scheduler should be able to grant a prefix of a
+large basebackup/WAL/tuple-result transport object so smaller foreground work can
+interleave. The first policies can require whole-record grants; later policies
+should expose tunables such as `maxGrantBytes`, `maxGrantFragments`, and an
+MTU-like target fragment size. Upper layers should still observe complete
+semantic objects only; fragmentation and reassembly are transport-substrate
+responsibilities.
+
+June 2, 2026 clarification: the first fragmentation design should stay much
+lighter than a standalone generic `HomerPayloadFragmentHeader`. Under the
+initial constraints that one stream is ordered on one RC QP/lane and transport
+records do not wrap around the byte ring, the existing
+`CitusTupleSinkTransportHeader` can remain the only transport envelope:
+`payloadBytes` means fragment byte count, `sinkSequence` remains the semantic
+object sequence, and small `FRAGMENT_FIRST` / `FRAGMENT_LAST` flags identify the
+object boundary. `FIRST | LAST` means the current whole-record behavior. `FIRST`
+starts one active reassembly object, plain continuation appends to it, and
+`LAST` makes the complete object deliverable.
+
+This design keeps object-family headers as DB-semantic metadata, not transport
+scheduler metadata. The first fragment of a tuple/result object still contains
+`CitusTupleSinkBatchHeader`; the first fragment of a basebackup object still
+contains `CitusRemoteBaseBackupMessageHeader`; and the tuple shape remains a
+setup/bind-time `CitusTupleViewContract`. The transport reassembly path does not
+need to parse those headers on every fragment just to know whether the object is
+complete. It can use the transport flags on the hot path, then invoke the
+object-family validator/materializer only after the `LAST` fragment has made a
+complete semantic object available.
+
+Terminology note: an RDMA **WR chain** is several work requests submitted
+together, typically linked by `wr.next` and posted with one `ibv_post_send()`.
+It is different from one large WR. One RDMA WRITE WR targets one contiguous
+remote address range, even if local memory is represented by one or more SGEs.
+The sender needs a WR chain when a grant crosses local/remote byte-ring wrap
+boundaries, covers non-contiguous fixed slots, or exceeds device/implementation
+limits for one WR. The goal of the byte-ring substrate and egress scheduler is to
+make common grants become one large contiguous WR plus one publication event; WR
+chains remain the fallback for wrap and non-contiguous cases.
 
 ## Multiple QPs from the start
 
@@ -2092,26 +2595,247 @@ control queue.
 
 ## Large-object fragmentation
 
-The first scheduler can grant whole semantic objects only. That avoids adding
-fragment headers and reassembly before the rest of the scheduler is stable.
+The first scheduler can grant whole semantic objects only. That avoids changing
+receiver reassembly before the rest of the scheduler is stable.
 
 However, the long-term design should not forbid slicing a very large semantic
 object. Large basebackup objects may be too coarse as the minimum scheduling
 unit. With RC QPs, writes posted on one QP are observed by the receiver in order
 for that QP, but the upper layer should still not see an incomplete object.
 
-Future fragmentation rule:
+Current terminology and code anchors:
 
-- the RDMA substrate may publish fragments of one large object
-- fragments include object id, fragment offset, fragment length, and final flag
-- the receiver-side substrate tracks object assembly state
-- the object family callback is invoked only after the full semantic object is
-  available
-- fragmentation is hidden below tuple/basebackup/WAL object consumers
+- Object-family headers are DB-semantic metadata inside the payload. Tuple/result
+  objects use `CitusTupleSinkBatchHeader` in
+  `src/include/distributed/homer/tuple_sink_protocol.h`; basebackup objects use
+  `CitusRemoteBaseBackupMessageHeader` in the same file. The tuple shape contract
+  is `CitusTupleViewContract`, but that is setup/bind metadata rather than a
+  per-object transport header.
+- Transport records are the neutral Homer/RDMA envelope:
+  `[CitusTupleSinkTransportHeader][object-family bytes]`. The current whole-record
+  byte-ring sender in `HomerServicePumpOutgoingByteRingBaseBackup()` parses
+  complete producer records, validates the object-family header, coalesces
+  contiguous RDMA ranges, and publishes the receiver byte tail. The receiver in
+  `HomerServicePumpIncomingByteRingBaseBackup()` parses records only after the
+  published byte tail makes them visible.
+
+Minimal future fragmentation rule:
+
+- the RDMA substrate may publish fragments of one large semantic object
+- a fragment is still a transport record:
+  `[CitusTupleSinkTransportHeader][fragment bytes]`
+- `CitusTupleSinkTransportHeader.payloadBytes` means fragment byte count
+- `CitusTupleSinkTransportHeader.sinkSequence` remains the semantic object
+  sequence, not a fragment sequence
+- add small transport flags, for example `FRAGMENT_FIRST` and `FRAGMENT_LAST`
+  - `FIRST | LAST`: complete object in one record, matching today's behavior
+  - `FIRST`: first fragment, whose bytes start with the object-family header
+  - no fragment flag: continuation of the current ordered object
+  - `LAST`: final fragment; the completed object may be validated and delivered
+- no large standalone fragment header is needed for the first design
+- no fragment offset/count is needed while a stream is ordered on one RC QP/lane
+  and the receiver allows only one active fragmented object per stream
+- transport records should still not wrap around the byte ring in the initial
+  implementation; the sender may skip trailing ring bytes before wrap as it does
+  today
+- fragmentation is hidden below tuple/basebackup/WAL object consumers; the object
+  family callback is invoked only after the full semantic object is available
+
+Sender-side representation decision:
+
+- Keep the backend/DB producer ring as complete semantic objects. The producer
+  should still publish prompt complete object records into the local byte ring;
+  it should not pre-fragment just because the current scheduler policy wants a
+  smaller egress unit. This preserves the scheduler's authority over fragment
+  size and avoids moving traffic-class policy into the DB engine.
+- Make the remote receiver byte ring naturally contain baked-in transport
+  records. The remote representation remains
+  `[CitusTupleSinkTransportHeader][fragment bytes]`, so the receiver can parse
+  the byte ring without a side table.
+- Generate per-fragment transport headers in the service/sender and store them in
+  a small pre-registered **per-lane** header source pool. The pool should live
+  with the lane-local RDMA connection resources, because the current baseline maps
+  each traffic class to one lane-local RDMA connection/QP and many payload streams
+  may share that lane. The fragment/reassembly frontiers remain stream-owned in
+  `HomerPayloadStreamState`; only the registered header source memory is lane-owned.
+  This pool is not a second remote data ring.
+- Post each fragment as one RDMA write with two local SGEs when the helper grows
+  that shape:
+  `SGE 0 = generated CitusTupleSinkTransportHeader`,
+  `SGE 1 = producer-ring object byte slice`, targeting one contiguous remote
+  byte-ring range. This keeps object bytes zero-copy while still producing the
+  desired remote `[header][fragment]` layout.
+- Track header-pool slot lifetime until the signaled send completion that covers
+  the corresponding fragment/batch. Reusing a header slot before the NIC has
+  retired the WR would corrupt the remote transport header. Use fixed rings and
+  frontiers; do not allocate header records on the hot path.
+- The existing RDMA helpers currently post one SGE per payload write. For
+  example, `TupleSinkServicePostPeerRegisteredPayloadBatchWithTailImmediateRdma()`
+  in `src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c`
+  sets `num_sge = 1` for payload WRs. The fragmentation implementation should
+  extend the payload write descriptor/helper to support a small fixed SGE count
+  rather than adding a bounce buffer copy.
+
+Rejected or scoped alternatives:
+
+- A service staging/bounce buffer is acceptable only for debugging; it copies
+  fragment bytes on the hot path and should not be used for performance numbers.
+- Producer-side pre-fragmentation can be a temporary smoke-test shortcut, but it
+  bakes the fragment size into the backend producer and weakens the scheduler
+  abstraction. It is not the target design.
+- Header-sized gaps pre-reserved inside the producer object layout also bake in a
+  fixed fragment size and waste byte-ring space. Avoid it for the scheduler-ready
+  design.
+
+The important frontier distinction is responder visibility versus semantic
+delivery. `publishedTail` says bytes/transport records are visible on the receiver
+ring; it does not by itself mean the semantic object is complete. The receiver
+should track a tiny per-stream reassembly state such as active object sequence,
+object start byte head, and accumulated fragment bytes. For blackhole basebackup,
+parsed bytes and reclaimable bytes can advance together. For tuple/result
+materialization, reclamation may need to stay at completed-object boundaries
+unless the backend-facing consumer can safely consume and release partial
+fragments.
 
 This can be deferred until scheduler experiments show object granularity is too
 coarse. The scheduler and QP design should nevertheless leave room for it by
-granting bytes and WRs in addition to object counts.
+granting bytes, fragments, and WRs in addition to object counts.
+
+Implementation-ready first slice:
+
+1. Add `FRAGMENT_FIRST` and `FRAGMENT_LAST` transport flags while preserving the
+   current `FIRST | LAST` whole-record behavior when fragmentation is disabled.
+2. Add a small registered per-lane fragment-header pool to the sending service
+   RDMA connection state, with fixed-size slots containing
+   `CitusTupleSinkTransportHeader` and completion-frontier based reuse. Stream
+   state should track which posted fragment frontier depends on which lane header
+   slot, but MR ownership stays lane-local.
+3. Extend `TupleSinkServicePeerPayloadWriteDescriptor` and
+   `TupleSinkServicePostPeerRegisteredPayloadBatchWithTailImmediateRdma()` so one
+   payload write can carry either one contiguous registered source range or two
+   SGEs for `[generated header][producer byte slice]`.
+4. Add a forced-fragment-size knob for bulk byte-ring streams. Start with remote
+   RDMA basebackup only; tuple/result fragmentation is deferred because tuple
+   byte-ring receive currently has service-passive/backend-visible behavior.
+5. In `HomerServicePumpOutgoingByteRingBaseBackup()`, validate the complete
+   source semantic object once, then emit one or more transport fragments from the
+   source payload range according to the forced size or later egress grant.
+6. In `HomerServicePumpIncomingByteRingBaseBackup()`, replace immediate
+   whole-record delivery with one active per-stream reassembly state. Accumulate
+   transport fragments and invoke the basebackup validator/accounting only when
+   `FRAGMENT_LAST` completes the semantic object.
+7. Keep transport fragments no-wrap in the first implementation. If a fragment
+   header plus bytes cannot fit before the receiver byte-ring wrap, skip the
+   remote trailer and start the fragment at offset zero, matching the existing
+   gap-skip convention for whole records.
+8. Verify no-regression with fragmentation disabled, then force a small fragment
+   size and verify remote RDMA basebackup correctness and warmed performance.
+   Treat forced fragmentation as a substrate validation step before adding dynamic
+   scheduler egress grants.
+
+Completion and verification criteria:
+
+- **No-fragment regression path.** Run with fragmentation disabled, or with the
+  configured fragment size larger than the largest observed object, so
+  `FIRST | LAST` remains the only normal transport-record shape. Correctness and
+  performance should remain on par for:
+  - remote Homer pgbench c1/c4 throughput and latency
+  - standalone remote RDMA basebackup warm runs
+  - concurrent remote c4 pgbench plus remote RDMA basebackup
+  - service logs should not report invalid transport headers, sequence mismatch,
+    reassembly error, header-pool exhaustion, send-completion/frontier mismatch,
+    or remote-credit corruption
+- **Operator/debug knob.** The first implementation should expose a narrow
+  forced-fragment-size setting for bulk byte-ring basebackup, for example an
+  environment variable such as `HOMER_BULK_FRAGMENT_BYTES`. The default must be
+  `0`/disabled so normal pgbench, standalone basebackup, and concurrent
+  pgbench+basebackup runs exercise the current no-extra-fragment path. A value
+  larger than the maximum emitted basebackup object is also a useful
+  no-fragment sanity check because it forces the code through the configured
+  path while still producing only `FIRST | LAST` transport records.
+- **Forced-fragment correctness path.** Run remote RDMA basebackup with a small
+  fixed fragment size, for example 4 KiB, so large basebackup objects are split
+  into multiple transport records. This test is for correctness, not performance.
+  It should verify:
+  - the stream reaches `CITUS_REMOTE_BASEBACKUP_OBJECT_END`
+  - received object count and payload byte count match the no-fragment run
+  - each semantic object sequence completes exactly once
+  - the receiver does not invoke the object-family validator/materializer until
+    `FRAGMENT_LAST`
+  - invalid fragment sequences are detected defensively: continuation without an
+    active object, `FIRST` while active, `LAST` without active state, sequence
+    mismatch, and accumulated bytes exceeding the expected object size
+  - remote ring credit advances only after bytes are safe to reclaim
+  - per-lane header-pool slots are not reused before the covering send completion
+- **Forced-fragment stress path.** Optionally run with very small fragments such
+  as 512 B or 1 KiB to exercise many fragments per object, byte-ring wrap/gap-skip
+  behavior, completion tracking, and reassembly state. Do not use this stress mode
+  as a steady-state performance comparison; it intentionally increases header and
+  WR overhead.
+- **Regression standard after implementation.** The pass/fail bar for the
+  substrate change is intentionally conservative: with the forced-fragment knob
+  disabled, warmed pgbench, warmed basebackup, and concurrent pgbench+basebackup
+  should not regress materially. Forced-fragment runs only need to prove the
+  receiver waits for complete semantic objects and preserves credit/frontier
+  correctness; throughput in that mode is diagnostic until a scheduler chooses
+  fragment size dynamically.
+
+June 2, 2026 implementation checkpoint:
+
+- Fragmentation/reassembly is implemented for remote RDMA basebackup byte-ring
+  streams. The active protocol flags are
+  `CITUS_TUPLE_SINK_TRANSPORT_FLAG_FRAGMENT_FIRST` and
+  `CITUS_TUPLE_SINK_TRANSPORT_FLAG_FRAGMENT_LAST` in
+  `src/include/distributed/homer/tuple_sink_protocol.h:38`.
+- Sender-side fragmentation is forced only by the diagnostic
+  `HOMER_BULK_FRAGMENT_BYTES` knob. The default is disabled, so pgbench,
+  standalone basebackup, and concurrent pgbench+basebackup still use the
+  no-extra-fragment path.
+- The sending service keeps the DB producer ring as complete semantic records
+  and emits transport fragments from
+  `HomerServiceAppendOutgoingBaseBackupFragmentWrite()` in
+  `src/backend/distributed/utils/homer/tuple_sink_service_process.c:3047`.
+  The receiver reassembles below object-family delivery in
+  `HomerServiceProcessReceivedBaseBackupTransportRecord()` at
+  `tuple_sink_service_process.c:9262`.
+- The RDMA helper now supports two local SGEs per payload WR. This required the
+  QP to request `max_send_sge = 2` through
+  `CITUS_REMOTE_EXEC_PEER_MAX_SEND_SGE` at
+  `src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:71`.
+  A validation bug showed why the final tail SGE must use
+  `tailSgeIndex = payloadWriteCount * 2U` at
+  `remote_execution_peer_transport_rdma.c:5928`; using `payloadWriteCount`
+  overlaps the SGE area for two-SGE payload WRs and corrupts later transport
+  records.
+- Completion tracking now uses explicit monotonic completion tokens and per-batch
+  WR counts. This was necessary because partial fragments can complete without
+  advancing the source-byte or semantic-object frontier. The WR cap
+  `HOMER_SERVICE_PAYLOAD_MAX_OUTSTANDING_WRS` at
+  `tuple_sink_service_process.c:153` keeps forced fragmentation from overfilling
+  the QP send queue before completions retire posted WR chains.
+- Validation used default/no-fragment remote RDMA basebackup and pgbench, forced
+  7 MiB basebackup fragmentation, forced 1 MiB basebackup fragmentation, forced
+  4 KiB basebackup fragmentation, and a concurrent c4 pgbench plus basebackup
+  smoke. Final observed checks after the optimization pass:
+  no-fragment warmed remote basebackup `4.30s`; remote c1 Homer pgbench
+  `4694.98 TPS`, p50 `0.210 ms`, p99 `0.233 ms`; remote c4 Homer pgbench
+  `10753.54 TPS`, p99 `0.616 ms`; concurrent c4 pgbench plus basebackup
+  completed with pgbench `9236.29 TPS`, p99 `0.773 ms`, and basebackup `4.45s`.
+- June 2, 2026 rerun after the two-SGE tail-index fix showed that the earlier
+  stopped `4 KiB` and `1 MiB` diagnostic attempts were pre-fix artifacts, not
+  inherent fragmentation failures. With the same remote RDMA basebackup command
+  and restarted services, the first post-restart run was slower for every mode:
+  default/no-fragment `5.86s`, forced 1 MiB `6.19s`, and forced 4 KiB `6.01s`.
+  Warmed repeats converged to the same band: default `4.25s` and `4.33s`;
+  forced 1 MiB `4.32s` and `4.30s`; forced 4 KiB `4.23s`, `4.21s`, and
+  `4.24s`.
+- Practical caveat: tiny forced fragments are still a diagnostic stress setting,
+  not the target scheduler policy. The current workload does not show warmed
+  steady-state degradation at 4 KiB because the service can batch many posted
+  WRs and the 400 Gbps link is not the bottleneck here. This result is useful as
+  a correctness and batching sanity check, but future scheduler work still needs
+  explicit fragment/WR counters and grant sizing because a different object mix,
+  traffic mix, or DPU placement could make per-fragment CPU and CQ work visible.
 
 ## Implementation sequence
 
@@ -2259,15 +2983,32 @@ granting bytes and WRs in addition to object counts.
    post/completion frontiers.
 
    The current RDMA layer still has CQ ownership details to clean up within each
-   traffic-class connection: subsystem-specific send-completion helpers such as
-   [`TupleSinkServicePollPeerPayloadSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5204)
-   and
-   [`TupleSinkServicePollPeerCommandSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5361)
-   know how to stash unrelated tagged completions. The target is for each
-   `HomerTransportLane` / transport resource to own its own send-post frontier,
-   completion frontier, and demux policy, so command/payload helpers no longer
-   carry ad hoc CQ ownership rules. The implementation checkpoint has exact
-   measurement details:
+   traffic-class connection. Physical lanes/QPs remove cross-class posted-WR HOL,
+   but helpers still poll the lane send CQ for one owner at a time. For example,
+   [`TupleSinkServicePollPeerPayloadSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6142)
+   asks for completions for one `serviceSinkId`, while
+   [`TupleSinkServicePollPeerCommandSendCompletionRdma()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6320)
+   asks for command write completions. Because the send CQ is lane/connection
+   owned, either helper may see a valid CQE for a different owner. The current
+   workaround is to stash unrelated tagged completions in
+   [`TupleSinkServiceStashPayloadSendCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1222)
+   and later recover them through
+   [`TupleSinkServicePopStashedPayloadSendCompletion()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1250).
+
+   The scheduler-integrated service loop should delete that pattern. Each
+   `HomerTransportLane` / transport resource should own a lane-CQ drain source.
+   The service-progress scheduler grants the lane a bounded CQ-drain budget; the
+   lane drain decodes each tagged `wr_id` and dispatches the completion directly
+   to fixed owner state, such as payload-stream completion trackers, command-post
+   slots, or peer-control op slots. Completion demux then becomes a normal
+   lane-progress result rather than a side effect of whichever payload or command
+   helper happened to poll first. If the per-pass event budget fills, leave
+   remaining CQEs in the verbs CQ for the next pass; do not move them into
+   temporary side queues. This removes normal-path stash search/move work and
+   gives the scheduler accurate per-lane feedback for outstanding WR pressure,
+   completed CQ count, and stale generation-safe CQEs.
+
+   The implementation checkpoint has exact measurement details:
    [client_sql_session_pgbench_checkpoint.md](../../../implementations/postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md).
 
 7. **Nonblocking peer transport/control state machines - next correctness
@@ -2941,17 +3682,133 @@ granting bytes and WRs in addition to object counts.
      and warmed remote RDMA basebackup `4.35s`. A final short smoke completed
      `100/100` transactions with zero failures.
 
-8. **Scheduler prototype**
-   - implement ready-set construction, policy selection, grants, and progress
-     accounting
+8. **Frontier-aware progress accounting cleanup - implemented June 2**
+   - this pre-scheduler cleanup has landed for the current fixed-priority
+     service loop; it does not implement scheduler policy yet
+   - [`HomerPayloadProgressDelta`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:858)
+     is a stack-local result object carrying `madeProgress`, future blocked/
+     readiness fields, CQ/WR/byte counters, and the four frontiers:
+     `transportCompletionFrontier`, `sourceReleaseFrontier`,
+     `semanticObjectFrontier`, and `remoteCreditFrontier`
+   - [`HomerServicePayloadProgressDeltaMade()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2235)
+     derives the old `bool madeProgress` return shape from typed progress so the
+     outer loop remains unchanged while callers stop treating all progress as the
+     same event
+   - byte-ring send completion now flows through
+     [`HomerServiceApplyTrackedPayloadCompletionFrontier()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2530),
+     which uses
+     [`HomerServiceCompleteTrackedPayload()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2429)
+     to retire transport resources independently from source-byte release and
+     semantic-object completion
+   - the fixed-slot sender path uses
+     [`HomerServiceApplySequencePayloadCompletionFrontier()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2601);
+     for that older layout the three frontiers still collapse to the same
+     sequence, but the executor vocabulary now matches the byte-ring path
+   - receiver consumed-head ACK CQ drain now reports transport-completion
+     progress through
+     [`HomerServiceDrainReceiverHeadAckCompletions()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11423)
+     instead of mutating a caller-owned boolean
+   - the cleanup is allocation-free on the payload hot path: the delta is
+     stack-local per pump call and folds back into the existing boolean at the
+     function boundary
+   - validation after `make -j8 service-bin client-bin`, `git diff --check`,
+     install/sync/restart on farnet1/farnet0:
+     warmed remote RDMA basebackup `4.34s` and `4.46s`; warmed remote c1
+     pgbench `4721.21 TPS`, p50 `0.209 ms`, p99 `0.231 ms`; warmed remote c4
+     pgbench `11107.73 TPS`, p50 `0.347 ms`, p99 `0.608 ms`; concurrent remote
+     c4 pgbench plus remote RDMA basebackup completed with both rc=0, pgbench
+     `9366.28 TPS`, p50 `0.391 ms`, p99 `0.775 ms`, and basebackup `4.50s`
+     (`/tmp/homer_concurrent_c4_frontier_cleanup_1780427101`)
+   - next cleanup remains: replace owner-polled send-CQ helpers with lane-owned
+     CQ drain that emits typed completion events/deltas; only after that should
+     the full ready-set / progress-plan / egress-grant scheduler prototype
+     consume these facts
+
+   Design takeaways from this cleanup:
+
+   - The scheduler should start from **executor feedback**, not from a new
+     egress policy. The landed delta shape proved that the current fixed-order
+     loop can preserve performance while returning typed progress. The first
+     scheduler slice should therefore convert more pumps to return stack-local
+     `HomerProgressResult`-style feedback before changing which source wins.
+   - Completion drain must be a first-class progress source. A CQE can retire
+     transport resources and reduce QP/source-resource pressure even when no
+     producer bytes or semantic objects become releasable, especially with
+     fragmentation. If scheduler readiness only watches producer frontiers, it
+     will under-service CQ drain work and can create artificial backpressure.
+   - ACK completion is transport-resource progress, not payload semantic
+     progress. Receiver-head ACK CQEs protect source-word reuse and close/reclaim
+     ordering, but they do not mean tuple/basebackup/WAL objects advanced. The
+     first scheduler design should fold ACK/credit maintenance into lane-CQ
+     drain as a transport-resource event kind rather than adding a separate
+     first-class source.
+   - The old `bool madeProgress` boundary is a current-code artifact to remove,
+     not an API to preserve. New scheduler-facing executors should not return
+     `madeProgress`; they should return success/failure and fill a rich progress
+     result. Any loop-level idle/backoff decision should be derived inside the
+     scheduler-integrated service loop from counters and frontiers, as
+     [`HomerServicePayloadProgressDeltaMade()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2235)
+     now does for the current fixed-order loop.
+   - The `stillReady`, `blockedOnRemoteCredit`, and `blockedOnLocalCompletion`
+     fields should be populated in the next slice. They are intentionally present
+     in the landed delta but not yet fully used; the scheduler needs them to
+     avoid repeatedly granting a source that made transport progress but cannot
+     post more egress work.
+   - Keep progress results stack-local and folded into fixed source/lane facts.
+     Do not create heap event objects, per-object scheduler records, or broad
+     scans to remember these deltas. The cleanup validated that the normal path
+     can keep the accounting vocabulary without adding allocation or measurable
+     overhead.
+
+9. **Scheduler prototype**
+   - first implementation slice: add fixed-table source refs plus source core /
+     executor-feedback state and stack-local `HomerProgressResult`, then make the
+     scheduler-integrated service loop call scheduler-facing executors directly.
+     Executor return values are success/failure only; progress is reported only
+     through the result object. Do not add a persistent compatibility-wrapper
+     layer that converts results back to `bool madeProgress`.
+   - implement cheap readiness/frontier metadata, ready-set construction, policy
+     selection, egress grants, and feedback/progress accounting
+   - add fixed-table source registration for lanes, sessions, command rings,
+     completion rings, local control slots, payload streams, lane-CQ drain, and
+     RDMA-CM setup. ACK/credit completion is folded into lane-CQ/transport
+     resource progress for the first scheduler design.
+   - make progress facts frontier-aware: track transport completion/resource
+     frontier, source-release frontier, semantic-object frontier, and
+     remote-credit frontier independently; do not use a single generic
+     `madeProgress` bit to decide whether a source deserves future service
+   - adapt existing completion loops first:
+     `HomerServiceTrackPayloadCompletion()` /
+     `HomerServiceCompleteTrackedPayload()` become the model for reporting
+     transport-completion progress even when source release does not move, and
+     the owner-polled send-CQ helpers should be replaced with lane-owned CQ drain
+     before the full egress scheduler lands
+   - model the two scheduling layers explicitly: service-progress grants decide
+     which source/lane to touch and for how long; transport-egress grants decide
+     bytes, records/objects, fragments, and WRs to post
+   - add a lightweight service-progress policy interface that returns a bounded
+     progress plan, not a per-WR callback and not an RDMA byte-batching decision
+   - convert existing dedicated pumps into bounded grant executors while keeping
+     their command/control/payload-specific logic specialized
+   - integrate command/control/completion work into the same ready/grant model
+     instead of leaving them as permanent dedicated service-loop side paths
    - treat the fixed-priority service loop from the multi-resource milestone as
      the baseline policy to replace, not as the final scheduler abstraction
    - cap sender payload publication by scheduler grant instead of only by
      `HOMER_SERVICE_PAYLOAD_SEND_COMPLETION_BATCH`
+   - update executor feedback after every bounded grant: completed CQ count,
+     empty polls, WRs posted, bytes posted, resource credits freed, source bytes
+     released, semantic objects completed, remote credits received, and
+     still-ready / blocked flags. These counters should be cheap and mostly
+     compile-time-gated for diagnostics, but the frontier fields themselves are
+     normal scheduler state.
+   - keep DPU offload constraints in the metadata design: avoid per-object
+     host-DMA readiness writes on the normal path; use owner-written frontiers and
+     idempotent ready bits/active sets
    - add weighted/deficit/age-aware policies only after traffic-class lanes are
      measurable
 
-9. **Push command completions - local frontend completed, peer still future**
+10. **Push command completions - local frontend completed, peer still future**
    - keep one in-flight command per session and use a small completion ring for
      the local frontend no-poll implementation
    - bind the local frontend completion destination during session/open setup
@@ -2963,9 +3820,32 @@ granting bytes and WRs in addition to object counts.
      tied to the push destination instead of a future poll
    - retain poll only as a fallback/debug path until the push path is validated
 
-10. **Optional fragmentation**
-   - add RDMA-substrate fragmentation only if object-level grants are too coarse
-     for latency/throughput goals
+11. **Fragmentation/reassembly path - basebackup RDMA implemented June 2, 2026**
+   - keep fragmentation as a first-class grant dimension from the scheduler's
+     first design, even if the first implementation grants only whole records
+   - start with the minimal ordered-stream design: extend
+     `CitusTupleSinkTransportHeader` with `FRAGMENT_FIRST` and `FRAGMENT_LAST`
+     flags, keep `payloadBytes` as fragment byte count, and keep `sinkSequence`
+     as the semantic object sequence
+   - avoid a standalone generic fragment header in the first implementation; rely
+     on the existing transport record envelope plus one active reassembly object
+     per ordered stream
+   - keep backend producers publishing complete semantic objects; generate
+     per-fragment transport headers in the sending service from a pre-registered
+     fixed header pool
+   - extend the RDMA payload write descriptor/helper to support a two-SGE fragment
+     write, with `SGE 0` as the generated transport header and `SGE 1` as the
+     zero-copy producer byte slice
+   - keep transport records no-wrap initially; use the existing byte-ring gap-skip
+     behavior at ring wrap instead of teaching the first reassembly path to join
+     a header split across the end of the ring
+   - add receiver-side reassembly state below object-family delivery; invoke
+     the basebackup validator/accounting only after `FRAGMENT_LAST`
+   - add RDMA-substrate fragmentation/reassembly when object-level grants are too
+     coarse for latency/throughput goals, especially for large basebackup/WAL
+     records
+   - make fragment sizing tunable, with at least a `maxGrantBytes` or MTU-like
+     target fragment size and room for a later dynamic policy
 
 ## Related
 
