@@ -146,6 +146,42 @@ ls -lh /dev/shm | grep -E 'citus|homer|remote_exec'
 
 Do not remove unrelated shared memory from other users' experiments.
 
+## Process preflight for experiments
+
+Before every performance, diagnostic, or rejection/acceptance run, check that the
+runtime process set is clean on both hosts. Do this even after a successful
+restart: aborted pgbench/basebackup runs and timed-out peer-control experiments
+can leave client or socketless backend processes behind, and any result collected
+on top of that state is contaminated.
+
+On `farnet1`:
+
+```sh
+ps -eo pid,ppid,psr,comm,args | \
+  grep -E 'citus_tuple_sink_service|postgres -D|remote exec|pgbench|pg_basebackup|walsender' | \
+  grep -v grep || true
+```
+
+On `farnet0`:
+
+```sh
+ssh farnet0 "ps -eo pid,ppid,psr,comm,args | \
+  grep -E 'citus_tuple_sink_service|postgres -D|remote exec|pgbench|pg_basebackup|walsender' | \
+  grep -v grep || true"
+```
+
+For a clean experiment start, the only Homer-specific long-lived process should
+be the intended `citus_tuple_sink_service` on each host, plus PostgreSQL
+postmaster/background processes on hosts where PostgreSQL is intentionally
+running. Do not start the measurement if an old `pgbench`, `pg_basebackup`,
+`walsender`, or `postgres: remote exec backend` from a previous run is present.
+Clean or restart first, then rerun the preflight and record that it was clean.
+
+If a candidate times out, is interrupted, or needs manual process cleanup, discard
+that run as diagnostic-only. Do not use it for acceptance/rejection performance
+claims. Return to the clean runtime baseline, rerun the process preflight, and
+then collect fresh warmed measurements.
+
 ## Start PostgreSQL
 
 For the pgbench foreground workload and the basebackup sender, PostgreSQL is
