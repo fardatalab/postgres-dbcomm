@@ -13,7 +13,7 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 ## Documents
 
 <!-- kb-docs:start -->
-- [homer_transport_scheduler_and_payload_streams.md](homer_transport_scheduler_and_payload_streams.md) - Future design for Homer service progress, nonblocking peer-transport state machines, multi-slot peer-control rings, RDMA egress scheduling, neutral payload-stream state, push command completions, traffic classes, multiple QPs, and large-object fragmentation.
+- [homer_transport_scheduler_and_payload_streams.md](homer_transport_scheduler_and_payload_streams.md) - Homer scheduler-ready design and checkpoint, including the completed service-progress/egress scheduler substrate plus remaining policy, peer push completion, traffic-class, multi-QP, and fragmentation directions.
 - [rdma_publication_visibility_and_doorbells.md](rdma_publication_visibility_and_doorbells.md) - RDMA publication/visibility rules, including why the tuple-sink prototype now uses WRITE_WITH_IMM doorbells rather than trusting memory polling alone as the responder-visible publish event.
 - [rdma_transport_control_plane_abstraction.md](rdma_transport_control_plane_abstraction.md) - TODO
 <!-- kb-docs:end -->
