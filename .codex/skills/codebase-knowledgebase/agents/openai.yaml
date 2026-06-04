@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codebase Knowledge Base"
+  short_description: "Maintain KB docs for facts, implementations, and research"
+  default_prompt: "Use $codebase-knowledgebase to maintain a hierarchical KB for the current codebase, separating grounded facts, implementation progress, and future directions."
