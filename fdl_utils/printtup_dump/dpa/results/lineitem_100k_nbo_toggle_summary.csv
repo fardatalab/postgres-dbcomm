@@ -1,0 +1,4 @@
+threads,normal_host_payload_mb_s,native_order_host_payload_mb_s,native_vs_normal_pct,normal_dpa_throughput_mb_s,native_order_dpa_throughput_mb_s,normal_mismatches,native_order_mismatches
+64,318.737,318.480,-0.081,757.248,756.994,0,100000
+256,392.803,395.976,0.808,2791.990,2792.190,0,100000
+512,407.873,410.519,0.649,5566.030,5566.130,0,100000

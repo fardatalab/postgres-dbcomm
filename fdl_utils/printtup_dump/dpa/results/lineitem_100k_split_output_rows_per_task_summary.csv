@@ -1,0 +1,5 @@
+variant,threads,rows_per_task,window_writeback,ring_output_location,host_payload_throughput_mb_s,cmdq_tasks,enqueue_elapsed_us,drain_wait_us,verification_skipped,notes
+split_lineitem_dpa_ring_no_headers_nowb,512,8,0,dpa,798.891,625000,71846,1186383,100000,timing-only
+split_lineitem_dpa_ring_no_headers_nowb,512,16,0,dpa,1158.240,312500,39081,828499,100000,timing-only
+split_lineitem_dpa_ring_no_headers_nowb,512,32,0,dpa,1019.240,156250,17875,967542,100000,timing-only
+split_lineitem_dpa_ring_no_headers_nowb,512,64,0,dpa,611.578,78150,9728,1632165,100000,timing-only

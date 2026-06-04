@@ -12,6 +12,7 @@ This is the living knowledge base (KB) for this repo. The directory tree is the 
 
 <!-- kb-subdirs:start -->
 - `citus/`: Citus design/workflow notes and how they map to timing spots (Citus source: `/data/dbcomm/citus-dbcomm`).
+- `dpa/`: BlueField DPA programming, memory classes, access paths, compute resources, and BenchBF3-derived bringup notes.
 - `future-directions/`: Forward-looking design notes, open questions, and research directions cross-linked to the grounded KB.
 - `implementations/`: TODO
 - `instrumentation/`: Timing/custom-stats instrumentation spots, call sites, and log aggregation tooling.

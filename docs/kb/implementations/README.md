@@ -8,6 +8,7 @@ Hold implementation-progress notes for prototypes and in-flight changes separate
 
 <!-- kb-subdirs:start -->
 - `citus/`: Implementation-progress notes for Citus-side prototype work.
+- `postgres/`: Implementation-progress notes for PostgreSQL-side prototype work.
 <!-- kb-subdirs:end -->
 
 ## Documents
@@ -19,4 +20,5 @@ Hold implementation-progress notes for prototypes and in-flight changes separate
 ## Related
 
 - `../citus/`: Grounded Citus behavior in the existing codebase.
+- `../postgres/`: Grounded PostgreSQL behavior in the existing codebase.
 - `../future-directions/`: Forward-looking design notes that motivate the implementation work.

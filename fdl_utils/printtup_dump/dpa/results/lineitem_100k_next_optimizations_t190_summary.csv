@@ -1,0 +1,17 @@
+experiment,variant,baseline_variant,delta_vs_baseline_pct,threads,rows,input_working_set_rows,input_working_set_bytes,input_map,host_payload_throughput_mb_s,baseline_mb_s,host_elapsed_us,cmdq_tasks,verification_skipped,source_csv
+contiguous_input_fastpath,contig,normal,12.867,190,25000000,4096,601509,logical,2202.86,1951.73,2279450,190,100000,lineitem_100k_contig_contig_input_4096_t190.csv
+contiguous_input_fastpath,normal,normal,0,190,25000000,4096,601509,logical,1951.73,1951.73,2572752,190,100000,lineitem_100k_contig_normal_input_4096_t190.csv
+contiguous_input_fastpath,contig,normal,-2.15544,190,25000000,100000,14681284,logical,2278.34,2328.53,2203498,190,100000,lineitem_100k_contig_contig_input_100000_t190.csv
+contiguous_input_fastpath,normal,normal,0,190,25000000,100000,14681284,logical,2328.53,2328.53,2156004,190,100000,lineitem_100k_contig_normal_input_100000_t190.csv
+contiguous_input_fastpath,contig,normal,-1.20625,190,25000000,524288,76969938,logical,2409.55,2438.97,2083463,190,100000,lineitem_100k_contig_contig_input_524288_t190.csv
+contiguous_input_fastpath,normal,normal,0,190,25000000,524288,76969938,logical,2438.97,2438.97,2058330,190,100000,lineitem_100k_contig_normal_input_524288_t190.csv
+input_map,logical,logical,0,190,25000000,1024,151410,logical,2010.74,2010.74,2509783,190,100000,lineitem_100k_inputmap_logical_input_1024_t190.csv
+input_map,worker-offset,logical,-4.30986,190,25000000,1024,151410,worker-offset,1924.08,2010.74,2622824,190,100000,lineitem_100k_inputmap_worker-offset_input_1024_t190.csv
+input_map,logical,logical,0,190,25000000,4096,601509,logical,1969.57,1969.57,2549448,190,100000,lineitem_100k_inputmap_logical_input_4096_t190.csv
+input_map,worker-offset,logical,-1.0119,190,25000000,4096,601509,worker-offset,1949.64,1969.57,2575515,190,100000,lineitem_100k_inputmap_worker-offset_input_4096_t190.csv
+input_map,logical,logical,0,190,25000000,16384,2404284,logical,2077.13,2077.13,2416140,190,100000,lineitem_100k_inputmap_logical_input_16384_t190.csv
+input_map,worker-offset,logical,-1.32779,190,25000000,16384,2404284,worker-offset,2049.55,2077.13,2448658,190,100000,lineitem_100k_inputmap_worker-offset_input_16384_t190.csv
+input_map,logical,logical,0,190,25000000,100000,14681284,logical,2336.04,2336.04,2149070,190,100000,lineitem_100k_inputmap_logical_input_100000_t190.csv
+input_map,worker-offset,logical,-3.26921,190,25000000,100000,14681284,worker-offset,2259.67,2336.04,2221713,190,100000,lineitem_100k_inputmap_worker-offset_input_100000_t190.csv
+input_map,logical,logical,0,190,25000000,524288,76969938,logical,2439.12,2439.12,2058203,190,100000,lineitem_100k_inputmap_logical_input_524288_t190.csv
+input_map,worker-offset,logical,-5.27362,190,25000000,524288,76969938,worker-offset,2310.49,2439.12,2172794,190,100000,lineitem_100k_inputmap_worker-offset_input_524288_t190.csv

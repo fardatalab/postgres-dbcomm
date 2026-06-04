@@ -1,0 +1,2 @@
+threads,iterations,rows,working_set_rows,rows_per_dpa_task,window_writeback,cmdq_chunks,cmdq_tasks,bytes,host_elapsed_us,enqueue_elapsed_us,start_elapsed_us,drain_wait_us,host_throughput_mb_s,dpa_throughput_mb_s,dpa_cycles_sum,dpa_cycles_max,avg_dpa_cycles_per_row,mismatches,status_errors,verification_skipped
+64,1,100000,32768,4,1,4,25000,5026534,49746,3203,69,47504,101.044,902.469,641635871,38962,6416.36,0,0,0

@@ -1,0 +1,12 @@
+experiment,threads,input_location,ring_output_location,ring_partition,window_writeback,host_payload_throughput_mb_s,host_elapsed_us,cmdq_tasks,verification_skipped,notes
+ring_partition,190,host,dpa,shared,0,2449.58,409893,190,100000,static split noheaders nowb
+ring_partition,256,host,dpa,shared,0,1848.82,543083,256,100000,static split noheaders nowb
+ring_partition,512,host,dpa,shared,0,2226.43,450975,512,100000,static split noheaders nowb
+ring_partition,190,host,dpa,per-worker,0,2453.68,409208,190,100000,static split noheaders nowb
+ring_partition,256,host,dpa,per-worker,0,1855.48,541134,256,100000,static split noheaders nowb
+ring_partition,512,host,dpa,per-worker,0,2227.91,450675,512,100000,static split noheaders nowb
+ring_location,190,host,host,per-worker,0,2358.27,425763,190,100000,static split noheaders nowb
+ring_location,190,host,dpa,per-worker,0,2454.19,409122,190,100000,static split noheaders nowb
+input_location,190,host,dpa,per-worker,0,2453.56,409227,190,100000,static split noheaders nowb
+input_location,190,dpa,dpa,per-worker,0,1637.12,613310,190,100000,static split noheaders nowb
+exact_smoke,190,host,host,shared,1,1787.86,11232,190,0,100K logical rows; byte verified mismatches=0

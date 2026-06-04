@@ -1,0 +1,7 @@
+rows_per_task,threads,iterations,rows,working_set_rows,rows_per_dpa_task,window_writeback,cmdq_chunks,cmdq_tasks,bytes,host_elapsed_us,enqueue_elapsed_us,start_elapsed_us,drain_wait_us,host_throughput_mb_s,dpa_throughput_mb_s,dpa_cycles_sum,dpa_cycles_max,avg_dpa_cycles_per_row,mismatches,status_errors,verification_skipped
+1,64,1,100000,32768,1,0,7,100000,5026534,118231,12992,83,107123,42.5145,0,0,0,0,0,0,32768
+4,64,1,100000,32768,4,0,4,25000,5026534,49462,3135,68,47290,101.624,0,0,0,0,0,0,32768
+16,64,1,100000,32768,16,0,4,6250,5026534,65980,867,62,65336,76.1827,0,0,0,0,0,0,32768
+64,64,1,100000,32768,64,0,4,1563,5026534,191803,210,61,191599,26.2068,0,0,0,0,0,0,32768
+256,64,1,100000,32768,256,0,4,391,5026534,376587,56,59,376490,13.3476,0,0,0,0,0,0,32768
+all,64,1,100000,32768,0,0,4,255,5026534,365614,40,63,365519,13.7482,0,0,0,0,0,0,32768

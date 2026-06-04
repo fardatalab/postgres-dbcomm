@@ -1,0 +1,16 @@
+variant,schedule,threads,rows_per_task,window_writeback,ring_output_location,cmdq_chunks,cmdq_tasks,host_payload_throughput_mb_s,dpa_throughput_mb_s,avg_dpa_cycles_per_row,mismatches,verification_skipped,notes
+exact_datarow_host_output,contiguous,190,16,1,host,31,312500,603.987,2439.140,28156.7,0,0,previous many-CmdQ-task baseline
+exact_datarow_host_output,contiguous,256,16,1,host,31,312500,714.055,3194.870,28963.5,0,0,previous many-CmdQ-task baseline
+exact_datarow_host_output,contiguous,512,16,1,host,31,312500,1078.530,6468.750,28609.7,0,0,previous many-CmdQ-task baseline
+exact_datarow_host_output,static-chunked,190,16,1,host,1,190,1917.690,2432.270,28236.2,0,0,byte verified
+exact_datarow_host_output,static-chunked,256,16,1,host,1,256,1453.270,3463.040,26720.6,0,0,byte verified
+exact_datarow_host_output,static-chunked,512,16,1,host,1,512,1817.470,7809.640,23697.5,0,0,byte verified
+split_lineitem_dpa_ring_no_headers_nowb,contiguous,190,16,0,dpa,31,312500,721.698,0.000,0.0,0,100000,previous many-CmdQ-task timing-only baseline
+split_lineitem_dpa_ring_no_headers_nowb,contiguous,256,16,0,dpa,31,312500,832.205,0.000,0.0,0,100000,previous many-CmdQ-task timing-only baseline
+split_lineitem_dpa_ring_no_headers_nowb,contiguous,512,16,0,dpa,31,312500,1158.330,0.000,0.0,0,100000,previous many-CmdQ-task timing-only baseline
+split_lineitem_dpa_ring_no_headers_nowb,static-chunked,190,16,0,dpa,1,190,2462.810,0.000,0.0,0,100000,timing-only; no per-row host headers and no window writeback
+split_lineitem_dpa_ring_no_headers_nowb,static-chunked,256,16,0,dpa,1,256,1846.490,0.000,0.0,0,100000,timing-only; no per-row host headers and no window writeback
+split_lineitem_dpa_ring_no_headers_nowb,static-chunked,512,16,0,dpa,1,512,2233.310,0.000,0.0,0,100000,timing-only; no per-row host headers and no window writeback
+split_lineitem_dpa_ring_with_headers,static-chunked,190,16,1,dpa,1,190,2340.500,3073.450,22345.6,100000,0,non-DataRow split output; mismatches are expected against DataRow verifier
+split_lineitem_dpa_ring_with_headers,static-chunked,256,16,1,dpa,1,256,1747.480,4258.440,21729.7,100000,0,non-DataRow split output; mismatches are expected against DataRow verifier
+split_lineitem_dpa_ring_with_headers,static-chunked,512,16,1,dpa,1,512,2161.810,9619.320,19239.3,100000,0,non-DataRow split output; mismatches are expected against DataRow verifier

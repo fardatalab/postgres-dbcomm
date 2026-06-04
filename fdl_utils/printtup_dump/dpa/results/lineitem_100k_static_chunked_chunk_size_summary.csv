@@ -1,0 +1,6 @@
+schedule,threads,rows_per_task,window_writeback,ring_output_location,cmdq_chunks,cmdq_tasks,host_payload_throughput_mb_s,host_elapsed_us,verification_skipped,notes
+static-chunked,190,1,0,dpa,1,190,2426.290,413827,100000,timing-only split output
+static-chunked,190,4,0,dpa,1,190,2464.620,407391,100000,timing-only split output
+static-chunked,190,16,0,dpa,1,190,2461.670,407880,100000,timing-only split output
+static-chunked,190,64,0,dpa,1,190,2467.300,406948,100000,timing-only split output
+static-chunked,190,256,0,dpa,1,190,2463.450,407584,100000,timing-only split output

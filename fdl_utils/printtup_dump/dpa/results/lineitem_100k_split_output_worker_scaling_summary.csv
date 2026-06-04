@@ -1,0 +1,10 @@
+variant,threads,rows_per_task,window_writeback,ring_output_location,host_payload_throughput_mb_s,dpa_throughput_mb_s,avg_dpa_cycles_per_row,mismatches,verification_skipped,notes
+exact_datarow_host_output,190,16,1,host,603.987,2439.140,28156.7,0,0,complete DataRow body; byte verified
+exact_datarow_host_output,256,16,1,host,714.055,3194.870,28963.5,0,0,complete DataRow body; byte verified
+exact_datarow_host_output,512,16,1,host,1078.530,6468.750,28609.7,0,0,complete DataRow body; byte verified
+split_lineitem_dpa_ring_with_headers,190,16,1,dpa,701.543,3013.790,22787.9,100000,0,non-DataRow split output; per-row host headers still written
+split_lineitem_dpa_ring_with_headers,256,16,1,dpa,811.997,3964.150,23342.8,100000,0,non-DataRow split output; per-row host headers still written
+split_lineitem_dpa_ring_with_headers,512,16,1,dpa,1130.530,7949.920,23279.4,100000,0,non-DataRow split output; per-row host headers still written
+split_lineitem_dpa_ring_no_headers_nowb,190,16,0,dpa,721.698,0.000,0.0,0,100000,timing-only; no per-row host result headers and no window writeback
+split_lineitem_dpa_ring_no_headers_nowb,256,16,0,dpa,832.205,0.000,0.0,0,100000,timing-only; no per-row host result headers and no window writeback
+split_lineitem_dpa_ring_no_headers_nowb,512,16,0,dpa,1158.330,0.000,0.0,0,100000,timing-only; no per-row host result headers and no window writeback

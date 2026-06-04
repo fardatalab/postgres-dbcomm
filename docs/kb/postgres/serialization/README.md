@@ -22,4 +22,5 @@ Capture how executor tuples become FE/BE protocol bytes, how `printtup` uses mem
 
 - `../memory-contexts/`: Allocation and context-lifetime groundwork that this path depends on.
 - `../libpq-io/socket_wait_and_io.md`: Lower-level socket flush and wait behavior once bytes reach libpq backend transport code.
+- `../../dpa/`: BlueField DPA programming and memory-access notes relevant to serializer offload.
 - `../../future-directions/postgres/serialization/`: Forward-looking design notes for serializer/send-path changes.

@@ -1,0 +1,10 @@
+variant,threads,input_location,ring_output_location,ring_partition,window_writeback,host_payload_throughput_mb_s,host_elapsed_us,cmdq_tasks,verification_skipped,notes
+pre_packed_input,190,host,dpa,per-worker,0,2453.56,409227,190,100000,host-window input baseline before DPA input packing
+pre_packed_input,190,dpa,dpa,per-worker,0,1637.12,613310,190,100000,old DPA-heap input; one tiny heap allocation per normalized field
+packed_input,190,host,dpa,per-worker,0,2455.53,408900,190,100000,host-window input after host code change; expected unchanged
+packed_input,256,host,dpa,per-worker,0,1852.53,541996,256,100000,host-window input after host code change
+packed_input,512,host,dpa,per-worker,0,2226.72,450916,512,100000,host-window input after host code change
+packed_input,190,dpa,dpa,per-worker,0,2398.61,418603,190,100000,DPA-heap input packed into one contiguous blob and copied once
+packed_input,256,dpa,dpa,per-worker,0,1708.40,587722,256,100000,DPA-heap input packed into one contiguous blob and copied once
+packed_input,512,dpa,dpa,per-worker,0,2289.30,438590,512,100000,DPA-heap input packed into one contiguous blob and copied once
+exact_smoke_packed_dpa_input,190,dpa,host,shared,1,1793.61,11196,190,0,100K logical rows; byte verified mismatches=0

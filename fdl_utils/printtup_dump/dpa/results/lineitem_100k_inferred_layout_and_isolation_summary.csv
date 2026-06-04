@@ -1,0 +1,14 @@
+variant,threads,rows_per_task,input_location,ring_output_location,ring_output_bytes,host_payload_throughput_mb_s,dpa_throughput_mb_s,avg_dpa_cycles_per_row,mismatches,verification_skipped,notes
+direct_lineitem_baseline,512,16,host,host,0,1067.500,6354.720,29123.1,0,0,direct writer before inferred layout
+inferred_layout,512,16,host,host,0,1074.840,6460.450,28646.5,0,0,best correct DataRow-body path
+fieldmeta_abi_only,512,16,host,host,0,1035.510,5915.300,31286.5,0,0,larger field descriptor without using metadata
+predecoded_fieldmeta,512,16,host,host,0,1042.100,5950.220,31102.9,0,0,larger field descriptor plus predecoded text/numeric metadata
+skip_text_payload_copy,512,16,host,host,0,1040.610,7811.950,23690.5,100000,0,isolation build; intentionally mismatched bytes
+fast_numeric,512,16,host,host,0,1031.210,7812.560,23688.7,100000,0,isolation build; intentionally mismatched bytes
+fast_numeric_skip_text,512,16,host,host,0,1014.910,8863.990,20878.7,100000,0,isolation build; intentionally mismatched bytes
+fast_lineitem_fields,512,16,host,host,0,961.300,10446.600,17715.8,100000,0,isolation build; writes length words and advances payload lengths only
+payload_only_output,512,16,host,host,0,1185.590,8471.400,21846.3,100000,0,output-shape experiment; omits natts and per-field length words
+inferred_layout_dpa_ring,512,16,host,dpa,67108800,1011.090,6328.910,29241.9,0,100000,correct DPA ring body; byte verification skipped for ring body
+fast_lineitem_fields_dpa_ring,512,16,host,dpa,67108800,1469.490,20375.200,9083.1,0,100000,isolation build showing host-window length-word stores are costly
+inferred_layout_input_dpa,512,16,dpa,host,0,866.573,4710.380,39289.6,0,0,DPA heap input is slower for this workload
+scratch_output,512,16,host,host,0,773.682,3570.160,51837.8,0,0,DPA-local row scratch plus final copy; rejected
