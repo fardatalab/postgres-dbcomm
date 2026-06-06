@@ -662,6 +662,13 @@ Current post-peer-push baseline captured on June 6, 2026:
   in `/tmp/citus_vanilla_copy_10m_baseline_1780783569`. Treat the remaining
   Homer gap as payload-loop/tuple-record overhead, not as terminal peer
   completion polling.
+- Later W4 scheduler-facts validation on June 6 saw a slower same-machine band:
+  W4 warmed repeats `7.71`, `7.98`, `8.05 s` in
+  `/tmp/homer_w4_copy_10m_trim3_1780785961`; direct parent-commit A/B at
+  `7be63cdb8` gave `8.01`, `8.30`, `7.99 s` in
+  `/tmp/homer_parent_copy_10m_ab_1780786118`. Treat those as comparable to each
+  other and keep the older 7.47 s band as a prior baseline, not a confirmed W4
+  regression.
 
 Discard the run if a timeout, interrupted client, or failed COPY leaves a stale
 `postgres: remote exec backend`. Return to the clean runtime baseline and rerun

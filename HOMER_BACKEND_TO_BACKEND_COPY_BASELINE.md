@@ -52,6 +52,14 @@ the normal terminal command-completion poll round trip, but the steady 10M-row
 COPY gap is now dominated by payload-loop and per-record work, not by terminal
 command completion.
 
+Later W4 scheduler-facts validation on the same day saw a slower current band.
+The W4 binary produced correct warmed runs of `7.71`, `7.98`, and `8.05 s` in
+`/tmp/homer_w4_copy_10m_trim3_1780785961`. A direct parent-commit A/B at
+`7be63cdb8` produced `8.01`, `8.30`, and `7.99 s` in
+`/tmp/homer_parent_copy_10m_ab_1780786118`, so treat the W4 COPY result as
+comparable to the current-machine parent band rather than as proof that W4
+introduced the older-baseline delta.
+
 ## Vanilla Citus Baseline
 
 The comparable vanilla Citus path uses the same distributed table and input file

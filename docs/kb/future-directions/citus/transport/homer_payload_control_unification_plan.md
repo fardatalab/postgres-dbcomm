@@ -299,40 +299,50 @@ traffic metadata. The missing work is mainly first-layer service-progress facts
 for payload-stream sources whose next useful action is not simply "send more
 payload bytes."
 
-Current facts and gaps:
+Current implementation state after the June 6, 2026 W4 slice:
 
-- First-layer source state already exists in
-  [`HomerProgressSourceCore`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1282),
-  [`HomerProgressSourceFeedback`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1313),
-  and [`HomerProgressResult`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1558).
+- Done: first-layer source state now carries generic readiness/blockage reasons
+  in
+  [`HomerProgressReasonMask`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1295),
+  [`HomerProgressSourceCore`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1350),
+  [`HomerProgressSourceFeedback`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1383),
+  and [`HomerProgressResult`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1632).
+- Done: payload-source traffic metadata is synchronized from each stream through
+  [`HomerServiceSyncPayloadProgressSourceMetadata()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12799),
+  and its service-progress CPU/liveness class is derived by
+  [`HomerServicePayloadCpuClassForTrafficClass()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12774).
+  This keeps the first-layer class derived from the operation-neutral traffic
+  class instead of making the service-progress scheduler understand tuple COPY,
+  client SQL, or basebackup semantics.
+- Done: neutral payload readiness/blockage facts are computed by
+  [`HomerServicePayloadStreamReasonMasks()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4659),
+  refreshed for explicit per-stream ready sources by
+  [`HomerServiceRefreshPayloadProgressSourceFacts()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4789),
+  and carried through grant feedback by
+  [`HomerServiceUpdateProgressFeedback()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5103).
 - Payload egress facts already exist in
-  [`HomerPayloadEgressReadyFacts`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1491).
+  [`HomerPayloadEgressReadyFacts`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1491)
+  and are built by
+  [`HomerServiceBuildPayloadEgressReadyFacts()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3096).
 - Transport traffic class is already workload-neutral and maps tuple/client-SQL
   payloads to foreground payload and basebackup to bulk payload in
-  [`HomerServicePayloadTrafficClassForOpKind()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1949).
-- A concrete gap remains: payload stream progress sources are initialized with
-  `HOMER_TRANSPORT_TRAFFIC_CLASS_INVALID` in
-  [`HomerServiceInitializeProgressRegistry()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5922).
-  The stream's egress metadata knows its class, but the first-layer
-  service-progress source does not unless this is synchronized when the stream is
-  opened or rebound.
-- Another gap is fact granularity: the ready predicate in
-  [`HomerServicePayloadStreamSourceReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4535)
-  can detect completions, receiver ACKs, close work, incoming doorbells, and
-  outgoing work, but current feedback mostly preserves outgoing ready
-  byte/object hints in
-  [`HomerServiceUpdateProgressFeedback()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4810).
-  A later policy cannot cheaply tell why a receive-side stream is still worth
-  polling.
+  [`HomerServicePayloadTrafficClassForOpKind()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2031).
+- Dense payload scans intentionally do not refresh per-stream source cores in
+  [`HomerServiceExecuteAggregatePayloadProgressScan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5409).
+  Aggregate scans represent the whole payload table as one source, so detailed
+  per-stream facts are only useful on the explicit per-source path. The W4
+  implementation also gates payload reason-bit accumulation in
+  [`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:16805)
+  when the aggregate path has no per-source feedback consumer. This was a
+  measured hot-path concern for tuple COPY.
 
 Implementation checklist:
 
-- Synchronize per-stream `HomerTransportTrafficClass` into the corresponding
+- Done: synchronize per-stream `HomerTransportTrafficClass` into the corresponding
   `HomerProgressSourceCore` when a payload stream is initialized, rebound, or
   reset. This lets first-layer policies order foreground tuple/client-SQL payload
   streams and bulk basebackup streams without reinterpreting DB operation kinds.
-- Add neutral readiness/blockage reason bits for payload-stream sources. Useful
-  names include:
+- Done: add neutral readiness/blockage reason bits for payload-stream sources:
   - `OUTGOING_PAYLOAD_READY`
   - `OUTGOING_COMPLETION_PENDING`
   - `INCOMING_DOORBELL_PENDING`
@@ -342,15 +352,17 @@ Implementation checklist:
   - `REMOTE_CREDIT_BLOCKED`
   - `LOCAL_SEND_RESOURCE_PRESSURE`
   - `CLOSE_OR_RECLAIM_PENDING`
-- Preserve these reason bits through the same path that already updates feedback:
+- Done: preserve these reason bits through the same path that already updates feedback:
   executor-local progress in the payload pump, merge through
-  [`HomerProgressResultMergePayloadDelta()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3771),
+  [`HomerProgressResultMergePayloadDelta()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3855),
   then update source feedback in
-  [`HomerServiceUpdateProgressFeedback()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4810).
-- Improve generic receive-side feedback, not tuple-specific feedback. Candidate
-  fields are pending receiver ACK count/frontier, pending receiver-credit bytes
-  or objects, local consumer blocked state, and outstanding receiver ACK WR
-  count. These should describe RDMA stream state, not tuple semantics.
+  [`HomerServiceUpdateProgressFeedback()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5103).
+- Partly done: generic receive-side feedback now exposes receiver doorbells,
+  receiver-credit publication need, receiver ACK completion retirement, and local
+  consumer backpressure as reason masks. More quantitative fields such as exact
+  pending receiver ACK count/frontier, pending receiver-credit bytes/objects, or
+  outstanding receiver ACK WR count remain future policy inputs if a policy needs
+  them.
 - Keep tuple-view passive receive explicit. In the tuple-view byte-ring branch
   inside the current byte-ring receiver
   [`HomerServicePumpIncomingByteRingBaseBackup()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15316),
@@ -372,22 +384,48 @@ not attempt to make a new policy clever yet; it should make the facts complete
 and cheap enough that future policies can reason about stream liveness,
 backpressure, and egress pressure without knowing DB-level semantics.
 
-Settlement status: the design boundary is settled: facts must be neutral and
-reusable across workloads. The first implementation should put generic
-readiness/blockage reason bits directly in `HomerProgressResult` and
-`HomerProgressSourceFeedback`, not in a payload-only side structure. Policies
-may branch on source kind, but they should not need a payload-specific detail API
-to understand common liveness and backpressure reasons.
+Settlement status: W4 is implemented as a fact-model slice. Facts remain neutral
+and reusable across workloads, and generic readiness/blockage reason bits live
+directly in `HomerProgressResult`, `HomerProgressSourceCore`, and
+`HomerProgressSourceFeedback`, not in a payload-only side structure. The
+per-stream `cpuClass` question is also settled for now: payload sources derive
+their CPU/liveness class from the stream's traffic class, so foreground
+tuple/client-SQL payloads map to hot data and bulk/basebackup payloads map to
+cold setup/maintenance without making the scheduler branch on DB operation kind.
 
-One implementation choice remains worth discussing before coding:
+Validation evidence for W4:
 
-- Whether to update payload-source `cpuClass` per stream in addition to
-  `trafficClass`. The current default maps every payload stream to
-  `HOMER_PROGRESS_CPU_CLASS_HOT_DATA` in
-  [`HomerServiceDefaultCpuClassForProgressSource()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5834).
-  That is safe but coarse. If basebackup needs to be lower liveness than
-  foreground tuple/client-SQL payloads at the first layer, the per-stream source
-  core needs a dynamic CPU-class update too.
+- Build/deploy: `git diff --cached --check` and `make -j8 service-bin
+  client-bin` passed in `/data/dbcomm/citus-dbcomm`; installed artifacts were
+  synced to `farnet0`.
+- Remote Homer pgbench after final W4 trim:
+  `/tmp/homer_w4_final_pgbench_1780786205` and
+  `/tmp/homer_w4_final_pgbench_warm_1780786227`.
+  Warm c1 was correct at `4359.37 TPS`, p99 `0.232 ms`, zero failed
+  transactions. c4 was correct at `7999.31 TPS`, p99 `0.566 ms`, zero failed
+  transactions.
+- Remote RDMA basebackup after final W4 trim:
+  `/tmp/homer_w4_final_basebackup_1780786241`. Warmup was `5.74 s`; repeats
+  were `4.46 s` and `4.45 s`; all runs completed successfully.
+- Concurrent remote Homer pgbench plus background remote RDMA basebackup:
+  `/tmp/homer_w4_final_concurrent_1780786269`. Foreground c1 pgbench was
+  correct at `3210.70` and `3185.23 TPS`, p99 `0.448` and `0.481 ms`, while
+  basebackup completed in `4.94` and `5.01 s`.
+- Concurrent performance caveat: the older W1/W2 notes had a hotter foreground
+  band, but a warmed same-day parent-commit A/B at `7be63cdb8` produced
+  `3460.26`, `3214.69`, and `3224.77 TPS` with basebackup at `4.99 s` in
+  `/tmp/homer_parent_concurrent_ab_warm_1780786777`. Treat the W4 concurrent
+  result as correct and comparable to the current parent band.
+- Backend-to-backend Citus COPY after final W4 trim:
+  `/tmp/homer_w4_copy_10m_trim3_1780785961`. Correctness check matched
+  `count=10000000`, `min=1`, `max=10000000`, `sum=500000050000000`; warmed
+  runs were `7.71`, `7.98`, and `8.05 s`.
+- COPY performance caveat: the older saved post-peer-push baseline was
+  `7.46/7.62/7.32 s`, but a direct same-day parent-commit A/B at `7be63cdb8`
+  reproduced a slower current band of `8.01/8.30/7.99 s` in
+  `/tmp/homer_parent_copy_10m_ab_1780786118`. Treat the W4 COPY result as
+  correct and comparable to today's parent band, not as evidence that W4 caused
+  the older-baseline delta.
 
 ## Non-Goals
 

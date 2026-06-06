@@ -36,10 +36,15 @@ Current status after the June 6, 2026 implementation:
   peer ring is available.
 
 Validation completed for tuple COPY correctness/performance, remote pgbench c1,
-and remote RDMA basebackup blackhole. Current COPY performance is about 7.3-7.6
-s warmed with the new default tuple geometry, versus vanilla Citus around 5.1 s;
-the remaining gap is payload-loop/record overhead rather than terminal
-command-completion polling.
+remote RDMA basebackup blackhole, and concurrent remote pgbench plus background
+remote RDMA basebackup. Current COPY performance is about 7.3-7.6 s warmed with
+the new default tuple geometry, versus vanilla Citus around 5.1 s; the
+remaining gap is payload-loop/record overhead rather than terminal
+command-completion polling. The concurrent parent/W3 check in
+`/tmp/homer_parent_concurrent_ab_warm_1780786777` processed `10000/10000`
+foreground pgbench transactions with zero failures on each repeat, at
+`3460.26`, `3214.69`, and `3224.77 TPS`, while background basebackup completed
+in `4.99 s` each time.
 
 ## Current Code Facts
 
