@@ -554,7 +554,7 @@ Target nonblocking shape:
    the appropriate caller-visible completion channel:
    - local frontend: the existing small-ring
      [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:458)
-   - peer service: the future fixed-size peer completion ring
+   - peer service: the requester-service-owned fixed-size peer completion ring
 4. A row-producing SQL command publishes a `STARTED` event with result-sink
    readiness once
    [`RemoteExecSqlDestStartup()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:678)
@@ -2913,13 +2913,14 @@ June 2, 2026 implementation checkpoint:
    - remaining direction: remove nested waits from normal paths rather than
      expanding the mask policy
 
-2. **Async command submission - local frontend completed, peer still future**
+2. **Async command submission - local frontend and peer normal path completed**
    - make local and peer `START_COMMAND` handlers publish work and return
      immediately
    - push `STARTED`, result-sink readiness, `COMPLETED`, and `FAILED` through
      completion channels
    - remove local and peer startup waits from normal paths
-   - add the peer completion ring before deleting peer completion polling
+   - keep peer completion polling only as fallback/debug while broader
+     validation determines whether it can be deleted
 
 3. **Neutral payload stream refactor - completed May 14, 2026**
    - split generic stream state from tuple object-family state
@@ -7539,23 +7540,24 @@ June 2, 2026 implementation checkpoint:
      ready-set and feedback vocabulary
    - optionally split peer-control into true first-class phase sources if the
      aggregate source plus subgrant model is not expressive enough for policy work
-   - add the peer service-to-service push completion ring before retiring normal
-     peer `POLL_COMMAND_COMPLETION`
+   - peer service-to-service push completion is now implemented for the normal
+     path; retain `POLL_COMMAND_COMPLETION` only as fallback/debug while mixed
+     workloads are broadened
    - keep polling/event-driven notification experiments separate from this
      completed milestone unless the transport resources are explicitly created
      for notification mode.
 
-10. **Push command completions - local frontend completed, peer still future**
+10. **Push command completions - local frontend and peer normal path completed**
    - keep one in-flight command per session and use a small completion ring for
      the local frontend no-poll implementation
    - bind the local frontend completion destination during session/open setup
    - publish terminal completion from the producing side instead of requiring a
      separate `POLL_COMMAND_COMPLETION` request
-   - add a small fixed-size peer completion ring for service-to-service push
-     completions before removing peer completion polling from the normal path
-   - retire `terminalCompletionPendingPeerPoll` once delivery acknowledgement is
-     tied to the push destination instead of a future poll
-   - retain poll only as a fallback/debug path until the push path is validated
+   - service-to-service push completions now use a requester-service-owned
+     fixed-size peer completion ring on the normal path
+   - `terminalCompletionPendingPeerPoll` remains as fallback/debug retirement
+     state when peer-ring publication is unavailable or fails
+   - narrow or remove peer polling only after broader mixed-workload validation
 
 11. **Fragmentation/reassembly path - basebackup RDMA implemented June 2, 2026**
    - keep fragmentation as a first-class grant dimension from the scheduler's

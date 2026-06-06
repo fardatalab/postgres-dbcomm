@@ -241,9 +241,12 @@ payload byte/WR sizing into a service-progress source-order policy.
 - Do not require DB-semantic awareness in the service-progress scheduler.
   Policies should operate on source kind, CPU/liveness class, traffic class,
   readiness, feedback, and frontier facts.
-- Do not treat peer push completions as required for policy work. Local frontend
-  push completions exist; service-to-service peer command completions still have
-  a future fixed-size peer completion-ring cleanup.
+- Do not treat peer push completions as required for first policy experiments.
+  Local frontend push completions exist, and service-to-service peer command
+  completions now use a requester-service-owned fixed-size peer completion ring
+  on the normal path. `POLL_COMMAND_COMPLETION` remains as a fallback/debug path,
+  so policy work should measure whether it is actually exercised before using it
+  as an explanation for performance.
 - Do not use cold first-run numbers as steady-state evidence. Warmed comparisons
   are the default for this prototype.
 

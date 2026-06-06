@@ -35,31 +35,36 @@ The receiver-side borrow is already present. The sender-side path still has an
 ownership boundary where PostgreSQL/Citus slot data is converted into a
 Homer-owned tuple-view byte image.
 
-## June 6, 2026 Batch-Size Sweep
+## June 6, 2026 Batch-Size Sweeps
 
 Baseline workload:
 
 - input: `/tmp/homer_tuple_sink_copy_10m.csv`
 - table: `homer_tuple_sink_copy_bench (id int, v bigint, payload text)`
 - size: 10,000,000 rows, about 323 MB
-- raw artifacts: `/tmp/homer_b2b_copy_batch_sweep_1780764011`
+- current raw artifacts:
+  - `/tmp/homer_b2b_copy_10m_batch_sweep_1780783606`
+  - `/tmp/homer_b2b_copy_10m_batch_sweep2_1780783711`
 
-Results:
+Current post-peer-push results:
 
 | Tuple Target | Slot Capacity | Result |
 | --- | --- | --- |
-| 16 | 1024 bytes | correct; measured runs 5.48 s and 5.29 s after warmup |
-| 64 | 1024 bytes | correct; measured runs 5.42 s and 5.34 s after warmup |
-| 64 | 4096 bytes | initially failed; fixed follow-up measured 5.37 s, 5.21 s, and 5.30 s after warmup |
+| default old (`16`) | default old (`1024` bytes) | correct; `62.93 s` |
+| `64` | `4096` bytes | correct; warmed around `44.96 s` |
+| `256` | `16384` bytes | correct; `21.42 s` |
+| `1024` | `65536` bytes | correct; `11.46 s` |
+| `4096` | `262144` bytes | correct; `8.00 s` |
+| `8192` | `524288` bytes | correct; `7.64 s` |
+| `16384` | `1048576` bytes | correct; `8.37 s` |
 
-Raising `citus.experimental_tuple_sink_batch_tuple_target` from `16` to `64`
-without increasing `citus.experimental_tuple_sink_slot_capacity_bytes` did not
-move throughput. That supports the suspicion that the default 1024-byte slot
-capacity caps the effective tuple count per record before the soft tuple target
-matters.
+The current default is now `8192` tuples and `524288` bytes. This is a
+pragmatic default, not a final transport result: it removes the pathological
+small-record overhead exposed by the post-peer-push service loop, while avoiding
+the slight regression seen at `16384` / `1048576`.
 
-Increasing slot capacity to 4096 bytes initially exposed a correctness/transport
-issue. The SQL client reported:
+Earlier in the same bring-up, increasing slot capacity to 4096 bytes initially
+exposed a correctness/transport issue. The SQL client reported:
 
 ```text
 remote execution control request timed out waiting for service progress
@@ -86,10 +91,27 @@ run=3 real=5.21 correct
 run=4 real=5.30 correct
 ```
 
-The warmed average was about 5.29 s, which is only modestly better than the
-1024-byte slot runs and still close to the vanilla Citus/libpq baseline. That
-keeps copy-reduction and RDMA loop efficiency as the more interesting future
-directions.
+That pre-peer-push 4096-byte result was useful for bring-up, but it should not be
+treated as the current baseline. After the later scheduler/peer-completion work,
+small tuple records were much slower (`64` / `4096` around 45 s), while the
+larger default recovered the path to about 7.3-7.6 s. Rechecking the old
+`65207cd4e` baseline in a detached worktree timed out with ready-set overflow,
+so the earlier near-vanilla number is historical evidence rather than a stable
+current comparison.
+
+The comparable vanilla Citus baseline on the same 10M-row input was:
+
+```text
+/tmp/citus_vanilla_copy_10m_baseline_1780783569
+run=1 real=5.18 correct
+run=2 real=5.11 correct
+run=3 real=5.11 correct
+```
+
+So the current Homer path is correct and no longer pathologically slow under the
+new default, but still carries about a 2.3-2.5 s gap on this workload. The
+remaining first-order work is service payload-loop efficiency and tuple-view
+record overhead, not terminal command-completion polling.
 
 The relevant code area is the tuple byte-ring RDMA path:
 
@@ -106,6 +128,17 @@ The relevant code area is the tuple byte-ring RDMA path:
   exact receive attach currently accepts the peer-provisioned sink geometry as
   authoritative even when the worker backend's local GUC defaults request a
   smaller geometry.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:28`:
+  `CITUS_TUPLE_SINK_DEFAULT_SLOT_CAPACITY_BYTES` is now `524288`.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:29`:
+  `CITUS_TUPLE_SINK_DEFAULT_BATCH_TUPLE_TARGET` is now `8192`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1224`:
+  `HOMER_PROGRESS_PLAN_MAX_GRANTS` is now `64`, so a 32-shard COPY can have
+  ready payload sources plus CQ/control/completion work without immediate
+  ready-set overflow.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4793`:
+  `HomerServiceBuildCoarseProgressReadySet()` uses one aggregate payload source
+  when the active payload stream scan limit is dense enough.
 
 After the RDMA failure, a service-only restart was not sufficient for trustworthy
 measurement. A full PostgreSQL plus Homer restart on both hosts recovered the
@@ -115,12 +148,12 @@ and should not be used as a steady-state throughput datapoint.
 
 ## Future Work Options
 
-### 1. Fix and measure larger tuple-view records first
+### 1. Measure and reduce payload-loop per-record overhead
 
-Before copy-reduction work, make larger tuple byte-ring slots reliable. The
-current 4096-byte slot failure means we cannot yet test whether fewer semantic
-records, fewer RDMA writes, fewer completions, and fewer service iterations
-recover the small Homer-vs-vanilla COPY gap.
+Larger tuple-view records are now reliable enough for the current 10M-row
+workload, and the default uses the best measured band. The next question is why
+the service loop still spends enough CPU per payload record to trail vanilla
+Citus by about 2.3-2.5 s.
 
 Useful counters for this step:
 
@@ -130,6 +163,9 @@ Useful counters for this step:
 - RDMA write descriptors per COPY
 - send completions and receiver head acknowledgements
 - receiver empty polls and blocked-on-local-receive-queue events
+- aggregate-source grants versus per-stream grants
+- `HomerServicePumpPayloadStream()` and
+  `HomerProgressResultMergePayloadDelta()` CPU profile share
 
 ### 2. Direct-fill Homer-owned tuple-view buffers
 

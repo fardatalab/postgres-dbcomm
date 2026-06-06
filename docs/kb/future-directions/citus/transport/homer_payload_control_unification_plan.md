@@ -221,12 +221,14 @@ Validation evidence for this completion:
 Goal: unify the peer-control operation machinery while preserving typed command
 semantics.
 
-The peer push-completion prerequisite lives in this workstream. The detailed
-implementation plan is
+The peer push-completion prerequisite lives in this workstream and is now
+implemented for the normal service-to-service command completion path. The
+detailed implementation/status note is
 [peer_service_push_completion_implementation_plan.md](peer_service_push_completion_implementation_plan.md).
-That plan replaces normal service-to-service `POLL_COMMAND_COMPLETION` with a
-requester-owned, backend-visible peer completion ring before broader
-command/control factoring continues.
+The implementation replaces normal service-to-service `POLL_COMMAND_COMPLETION`
+with a requester-owned, backend-visible peer completion ring; peer polling
+remains as a fallback/debug path while broader mixed-workload validation
+continues.
 
 Tuple COPY uses both a payload stream and remote worker commands. The
 coordinator opens the tuple stream, starts the worker transaction and COPY ingest
@@ -256,9 +258,9 @@ Implementation checklist:
   helper names. Tuple COPY currently obtains its peer command endpoint as a
   consequence of stream open; that relationship should be documented as a
   payload-bound command session, not hidden in stream-open side effects.
-- Implement peer service-to-service push completion with a direct
-  backend-visible peer completion ring. This is the concrete prerequisite before
-  removing hot completion polling from the peer-control umbrella.
+- Done: peer service-to-service push completion now uses a direct
+  backend-visible peer completion ring on the normal path. The remaining cleanup
+  is to narrow or remove fallback polling after broader validation.
 - Do not collapse `OPEN_SESSION` and `START_COMMAND` conceptually. A future wire
   fast path may fuse them for startup latency, but session/channel
   establishment and command dispatch/completion remain different abstractions.
@@ -267,17 +269,15 @@ Implementation checklist:
   poll pending"; it should not say "COPY is pending" as a scheduling reason.
 - Separate three implementation concerns even if they share helper code:
   endpoint/session lifetime, operation state-machine progress, and command
-  payload semantics. Mixing these would make future peer push completion harder
-  because completion delivery would again depend on operation-specific polling
-  code.
+  payload semantics. Mixing these would make peer-ring completion cleanup harder
+  because delivery would again depend on operation-specific polling code.
 
-Settlement status: keep `OPEN_SESSION` and `START_COMMAND` distinct. First
-remove normal peer completion polling with the direct peer completion ring. After
-that, reassess whether aggregate peer-control still hides materially different
-readiness phases; if it does, split peer-control readiness into explicit
-per-operation/per-phase facts. Do not add those extra facts before push
-completion lands, because the current hot completion-polling phase is expected to
-disappear.
+Settlement status: keep `OPEN_SESSION` and `START_COMMAND` distinct. Normal peer
+completion now uses the direct peer completion ring when available. The next
+question is whether aggregate peer-control still hides materially different
+readiness phases now that hot terminal-completion polling is no longer expected
+on the normal path; if it does, split peer-control readiness into explicit
+per-operation/per-phase facts.
 
 ## Workstream 4: Common Payload-Stream Scheduler Facts
 
@@ -400,8 +400,9 @@ One implementation choice remains worth discussing before coding:
 - Do not implement remote PostgreSQL materialization for basebackup in this
   milestone. The current remote basebackup receiver remains the Homer service
   blackhole/accounting path.
-- Do not remove peer `POLL_COMMAND_COMPLETION` until the future peer push
-  completion ring is implemented and verified.
+- Do not remove fallback peer `POLL_COMMAND_COMPLETION` until broader
+  mixed-workload validation shows the peer completion ring is sufficient outside
+  the tuple COPY acceptance path.
 
 ## Verification Plan
 

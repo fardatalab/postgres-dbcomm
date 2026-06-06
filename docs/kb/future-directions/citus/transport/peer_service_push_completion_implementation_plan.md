@@ -2,40 +2,67 @@
 
 ## Summary
 
-The existing no-poll command-completion plan is directionally correct, but it is
-not detailed enough to implement the service-to-service path without making new
-ad hoc choices. This note narrows the next prerequisite milestone: remove the
-normal peer `POLL_COMMAND_COMPLETION` round trip for backend-to-backend command
-completion, with Citus tuple COPY as the first acceptance workload.
+The existing no-poll command-completion plan was narrowed here and has now been
+implemented for the normal service-to-service command completion path. Citus
+tuple COPY was the first acceptance workload.
 
 This is separate from local frontend client-SQL pushed completion. That path
 already has a caller-visible completion mailbox. The missing path is generic
 service-to-service command completion for commands started through a peer service,
 including tuple COPY's `COPY_INGEST_FROM_TUPLE_SINK`.
 
+## Implementation Status
+
+Current status after the June 6, 2026 implementation:
+
+- Implemented a requester-service-owned, backend-visible peer command completion
+  ring in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:501`.
+- Extended peer open requests so payload-bound command endpoints and
+  command-only endpoints both carry a requester completion-ring descriptor in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_peer_control_protocol.h:120`.
+- Added requester-side direct ring mapping and consumption in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c:1824`
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c:1908`.
+- Changed `PollRemoteExecutionCommandCompletion()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c:2928`
+  to prefer cached/ring peer completions before falling back to local-service
+  polling.
+- Added responder-side peer completion publication in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8090`.
+- Kept `POLL_COMMAND_COMPLETION` as a debug/compatibility fallback. It should no
+  longer be required for the normal tuple COPY terminal completion path when the
+  peer ring is available.
+
+Validation completed for tuple COPY correctness/performance, remote pgbench c1,
+and remote RDMA basebackup blackhole. Current COPY performance is about 7.3-7.6
+s warmed with the new default tuple geometry, versus vanilla Citus around 5.1 s;
+the remaining gap is payload-loop/record overhead rather than terminal
+command-completion polling.
+
 ## Current Code Facts
 
 - The high-level target is already described in
   [homer_transport_scheduler_and_payload_streams.md](homer_transport_scheduler_and_payload_streams.md),
   especially the concrete no-poll plan around `POLL_COMMAND_COMPLETION`.
-- The peer protocol still exposes
+- The peer protocol still exposes the fallback/debug
   `CITUS_REMOTE_EXEC_PEER_REQUEST_POLL_COMMAND_COMPLETION` in
   `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_peer_control_protocol.h:40`.
-- The backend-facing wait API still issues a local service
-  `POLL_COMMAND_COMPLETION` request in
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c:2301`,
-  and `WaitForRemoteExecutionCommandCompletion()` loops on that poll at
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c:2722`.
-- Local-control async peer polling is still built in
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18205`.
+- The backend-facing wait API still has a local service
+  `POLL_COMMAND_COMPLETION` fallback in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c:2523`.
+- Local-control async peer polling is still built as the fallback/debug path in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18772`.
 - The worker-side service consumes backend completion records in
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8450`.
-  For non-client-SQL terminal peer commands it still sets
-  `terminalCompletionPendingPeerPoll` at
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8595`.
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8879`.
+- For non-client-SQL terminal peer commands, it now calls
+  `TupleSinkServicePublishPeerCommandCompletion()` before falling back to
+  `terminalCompletionPendingPeerPoll` if publication cannot be used
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9036`).
 - The responder-side peer poll handler still serializes completion into a peer
-  response in
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19545`.
+  response for fallback/debug use in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20148`.
 - Tuple COPY starts and later waits for the worker-side ingest command in
   `/data/dbcomm/citus-dbcomm/src/backend/distributed/commands/multi_copy.c:2650`
   and
@@ -78,7 +105,7 @@ Use the same choices as local frontend pushed completion:
 
 ## Implementation Steps
 
-### 1. Define The Peer Completion Ring
+### 1. Define The Peer Completion Ring - Done
 
 Add a small fixed-size SPSC ring to the peer control protocol header near the
 existing peer request/response types:
@@ -98,7 +125,7 @@ The ring should carry command completion events only. Tuple/result sink
 descriptors remain inside `CitusRemoteExecCommandCompletion` when the command
 state/result flags require them.
 
-### 2. Allocate And Register The Requester-Side Ring
+### 2. Allocate And Register The Requester-Side Ring - Done
 
 Add requester-service state for a peer command completion ring. The ring should
 be local to the requester service and registered for RDMA writes before the peer
@@ -132,7 +159,7 @@ Add corresponding cleanup paths:
   closed,
 - responder deregisters any scratch/source memory it uses for publishing events.
 
-### 3. Publish Completion From Backend-Mailbox Consumption
+### 3. Publish Completion From Backend-Mailbox Consumption - Done
 
 When the responder service consumes a backend completion in
 `TupleSinkServiceConsumeCompletionMailbox()`, it should publish push-visible
@@ -149,7 +176,7 @@ The publish order should be:
 This mirrors the local/client-SQL pushed completion pattern but targets the peer
 completion ring rather than `CitusRemoteExecClientCompletionMailbox`.
 
-### 4. Add Requester-Side Consumption
+### 4. Add Requester-Side Consumption - Done
 
 Add a requester-side service helper that consumes events from the local peer
 completion ring and records scheduler/progress facts if the service needs them.
@@ -163,7 +190,7 @@ completion ring directly, copy matching events in order, and advance
 `consumedEpoch`. It should validate `(localServiceSessionId, peerServiceSessionId,
 commandSequence)` before treating an event as the requested completion.
 
-### 5. Route Tuple COPY Waits Through Push Completion
+### 5. Route Tuple COPY Waits Through Push Completion - Done
 
 Change `PollRemoteExecutionCommandCompletionThroughLocalService()` so remote peer
 sessions prefer the directly mapped peer-completion ring path. It should submit
@@ -173,10 +200,12 @@ explicit debug fallback is enabled.
 This keeps callers such as `FinishExperimentalTupleSinkWorkerInsert()` unchanged
 while the lower command-completion implementation changes.
 
-### 6. Replace Terminal-Pending Retirement State
+### 6. Replace Terminal-Pending Retirement State - Partially Done
 
-Replace `terminalCompletionPendingPeerPoll` with delivery-oriented state, for
-example:
+Normal peer completion now publishes to the requester ring and clears
+`terminalCompletionPendingPeerPoll` after successful delivery. The old field
+still exists as fallback/debug retirement state. A later cleanup can replace it
+with explicit delivery-oriented state, for example:
 
 - completion not yet consumed from backend mailbox,
 - completion consumed and peer-push delivery pending,
@@ -185,10 +214,11 @@ example:
 Session retirement should wait for delivery to the bound destination, not for a
 future peer poll request.
 
-### 7. Demote Poll Completion
+### 7. Demote Poll Completion - Partially Done
 
-After validation, remove `POLL_COMMAND_COMPLETION` from normal backend-to-backend
-paths:
+After validation, `POLL_COMMAND_COMPLETION` is no longer the preferred normal
+backend-to-backend wait path when a peer completion ring is mapped. Remaining
+cleanup:
 
 - local-control async code should not build
   `CITUS_REMOTE_EXEC_PEER_REQUEST_POLL_COMMAND_COMPLETION` for ordinary remote
@@ -221,5 +251,7 @@ Validate in this order:
 4. local and remote Homer basebackup smoke to catch shared peer/control regressions,
 5. grep service logs for unexpected fallback peer `POLL_COMMAND_COMPLETION`.
 
-Do not claim this prerequisite complete until the normal tuple COPY path reaches
-terminal command completion without a peer `POLL_COMMAND_COMPLETION` request.
+The prerequisite is complete for normal tuple COPY behavior: terminal command
+completion is delivered through the peer completion ring when the ring is
+available. The remaining cleanup is to narrow or remove the fallback poll path
+after more mixed-workload validation.

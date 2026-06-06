@@ -14,8 +14,8 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 
 <!-- kb-docs:start -->
 - [homer_payload_control_unification_plan.md](homer_payload_control_unification_plan.md) - Planned unification milestone for Homer byte-ring payload lifecycle, peer command/control lifecycle, and neutral bidirectional payload-stream scheduler facts without rewriting DB-semantic adapters.
-- [homer_transport_scheduler_and_payload_streams.md](homer_transport_scheduler_and_payload_streams.md) - Homer scheduler-ready design and checkpoint, including the completed service-progress/egress scheduler substrate plus remaining policy, peer push completion, traffic-class, multi-QP, and fragmentation directions.
-- [peer_service_push_completion_implementation_plan.md](peer_service_push_completion_implementation_plan.md) - Implementation-ready plan for replacing service-to-service peer completion polling with a requester-owned peer command completion ring.
+- [homer_transport_scheduler_and_payload_streams.md](homer_transport_scheduler_and_payload_streams.md) - Homer scheduler-ready design and checkpoint, including the completed service-progress/egress scheduler substrate plus remaining policy, traffic-class, multi-QP, peer-poll fallback cleanup, and fragmentation directions.
+- [peer_service_push_completion_implementation_plan.md](peer_service_push_completion_implementation_plan.md) - Implementation status and cleanup plan for replacing normal service-to-service peer completion polling with a requester-owned peer command completion ring.
 - [rdma_publication_visibility_and_doorbells.md](rdma_publication_visibility_and_doorbells.md) - RDMA publication/visibility rules, including why the tuple-sink prototype now uses WRITE_WITH_IMM doorbells rather than trusting memory polling alone as the responder-visible publish event.
 - [rdma_transport_control_plane_abstraction.md](rdma_transport_control_plane_abstraction.md) - TODO
 <!-- kb-docs:end -->

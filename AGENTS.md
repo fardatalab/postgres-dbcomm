@@ -571,8 +571,9 @@ baseline from the previous section.
 
 This workload exercises the Citus coordinator backend on `farnet1`, the
 standalone Homer services on both hosts, and a socketless Citus worker backend on
-`farnet0`. It is the current service-to-service tuple payload path to baseline
-before implementing peer push completions.
+`farnet0`. It is the current service-to-service tuple payload path. The normal
+terminal command-completion path now uses the peer completion ring; the old peer
+`POLL_COMMAND_COMPLETION` path is retained as fallback/debug behavior.
 
 Prerequisites:
 
@@ -647,15 +648,20 @@ for f in "$OUT"/run_*.log; do
 done
 ```
 
-Current baseline captured on June 6, 2026:
+Current post-peer-push baseline captured on June 6, 2026:
 
 - Input: `/tmp/homer_tuple_sink_copy_10m.csv`, 10,000,000 rows, about 323 MB.
 - Correctness check: `count=10000000`, `min=1`, `max=10000000`,
   `sum=500000050000000` on every repeat.
-- Warmup: `real 5.09`.
-- Measured repeats: `real 5.34`, `5.58`, `5.75`; average repeat time about
-  `5.56 s`, about `1.80M rows/s`.
-- Raw artifacts: `/tmp/homer_b2b_copy_10m_baseline_1780761813`.
+- Default Homer tuple-sink geometry is now `8192` tuples and `524288` bytes.
+- Warmup after rebuild/sync: `real 11.47`.
+- Measured repeats: `real 7.46`, `7.62`, `7.32`; average repeat time about
+  `7.47 s`, about `1.34M rows/s`.
+- Raw artifacts: `/tmp/homer_b2b_copy_10m_default_after_batch_default_1780784020`.
+- Vanilla Citus on the same 10M-row input measured `5.18`, `5.11`, and `5.11 s`
+  in `/tmp/citus_vanilla_copy_10m_baseline_1780783569`. Treat the remaining
+  Homer gap as payload-loop/tuple-record overhead, not as terminal peer
+  completion polling.
 
 Discard the run if a timeout, interrupted client, or failed COPY leaves a stale
 `postgres: remote exec backend`. Return to the clean runtime baseline and rerun

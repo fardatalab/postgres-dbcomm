@@ -2,8 +2,9 @@
 
 Captured: June 6, 2026.
 
-Purpose: preserve the current Citus backend-to-backend Homer COPY workload and
-baseline before implementing peer push completions.
+Purpose: preserve the current Citus backend-to-backend Homer COPY workload,
+including the post-peer-push-completion baseline and the remaining performance
+gap against vanilla Citus.
 
 ## Workload
 
@@ -18,31 +19,38 @@ baseline before implementing peer push completions.
   - `citus.enable_experimental_tuple_sink_routing=on`
   - `citus.enable_experimental_tuple_sink_loopback_validation=off`
 
-## Baseline Result
-
-One warmup plus three measured Homer repeats were collected after clean process
-preflight and matching installed artifacts on both hosts.
-
-| Run | Result | Real Time |
-| --- | --- | --- |
-| 1 | warmup, correct | 5.09 s |
-| 2 | correct | 5.34 s |
-| 3 | correct | 5.58 s |
-| 4 | correct | 5.75 s |
-
-Measured repeat average: about 5.56 s, about 1.80M rows/s.
-
-Correctness check on every run:
+Correctness check on every accepted run:
 
 ```text
 count=10000000 min=1 max=10000000 sum=500000050000000
 ```
 
+## Current Homer Result
+
+This is the current default after peer service-to-service push command
+completion and after changing the tuple-sink default batch geometry to
+`8192` tuples / `524288` bytes.
+
 Raw artifacts:
 
 ```text
-/tmp/homer_b2b_copy_10m_baseline_1780761813
+/tmp/homer_b2b_copy_10m_default_after_batch_default_1780784020
 ```
+
+| Run | Result | Real Time |
+| --- | --- | --- |
+| 1 | warmup, correct | 11.47 s |
+| 2 | correct | 7.46 s |
+| 3 | correct | 7.62 s |
+| 4 | correct | 7.32 s |
+
+Measured repeat average: about 7.47 s, about 1.34M rows/s.
+
+Interpretation: the pathological small-batch default is fixed, but Homer is
+still slower than vanilla Citus for this workload. Peer push completion removes
+the normal terminal command-completion poll round trip, but the steady 10M-row
+COPY gap is now dominated by payload-loop and per-record work, not by terminal
+command completion.
 
 ## Vanilla Citus Baseline
 
@@ -53,138 +61,115 @@ with Homer tuple-sink routing disabled:
 SET citus.enable_experimental_tuple_sink_routing=off;
 ```
 
+Raw artifacts:
+
+```text
+/tmp/citus_vanilla_copy_10m_baseline_1780783569
+```
+
 | Run | Result | Real Time |
 | --- | --- | --- |
 | 1 | warmup, correct | 5.18 s |
-| 2 | correct | 5.34 s |
-| 3 | correct | 5.44 s |
-| 4 | correct | 5.19 s |
+| 2 | correct | 5.11 s |
+| 3 | correct | 5.11 s |
 
-Measured repeat average: about 5.33 s, about 1.88M rows/s.
+Measured repeat average: about 5.11 s, about 1.96M rows/s.
 
-Raw artifacts:
+## Post-Peer-Push Batch Sweep
 
-```text
-/tmp/vanilla_citus_copy_10m_baseline_1780762245
-```
-
-## Batch-Size Sweep
-
-Captured on June 6, 2026 after the baseline above, using the same 10M-row input
-and table. This sweep changes only Homer tuple-sink batching GUCs.
+Captured on June 6, 2026 after peer service-to-service push completion,
+aggregate payload scheduling, close/lifecycle fixes, and clean rebuild/sync.
+This sweep changes only Homer tuple-sink batching GUCs.
 
 Raw artifacts:
 
 ```text
-/tmp/homer_b2b_copy_batch_sweep_1780764011
+/tmp/homer_b2b_copy_10m_batch_sweep_1780783606
+/tmp/homer_b2b_copy_10m_batch_sweep2_1780783711
 ```
 
-| Tuple Target | Slot Capacity | Run 1 | Run 2 | Run 3 | Result |
-| --- | --- | --- | --- | --- | --- |
-| 16 | 1024 bytes | 5.01 s | 5.48 s | 5.29 s | correct; measured avg of runs 2-3 about 5.39 s |
-| 64 | 1024 bytes | 5.28 s | 5.42 s | 5.34 s | correct; measured avg of runs 2-3 about 5.38 s |
-| 64 | 4096 bytes | 5.02 s | n/a | n/a | failed; not a performance datapoint |
+| Tuple Target | Slot Capacity | Result |
+| --- | --- | --- |
+| default old (`16`) | default old (`1024` bytes) | correct; `62.93 s` |
+| `64` | `4096` bytes | correct; warmed around `44.96 s` |
+| `256` | `16384` bytes | correct; `21.42 s` |
+| `1024` | `65536` bytes | correct; `11.46 s` |
+| `4096` | `262144` bytes | correct; `8.00 s` |
+| `8192` | `524288` bytes | correct; `7.64 s` |
+| `16384` | `1048576` bytes | correct; `8.37 s` |
 
-Interpretation: raising `citus.experimental_tuple_sink_batch_tuple_target` from
-`16` to `64` while leaving `citus.experimental_tuple_sink_slot_capacity_bytes`
-at the default `1024` bytes did not improve throughput. The slot byte capacity
-is likely limiting the effective tuple count per tuple-view record. Raising slot
-capacity to `4096` exposed a transport correctness issue before a throughput
-measurement could be collected.
+The default was raised to `8192` tuples and `524288` bytes because that is the
+best measured band from this sweep. Larger records did not continue improving
+throughput.
 
-The failed larger-slot run ended with:
+An opt-in `HOMER_PROGRESS_POLICY=cpu-liveness` check confirmed that scheduling
+policy selection was not the main fix:
 
 ```text
-ERROR: experimental worker tuple-sink insert command did not complete successfully
-DETAIL: shard=102638 placement=631 state=4 detail=remote execution control request timed out waiting for service progress
+/tmp/homer_b2b_copy_10m_policy_cpu_liveness_1780783859
+64:4096      50.44 s correct
+8192:524288   7.41 s correct
 ```
 
-The receiver service log reported an RDMA payload/head publication failure:
+## Peer Push Completion And Lifecycle Fixes
 
-```text
-tuple-sink service: byte-ring tuple incoming head publish failed session=27 sink=25 head=514998464 detail=payload send completion failed: opcode=0 status=10
-```
+The current code adds a requester-service-owned peer command completion ring for
+service-to-service command sessions. The backend maps that ring directly and
+`PollRemoteExecutionCommandCompletion()` checks it before using the old local
+service `POLL_COMMAND_COMPLETION` fallback. The responder writes completion
+events into the requester ring when it consumes the backend completion mailbox.
 
-After that RDMA error, service-only restart was not enough for trustworthy
-measurement; a full PostgreSQL plus Homer restart on both hosts was needed. A
-post-clean-restart default-geometry smoke succeeded with the 10M-row correctness
-check in:
+Important code anchors:
 
-```text
-/tmp/homer_b2b_copy_post_clean_restart_smoke_1780764262
-```
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:352`:
+  `CitusRemoteExecPeerCommandCompletionRingDescriptor`.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:501`:
+  `CitusRemoteExecPeerCommandCompletionEvent`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c:1908`:
+  `TryConsumeRemoteExecutionPeerCommandCompletion()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c:2928`:
+  `PollRemoteExecutionCommandCompletion()` prefers cached/ring completion before
+  falling back to local-service polling.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8090`:
+  `TupleSinkServicePublishPeerCommandCompletion()` publishes the peer event and
+  epoch over RDMA.
 
-That smoke was a cold post-restart run (`real 9.09`) and should not be used as a
-steady-state throughput datapoint.
+The same implementation slice fixed two lifecycle issues observed during tuple
+COPY profiling:
 
-Follow-up fix and rerun on June 6, 2026:
-
-- fixed receiver consumed-head ACK bookkeeping to count outstanding ACK WRs
-  separately from byte-frontier distance
-- kept the sender-owned tuple byte-ring head mirror registered after exact-stream
-  teardown so late peer ACK WRs do not hit a deregistered remote key
-- suppressed terminal tuple byte-ring credit ACKs after the backend consumed
-  in-band EOS and marked the receive ring peer-closed
-- added byte-ring remote range validation before payload/tail RDMA posts
-
-Raw artifacts:
-
-```text
-/tmp/homer_b2b_copy_slot4096_fix2_1780765554
-```
-
-| Tuple Target | Slot Capacity | Run 1 | Run 2 | Run 3 | Run 4 | Result |
-| --- | --- | --- | --- | --- | --- | --- |
-| 64 | 4096 bytes | 8.24 s | 5.37 s | 5.21 s | 5.30 s | correct; measured avg of runs 2-4 about 5.29 s |
-
-The first run was a cold post-restart warmup. Runs 2-4 all produced:
-
-```text
-count=10000000 min=1 max=10000000 sum=500000050000000
-```
+- byte-ring receive now preserves `receivedPeerClosePending` until the peer close
+  is drained through the normal payload stream pump
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15866`);
+- exact sink close is idempotent when a stream has already been reclaimed and
+  the owning session has no active sinks left
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19302`).
 
 ## Regression Smokes
 
-After the backend-to-backend COPY fixes, the other Homer workloads were smoke
-checked without a PostgreSQL/service restart between warm repeats:
+After the peer-push and tuple-COPY default changes, the shared Homer paths were
+smoke checked:
 
-- Before the 4096-byte slot follow-up: remote RDMA pgbench c1, warmed:
-  `10000/10000` transactions, `0` failures, `4730 TPS`, p50 `0.208 ms`, p95
-  `0.223 ms`, p99 `0.233 ms`.
-- Before the 4096-byte slot follow-up: remote RDMA basebackup blackhole: warmup
-  `9.18 s`, repeats `4.59 s` and `4.65 s`, all completed.
-- After the 4096-byte slot fix: remote RDMA pgbench c1, warmed:
-  `10000/10000` transactions, `0` failures, `4609 TPS`, p50 `0.213 ms`, p95
-  `0.228 ms`, p99 `0.239 ms`; artifact
-  `/tmp/homer_pgbench_regression_after_copy_fix_warm_1780765620.log`.
-- After the 4096-byte slot fix: remote RDMA basebackup blackhole completed:
-  warmup `6.43 s`, warmed `4.68 s`; artifacts
-  `/tmp/homer_basebackup_regression_after_copy_fix_1780765634`.
+- Remote Homer pgbench c1 after rebuilding/installing matching Postgres and
+  Citus/Homer artifacts:
+  `/tmp/homer_pgbench_remote_c1_warm_after_pg_rebuild_1780784173`, `20000/20000`
+  transactions, `0` failures, `4303.6 TPS`, p50 `0.211 ms`, p95 `0.223 ms`,
+  p99 `0.235 ms`.
+- Remote RDMA basebackup blackhole:
+  `/tmp/homer_basebackup_remote_regression_1780784191`, run 1 `6.73 s`, run 2
+  `4.81 s`, both completed.
+- Final process preflight showed only intended PostgreSQL and Homer service
+  processes on both hosts, with no stale `pgbench`, `pg_basebackup`, or
+  `postgres: remote exec backend`.
 
-Basebackup artifacts:
+## Historical Pre-Peer-Push Notes
 
-```text
-/tmp/homer_basebackup_regression_1780762311
-```
+Earlier in the day, before the W3 peer-push changes, this workload was measured
+around 5.3-5.6 s with smaller tuple records. That result did not reproduce after
+the later scheduler/peer-completion work: rechecking the old commit in a
+detached worktree timed out with ready-set overflow. Treat the old numbers as
+historical bring-up evidence only, not as the current baseline.
 
-Installed artifact hashes for this baseline:
-
-```text
-17014869e26946457fbb8c9ea77454cb4e86f70fffa58cfd60ce29266ccbf48d  /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so
-53f0c9c1cb8735c2e42e4981545825731aa2d026d489c77af01537a6633f9160  /data/dbcomm/pg-citus/bin/citus_tuple_sink_service
-```
-
-Installed artifact hashes after the 4096-byte slot fix:
-
-```text
-0b6ce8d0ed9dccfb93b6be5510d21d9d6a2c080b8c442c112355884981632943  /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so
-58bdd0bca77f7dc3630b148971eadf49643379a00d7560ae3c446caf0df0cd4f  /data/dbcomm/pg-citus/bin/citus_tuple_sink_service
-```
-
-## Notes From Bring-Up
-
-The workload did not run cleanly before this baseline. Correctness issues fixed
-along the way:
+Correctness issues fixed during the initial bring-up:
 
 - Async local-control failures for non-open requests were reported with the
   wrong response kind.
@@ -198,5 +183,7 @@ along the way:
   EOS.
 - The backend receiver did not turn in-band tuple byte-ring EOS into the
   backend-visible peer-closed flag.
-- A normal-path peer-control fallback print was gated behind the peer transport
-  stats macro; it was too noisy for performance runs.
+- Receiver consumed-head ACK bookkeeping conflated outstanding ACK WR count with
+  byte-frontier distance.
+- Late peer ACK WRs could target a deregistered sender-owned byte-ring head
+  mirror.
