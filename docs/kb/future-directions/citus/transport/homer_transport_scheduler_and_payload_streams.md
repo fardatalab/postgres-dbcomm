@@ -375,6 +375,12 @@ write completion metadata first, then publish with a doorbell.
 
 Concrete no-poll plan:
 
+Implementation detail for the service-to-service peer prerequisite is tracked in
+[peer_service_push_completion_implementation_plan.md](peer_service_push_completion_implementation_plan.md).
+That note narrows the next step to a requester-owned peer command completion
+ring, the requester-side consumption path, and the replacement for
+`terminalCompletionPendingPeerPoll`.
+
 1. **Keep one in-flight command per local frontend session.** Preserve the
    single-slot command mailbox invariant documented by
    [`TupleSinkServicePublishLocalCommand()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2576).

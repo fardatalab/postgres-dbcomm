@@ -567,6 +567,100 @@ For a libpq foreground comparison under the same background basebackup load,
 rerun the same background loop and replace the pgbench command with the libpq
 baseline from the previous section.
 
+## Run Citus backend-to-backend COPY through Homer
+
+This workload exercises the Citus coordinator backend on `farnet1`, the
+standalone Homer services on both hosts, and a socketless Citus worker backend on
+`farnet0`. It is the current service-to-service tuple payload path to baseline
+before implementing peer push completions.
+
+Prerequisites:
+
+- PostgreSQL must be running on both `farnet1` and `farnet0`.
+- Homer services must be running on both hosts with the normal peer bind
+  addresses from the "Start Homer services" section.
+- The process preflight must show no stale `remote exec backend`, `psql`,
+  `pgbench`, or old Homer service process from an earlier run.
+- Keep verbose Homer logging and diagnostic stats macros off for performance
+  runs.
+
+Prepare the input file on `farnet1`:
+
+```sh
+awk 'BEGIN {
+  for (i = 1; i <= 10000000; i++)
+    printf "%d,%d,payload_%08d\n", i, i * 10, i
+}' > /tmp/homer_tuple_sink_copy_10m.csv
+
+wc -l /tmp/homer_tuple_sink_copy_10m.csv
+ls -lh /tmp/homer_tuple_sink_copy_10m.csv
+```
+
+Create the distributed table and verify that its single placement lands on
+`10.10.1.100`:
+
+```sh
+sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql \
+  -h /tmp -p 5432 -U dbcomm -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+SET client_min_messages=notice;
+SET citus.shard_count=1;
+DROP TABLE IF EXISTS homer_tuple_sink_copy_bench;
+CREATE TABLE homer_tuple_sink_copy_bench (id int, v bigint, payload text);
+SELECT create_distributed_table('homer_tuple_sink_copy_bench', 'id');
+SELECT p.shardid, n.nodename, n.nodeport
+FROM pg_dist_placement p JOIN pg_dist_node n ON p.groupid = n.groupid
+WHERE p.shardid IN (
+  SELECT shardid
+  FROM pg_dist_shard
+  WHERE logicalrelid = 'homer_tuple_sink_copy_bench'::regclass
+)
+ORDER BY p.shardid, n.nodename;
+SQL
+```
+
+Warm once, then use repeat runs as the baseline:
+
+```sh
+OUT=/tmp/homer_b2b_copy_10m_baseline_$(date +%s)
+mkdir -p "$OUT"
+
+for run in 1 2 3 4; do
+  {
+    echo "backend-to-backend-homer-copy-10m run=$run"
+    /usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql \
+      -h /tmp -p 5432 -U dbcomm -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+SET client_min_messages=notice;
+SET citus.enable_experimental_tuple_sink_routing=on;
+SET citus.enable_experimental_tuple_sink_loopback_validation=off;
+TRUNCATE homer_tuple_sink_copy_bench;
+\copy homer_tuple_sink_copy_bench FROM '/tmp/homer_tuple_sink_copy_10m.csv' WITH (FORMAT csv);
+SELECT count(*), min(id), max(id), sum(v) FROM homer_tuple_sink_copy_bench;
+SQL
+  } > "$OUT/run_${run}.log" 2>&1
+  echo "run=$run rc=$? log=$OUT/run_${run}.log"
+done
+
+printf 'artifacts=%s\n' "$OUT"
+for f in "$OUT"/run_*.log; do
+  echo "--- $f"
+  tail -20 "$f"
+done
+```
+
+Current baseline captured on June 6, 2026:
+
+- Input: `/tmp/homer_tuple_sink_copy_10m.csv`, 10,000,000 rows, about 323 MB.
+- Correctness check: `count=10000000`, `min=1`, `max=10000000`,
+  `sum=500000050000000` on every repeat.
+- Warmup: `real 5.09`.
+- Measured repeats: `real 5.34`, `5.58`, `5.75`; average repeat time about
+  `5.56 s`, about `1.80M rows/s`.
+- Raw artifacts: `/tmp/homer_b2b_copy_10m_baseline_1780761813`.
+
+Discard the run if a timeout, interrupted client, or failed COPY leaves a stale
+`postgres: remote exec backend`. Return to the clean runtime baseline and rerun
+the process preflight before measuring again.
+
 ## Quick validation checklist
 
 After each run, capture:
