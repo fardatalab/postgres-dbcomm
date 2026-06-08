@@ -654,21 +654,34 @@ Current post-peer-push baseline captured on June 6, 2026:
 - Correctness check: `count=10000000`, `min=1`, `max=10000000`,
   `sum=500000050000000` on every repeat.
 - Default Homer tuple-sink geometry is now `8192` tuples and `524288` bytes.
-- Warmup after rebuild/sync: `real 11.47`.
-- Measured repeats: `real 7.46`, `7.62`, `7.32`; average repeat time about
-  `7.47 s`, about `1.34M rows/s`.
-- Raw artifacts: `/tmp/homer_b2b_copy_10m_default_after_batch_default_1780784020`.
-- Vanilla Citus on the same 10M-row input measured `5.18`, `5.11`, and `5.11 s`
-  in `/tmp/citus_vanilla_copy_10m_baseline_1780783569`. Treat the remaining
-  Homer gap as payload-loop/tuple-record overhead, not as terminal peer
-  completion polling.
+- Latest clean Homer recheck, after the shared-path SQL result-sink geometry
+  fix and process preflight: `5.39`, `5.04`, `5.20`, `5.95 s` in
+  `/tmp/homer_tuple_copy_investigate_baseline_1780796369`, followed by `5.13`,
+  `5.23`, `5.07`, `5.17 s` in
+  `/tmp/homer_tuple_copy_investigate_recheck2_1780796468`.
+- Vanilla Citus in the same runtime state measured `5.20`, `5.22`, `5.27`, and
+  `6.32 s` in `/tmp/citus_vanilla_copy_recheck_1780796433`.
+- The current default Homer path is therefore in the same band as vanilla Citus
+  for this workload. farnet1/farnet0 service logs confirmed this was the Homer
+  service-to-service byte-ring path (`published_tail=512005120`), not a silent
+  fallback to vanilla libpq COPY.
+- Treat parity with vanilla as a no-regression checkpoint, not the final Homer
+  target. The tuple-view path should eventually beat vanilla Citus here because
+  it avoids full libpq COPY serialization/deserialization and uses a lighter
+  Homer-owned payload format. If a future run is only at parity, investigate
+  tuple-view materialization, byte-ring transport progress, worker insert cost,
+  and service-progress scheduling before accepting that as the ceiling.
+- Older post-peer-push artifacts in
+  `/tmp/homer_b2b_copy_10m_default_after_batch_default_1780784020` measured
+  `7.46`, `7.62`, and `7.32 s`. Treat those as historical/runtime-state
+  evidence, not as the current accepted baseline.
 - Later W4 scheduler-facts validation on June 6 saw a slower same-machine band:
   W4 warmed repeats `7.71`, `7.98`, `8.05 s` in
   `/tmp/homer_w4_copy_10m_trim3_1780785961`; direct parent-commit A/B at
   `7be63cdb8` gave `8.01`, `8.30`, `7.99 s` in
   `/tmp/homer_parent_copy_10m_ab_1780786118`. Treat those as comparable to each
   other and keep the older 7.47 s band as a prior baseline, not a confirmed W4
-  regression.
+  regression. These also did not reproduce in the latest clean paired recheck.
 
 Discard the run if a timeout, interrupted client, or failed COPY leaves a stale
 `postgres: remote exec backend`. Return to the clean runtime baseline and rerun

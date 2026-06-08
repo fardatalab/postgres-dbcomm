@@ -31,6 +31,52 @@ This is the current default after peer service-to-service push command
 completion and after changing the tuple-sink default batch geometry to
 `8192` tuples / `524288` bytes.
 
+Latest clean recheck after the shared-path SQL result-sink geometry fix and a
+clean process preflight:
+
+```text
+/tmp/homer_tuple_copy_investigate_baseline_1780796369
+/tmp/homer_tuple_copy_investigate_recheck2_1780796468
+```
+
+| Run Set | Run | Result | Real Time |
+| --- | --- | --- | --- |
+| first Homer pass | 1 | correct | 5.39 s |
+| first Homer pass | 2 | correct | 5.04 s |
+| first Homer pass | 3 | correct | 5.20 s |
+| first Homer pass | 4 | correct; outlier | 5.95 s |
+| second Homer pass | 1 | correct | 5.13 s |
+| second Homer pass | 2 | correct | 5.23 s |
+| second Homer pass | 3 | correct | 5.07 s |
+| second Homer pass | 4 | correct | 5.17 s |
+
+The same runtime state with Homer tuple-sink routing disabled produced vanilla
+Citus repeats of `5.20`, `5.22`, and `5.27 s`, plus one `6.32 s` outlier in
+`/tmp/citus_vanilla_copy_recheck_1780796433`. Current evidence therefore does
+not support an active Homer-vs-vanilla COPY regression for the default
+`8192`/`524288` geometry.
+
+This should be read as a no-regression acceptance point, not the final
+performance target. Homer should eventually outperform vanilla Citus on this
+workload because the tuple-view path avoids the full libpq COPY
+serialization/deserialization cycle and uses a lighter Homer-owned tuple payload
+format. If future runs only stay at parity, the next investigation should focus
+on whether tuple-view materialization, byte-ring transport progress, worker
+insert overhead, or runtime scheduling state is consuming the expected savings.
+
+The Homer path was confirmed through service logs: farnet1 recorded tuple COPY
+send sessions with `published_tail=512005120`, and farnet0 recorded matching
+peer-provisioned receive sessions that drained the byte ring and reclaimed the
+sink after peer close. These are Homer service-to-service payload streams, not a
+silent fallback to vanilla libpq COPY.
+
+## Older Homer Result
+
+The following artifacts are preserved as the older post-peer-push measurement
+band. They did not reproduce in the later clean paired recheck above, so keep
+them as historical/runtime-state evidence rather than the current accepted COPY
+baseline.
+
 Raw artifacts:
 
 ```text
@@ -45,12 +91,6 @@ Raw artifacts:
 | 4 | correct | 7.32 s |
 
 Measured repeat average: about 7.47 s, about 1.34M rows/s.
-
-Interpretation: the pathological small-batch default is fixed, but Homer is
-still slower than vanilla Citus for this workload. Peer push completion removes
-the normal terminal command-completion poll round trip, but the steady 10M-row
-COPY gap is now dominated by payload-loop and per-record work, not by terminal
-command completion.
 
 Later W4 scheduler-facts validation on the same day saw a slower current band.
 The W4 binary produced correct warmed runs of `7.71`, `7.98`, and `8.05 s` in
