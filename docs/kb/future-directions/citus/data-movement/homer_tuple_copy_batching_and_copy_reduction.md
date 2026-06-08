@@ -94,10 +94,10 @@ run=4 real=5.30 correct
 That pre-peer-push 4096-byte result was useful for bring-up, but it should not be
 treated as the current baseline. After the later scheduler/peer-completion work,
 small tuple records were much slower (`64` / `4096` around 45 s), while the
-larger default recovered the path to about 7.3-7.6 s. Rechecking the old
-`65207cd4e` baseline in a detached worktree timed out with ready-set overflow,
-so the earlier near-vanilla number is historical evidence rather than a stable
-current comparison.
+larger default initially recovered the path to about 7.3-7.6 s. Rechecking the
+old `65207cd4e` baseline in a detached worktree timed out with ready-set
+overflow, so the earlier near-vanilla number is historical evidence rather than
+a stable current comparison.
 
 The comparable vanilla Citus baseline on the same 10M-row input was:
 
@@ -108,10 +108,34 @@ run=2 real=5.11 correct
 run=3 real=5.11 correct
 ```
 
-So the current Homer path is correct and no longer pathologically slow under the
-new default, but still carries about a 2.3-2.5 s gap on this workload. The
-remaining first-order work is service payload-loop efficiency and tuple-view
-record overhead, not terminal command-completion polling.
+Latest clean recheck after the shared-path SQL result-sink geometry fix and
+process preflight no longer shows a Homer-vs-vanilla wall-time gap for the
+default geometry:
+
+```text
+/tmp/homer_tuple_copy_investigate_baseline_1780796369
+Homer: 5.39, 5.04, 5.20, 5.95 s
+
+/tmp/homer_tuple_copy_investigate_recheck2_1780796468
+Homer: 5.13, 5.23, 5.07, 5.17 s
+
+/tmp/citus_vanilla_copy_recheck_1780796433
+vanilla Citus: 5.20, 5.22, 5.27, 6.32 s
+```
+
+The older 7.3-8.0 s bands remain useful as runtime-state sensitivity evidence,
+but they are not the current accepted default-geometry baseline. The
+copy-reduction ideas below remain useful future work for lowering CPU cost,
+reducing sensitivity to warmup/runtime state, and making the tuple-view path a
+stronger transport substrate, not for fixing an active measured wall-time
+regression against vanilla on this 10M-row workload.
+
+Parity with vanilla Citus is only a no-regression checkpoint. The expected
+research target is better-than-vanilla COPY throughput because Homer's
+tuple-view path avoids full libpq COPY serialization/deserialization and should
+spend less CPU per tuple once the remaining transport/materialization/scheduling
+costs are under control. Future optimization work should treat persistent parity
+as evidence that one of those expected savings is being lost.
 
 The relevant code area is the tuple byte-ring RDMA path:
 

@@ -7532,6 +7532,10 @@ June 2, 2026 implementation checkpoint:
       [`HomerServiceUpdateProgressFeedback()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4720).
 
    The milestone therefore closes as scheduler-ready, not policy-complete.
+   The next scheduler design is now tracked separately in
+   [`service_progress_control_data_plane_scheduler.md`](service_progress_control_data_plane_scheduler.md):
+   persistent plans with typed grants, cursor-based execution, cheap executor-side
+   guards, feedback-driven early stop, and split peer-control phase sources.
    What remains is research/engineering on policy quality and protocol cleanup:
 
    - decide whether `cpu-liveness` should stay opt-in or become the default after
