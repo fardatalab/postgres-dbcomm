@@ -1497,10 +1497,26 @@ scheduler.
      [`TupleSinkServicePublishPendingPeerClientCommandCompletions()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12370)
      now counts only `PUBLISHED` as work done. This preserves the current retry
      lifecycle while making the async dependency visible to scheduler feedback.
-   - Follow-up caveat: the implementation still uses the compatibility
-     `ActiveSessionScanLimit` retry scan. The result enum and reason bits are the
-     prerequisite for a fixed pending-completion table/list, but that list is not
-     implemented in this slice.
+   - Follow-up deferred-state progress: the compatibility
+     `ActiveSessionScanLimit` retry scan has been replaced for peer-client
+     completion publication. `TupleSinkServiceSessionState` now owns a
+     session-local deferred completion snapshot and fixed intrusive-list links.
+     `TupleSinkServiceMarkDeferredPeerClientCompletion()` records a `NOT_READY`
+     publication with the current command sequence, result sink id, and blocked
+     reason; `TupleSinkServiceClearDeferredPeerClientCompletion()` unlinks the
+     session on publish, stale generation, new command, or reset; and
+     `TupleSinkServicePublishPendingPeerClientCommandCompletions()` now walks
+     only the deferred-session list after payload-frontier work. The command
+     machine candidate builder also exposes this state as
+     `HOMER_PROGRESS_MACHINE_STATE_WAIT_PAYLOAD` with
+     `HOMER_PROGRESS_WAIT_PAYLOAD_FRONTIER`, so the scheduler sees a blocked
+     command machine instead of hidden payload-side cleanup.
+   - Follow-up caveat: publish `FAILED` currently remains retryable rather than
+     clearing the deferred entry. The publish helper still reports one `FAILED`
+     shape for both hard descriptor bugs and potentially transient transport post
+     failures, so clearing all failures would silently change the old retrying
+     behavior. A later slice should split terminal and retryable failure shapes if
+     policy needs to reason about them.
    - Validation status: `git clang-format HEAD --
      src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
      `git diff --check`, `sudo -n -u dbcomm make -j8 service-bin client-bin`,
@@ -1946,30 +1962,28 @@ and `FAILED`, with `NOT_READY` carrying a generic blocked reason such as
 source's blocked reason and set a dependent-work hint on the prerequisite payload
 source.
 
-Current implementation note: this API split is now landed. The code adds
+Current implementation note: the API split and the first fixed-table deferred
+bookkeeping are now landed. The code adds
 `HOMER_PROGRESS_REASON_DEPENDENT_COMPLETION_WAIT_PAYLOAD_EOS` and
 `HOMER_PROGRESS_REASON_DEPENDENT_COMPLETION_WAIT_RESULT_SEND_CQ`; `NOT_READY`
 sets `HOMER_PROGRESS_REASON_OUTGOING_COMPLETION_PENDING` plus one of those
-blocked reasons without marking publication progress. The current active-session
-retry scan is still a pragmatic compatibility shape, not the desired long-term
-design. The better design is fixed-table, event-driven bookkeeping:
+blocked reasons without marking publication progress. When completion
+publication first returns `NOT_READY`,
+`TupleSinkServiceMarkDeferredPeerClientCompletion()` records the session's
+current command sequence, result sink id, and blocked reason, then links the
+session into a fixed intrusive deferred-completion list. The retry helper walks
+that list instead of scanning `ActiveSessionScanLimit`; each entry is guarded by
+the command sequence and result sink id before publication is retried. The mark
+is cleared on successful publication, no-op/stale retry, new local command, or
+session reset.
 
-- when completion publication first returns `NOT_READY`, mark the session as
-  having one deferred peer-client completion and record the prerequisite stream
-  index/service stream id plus blocked reason
-- add that session to an intrusive pending list, or update a small fixed-table
-  pending bit/hint, without heap allocation or locks
-- when payload EOS/source-release or result send-CQ retirement advances, retry
-  only the pending sessions for the affected stream or for the small global
-  deferred-completion list
-- clear the pending mark when publication succeeds, fails terminally, or the
-  owning session/stream is reset
-
-This keeps the useful payload->completion locality while avoiding an
-`ActiveSessionScanLimit` walk on every payload grant. Until measurements show the
-scan is visible, the implicit payload retry can remain as a behavior-preserving
-transition; the important design point is that the fact vocabulary and result
-API should no longer hide `NOT_READY` behind a success bool.
+The current retry trigger is still the behavior-preserving payload-frontier
+hook: after payload work, retry the small global deferred-completion list. That
+keeps the useful payload->completion locality while removing the broad
+active-session walk. A later optimization can shard the pending list by
+prerequisite stream id if measurements show the global deferred list is visible.
+Publish `FAILED` remains retryable for now because the helper does not yet split
+terminal descriptor failures from retryable transport post failures.
 
 For non-bundled dependencies, add a generic dependency-planning pass between
 policy ordering and plan execution:
@@ -2101,6 +2115,33 @@ Implementation progress:
   preflight showed only intended PostgreSQL and Homer services, and both service
   logs had no `failed`, `error`, `invalid`, `overrun`, `stale`, `corrupt`, or
   `panic` lines.
+- Fixed deferred peer-client completion list validation, June 9, 2026: `git
+  clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+  `git diff --check`, `git diff --cached --check`, and `sudo -n -u dbcomm make
+  -j8 service-bin client-bin` passed. The installed `citus_tuple_sink_service`
+  matched on farnet1/farnet0 with SHA-256
+  `19d30de6ffaad6c03da6f65de26bc535daeb26040c734a5f3b4f868e8b9d2da6`.
+  Runtime gates after clean service restart passed: remote c1 Homer pgbench
+  `10000/10000`, `0` failures, warm repeats `4264.37` and `3878.50 TPS` in
+  `/tmp/homer_deferred_peer_completion_pgbench_1780981614`; remote c4 Homer
+  pgbench `10000/10000`, `0` failures, `10012.69 TPS`; remote RDMA basebackup
+  cold/warm repeats `5.95`, `4.48`, and `4.55 s` in
+  `/tmp/homer_deferred_peer_completion_basebackup_1780981635`; backend-to-backend
+  Homer tuple COPY 10M rows completed with `count=10000000`, `min=1`,
+  `max=10000000`, `sum=500000050000000`, with repeats `9.73`, `6.92`, and
+  `6.93 s` in `/tmp/homer_deferred_peer_completion_copy_1780981666`, followed by
+  recheck repeats `6.95`, `7.05`, `6.68`, and `6.53 s` in
+  `/tmp/homer_deferred_peer_completion_copy_recheck_1780981733`; mixed remote c4
+  pgbench plus remote RDMA basebackup passed with `8339.96 TPS` and basebackup
+  `4.56 s` in `/tmp/homer_deferred_peer_completion_mixed_1780981714`. Because
+  tuple COPY was slower than the earlier clean `~5.1-5.4 s` band, an immediate
+  parent A/B was run with `a2c0716d4` in the same runtime state: parent COPY
+  repeats were `10.44`, `6.37`, and `6.76 s` in
+  `/tmp/homer_parent_a2c0716d4_copy_ab_1780981812`. Treat this as evidence that
+  the fixed deferred-list slice did not introduce the COPY slowdown; keep COPY
+  variance/performance as a separate measurement issue before claiming a new
+  faster baseline. Post-run process preflight showed only intended PostgreSQL and
+  Homer services.
 
 Cheap diagnostics for this sub-milestone:
 
