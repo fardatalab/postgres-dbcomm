@@ -1268,11 +1268,12 @@ scheduler.
      and only scans request-ready slots when `COLLECT_SLOTS` is granted.
      Existing grants still use zero flags and therefore preserve the previous
      aggregate order: advance async continuations first, then collect new slots.
-     Remaining local-control split work: represent individual active
-     local-control requests as machine facts with waiting-on and next-action
-     state, and move the existing periodic async readiness cooldown out of
-     [`HomerServiceLocalControlSourceReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19054)
-     into the baseline machine-aware policy.
+     The selected-machine follow-up below represents active local-control
+     requests as per-slot machine facts. Remaining local-control cleanup is to
+     remove the flat-ready-set bridge for fresh slot collection; the legacy
+     aggregate predicate still exists as the compatibility discovery gate for new
+     control slots until collectors can be produced directly from maintained
+     facts.
    - Validation for the local-control action-mask slice: `git diff --check`
      passed. `make -j8 service-bin client-bin` hit only the known output-file
      permission issue, then `sudo -n -u dbcomm make -j8 service-bin client-bin`
@@ -1343,6 +1344,49 @@ scheduler.
      reproduce it. Treat that artifact as a diagnostic reminder that accepted
      measurements need a clean internal service state, not just an external
      process preflight.
+   - Follow-up peer-wait fact progress: local-control machine facts now
+     distinguish a runnable async continuation from a continuation whose
+     published peer request is only waiting for peer transport progress.
+     [`TupleSinkServicePeerControlAsyncOpReady()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7194)
+     exposes a non-progressing transport-owned readiness probe, declared in
+     [`remote_execution_peer_transport_rdma.h`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:234).
+     [`HomerServiceBuildLocalControlMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24978)
+     uses that probe for `WAIT_PEER` phases: a published peer async op that is
+     still in `WAIT_RESPONSE` clears the local-control machine's ready action and
+     reports waits on peer recv-CQ, peer response-mailbox, and peer send-CQ
+     collectors. Terminal or failed peer ops remain ready so
+     [`TupleSinkServicePollPeerRequestRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7262)
+     can consume the response or publish the local error, and unpublished
+     requests remain ready because the local owner must retry publication after
+     peer setup/lifetime progress. This is an intentionally narrow state-machine
+     boundary change: it removes repeated local-control polling while a peer
+     response is merely pending, but it does not yet expose exact peer-connection
+     setup facts for unpublished requests.
+   - Validation for the peer-wait fact slice: `git clang-format HEAD --
+     src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c
+     src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h
+     src/backend/distributed/utils/homer/tuple_sink_service_process.c`, `git
+     diff --check`, `git diff --cached --check`, and `sudo -n -u dbcomm make -j8
+     service-bin client-bin` passed; `sudo -n make install-service-bin` passed.
+     Runtime service binaries were synced to farnet0 and matched by SHA-256:
+     `b995c859bf2193d484bbe22f5e0c961b060c57f0d5daa0f4d4c1e6457dd5ce05`.
+     After a clean restart with `HOMER_PROGRESS_POLICY=machine-baseline`, remote
+     c1 Homer pgbench completed with zero failures, warmup `2575.76 TPS`, then
+     warmed `4547.33` and `4185.20 TPS` in
+     `/tmp/homer_peer_async_ready_pgbench_1780987730`; remote c4 Homer pgbench
+     completed with zero failures at `10577.54` and `10520.30 TPS` in the same
+     artifact directory. Remote RDMA basebackup completed with warmup `6.12 s`
+     then warmed `4.52` and `4.55 s` in
+     `/tmp/homer_peer_async_ready_basebackup_1780987759`. Backend-to-backend
+     Homer tuple COPY 10M rows completed with `count=10000000`, `min=1`,
+     `max=10000000`, `sum=500000050000000`, warmup `8.69 s`, then warmed `5.22`
+     and `4.99 s` in `/tmp/homer_peer_async_ready_copy_10m_1780987785`. Mixed
+     remote c4 pgbench plus remote RDMA basebackup passed with zero failures at
+     `8952.39 TPS` and basebackup `4.73 s` in
+     `/tmp/homer_peer_async_ready_mixed_c4_bb_1780987817`. Post-run process
+     preflight showed only the intended PostgreSQL and Homer service processes,
+     and service-log signature checks found no `error`, `failed`, `reset`,
+     `broken`, `stale`, `could not`, `invalid`, `timeout`, or `panic` lines.
 2. **Machine and collector scaffolding.** Add fixed-table
    `HomerProgressMachineRef`, machine facts, collector facts, action refs,
    machine grants, collector grants, action results, and transition results.
