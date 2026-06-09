@@ -1135,15 +1135,82 @@ scheduler.
      instead of being hidden under the frontend command-ring collector.
    - Validation status: `git clang-format HEAD --
      src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
-     `git diff --check`, and `sudo -n -u dbcomm make -j8 service-bin
-     client-bin` passed for this checkpoint. Runtime/performance validation for
-     the collector bridge remains pending; because it refreshes candidates in the
-     pump loop, warmed c1/c4 pgbench and basebackup checks should be run before
-     claiming Step 3 completion.
+     `git diff --check`, `sudo -n -u dbcomm make -j8 service-bin client-bin`,
+     and `sudo -n make install-headers install-service-bin install` passed.
+     Runtime artifacts were synced to farnet0 and matched by SHA-256:
+     `citus_tuple_sink_service`
+     `723d5ea7d58749e9d6541cdb9443c59aef3d0f36bb778f6c8960fb544b3f0521`,
+     `citus.so`
+     `55dcf6cadef046bbf547bc5f3ff45b4612dae1a180888178fd6a2b79c55a9be5`,
+     and `libhomer_client.a`
+     `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+     Focused runtime checks passed after clean process preflight: warmed remote c1
+     Homer pgbench `20000/20000` transactions, `0` failures, `4689.84 TPS`, p99
+     `0.232 ms`; remote c4 Homer pgbench `40000/40000` transactions, `0`
+     failures, `11222.19 TPS`, p99 `0.575 ms`; remote RDMA basebackup warmed
+     repeat completed in `4.55 s`; backend-to-backend Homer tuple COPY 10M rows
+     completed with `count=10000000`, `min=1`, `max=10000000`,
+     `sum=500000050000000`, repeats `8.66`, `5.69`, and `5.15 s` in
+     `/tmp/homer_state_machine_collector_bridge_copy_1780971500`. The `8.66 s`
+     COPY run was treated as warmup and the `5.69 s` repeat was followed by a
+     `5.15 s` recheck, so there was no clear collector-bridge regression. Service
+     logs had no `error`, `failed`, `reset`, `broken`, `stale`, `could not`, or
+     `invalid` lines.
 4. **Machine candidate builder.** Register active machines for local control,
    remote client SQL sender, command session, payload stream, peer-control op,
    peer connection, and maintenance. Populate ready action masks, blocked
    reasons, waiting-on masks, unblocks masks, and budget hints.
+   - Current progress: a behavior-neutral machine candidate builder now refreshes
+     machine fact snapshots in
+     [`HomerServiceBuildProgressMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22766),
+     called from
+     [`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23278)
+     immediately after the collector bridge. The candidate set now stores
+     [`HomerProgressMachineFacts`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1531)
+     snapshots directly instead of only machine refs, and duplicates are merged by
+     [`HomerProgressMachineCandidateSetAppendMachine()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4656).
+     This avoids forcing future policies to resolve candidate refs through a
+     second owner lookup in the hot scheduling path.
+   - Implemented machine categories:
+     [`HomerServiceBuildLocalControlMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22482)
+     exposes active async local-control ops only; fresh control slots remain
+     collector candidates until claimed.
+     [`HomerServiceBuildSessionMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22516)
+     exposes remote client SQL sender machines and command-session completion
+     machines.
+     [`HomerServiceBuildPayloadMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22676)
+     maps payload ready/blocked reason masks into ready actions, wait masks, byte
+     and object hints, and WR/CQE hints through
+     [`HomerServicePopulatePayloadMachineFacts()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22584).
+     [`HomerServiceBuildPeerAndMaintenanceMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22729)
+     derives coarse peer-connection and maintenance machine candidates from
+     collector candidates.
+   - Cost boundary: the machine builder is still a side-channel snapshot and does
+     not drive execution yet. To avoid adding unconditional hot-loop scans, session
+     and payload machine scans are gated by existing collector candidates, and
+     local-control async scanning is gated by `LocalControlAsyncActiveCount`.
+     Peer-control remains one aggregate peer-connection machine until the RDMA
+     peer transport exposes stable per-connection fact iteration.
+   - Validation status: `git clang-format HEAD --
+     src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+     `git diff --check`, `sudo -n -u dbcomm make -j8 service-bin client-bin`,
+     and `sudo -n make install-headers install-service-bin install` passed.
+     Runtime artifacts were synced to farnet0 and matched by SHA-256:
+     `citus_tuple_sink_service`
+     `e563060d77ecd7b0b4c551da9c66ef63be412ba3954eddd83aceeab8cdee757b`,
+     `citus.so`
+     `55dcf6cadef046bbf547bc5f3ff45b4612dae1a180888178fd6a2b79c55a9be5`,
+     and `libhomer_client.a`
+     `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+     Focused runtime checks passed: warmed remote c1 Homer pgbench `20000/20000`
+     transactions, `0` failures, `4628.94 TPS`, p99 `0.236 ms`; remote c4 Homer
+     pgbench `40000/40000` transactions, `0` failures, `11132.67 TPS`, p99
+     `0.588 ms`; remote RDMA basebackup warmed repeat completed in `4.60 s`;
+     backend-to-backend Homer tuple COPY 10M rows completed with `count=10000000`,
+     `min=1`, `max=10000000`, `sum=500000050000000`, repeats `8.66`, `5.65`,
+     and `5.09 s` in `/tmp/homer_state_machine_machine_candidate_copy_1780972018`.
+     The `8.66 s` COPY run was treated as warmup. Service logs had no `error`,
+     `failed`, `reset`, `broken`, `stale`, `could not`, or `invalid` lines.
 5. **Machine action compiler and executor.** Compile collector and machine grants
    into the small action executors from Step 1. Convert bool-shaped helpers such
    as peer-client completion publication into explicit `PUBLISHED` / `NOT_READY`
