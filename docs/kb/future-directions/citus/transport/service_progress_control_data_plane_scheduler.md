@@ -2003,6 +2003,80 @@ Implementation status:
   but was correct, error-free, and in the same broad band; keep watching this
   gate when adding adaptive backoff/deficit behavior.
 
+Additional implementation status:
+
+- A first feedback-backed blind-collector backoff slice has landed for
+  `HOMER_PROGRESS_POLICY=machine-baseline`. The policy constants are
+  `HOMER_SERVICE_MACHINE_BASELINE_BLIND_BACKOFF_EMPTY_GRANTS` and
+  `HOMER_SERVICE_MACHINE_BASELINE_BLIND_BACKOFF_MAX_SKIP_GRANTS`, documented
+  near
+  [`HOMER_SERVICE_MACHINE_BASELINE_BLIND_BACKOFF_EMPTY_GRANTS`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:167).
+  The policy-local diagnostics live in
+  [`HomerMachineBaselinePolicyState`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2063)
+  as `lastPlanFeedbackBackoffSkipCount` and
+  `lastPlanFeedbackBackoffCollectorMask`.
+- The backoff deliberately applies only to blind collector polls. It does not
+  suppress exact/known-expected work, dependency-demanded collectors, heartbeat
+  maintenance, or an otherwise idle service loop. The admission check is
+  [`HomerMachineBaselineCollectorFeedbackBackoffActive()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6058),
+  and the main collector append path calls it from
+  [`HomerServiceMachineBaselineAppendCollectorAction()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6256).
+  Dependency-demanded collectors are intentionally not charged to the blind
+  collector budget, because they are not speculative polling; they are the work
+  currently expected to unblock an active machine.
+- Split peer collectors currently still execute through the aggregate
+  peer-control grant, so
+  [`HomerServiceProgressCollectorFeedbackForKind()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24572)
+  maps `PEER_CM_SETUP`, `PEER_RECV_CQ`, `PEER_REQUEST_MAILBOX`,
+  `PEER_RESPONSE_MAILBOX`, `PEER_SEND_CQ`, and `PEER_CLOSE_LIFETIME` to the
+  aggregate `peerControlFeedback`. This is a temporary fact/fanout limitation,
+  not the target model: once peer phases have per-phase executor feedback, the
+  policy can back off hot recv/mailbox polling without importing unrelated setup
+  or close history.
+- Because of that temporary aggregate feedback, `PEER_CM_SETUP` and
+  `PEER_CLOSE_LIFETIME` are explicitly exempt from the blind backoff. An earlier
+  version treated aggregate peer-control due candidates as ordinary blind work
+  and reproduced a correctness failure in remote c1 pgbench: session open timed
+  out at outgoing RDMA setup phase 3 in
+  `/tmp/homer_machine_feedback_backoff_pgbench_1780985720/c1_run_1.log`.
+  The fix was to keep setup/close on the parameter-equivalent liveness cadence
+  until the transport exposes exact setup/close facts, and to make dependency
+  demand bypass both feedback backoff and the blind collector budget.
+- Aggregate peer-control readiness is now treated as coarse pollable liveness,
+  not as proof that each split peer phase has expected work. In
+  [`HomerServiceBuildProgressCollectorCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25198),
+  aggregate peer due still creates split candidates, but their
+  `knownExpectedWork` comes only from split-specific due facts and their
+  `waitingMachineCount` stays zero unless a real dependency-demand candidate is
+  appended. This prevents a repeatedly empty aggregate peer poll from looking
+  like known work or like an active dependency waiter.
+- Verification for this slice used stats/logging macros off and matching
+  installed service hashes on both hosts:
+  `60ec80326c3efefbb7f1232b36eb270f3e2dfdbe7cbe6a70ef2584492b237848`.
+  Build and install gates were `git clang-format HEAD --
+  src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+  `git diff --check`, `sudo -n -u dbcomm make -j8 service-bin client-bin`, and
+  `sudo -n make install-service-bin`, followed by syncing
+  `citus_tuple_sink_service` to `farnet0`.
+- Runtime gates after the fix were clean. Remote c1 Homer pgbench artifacts in
+  `/tmp/homer_machine_feedback_backoff_pgbench_fix_1780985847`: warmup
+  `2600.51 TPS`, then `4634.12 TPS` with p99 `0.235 ms`, then `4168.01 TPS`
+  with p99 `0.270 ms`, all `10000/10000` with zero failures. Remote c4 Homer
+  pgbench in `/tmp/homer_machine_feedback_backoff_more_1780985872` completed
+  `10000/10000`, zero failures, `10711.87 TPS`, p99 `0.603 ms`. Remote RDMA
+  basebackup in the same artifact directory ran `6.66 s` warmup, then `4.56 s`
+  and `4.49 s`. Backend-to-backend Homer tuple COPY in
+  `/tmp/homer_machine_feedback_backoff_copy_1780985898` completed 10M rows with
+  `count=10000000`, `min=1`, `max=10000000`, `sum=500000050000000`; run 1 was
+  `9.37 s` and warmed run 2 was `4.90 s`. Post-run process preflight showed
+  only the expected PostgreSQL and Homer service processes, and service logs had
+  no failed/error/invalid/stale/corrupt/reset/timeout signatures.
+- Follow-up caveat: some existing collector facts still overload
+  `waitingMachineCount` as both dependency-waiter count and coarse item-count
+  hint in older paths. The peer aggregate path no longer does that, but a later
+  cleanup should split dependency waiters from ready-item hints so adaptive
+  policies do not accidentally treat a count hint as a dependency boost.
+
 ### B. Make Dependency-Aware Planning Explicit
 
 The Step 7 rejection of true class reordering exposed a dependency problem, not
