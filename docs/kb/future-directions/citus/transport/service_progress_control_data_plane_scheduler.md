@@ -1483,6 +1483,24 @@ scheduler.
      as a transitional reference; future slices should either remove it or split
      the remaining source-shaped helpers once `machine-baseline` emits direct
      collector/machine action grants.
+   - Follow-up result-shape progress: peer-client completion publication is no
+     longer bool-shaped.
+     [`TupleSinkServicePeerClientCompletionPublishResult`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1100)
+     distinguishes `NOOP`, `PUBLISHED`, `NOT_READY`, and `FAILED`.
+     [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11039)
+     reports `NOT_READY` when terminal completion publication is waiting on
+     payload EOS/source-release retirement or earlier result-stream send CQ
+     retirement, and
+     [`TupleSinkServiceRecordPeerClientCompletionPublishFeedback()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11293)
+     maps that state to source-neutral blocked reasons rather than progress.
+     The aggregate retry helper
+     [`TupleSinkServicePublishPendingPeerClientCommandCompletions()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12370)
+     now counts only `PUBLISHED` as work done. This preserves the current retry
+     lifecycle while making the async dependency visible to scheduler feedback.
+   - Follow-up caveat: the implementation still uses the compatibility
+     `ActiveSessionScanLimit` retry scan. The result enum and reason bits are the
+     prerequisite for a fixed pending-completion table/list, but that list is not
+     implemented in this slice.
    - Validation status: `git clang-format HEAD --
      src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
      `git diff --check`, `sudo -n -u dbcomm make -j8 service-bin client-bin`,
@@ -1928,9 +1946,13 @@ and `FAILED`, with `NOT_READY` carrying a generic blocked reason such as
 source's blocked reason and set a dependent-work hint on the prerequisite payload
 source.
 
-The current active-session retry scan is a pragmatic compatibility shape, not the
-desired long-term design. The better design is fixed-table, event-driven
-bookkeeping:
+Current implementation note: this API split is now landed. The code adds
+`HOMER_PROGRESS_REASON_DEPENDENT_COMPLETION_WAIT_PAYLOAD_EOS` and
+`HOMER_PROGRESS_REASON_DEPENDENT_COMPLETION_WAIT_RESULT_SEND_CQ`; `NOT_READY`
+sets `HOMER_PROGRESS_REASON_OUTGOING_COMPLETION_PENDING` plus one of those
+blocked reasons without marking publication progress. The current active-session
+retry scan is still a pragmatic compatibility shape, not the desired long-term
+design. The better design is fixed-table, event-driven bookkeeping:
 
 - when completion publication first returns `NOT_READY`, mark the session as
   having one deferred peer-client completion and record the prerequisite stream
@@ -2055,6 +2077,30 @@ Implementation progress:
   `/tmp/homer_state_machine_wait_collector_concurrent_c4_1780976195`.
   Post-run service logs had no error/reset/stale-owner signatures and process
   preflight showed only the intended PostgreSQL and Homer service processes.
+- Peer-client completion result-shape validation, June 9, 2026: `git
+  clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+  `git diff --check`, `git diff --cached --check`, and `sudo -n -u dbcomm make
+  -j8 service-bin client-bin` passed. The installed `citus_tuple_sink_service`
+  matched on farnet1/farnet0 with SHA-256
+  `83d7d7bfa73721cd6dec9be0dafca0d1fdf4bf0fd4094456eb2c5595a245a4c2`;
+  `libhomer_client.a` remained
+  `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+  Runtime gates with `HOMER_PROGRESS_POLICY=machine-baseline` passed after clean
+  service restart and process preflight: remote c1 Homer pgbench `10000/10000`,
+  `0` failures, warmed repeats `4338.22`, `3863.54`, and `3985.59 TPS` in
+  `/tmp/homer_typed_completion_pgbench_c1_1780980700` and
+  `/tmp/homer_typed_completion_pgbench_more_1780980722`; remote c4 Homer pgbench
+  `40000/40000`, `0` failures, `10408.87 TPS`, p99 `0.634 ms`; remote RDMA
+  basebackup cold/warm repeats `6.72`, `4.67`, and `4.51 s` in
+  `/tmp/homer_typed_completion_basebackup_1780980737`; backend-to-backend Homer
+  tuple COPY 10M rows completed with `count=10000000`, `min=1`, `max=10000000`,
+  `sum=500000050000000`, warm repeats `5.79`, `5.39`, and `5.35 s` in
+  `/tmp/homer_typed_completion_copy_1780980772`; mixed remote c4 pgbench plus
+  remote RDMA basebackup passed with `8417.20 TPS` and basebackup `4.67 s` in
+  `/tmp/homer_typed_completion_concurrent_c4_1780980817`. Post-run process
+  preflight showed only intended PostgreSQL and Homer services, and both service
+  logs had no `failed`, `error`, `invalid`, `overrun`, `stale`, `corrupt`, or
+  `panic` lines.
 
 Cheap diagnostics for this sub-milestone:
 
