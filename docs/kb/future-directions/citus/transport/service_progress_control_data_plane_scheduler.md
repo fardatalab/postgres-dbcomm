@@ -1021,19 +1021,19 @@ scheduler.
      change. Payload send-CQ retirement is now also split as an exact selected
      stream action through
      [`HomerServiceDrainPayloadSendCqForStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18599).
-     Remaining payload split work: break receiver-credit publication and
-     tuple-view EOS synthesis into smaller action results that machine facts can
-     expose directly.
+     Receiver-credit publication is now also split as an exact selected stream
+     action. Remaining payload split work: break tuple-view EOS synthesis into a
+     smaller action result that machine facts can expose directly.
    - Current progress: per-stream `machine-baseline` payload grants now pass
      nonzero payload action flags for the split families that already exist.
      [`HomerServicePayloadGrantFlagsForActionKind()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5940)
      maps `PAYLOAD_LOCAL_BLACKHOLE`, `PAYLOAD_OUTGOING`, `PAYLOAD_INCOMING`,
      `PAYLOAD_CLOSE_RECLAIM`, and `PAYLOAD_SEND_CQ` to executor masks consumed by
      [`HomerServicePayloadActionMaskForGrant()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19713).
-     It deliberately leaves `PAYLOAD_CREDIT_PUBLISH` and `PAYLOAD_EOS` on the
-     zero-flag compatibility path because those sub-actions are still embedded
-     inside outgoing/incoming helpers; selecting them precisely before the helpers
-     are split would give the scheduler a false boundary.
+     It deliberately leaves `PAYLOAD_EOS` on the zero-flag compatibility path
+     because tuple-view EOS synthesis is still embedded inside outgoing helpers;
+     selecting it precisely before the helper is split would give the scheduler a
+     false boundary. `PAYLOAD_CREDIT_PUBLISH` is now exact in a later slice.
    - Validation for the payload action-mask slice: `make -j8 service-bin
      client-bin` and `sudo -n make install-headers install-service-bin install`
      passed in `/data/dbcomm/citus-dbcomm`. Runtime artifacts were synced to
@@ -1088,9 +1088,9 @@ scheduler.
      ([`HomerServiceDrainPayloadSendCqForStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18599),
      dispatch in
      [`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19859)).
-     `PAYLOAD_CREDIT_PUBLISH` and `PAYLOAD_EOS` still use the zero-flag
-     compatibility path because their executor boundaries remain embedded in the
-     incoming/outgoing payload helpers.
+     `PAYLOAD_CREDIT_PUBLISH` was split in the next slice. `PAYLOAD_EOS` still
+     uses the zero-flag compatibility path because tuple-view EOS synthesis
+     remains embedded in the outgoing payload helper.
    - Validation for the selected `PAYLOAD_SEND_CQ` slice: `git clang-format HEAD
      -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`, `git
      diff --cached --check`, `git diff --check`, `sudo -n -u dbcomm make -j8
@@ -1124,6 +1124,59 @@ scheduler.
      `/tmp/homer_sendcq_toggle_pgbench_c4_alone_1780977367`). Treat the mixed
      c4 difference as a `machine-baseline` policy/tuning caveat, not evidence
      that the selected send-CQ executor regressed the path.
+   - Current progress: per-stream `machine-baseline` payload grants now pass an
+     exact `PAYLOAD_CREDIT_PUBLISH` flag. The payload action mask adds
+     `HOMER_PAYLOAD_PROGRESS_ACTION_CREDIT_PUBLISH` to the known explicit grant
+     mask without adding it to `HOMER_PAYLOAD_PROGRESS_ACTION_ALL`, so aggregate
+     payload grants preserve the old compatibility behavior while explicit
+     machine grants can publish receiver credit alone
+     ([`HomerPayloadProgressActionMask`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1392),
+     [`HomerServicePayloadGrantFlagsForActionKind()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5944),
+     [`HomerServicePayloadActionMaskForGrant()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19826)).
+     The scheduler-facing predicate
+     [`HomerServiceReceiverCreditPublishReady()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7133)
+     reads the authoritative local receive ring frontier and mirrors
+     [`HomerServiceShouldPublishReceiverHeadAck()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18906),
+     so below-threshold consumed-head gaps do not produce ready facts that would
+     become empty grants. The exact executor
+     [`HomerServicePublishReceiverCreditForStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18851)
+     publishes only the selected stream's consumed-head ACK; it does not consume
+     doorbells, parse incoming payload, synthesize tuple EOS, or close/reclaim.
+     The dispatch is in
+     [`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19977).
+   - Validation for the selected `PAYLOAD_CREDIT_PUBLISH` slice: `git
+     clang-format HEAD --
+     src/backend/distributed/utils/homer/tuple_sink_service_process.c`, `git
+     diff --cached --check`, `git diff --check`, `sudo -n -u dbcomm make -j8
+     service-bin client-bin`, and `sudo -n make install-headers
+     install-service-bin install` passed. Runtime artifacts were synced to
+     farnet0 and matched by SHA-256: `citus_tuple_sink_service`
+     `b0eb5d52a67c1f3b573fead34e26edf5fe84a1df377f12e60e069cf3ae002611`,
+     `citus.so`
+     `c00349179be073035c26fa56199f0369b4b62e6f67c4fc17305e7af7a76c0e7b`,
+     and `libhomer_client.a`
+     `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+     Focused `machine-baseline` gates passed: remote c1 Homer pgbench smoke plus
+     warmed repeats completed with zero failures, warmed `4480.77` and
+     `4184.84 TPS` in `/tmp/homer_credit_slice_pgbench_1780977911`; remote c4
+     Homer pgbench warmed repeats completed with zero failures at `10277.47` and
+     `10430.10 TPS` in the same artifact directory; remote RDMA basebackup
+     completed with warmup `6.75 s` then warmed `4.58` and `4.44 s` in
+     `/tmp/homer_credit_slice_basebackup_1780977932`; backend-to-backend Homer
+     tuple COPY 10M rows completed with `count=10000000`, `min=1`,
+     `max=10000000`, `sum=500000050000000`, warmup `9.96 s`, then warmed `5.78`
+     and `5.39 s` in `/tmp/homer_credit_slice_copy_10m_1780977957`; a COPY
+     recheck completed at `5.37` and `5.51 s` in
+     `/tmp/homer_credit_slice_copy_recheck_1780978024`. Mixed remote c4 pgbench
+     plus remote RDMA basebackup remained in the current `machine-baseline`
+     mixed band with zero failures: `8775.16 TPS` with basebackup `4.60 s`, then
+     `8615.45 TPS` with basebackup `4.69 s` in
+     `/tmp/homer_credit_slice_concurrent_c4_1780977994`. Service-log signature
+     checks and post-run process preflight were clean. As with the selected
+     send-CQ slice, the mixed c4 number is below the older Step 8
+     `adaptive-bounded-class` record and should be treated as a baseline policy
+     tuning caveat, not as evidence that exact credit publication regressed the
+     transport path.
    - Current progress: local-control execution now distinguishes slot collection
      from async continuation advancement through
      [`HomerLocalControlProgressActionMask`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1361).
@@ -1380,8 +1433,8 @@ scheduler.
      machine plan would expand hot COPY into many grants before the payload egress
      layer can batch real transport work. Per-stream payload machine actions now
      pass exact flags for the already split local-blackhole, outgoing, incoming,
-     close/reclaim, and send-CQ retirement families, but still pass zero flags
-     for embedded receiver-credit publication and tuple EOS synthesis.
+     close/reclaim, send-CQ retirement, and receiver-credit publication families,
+     but still pass zero flags for embedded tuple EOS synthesis.
      Peer-control uses the aggregate peer-control action when the current ready
      set admits aggregate peer-control, because setup/close progress is not yet
      fully represented by collector facts.
