@@ -1529,6 +1529,64 @@ adaptive policy should be. The recommended sequence is to first land the
 parameter-equivalent cooldown policy, validate no regression, then add feedback
 backoff and class deficits in separate measured slices.
 
+Implementation status:
+
+- The parameter-equivalent cooldown slice has landed in the Citus/Homer tree.
+  `HOMER_PROGRESS_POLICY=machine-baseline` now owns cooldown counters in
+  [`HomerMachineBaselinePolicyState`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1993)
+  for active peer-control polling, idle peer-control polling, async
+  local-control continuation polling, heartbeat maintenance, and command
+  send-CQ polling. Legacy non-machine policies still use the service-global
+  counters documented near
+  [`HomerServiceHeartbeatPassCountdown`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2298),
+  so this is not yet a full removal of source-shaped readiness gates.
+- The policy-owned cooldown helpers are
+  [`HomerMachineBaselinePolicyPeerControlDue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4443),
+  [`HomerMachineBaselinePolicyLocalControlAsyncDue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4462),
+  [`HomerMachineBaselinePolicyHeartbeatDue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4475),
+  and
+  [`HomerMachineBaselinePolicyCommandSendCqDue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4481).
+  They are called from the existing readiness hooks
+  [`HomerServicePeerControlSourceReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4602),
+  [`HomerServiceLocalControlSourceReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20696),
+  [`HomerServiceHeartbeatDueForPump()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4516),
+  and
+  [`HomerServiceCommandSendCqReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7972).
+  This is intentionally a transitional boundary: the policy owns the decision
+  state, while the old source-ready construction still asks whether the
+  pollable source is due.
+- The initial machine-baseline cooldown values are set in
+  [`HomerMachineBaselinePolicyInitialize()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6618)
+  to preserve the old first-pass cadence. Fresh local-control slots and exact
+  payload/frontier facts remain immediate rather than cooldown-gated.
+- Validation for this slice passed with stats/logging macros off. Build/install:
+  `sudo -n -u dbcomm make -j8 service-bin client-bin`, `sudo -n make
+  install-headers install-service-bin install`, targeted artifact sync to
+  farnet0, and matching installed hashes on both hosts. Runtime hashes:
+  `citus_tuple_sink_service`
+  `b75f5083ff2e0713f123af25d54a64a6b25797bac814b5712661dfb1d1bce344`,
+  `citus.so`
+  `a6916f51cf0ba0d1151bd8fe48d626aeba020a4355497607923b3492189fbf9f`,
+  and `libhomer_client.a`
+  `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+- Focused runtime gates were clean after service restart and process preflight:
+  remote c1 Homer pgbench warm rerun `20000/20000`, `0` failures, `4658.22
+  TPS`, p99 `0.234 ms`; remote c4 Homer pgbench `40000/40000`, `0` failures,
+  `11104.29 TPS`, p99 `0.599 ms`; remote RDMA basebackup cold/warm repeats
+  `6.37` and `4.52 s` in
+  `/tmp/homer_state_machine_policy_cooldown_basebackup_1780975525`;
+  backend-to-backend Homer tuple COPY 10M rows completed with
+  `count=10000000`, `min=1`, `max=10000000`, `sum=500000050000000`, warm run
+  `5.14 s` in `/tmp/homer_state_machine_policy_cooldown_copy_1780975546`;
+  mixed remote c4 pgbench plus remote RDMA basebackup passed twice with
+  `8271.87 TPS`/`4.52 s` in
+  `/tmp/homer_state_machine_policy_cooldown_concurrent_c4_1780975573` and
+  `8385.68 TPS`/`4.67 s` in
+  `/tmp/homer_state_machine_policy_cooldown_concurrent_c4_rerun_1780975590`.
+  The mixed TPS is lower than the prior single warmed reference (`8767.48 TPS`)
+  but was correct, error-free, and in the same broad band; keep watching this
+  gate when adding adaptive backoff/deficit behavior.
+
 ### B. Make Dependency-Aware Planning Explicit
 
 The Step 7 rejection of true class reordering exposed a dependency problem, not
