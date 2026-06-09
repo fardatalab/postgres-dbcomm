@@ -1620,18 +1620,26 @@ scheduler.
      bundles only the physical peer pump execution.
    - Target-completion waits no longer use a special ready-set fallback grant in
      `machine-baseline`. The policy builder
-     [`HomerServiceBuildMachineBaselineProgressActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6554)
+     [`HomerServiceBuildMachineBaselineProgressActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6528)
      now treats the `readySet` parameter as transitional input that was already
      consumed by the collector/machine candidate bridge. Synchronous target waits
      are represented by command-session machine facts: the session candidate
      builder
-     [`HomerServiceBuildSessionMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24730)
+     [`HomerServiceBuildSessionMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24704)
      includes the `targetCompletionSession` even when the pump flags do not ask
      for a full completion-table scan, and command-session actions publish the
      completion through the normal `HOMER_PROGRESS_ACTION_PUBLISH_COMMAND_COMPLETION`
      path. This removes a duplicate target-completion action followed by an empty
      command-session action and makes the direct policy builder consume only
      maintained candidate facts after the bridge.
+     Follow-up progress: the session-machine candidate builder now admits target
+     waits directly when `targetCompletionSession != NULL` in
+     [`HomerServiceBuildProgressMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24972),
+     and the collector bridge ignores `HOMER_PROGRESS_SOURCE_TARGET_COMPLETION`
+     rather than manufacturing a target-completion collector with no independent
+     executor. Source-plan policies still consume the flat ready-set source
+     directly; this change only removes the machine-baseline dependency on that
+     synthetic collector admission.
    - Diagnostics: progress stats now record direct action-plan builds through
      [`HomerServiceProgressStatsRecordActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4250),
      so `machine-baseline` does not disappear from plan-build counters when stats
@@ -1698,6 +1706,19 @@ scheduler.
      preflight showed only intended PostgreSQL and Homer service processes, and
      both service logs had no `failed`, `error`, `invalid`, `overrun`, `stale`,
      `corrupt`, `panic`, or `reset` signatures.
+   - Focused runtime checks after direct target-session machine admission passed
+     with `citus_tuple_sink_service`
+     `97aec5dce3effe17e1786988030c4c1e627b0b4ad16af8fb6b025c173f359afa`
+     installed on both hosts. Remote c1 Homer pgbench completed `10000/10000`,
+     `0` failures on all repeats: warmup `2594.85 TPS`, then warmed `4634.85`
+     and `4154.52 TPS`; remote c4 Homer pgbench completed `10000/10000`, `0`
+     failures, `10485.19 TPS`; remote RDMA basebackup completed `6.32`, `4.50`,
+     and `4.62 s`; backend-to-backend Homer tuple COPY 10M rows completed with
+     `count=10000000`, `min=1`, `max=10000000`, `sum=500000050000000`, with
+     warm run `5.14 s` in `/tmp/homer_machine_direct_target_scan_copy_1780984637`.
+     Post-run process preflight showed only intended PostgreSQL and Homer service
+     processes, and both service logs had no `failed`, `error`, `invalid`,
+     `overrun`, `stale`, `corrupt`, `panic`, or `reset` signatures.
 7. **Tune and diagnose.** Tune action burst sizes, collector backoff, blind poll
    caps, payload byte/object caps, and stop/replan triggers. Accept the milestone
    only after clean correctness, clean process/log preflight, and no meaningful
