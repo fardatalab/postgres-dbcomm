@@ -1215,6 +1215,46 @@ scheduler.
    into the small action executors from Step 1. Convert bool-shaped helpers such
    as peer-client completion publication into explicit `PUBLISHED` / `NOT_READY`
    / `FAILED` results where needed.
+   - Current progress: execution now passes through a compiled action layer. The
+     installed execution plan owns one
+     [`HomerProgressCompiledActionGrant`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1758)
+     per selected source-plan grant. The source-to-action mapping lives in
+     [`HomerServiceProgressActionKindForSourceKind()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5104),
+     and
+     [`HomerProgressExecutionPlanCompileActions()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5230)
+     compiles the source plan into typed action grants during installation.
+     [`HomerServiceExecuteProgressExecutionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23513)
+     now iterates `actionGrants`, dispatching through
+     [`HomerServiceExecuteProgressActionGrant()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23253)
+     while preserving the old source-plan ordering and per-grant policy feedback.
+   - Boundary/caveat: this is a one-action-per-source compatibility slice, not the
+     final machine policy. Local-control and payload actions still carry zero
+     flags from the old source plan, which their executors decode as "all ready
+     action families". This preserves behavior while moving the hot execution
+     boundary to typed action grants. The old source dispatcher is marked unused
+     as a transitional reference; future slices should either remove it or split
+     the remaining source-shaped helpers once `machine-baseline` emits direct
+     collector/machine action grants.
+   - Validation status: `git clang-format HEAD --
+     src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+     `git diff --check`, `sudo -n -u dbcomm make -j8 service-bin client-bin`,
+     and `sudo -n make install-headers install-service-bin install` passed.
+     Runtime artifacts were synced to farnet0 and matched by SHA-256:
+     `citus_tuple_sink_service`
+     `b39f9d26e3ef885c7d9f392e57417d94c6547ed11337813c661d78983a5afe9b`,
+     `citus.so`
+     `b0afd5aefcb5ad4ddbe2be118b3a6a4fb0696ad55550147e5ff328a3368c0bc7`,
+     and `libhomer_client.a`
+     `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+     Focused runtime checks passed: warmed remote c1 Homer pgbench `20000/20000`
+     transactions, `0` failures, `4635.45 TPS`, p99 `0.239 ms`; remote c4 Homer
+     pgbench `40000/40000` transactions, `0` failures, `10827.32 TPS`, p99
+     `0.631 ms`; remote RDMA basebackup warmed repeat completed in `4.61 s`;
+     backend-to-backend Homer tuple COPY 10M rows completed with `count=10000000`,
+     `min=1`, `max=10000000`, `sum=500000050000000`, repeats `8.89`, `5.40`,
+     and `5.20 s` in `/tmp/homer_state_machine_action_plan_copy_1780972576`.
+     The first COPY run was treated as warmup. Service logs had no `error`,
+     `failed`, `reset`, `broken`, `stale`, `could not`, or `invalid` lines.
 6. **Enable `machine-baseline` policy.** Use collector/machine facts to build
    plans with bounded collector grants, foreground command/client grants,
    peer/local-control grants, capped payload grants, and non-starvable
