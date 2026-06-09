@@ -2024,24 +2024,32 @@ Additional implementation status:
   Dependency-demanded collectors are intentionally not charged to the blind
   collector budget, because they are not speculative polling; they are the work
   currently expected to unblock an active machine.
-- Split peer collectors currently still execute through the aggregate
-  peer-control grant, so
-  [`HomerServiceProgressCollectorFeedbackForKind()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24572)
-  maps `PEER_CM_SETUP`, `PEER_RECV_CQ`, `PEER_REQUEST_MAILBOX`,
-  `PEER_RESPONSE_MAILBOX`, `PEER_SEND_CQ`, and `PEER_CLOSE_LIFETIME` to the
-  aggregate `peerControlFeedback`. This is a temporary fact/fanout limitation,
-  not the target model: once peer phases have per-phase executor feedback, the
-  policy can back off hot recv/mailbox polling without importing unrelated setup
-  or close history.
-- Because of that temporary aggregate feedback, `PEER_CM_SETUP` and
-  `PEER_CLOSE_LIFETIME` are explicitly exempt from the blind backoff. An earlier
-  version treated aggregate peer-control due candidates as ordinary blind work
-  and reproduced a correctness failure in remote c1 pgbench: session open timed
-  out at outgoing RDMA setup phase 3 in
-  `/tmp/homer_machine_feedback_backoff_pgbench_1780985720/c1_run_1.log`.
-  The fix was to keep setup/close on the parameter-equivalent liveness cadence
-  until the transport exposes exact setup/close facts, and to make dependency
-  demand bypass both feedback backoff and the blind collector budget.
+- Split peer collectors still execute through a bundled physical peer-control
+  grant when `machine-baseline` selects multiple peer phases, but that grant now
+  fans its executor result back out to split source feedback. The transport
+  result struct
+  [`TupleSinkServicePeerPumpProgress`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:284)
+  now carries phase-specific empty/productive counters for listener CM,
+  recv-CQ, request mailbox, response mailbox, and send-CQ. The service feedback
+  fanout is implemented by
+  [`HomerServiceFinishPeerControlProgressGrant()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8619),
+  which updates the aggregate source and selected split phase sources at the same
+  service-feedback tick, so one bundled physical grant does not look like several
+  independent service-loop grants. Collector facts now read the split feedback
+  slots through
+  [`HomerServiceProgressCollectorFeedbackForKind()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24768)
+  instead of importing aggregate `peerControlFeedback`.
+- `PEER_CM_SETUP` and `PEER_CLOSE_LIFETIME` remain explicitly exempt from blind
+  backoff. This is no longer because all peer phases share aggregate feedback;
+  it is because setup/listener and close/lifetime are liveness-sensitive and the
+  transport still does not expose complete exact setup/close work facts. An
+  earlier version treated aggregate peer-control due candidates as ordinary blind
+  work and reproduced a correctness failure in remote c1 pgbench: session open
+  timed out at outgoing RDMA setup phase 3 in
+  `/tmp/homer_machine_feedback_backoff_pgbench_1780985720/c1_run_1.log`. The fix
+  was to keep setup/close on the parameter-equivalent liveness cadence until
+  exact setup/close facts exist, and to make dependency demand bypass both
+  feedback backoff and the blind collector budget.
 - Aggregate peer-control readiness is now treated as coarse pollable liveness,
   not as proof that each split peer phase has expected work. In
   [`HomerServiceBuildProgressCollectorCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25198),
@@ -2071,6 +2079,34 @@ Additional implementation status:
   `9.37 s` and warmed run 2 was `4.90 s`. Post-run process preflight showed
   only the expected PostgreSQL and Homer service processes, and service logs had
   no failed/error/invalid/stale/corrupt/reset/timeout signatures.
+- Follow-up implementation status: per-phase peer feedback fanout has landed and
+  validated with service hash
+  `b5fd3ec700171378ef15fdc90faa7744436f2d91280c4fbd60d1a299343c4b7e`
+  installed on both hosts. Formatting/build/install gates were `git clang-format
+  HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c
+  src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c
+  src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h`,
+  `git diff --check`, `sudo -n -u dbcomm make -j8 service-bin client-bin`, and
+  `sudo -n make install-service-bin`, followed by syncing the service binary to
+  `farnet0`.
+- Runtime gates for the per-phase peer feedback slice were clean. Remote c1
+  Homer pgbench artifacts in
+  `/tmp/homer_peer_phase_feedback_pgbench_1780986700`: warmup `2591.02 TPS`,
+  then `4633.96 TPS` with p99 `0.236 ms`, then `4190.11 TPS` with p99
+  `0.264 ms`, all `10000/10000` with zero failures. Remote c4 Homer pgbench in
+  the same artifact directory completed `10000/10000`, zero failures,
+  `10707.59 TPS`, p99 `0.610 ms`. Remote RDMA basebackup in
+  `/tmp/homer_peer_phase_feedback_more_1780986727` ran `6.04 s` warmup, then
+  `4.54 s` and `4.53 s`. Backend-to-backend Homer tuple COPY in
+  `/tmp/homer_peer_phase_feedback_copy_1780986755` completed 10M rows with
+  `count=10000000`, `min=1`, `max=10000000`, `sum=500000050000000`; run 1 was
+  `8.07 s` and warmed run 2 was `5.23 s`. Mixed remote c4 pgbench plus remote
+  RDMA basebackup passed in
+  `/tmp/homer_peer_phase_feedback_concurrent_1780986781` with pgbench
+  `10000/10000`, zero failures, `8653.72 TPS`, p99 `0.843 ms`, and basebackup
+  `4.60 s`. Post-run process preflight showed only the expected PostgreSQL and
+  Homer service processes, and service logs had no
+  failed/error/invalid/stale/corrupt/reset/timeout signatures.
 - Follow-up caveat: some existing collector facts still overload
   `waitingMachineCount` as both dependency-waiter count and coarse item-count
   hint in older paths. The peer aggregate path no longer does that, but a later
