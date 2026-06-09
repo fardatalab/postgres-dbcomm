@@ -1260,6 +1260,77 @@ scheduler.
    peer/local-control grants, capped payload grants, and non-starvable
    maintenance. Validate against remote pgbench c1/c4, remote RDMA basebackup,
    mixed pgbench+basebackup, and Citus tuple COPY.
+   - Current progress: the first direct machine-aware policy is now selectable as
+     `HOMER_PROGRESS_POLICY=machine-baseline`. The policy interface has a direct
+     action-plan hook in
+     [`HomerProgressPolicyOps`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1907),
+     registered by
+     [`HomerMachineBaselineProgressPolicyOps`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6328).
+     Existing fixed-priority, round-robin, unblocked-first, cpu-liveness, and
+     adaptive-bounded-class policies still use the source-plan hook. The service
+     loop selects the direct action-plan path in
+     [`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24106)
+     only when the selected policy exposes `buildActionPlan`.
+   - The direct policy builder
+     [`HomerServiceBuildMachineBaselineProgressActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5644)
+     consumes the maintained collector/machine candidate set and emits typed
+     action grants through
+     [`HomerProgressExecutionPlanAppendExplicitActionGrant()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5272).
+     Its conservative ordering is command send-CQ, foreground remote-client
+     command machines, active local-control async machines plus local-control slot
+     collection, peer-control progress, target/completion publication, payload
+     progress, then heartbeat/maintenance. This is intentionally a baseline
+     machine-aware policy, not the tuned adaptive policy.
+   - Boundary/caveats: dense payload COPY/basebackup streams still preserve the
+     aggregate payload source when the old ready set contains
+     `HOMER_PROGRESS_PAYLOAD_AGGREGATE_INDEX`; otherwise a direct per-stream
+     machine plan would expand hot COPY into many grants before the payload egress
+     layer can batch real transport work. Per-stream payload machine actions also
+     still pass zero payload action flags, which the executor decodes as all
+     currently ready payload families, because send-CQ, receiver-credit, EOS, and
+     close/reclaim are not yet separate payload grant flags. Peer-control uses
+     the aggregate peer-control action when the current ready set admits aggregate
+     peer-control, because setup/close progress is not yet fully represented by
+     collector facts.
+   - Diagnostics: progress stats now record direct action-plan builds through
+     [`HomerServiceProgressStatsRecordActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4176),
+     so `machine-baseline` does not disappear from plan-build counters when stats
+     macros are enabled. Startup env parsing for the new policy is in
+     [`HomerServiceReadProgressPolicyEnv()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3815).
+   - Validation status: `git clang-format HEAD --
+     src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+     `git diff --check`, `git diff --cached --check`,
+     `sudo -n -u dbcomm make -j8 service-bin client-bin`, and `sudo -n make
+     install-headers install-service-bin install` passed in
+     `/data/dbcomm/citus-dbcomm`. Runtime artifacts were synced to farnet0 and
+     matched by SHA-256: `citus_tuple_sink_service`
+     `03e4bd3a36a426094334aa4684a478fa0ecd3dea91d4c6c3b7f99fa83393a87e`,
+     `citus.so`
+     `a06feb378a579e37fc2161228dcdcf88bf5d3db63a0e93e1ae204add56b9f25b`,
+     and `libhomer_client.a`
+     `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+     Both services logged `HOMER_PROGRESS_POLICY=machine-baseline max_grants=64`.
+   - Focused runtime checks passed after clean process preflight: warmed remote
+     c1 Homer pgbench `20000/20000` transactions, `0` failures, `4517.13 TPS`,
+     p99 `0.241 ms`; remote c4 Homer pgbench `40000/40000` transactions, `0`
+     failures, `10710.53 TPS`, p99 `0.621 ms`; remote RDMA basebackup warmed
+     repeat completed in `4.49 s`; backend-to-backend Homer tuple COPY 10M rows
+     completed with `count=10000000`, `min=1`, `max=10000000`,
+     `sum=500000050000000`, repeats `8.73`, `5.37`, and `5.11 s` in
+     `/tmp/homer_state_machine_machine_baseline_copy_1780973489`. The first COPY
+     run was treated as warmup. Mixed remote c4 pgbench plus remote RDMA
+     basebackup completed correctly with no failures; repeats were variable:
+     pgbench `8013.51`, `8983.49`, and `8387.55 TPS`, with basebackup `4.63`,
+     `4.65`, and `4.60 s` in
+     `/tmp/homer_state_machine_machine_baseline_concurrent_c4_1780973531`,
+     `/tmp/homer_state_machine_machine_baseline_concurrent_c4_repeat_1780973551`,
+     and
+     `/tmp/homer_state_machine_machine_baseline_concurrent_c4_repeat2_1780973569`.
+     Treat the mixed-workload band as a correctness/no-crash gate for this
+     baseline policy, not as evidence that adaptive interference policy is tuned.
+     Post-run process preflight showed only intended PostgreSQL and Homer service
+     processes, and both service logs had no `error`, `failed`, `reset`,
+     `broken`, `stale`, `could not`, or `invalid` lines.
 7. **Tune and diagnose.** Tune action burst sizes, collector backoff, blind poll
    caps, payload byte/object caps, and stop/replan triggers. Accept the milestone
    only after clean correctness, clean process/log preflight, and no meaningful
