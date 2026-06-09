@@ -326,18 +326,41 @@ hot while peer sessions or streams are active. Setup/listener work is cold.
 Close/lifetime progress should have its own non-starvable class because it is
 low throughput value but correctness-visible.
 
-The current code maps `HOMER_PROGRESS_SOURCE_PEER_SEND_CQ` to
-`TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ_RESPONSE` in
-[`HomerServicePeerControlPhaseMaskForSource()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7023).
-That phase drains tagged send completions and then calls
-`TupleSinkServiceProgressPeerControlResponses()` from
-[`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7547).
-This should be cleaned up as an early implementation step so `PEER_SEND_CQ`
-facts mean "locally posted WRs are expected to retire" and
-`PEER_RESPONSE_MAILBOX` facts mean "a local async continuation may now complete".
+The pre-split code mapped `HOMER_PROGRESS_SOURCE_PEER_SEND_CQ` to a combined
+send-CQ/response phase, so one grant both drained tagged send completions and
+called `TupleSinkServiceProgressPeerControlResponses()`. That ambiguity needed
+to be removed before peer-control facts could safely mean either "locally posted
+WRs are expected to retire" or "a local async continuation may now complete".
 
 The existing aggregate phase-grant path can remain as a compatibility fallback
 or default policy behavior while the split-source facts are introduced.
+
+Implementation progress: the first peer-control executor split now gives the
+flat-source substrate separate request-mailbox, response-mailbox, and send-CQ
+identities. [`HomerProgressSourceKind`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1288)
+now has `HOMER_PROGRESS_SOURCE_PEER_REQUEST_MAILBOX` and
+`HOMER_PROGRESS_SOURCE_PEER_RESPONSE_MAILBOX`; the service-progress phase mapper
+maps them independently in
+[`HomerServicePeerControlPhaseMaskForSource()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7046).
+At the transport layer,
+[`TupleSinkServicePeerPumpPhaseMask`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:248)
+now has separate `TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ`,
+`TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_REQUEST_MAILBOX`, and
+`TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_RESPONSE_MAILBOX` bits.
+[`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7547)
+drains outgoing send CQEs in the send-CQ branch, consumes outgoing async
+peer-control responses in the response-mailbox branch, and dispatches accepted
+incoming mailbox work in the request-mailbox branch.
+
+Caveat: this split is clean at the scheduler/action boundary, but the physical
+inbound peer-control mailbox is still one FIFO ring that can carry both request
+and response messages. The request-mailbox branch therefore still completes a
+response if that response is the next FIFO message on an accepted lane; otherwise
+it could create head-of-line blocking. A fully pure request-vs-response collector
+split would need either separate physical mailboxes or a peekable/deferred
+mailbox reader. Do not design baseline policy rules that assume the incoming
+request-mailbox action can always ignore response messages without consuming
+them.
 
 ## Facts, Feedback, And Planner Inputs
 
@@ -737,16 +760,13 @@ CQ. This machine is why `PEER_RESPONSE_MAILBOX` must be split from
 `PEER_SEND_CQ`: response mailbox consumption advances the async op, while
 send-CQ retirement releases transport resources.
 
-Implementation prerequisite: clean up the current peer-control phase ambiguity
-before using peer-control facts in the state-machine scheduler. Today
-`HOMER_PROGRESS_SOURCE_PEER_SEND_CQ` maps to
-`TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ_RESPONSE` in
-[`HomerServicePeerControlPhaseMaskForSource()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7023),
-and that phase in
-[`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7547)
-both drains send CQEs and consumes outgoing peer-control responses through
-[`TupleSinkServiceProgressPeerControlResponses()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6826).
-The state-machine scheduler must split these into separate action boundaries:
+Implementation prerequisite: the pre-split peer-control phase ambiguity must
+stay removed before using peer-control facts in the state-machine scheduler.
+`HOMER_PROGRESS_SOURCE_PEER_SEND_CQ`,
+`HOMER_PROGRESS_SOURCE_PEER_REQUEST_MAILBOX`, and
+`HOMER_PROGRESS_SOURCE_PEER_RESPONSE_MAILBOX` now map to distinct pump phases in
+[`HomerServicePeerControlPhaseMaskForSource()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7046).
+The state-machine scheduler should keep these separate action boundaries:
 
 - `DRAIN_PEER_CONTROL_SEND_CQ`: resource/lifetime release for locally posted
   control/response WRs
@@ -755,9 +775,10 @@ The state-machine scheduler must split these into separate action boundaries:
 - `COLLECT_PEER_REQUEST_MAILBOX`: incoming peer request dispatch, replacing the
   generic `PEER_MAILBOX` meaning
 
-Do this split early. Otherwise the machine facts would encode a special case
-where one action both releases send resources and completes async response waits,
-which would weaken collector demand accounting and baseline policy decisions.
+Keep this split intact as the state-machine scheduler lands. Otherwise the
+machine facts would reintroduce a special case where one action both releases
+send resources and completes async response waits, which would weaken collector
+demand accounting and baseline policy decisions.
 
 `PEER_CONNECTION_MACHINE` states:
 
@@ -837,6 +858,19 @@ Current mappings for the first implementation:
   send-CQ/source-release retirement, credit publication, EOS, and close/reclaim.
   Do not keep the aggregate helper as a scheduler-visible action in the target
   design.
+  Implementation progress: payload grants now have a payload-specific action
+  mask, [`HomerPayloadProgressActionMask`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1344).
+  Zero grant flags preserve the old all-actions behavior through
+  [`HomerServicePayloadActionMaskForGrant()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17819),
+  while selected grants can already name `LOCAL_BLACKHOLE`, `OUTGOING`,
+  `INCOMING`, or `CLOSE_RECLAIM`. Close/reclaim logic is split into
+  [`HomerServiceProgressPayloadCloseAndReclaim()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17834),
+  and [`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17924)
+  dispatches action families by mask. This is not yet a full payload
+  state-machine executor: send-CQ/source-release retirement, receiver-credit
+  publication, and EOS synthesis are still partly inside the existing outgoing
+  and incoming helpers, with payload send CQEs also visible through the shared
+  CQ-drain source.
 - `COLLECT_PEER_RECV_CQ_OR_CM`: use the recv-CQ/listener parts of
   [`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7288)
   and the underlying peer event drain helper. This collector updates
@@ -850,9 +884,9 @@ Current mappings for the first implementation:
   [`TupleSinkServiceProgressPeerControlResponses()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6826).
   It consumes outgoing peer-control responses and unblocks
   `LOCAL_CONTROL_REQUEST_MACHINE` or `PEER_CONTROL_OP_MACHINE`.
-- `DRAIN_PEER_CONTROL_SEND_CQ`: split from the current
-  `TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ_RESPONSE` branch in
-  `TupleSinkServicePumpPeerRequestsRdma()`. It should drain tagged send CQEs but
+- `DRAIN_PEER_CONTROL_SEND_CQ`: use the current
+  `TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ` branch in
+  `TupleSinkServicePumpPeerRequestsRdma()`. It drains tagged send CQEs but does
   not also consume response mailbox messages.
 - `ADVANCE_PEER_CONTROL_OP_MACHINE`: use
   [`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:215)
@@ -944,6 +978,45 @@ scheduler.
    outgoing publication, incoming consumption, send-CQ/source-release retirement,
    credit publication, EOS, and close/reclaim actions. Then split local-control
    slot collection from async continuation advancement.
+   - Current progress: peer-control send-CQ and outgoing response-mailbox work
+     are now separate phase/source identities, and the old combined
+     send-CQ/response phase is removed. Request-mailbox remains a bounded action
+     over the existing FIFO inbound mailbox, with the caveat above about mixed
+     request/response messages. Remaining peer-control split work: separate
+     recv-CQ/CM from listener/setup more mechanically if needed for machine
+     facts, and keep close/lifetime as an independent non-starvable action when
+     the machine executor lands.
+   - Validation for this slice: `make -j8 service-bin client-bin` and
+     `sudo -n make install-headers install-service-bin install` passed in
+     `/data/dbcomm/citus-dbcomm`. Runtime artifacts were synced to farnet0 and
+     matched by SHA-256. Focused peer-RDMA checks passed: warmed remote c1 Homer
+     pgbench `20000/20000` transactions, `0` failures, `4604.77 TPS`, p99
+     `0.238 ms`; remote c4 Homer pgbench `40000/40000` transactions, `0`
+     failures, `11045.16 TPS`, p99 `0.591 ms`; remote RDMA basebackup warmed
+     run completed in `4.59 s`; backend-to-backend Homer tuple COPY 10M rows
+     completed with `count=10000000`, `min=1`, `max=10000000`,
+     `sum=500000050000000`, warmed `5.24 s` in
+     `/tmp/homer_state_machine_peer_split_copy_1780969094`. Service log tails
+     showed normal setup/close/reclaim progress and no reset/error messages from
+     the split peer-control branches.
+   - Current progress: payload stream execution now has explicit action-mask
+     families for local blackhole, outgoing publication, incoming consumption,
+     and close/reclaim. The flat payload source still grants all families by
+     default, so this is an executor-boundary split rather than a policy behavior
+     change. Remaining payload split work: break send-CQ/source-release
+     retirement, receiver-credit publication, and tuple-view EOS synthesis into
+     smaller action results that machine facts can expose directly.
+   - Validation for the payload action-mask slice: `make -j8 service-bin
+     client-bin` and `sudo -n make install-headers install-service-bin install`
+     passed in `/data/dbcomm/citus-dbcomm`. Runtime artifacts were synced to
+     farnet0 and matched by SHA-256. Focused checks passed: warmed remote c1
+     Homer pgbench `20000/20000` transactions, `0` failures, `4584.35 TPS`, p99
+     `0.239 ms`; remote RDMA basebackup warmed run completed in `4.60 s`;
+     backend-to-backend Homer tuple COPY 10M rows completed with
+     `count=10000000`, `min=1`, `max=10000000`, `sum=500000050000000`, warmed
+     `5.16 s` in `/tmp/homer_state_machine_payload_action_split_copy_1780969544`.
+     Service log tails showed normal setup, basebackup completion, payload
+     close, and reclaim progress.
 2. **Machine and collector scaffolding.** Add fixed-table
    `HomerProgressMachineRef`, machine facts, collector facts, action refs,
    machine grants, collector grants, action results, and transition results.
