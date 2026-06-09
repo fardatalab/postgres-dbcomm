@@ -485,11 +485,19 @@ The generic scheduler objects should be:
 
 - `HomerProgressMachineRef`: machine kind, fixed-table index, generation, and
   owner pointer. This is the state-machine analogue of
-  [`HomerProgressSourceRef`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1360).
+  [`HomerProgressSourceRef`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1504).
 - `HomerProgressMachineFacts`: compact policy-readable facts: current state,
   ready action mask, blocked reason mask, waiting-on mask, unblocks mask,
   CPU/liveness class, traffic class, age/ticks, ready byte/object hints,
   outstanding WR/CQE hints, and recommended action burst.
+  Implementation progress: the fixed-table scaffold now defines
+  [`HomerProgressMachineKind`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1383),
+  [`HomerProgressCollectorKind`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1396),
+  [`HomerProgressActionKind`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1412),
+  [`HomerProgressMachineFacts`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1531),
+  [`HomerProgressCollectorFacts`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1556),
+  and the grant/result scaffolding near
+  [`HomerProgressActionRef`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1576).
 - `HomerProgressActionRef`: small nonblocking action selected for execution. It
   names the action kind, owner machine, source executor kind if one is reused,
   and typed budgets such as max polls, max messages, max objects, max bytes, or
@@ -820,14 +828,21 @@ behavior.
 Current mappings for the first implementation:
 
 - `COLLECT_LOCAL_CONTROL_SLOTS`: split from
-  [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21460).
+  [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21598).
   This collector scans request-ready control slots and activates
   `LOCAL_CONTROL_REQUEST_MACHINE`s. It should not also drive all active async
   continuations in the same action.
+  Implementation progress: local-control grants now have an explicit action mask,
+  [`HomerLocalControlProgressActionMask`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1361),
+  with `COLLECT_SLOTS` and `ADVANCE_ASYNC` families. Existing flat local-control
+  grants still pass zero flags, which
+  [`HomerServiceLocalControlActionMaskForGrant()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17866)
+  decodes as both families. Nonzero future machine grants can select only the
+  collector or only async continuation advancement.
 - `ADVANCE_LOCAL_CONTROL_MACHINE`: refactor from
-  [`TupleSinkServicePumpLocalControlAsyncOps()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20103)
+  [`TupleSinkServicePumpLocalControlAsyncOps()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20240)
   and
-  [`TupleSinkServiceProgressLocalControlAsyncOp()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19895).
+  [`TupleSinkServiceProgressLocalControlAsyncOp()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20032).
   One grant advances a bounded number of async local-control machines by one or a
   small exact-ready burst.
 - `COLLECT_FRONTEND_COMMAND_RING` and `POST_REMOTE_CLIENT_SQL_COMMAND`: split
@@ -1017,13 +1032,114 @@ scheduler.
      `5.16 s` in `/tmp/homer_state_machine_payload_action_split_copy_1780969544`.
      Service log tails showed normal setup, basebackup completion, payload
      close, and reclaim progress.
+   - Current progress: local-control execution now distinguishes slot collection
+     from async continuation advancement through
+     [`HomerLocalControlProgressActionMask`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1361).
+     [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21598)
+     dispatches `ADVANCE_ASYNC` by calling
+     [`TupleSinkServicePumpLocalControlAsyncOps()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20240),
+     and only scans request-ready slots when `COLLECT_SLOTS` is granted.
+     Existing grants still use zero flags and therefore preserve the previous
+     aggregate order: advance async continuations first, then collect new slots.
+     Remaining local-control split work: represent individual active
+     local-control requests as machine facts with waiting-on and next-action
+     state, and move the existing periodic async readiness cooldown out of
+     [`HomerServiceLocalControlSourceReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19054)
+     into the baseline machine-aware policy.
+   - Validation for the local-control action-mask slice: `git diff --check`
+     passed. `make -j8 service-bin client-bin` hit only the known output-file
+     permission issue, then `sudo -n -u dbcomm make -j8 service-bin client-bin`
+     passed; `sudo -n make install-headers install-service-bin install` passed.
+     Runtime artifacts were synced to farnet0 and matched by SHA-256:
+     `citus_tuple_sink_service`
+     `21f91ba1011933e3b59e15765cdded694a2b99f5d2cb186dd52a1b168da038f7`,
+     `citus.so`
+     `9de33407aa41bfa51c090f4336c41d05325d0810ccdbac73602903d45c8e4b77`,
+     and `libhomer_client.a`
+     `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+     Focused checks passed after clean process preflight: warmed remote c1 Homer
+     pgbench `20000/20000` transactions, `0` failures, `4619.30 TPS`, p99
+     `0.244 ms`; remote c4 Homer pgbench `40000/40000` transactions, `0`
+     failures, `11046.38 TPS`, p99 `0.578 ms`; remote RDMA basebackup warmed
+     repeat completed in `4.56 s`; backend-to-backend Homer tuple COPY 10M rows
+     completed with `count=10000000`, `min=1`, `max=10000000`,
+     `sum=500000050000000`, warmed repeat `5.05 s` in
+     `/tmp/homer_state_machine_local_control_split_copy_1780970167`. Post-run
+     process preflight showed only the intended PostgreSQL and Homer service
+     processes, and service logs had no `error`, `failed`, `reset`, `broken`,
+     `stale`, `could not`, or `invalid` lines.
 2. **Machine and collector scaffolding.** Add fixed-table
    `HomerProgressMachineRef`, machine facts, collector facts, action refs,
    machine grants, collector grants, action results, and transition results.
    Initially populate facts from existing session, stream, control, and peer
    transport state.
+   - Current progress: the behavior-neutral scaffold has landed in
+     [`tuple_sink_service_process.c`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1383).
+     [`HomerServiceProgressRegistry`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2132)
+     now owns fixed machine fact arrays for local-control slots, remote client SQL
+     sender sessions, command sessions, payload streams, peer-control ops, plus
+     one peer-connection machine and one maintenance machine. Startup
+     initialization happens through
+     [`HomerServiceInitializeProgressMachineFacts()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7554)
+     and
+     [`HomerServiceInitializeProgressCollectorFacts()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7577),
+     called from
+     [`HomerServiceInitializeProgressRegistry()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7622).
+     This does not yet change source ready-set behavior or policy decisions; later
+     candidate builders must refresh these facts from authoritative service state
+     before the `machine-baseline` policy consumes them.
+   - Caveat: peer transport still owns private per-connection arrays, so this
+     scaffold keeps one aggregate
+     [`peerConnectionMachine`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2182)
+     tied to the peer request context. Split per-connection machines should wait
+     until the peer transport exposes stable connection refs or a compact
+     connection-fact iterator; otherwise the scheduler would either duplicate peer
+     internals or guess at stale connection identity.
+   - Validation for the scaffold slice: `git clang-format HEAD --
+     src/backend/distributed/utils/homer/tuple_sink_service_process.c` was run,
+     `git diff --check` passed, `sudo -n -u dbcomm make -j8 service-bin
+     client-bin` passed, and `sudo -n make install-headers install-service-bin
+     install` passed. Runtime artifacts were synced to farnet0 and matched by
+     SHA-256: `citus_tuple_sink_service`
+     `bea45295c9d0e38a9f2d5ac5e6694ea935aa92183b7874a66b29df90225ddb8a`,
+     `citus.so`
+     `9de33407aa41bfa51c090f4336c41d05325d0810ccdbac73602903d45c8e4b77`,
+     and `libhomer_client.a`
+     `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+     Focused runtime checks passed after clean process preflight: warmed remote c1
+     Homer pgbench `20000/20000` transactions, `0` failures, `4641.92 TPS`, p99
+     `0.235 ms`; remote c4 Homer pgbench `40000/40000` transactions, `0`
+     failures, `11106.28 TPS`, p99 `0.587 ms`; remote RDMA basebackup warmed
+     repeat completed in `4.54 s`. Post-run process preflight showed only the
+     intended PostgreSQL and Homer service processes, and service logs had no
+     `error`, `failed`, `reset`, `broken`, `stale`, `could not`, or `invalid`
+     lines.
 3. **Collector candidate builder.** Replace the conceptual ready-set entrypoint
    with collector candidates plus machine candidates.
+   - Current progress: a behavior-neutral collector candidate bridge now consumes
+     the existing coarse ready set in
+     [`HomerServiceBuildProgressCollectorCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22352),
+     called from
+     [`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22824).
+     The bridge intentionally does not re-run local-control or peer-control
+     readiness predicates, because those predicates still own cooldown counters
+     until the machine-aware policy takes over. Local-control slot counting is
+     guarded by the old ready-set signal and performed by
+     [`HomerServiceFreshLocalControlRequestSlotCount()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22292)
+     so the bridge does not add a fixed control-slot scan to every pump pass.
+     Duplicate collector candidates are merged by
+     [`HomerProgressMachineCandidateSetAppendCollector()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4590).
+   - The bridge adds an explicit command-send-CQ collector,
+     [`HOMER_PROGRESS_COLLECTOR_COMMAND_SEND_CQ`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1401),
+     because command/payload WR retirement should be visible as collector work
+     instead of being hidden under the frontend command-ring collector.
+   - Validation status: `git clang-format HEAD --
+     src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+     `git diff --check`, and `sudo -n -u dbcomm make -j8 service-bin
+     client-bin` passed for this checkpoint. Runtime/performance validation for
+     the collector bridge remains pending; because it refreshes candidates in the
+     pump loop, warmed c1/c4 pgbench and basebackup checks should be run before
+     claiming Step 3 completion.
 4. **Machine candidate builder.** Register active machines for local control,
    remote client SQL sender, command session, payload stream, peer-control op,
    peer connection, and maintenance. Populate ready action masks, blocked
