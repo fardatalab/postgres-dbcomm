@@ -2107,11 +2107,46 @@ Additional implementation status:
   `4.60 s`. Post-run process preflight showed only the expected PostgreSQL and
   Homer service processes, and service logs had no
   failed/error/invalid/stale/corrupt/reset/timeout signatures.
-- Follow-up caveat: some existing collector facts still overload
-  `waitingMachineCount` as both dependency-waiter count and coarse item-count
-  hint in older paths. The peer aggregate path no longer does that, but a later
-  cleanup should split dependency waiters from ready-item hints so adaptive
-  policies do not accidentally treat a count hint as a dependency boost.
+- Follow-up implementation status: collector ready-count hints are now separate
+  from dependency-waiter counts. `HomerProgressCollectorFacts` has an explicit
+  `readyItemCountHint` next to `waitingMachineCount` in
+  [`HomerProgressCollectorFacts`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1661).
+  Ready-set-derived collector candidates populate `readyItemCountHint` through
+  [`HomerServiceAppendProgressCollectorCandidate()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24884),
+  while dependency-demand candidates leave the ready hint at zero and increment
+  only `waitingMachineCount` through
+  [`HomerServiceAppendProgressCollectorDemandCandidate()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24905).
+  The machine-baseline collector executor sizes bounded mailbox/slot work through
+  [`HomerServiceMachineBaselineCollectorItemBudget()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6268),
+  which prefers exact ready counts and falls back to dependency waiter count only
+  when a collector was admitted because active machines are blocked on it. This
+  removes the previous semantic overload where a local-slot count, completion
+  count, or payload-ready count could look like dependency demand to adaptive
+  policy diagnostics.
+- Validation for the ready-hint split used service hash
+  `401f66acbacbedd374bea1a36c6fb9b73a1c536316e59fe671e53dc5baf9d6a4`
+  installed on both hosts. Formatting/build/install gates were `git
+  clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+  `git diff --check`, `sudo -n -u dbcomm make -j8 service-bin client-bin`, and
+  `sudo -n make install-service-bin`, followed by syncing the service binary to
+  `farnet0`.
+- Runtime gates for the ready-hint split were clean. Remote c1 Homer pgbench
+  artifacts in `/tmp/homer_collector_ready_hint_pgbench_1780987090`: warmup
+  `2580.05 TPS`, then `4599.42 TPS` with p99 `0.237 ms`, then `4190.52 TPS`
+  with p99 `0.259 ms`, all `10000/10000` with zero failures. Remote c4 Homer
+  pgbench in the same artifact directory completed `10000/10000`, zero failures,
+  `10741.00 TPS`, p99 `0.618 ms`. Remote RDMA basebackup in
+  `/tmp/homer_collector_ready_hint_more_1780987110` ran `5.84 s` warmup, then
+  `4.79 s` and `4.52 s`. Backend-to-backend Homer tuple COPY in
+  `/tmp/homer_collector_ready_hint_copy_1780987138` completed 10M rows with
+  `count=10000000`, `min=1`, `max=10000000`, `sum=500000050000000`; run 1 was
+  `9.04 s` and warmed run 2 was `5.24 s`. Mixed remote c4 pgbench plus remote
+  RDMA basebackup passed in
+  `/tmp/homer_collector_ready_hint_concurrent_1780987164` with pgbench
+  `10000/10000`, zero failures, `8746.13 TPS`, p99 `0.823 ms`, and basebackup
+  `4.67 s`. Post-run process preflight showed only the expected PostgreSQL and
+  Homer service processes, and service logs had no
+  failed/error/invalid/stale/corrupt/reset/timeout signatures.
 
 ### B. Make Dependency-Aware Planning Explicit
 
