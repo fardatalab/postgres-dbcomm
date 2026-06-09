@@ -306,18 +306,35 @@ close/lifetime work, and
 applies those grants.
 
 The next design should split peer control into first-class service-progress
-sources rather than only subgrants under one aggregate source:
+sources rather than only subgrants under one aggregate source. The split should
+also remove the current `send-CQ/response` ambiguity before adaptive policies
+consume per-source facts: send-CQ retirement and outgoing async response
+mailbox consumption are different CPU/liveness work and should not share one
+source identity.
 
 - `PEER_CM_SETUP`: cold setup/listener/RDMA-CM transition progress
 - `PEER_RECV_CQ`: hot active peer recv-CQ and doorbell polling
-- `PEER_MAILBOX`: hot fixed-width peer request dispatch
-- `PEER_SEND_CQ`: response/control send-CQ retirement
+- `PEER_REQUEST_MAILBOX`: hot fixed-width incoming peer request dispatch
+- `PEER_RESPONSE_MAILBOX`: outgoing async peer response consumption for local
+  control continuations
+- `PEER_SEND_CQ`: response/control send-CQ retirement and local resource/lifetime
+  release
 - `PEER_CLOSE_LIFETIME`: low-volume but non-starvable deferred close and cleanup
 
 This split makes hot/cold separation visible to policy. CQ and mailbox work are
 hot while peer sessions or streams are active. Setup/listener work is cold.
 Close/lifetime progress should have its own non-starvable class because it is
 low throughput value but correctness-visible.
+
+The current code maps `HOMER_PROGRESS_SOURCE_PEER_SEND_CQ` to
+`TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ_RESPONSE` in
+[`HomerServicePeerControlPhaseMaskForSource()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7023).
+That phase drains tagged send completions and then calls
+`TupleSinkServiceProgressPeerControlResponses()` from
+[`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7547).
+This should be cleaned up as an early implementation step so `PEER_SEND_CQ`
+facts mean "locally posted WRs are expected to retire" and
+`PEER_RESPONSE_MAILBOX` facts mean "a local async continuation may now complete".
 
 The existing aggregate phase-grant path can remain as a compatibility fallback
 or default policy behavior while the split-source facts are introduced.
@@ -421,14 +438,850 @@ Simple initial behavior:
 - skip or delay sources that are credit/resource blocked until feedback or
   facts show progress is possible again
 
+## State-Machine Scheduler Pivot
+
+The flat source-plan model above is useful as an executor dispatch substrate, but
+it is not the right conceptual boundary for the first-layer scheduler. Homer
+service work is mostly asynchronous state-machine progress: one action makes the
+next action expected, or leaves the machine known-blocked on a frontier, CQE,
+mailbox response, remote credit, or local resource. Treating command rings,
+completion rings, payload streams, peer recv-CQ, peer mailboxes, and send-CQs as
+independent `cpuClass` sources loses this ordering information.
+
+The target first-layer scheduler should therefore schedule Homer async work state
+machines. Source executors remain the low-level nonblocking action primitives,
+but policy input should be active machines plus event collectors, not only a
+flat ready set of source refs.
+
+### Generic Model
+
+Keep the implementation fixed-table and switch-based. Do not introduce heap
+allocated scheduler work items or per-machine vtables on the hot path.
+
+The generic scheduler objects should be:
+
+- `HomerProgressMachineRef`: machine kind, fixed-table index, generation, and
+  owner pointer. This is the state-machine analogue of
+  [`HomerProgressSourceRef`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1360).
+- `HomerProgressMachineFacts`: compact policy-readable facts: current state,
+  ready action mask, blocked reason mask, waiting-on mask, unblocks mask,
+  CPU/liveness class, traffic class, age/ticks, ready byte/object hints,
+  outstanding WR/CQE hints, and recommended action burst.
+- `HomerProgressActionRef`: small nonblocking action selected for execution. It
+  names the action kind, owner machine, source executor kind if one is reused,
+  and typed budgets such as max polls, max messages, max objects, max bytes, or
+  max WRs.
+- `HomerProgressMachineGrant`: policy output for one machine: advance this
+  machine for up to N actions, N polls, N objects, N bytes, or until blocked.
+- `HomerProgressActionResult`: executor output: made progress, empty poll,
+  blocked reason, terminal/failure, updated frontiers, and any newly unblocked
+  machine/event collector.
+- `HomerProgressTransitionResult`: machine transition output after an action:
+  new state, next ready action, waiting-on source/event, unblocks relation, and
+  whether the current plan should stop and replan.
+
+The service loop should separate three phases:
+
+1. **Collect events:** schedule event collectors that discover unknown external
+   arrivals or local request publication. Collectors update machine facts and may
+   activate machines, but they are not themselves the higher-level async work.
+2. **Plan machines:** let the policy choose one or more machine grants using the
+   maintained machine facts.
+3. **Execute actions:** compile each machine grant into small nonblocking actions
+   and dispatch existing source executors or refactored action helpers. Each
+   action updates the owning machine facts and may unblock another machine.
+
+Event collectors are scheduled work too. The policy may schedule collector
+actions and machine actions in the same execution plan, but they have different
+roles: collectors discover or publish facts, while machines represent the
+higher-level async work being advanced. Collectors should have policy-owned
+cooldowns/backoff, and they should be boosted when one or more active machines
+are waiting on the event they collect.
+
+The producer/consumer boundary should be explicit:
+
+- fixed collector registries and maintained facts produce collector candidates,
+  not collector grants
+- active machine registries and maintained facts produce machine candidates, not
+  machine grants
+- the policy consumes both candidate sets and produces collector grants plus
+  machine grants
+- the plan executor consumes grants; collector execution refreshes facts and may
+  activate machines, while machine execution transitions higher-level async state
+  and may add demand for collectors
+
+This avoids treating collectors as autonomous work items. A collector grant is a
+scheduling decision made because the collector is due, has known expected work,
+or is demanded by one or more blocked/waiting machines.
+
+### Required Machine Kinds
+
+The initial machine registry should cover exactly these current Homer async work
+families. These are local to one service process; a cross-node workflow is made
+from cooperating machines on each service, not from one global distributed
+machine.
+
+1. `LOCAL_CONTROL_REQUEST_MACHINE`: one active local control slot or async local
+   control continuation. It covers local open/start/poll requests, including
+   remote command/session/stream operations currently handled by
+   [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21460)
+   and the async phases in
+   [`TupleSinkServiceLocalControlAsyncPhase`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18752).
+2. `REMOTE_CLIENT_SQL_SENDER_MACHINE`: frontend-node client SQL command
+   transport. It consumes local frontend command mailboxes, posts RDMA command
+   writes to the peer, drains command-write CQEs when source slots approach wrap,
+   and consumes the pushed client completion mailbox. The current write
+   completion state is
+   [`TupleSinkServiceClientSqlCommandWriteCompletion`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:839).
+3. `COMMAND_SESSION_MACHINE`: one service-side command session, whether local
+   backend, peer-command worker, or backend-node client SQL receiver. It covers
+   backend command execution, backend completion consumption through
+   [`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10120),
+   result payload dependency, and completion publication through
+   [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9054)
+   or peer command completion publication.
+4. `PAYLOAD_STREAM_MACHINE`: one active neutral payload stream in
+   [`HomerPayloadStreamState`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:872).
+   It covers outgoing producer-byte/object publication, incoming peer-written
+   payload consumption, remote-credit publication, send-CQ/source-release
+   frontiers, EOS, and close/reclaim. The current aggregate executor is
+   [`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17772).
+5. `PEER_CONTROL_OP_MACHINE`: one outgoing peer-control request/response
+   operation or one incoming request dispatch/response publication. It covers
+   start peer request, response mailbox wait, incoming mailbox dispatch, and
+   response send-CQ retirement. The current primitives are
+   [`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:215),
+   `TupleSinkServicePollPeerRequestRdma()`, and
+   [`TupleSinkServiceProgressPeerControlResponses()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6826).
+6. `PEER_CONNECTION_MACHINE`: one peer connection/lane setup and lifetime
+   machine. It covers listener/CM setup, active recv-CQ polling, send-CQ
+   retirement, disconnect, close, and reclaim. The current phase-grant executor is
+   [`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7288).
+7. `MAINTENANCE_MACHINE`: service heartbeat, cold cleanup, diagnostics, and
+   non-starvable background maintenance. It should stay separate from hot
+   connection/command/payload machines so policy can cap it without losing
+   liveness.
+
+### Event Collectors
+
+Collectors kickstart machines and refresh facts for unknown arrivals. They are
+scheduled actions, but they do not own the higher-level async state. The initial
+collector set should be:
+
+- local control slot collector: finds request-ready control slots and either
+  handles simple local work or activates `LOCAL_CONTROL_REQUEST_MACHINE`
+- local command/completion mailbox collectors: observe frontend command slots,
+  backend completion slots, target completion waits, and peer command completion
+  rings
+- peer recv-CQ collector: drains peer doorbells/events and marks request mailbox,
+  payload, client-command, or connection machines likely runnable
+- peer request-mailbox collector: dispatches incoming peer requests and activates
+  command/session/payload/control machines as needed
+- peer response-mailbox collector: consumes outgoing peer-control responses and
+  unblocks local-control or peer-control-op machines
+- peer send-CQ collector: retires locally posted peer-control WRs and unblocks
+  scratch/lifetime/retry state
+- payload producer/consumer frontier collectors: read producer published tails,
+  local consumed heads, remote consumed-head mirrors, payload doorbells, and
+  payload send/ACK CQEs for active `PAYLOAD_STREAM_MACHINE`s
+- heartbeat/maintenance collector: marks maintenance due and updates liveness
+  diagnostics
+
+The old ready-set construction is a collector implementation detail in this
+model. It should no longer be treated as the first-layer scheduler's main input.
+
+Collector facts need their own scheduler-visible vocabulary so the policy can
+avoid both starvation and over-polling:
+
+- `candidateDue`: collector is due by maintenance interval, cold liveness, or
+  backoff expiry
+- `knownExpectedWork`: local state says the collector should find work, such as
+  outstanding WRs, published local request slots, known mailbox head/tail
+  movement, pending close/reclaim, or command/source ring wrap pressure
+- `waitingMachineCount`: number of active machines waiting on this collector
+  family
+- `oldestWaitingMachineAge`: age of the oldest machine blocked on this collector
+- `lastProductiveTick`, `lastEmptyTick`, and `consecutiveEmptyGrants`
+- `lastItemsCollected`, `lastPolls`, `lastMessages`, and `lastCqes`
+- `collectorCostClass`: cheap exact check, bounded mailbox/CQ poll, or cold
+  setup/maintenance scan
+
+Baseline policy rules for collectors:
+
+- Do not starve collectors. If no machine grants are runnable, schedule due
+  collectors before sleeping/spinning on nothing.
+- Boost collectors with waiting machines, especially when the oldest waiter age
+  grows or the wait is on a known prerequisite such as peer response, send CQ, or
+  payload credit.
+- Prefer exact/known-expected collectors over blind polling.
+- Back off collectors with repeated empty grants when there are enough runnable
+  machine grants to spend CPU productively.
+- Still reserve a small non-starvation budget for unknown external-arrival
+  collectors, because they are the only way to discover new work in a polled
+  design.
+- Cap collector bursts. A productive collector should make machines eligible and
+  then yield to machine advancement unless it has a bounded backlog and the
+  policy explicitly grants more collection.
+
+### Initial State/Action Inventory
+
+The first implementation should encode states mechanically from current async
+logic, then refactor names later if needed. The following state/action sets are
+the implementation baseline.
+
+`LOCAL_CONTROL_REQUEST_MACHINE` states:
+
+- `IDLE`
+- `REQUEST_READY`
+- command-open phases mirroring
+  `TUPLE_SINK_SERVICE_LOCAL_CONTROL_ASYNC_COMMAND_CREATE`,
+  `COMMAND_ENSURE_CONNECTION`, `COMMAND_REGISTER_MEMORY`,
+  `COMMAND_START_PEER_OPEN`, and `COMMAND_WAIT_PEER_OPEN`
+- stream-open phases mirroring `STREAM_CREATE`, `STREAM_ENSURE_CONNECTION`,
+  `STREAM_REGISTER_MIRROR`, `STREAM_START_PEER_OPEN`, and
+  `STREAM_WAIT_PEER_OPEN`
+- start-command phases `START_COMMAND_START_PEER` and
+  `START_COMMAND_WAIT_PEER`
+- poll-completion phases `POLL_COMPLETION_START_PEER` and
+  `POLL_COMPLETION_WAIT_PEER`
+- `PUBLISH_LOCAL_RESPONSE`, `COMPLETED`, and `FAILED`
+
+Actions: claim/request slot, allocate session/stream, ensure peer connection,
+register memory/mirror, start peer request, consume peer response, publish local
+response, fail local response. Transitions are currently implemented across
+`TupleSinkServicePumpControlSlots()`,
+`TupleSinkServiceProgressCommandOpenAsyncOp()`,
+`TupleSinkServiceProgressStreamOpenAsyncOp()`, and
+`TupleSinkServiceProgressLocalControlAsyncOp()`.
+
+`REMOTE_CLIENT_SQL_SENDER_MACHINE` states:
+
+- `IDLE_WAIT_FRONTEND_COMMAND`
+- `COMMAND_RDMA_POST_READY`
+- `COMMAND_RDMA_POSTED`
+- `COMMAND_SOURCE_SLOT_WAIT_SEND_CQ`
+- `WAIT_CLIENT_COMPLETION_MAILBOX`
+- `COMPLETION_READY`
+- `CLOSE_REQUESTED`
+- `FAILED`
+
+Actions: consume frontend command slot, post command RDMA write plus doorbell,
+track write completion, drain command send CQ, poll/consume client completion
+mailbox, publish frontend-visible completion, close. This is the frontend-node
+counterpart to the backend-node `COMMAND_SESSION_MACHINE`.
+
+`COMMAND_SESSION_MACHINE` states:
+
+- `IDLE`
+- `COMMAND_READY`
+- `BACKEND_RUNNING`
+- `BACKEND_COMPLETION_READY`
+- `RESULT_SINK_READY`
+- `RESULT_PAYLOAD_ACTIVE`
+- `COMPLETION_PUBLISH_READY`
+- `COMPLETION_BLOCKED_ON_PAYLOAD_EOS`
+- `COMPLETION_BLOCKED_ON_RESULT_SEND_CQ`
+- `TERMINAL_REUSE_READY`
+- `CLOSE_REQUESTED`
+- `FAILED`
+
+Actions: consume command mailbox, start backend command, consume backend
+completion mailbox, prepare result stream, advance payload stream, publish local
+client completion, publish peer-client completion, publish peer-command
+completion, retire/reuse/close session. The key transition to encode explicitly
+is the current hidden deferral in
+`TupleSinkServicePublishPeerClientCommandCompletion()`: `NOT_READY` should move
+to `COMPLETION_BLOCKED_ON_PAYLOAD_EOS` or
+`COMPLETION_BLOCKED_ON_RESULT_SEND_CQ` instead of returning a success bool.
+
+`PAYLOAD_STREAM_MACHINE` states:
+
+- `INACTIVE`
+- `LOCAL_OPEN`
+- `PEER_BINDING_WAIT`
+- `OUTGOING_READY`
+- `OUTGOING_REMOTE_CREDIT_BLOCKED`
+- `OUTGOING_SEND_RESOURCE_BLOCKED`
+- `OUTGOING_SEND_CQ_PENDING`
+- `OUTGOING_EOS_POSTED_WAIT_SOURCE_RELEASE`
+- `INCOMING_DOORBELL_PENDING`
+- `INCOMING_HEADER_WAIT`
+- `INCOMING_LOCAL_CONSUMER_BLOCKED`
+- `INCOMING_ACK_SEND_CQ_PENDING`
+- `CLOSE_OR_RECLAIM_PENDING`
+- `FAILED`
+
+Actions: build egress facts/grant, pump outgoing byte/object payload, track
+payload send completion, drain payload send CQ, consume remote credit doorbell,
+consume incoming payload, publish receiver head ACK, drain receiver-head ACK CQ,
+append tuple-view EOS record, mark close/reclaim. Current code roots include
+`HomerServicePumpOutgoingByteRingPayload()`,
+`HomerServicePumpIncomingPayloadStream()`,
+`HomerServiceTrackPayloadCompletion()`, and
+`HomerServiceApplyTrackedPayloadCompletionFrontier()`.
+
+`PEER_CONTROL_OP_MACHINE` states:
+
+- `IDLE`
+- `REQUEST_POST_READY`
+- `REQUEST_POSTED`
+- `WAIT_RESPONSE_MAILBOX`
+- `RESPONSE_READY`
+- `RESPONSE_SEND_CQ_PENDING`
+- `COMPLETED`
+- `FAILED`
+
+Actions: allocate peer op slot, post peer request, poll/consume response
+mailbox, dispatch incoming request, publish peer response, drain response send
+CQ. This machine is why `PEER_RESPONSE_MAILBOX` must be split from
+`PEER_SEND_CQ`: response mailbox consumption advances the async op, while
+send-CQ retirement releases transport resources.
+
+Implementation prerequisite: clean up the current peer-control phase ambiguity
+before using peer-control facts in the state-machine scheduler. Today
+`HOMER_PROGRESS_SOURCE_PEER_SEND_CQ` maps to
+`TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ_RESPONSE` in
+[`HomerServicePeerControlPhaseMaskForSource()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:7023),
+and that phase in
+[`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7547)
+both drains send CQEs and consumes outgoing peer-control responses through
+[`TupleSinkServiceProgressPeerControlResponses()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6826).
+The state-machine scheduler must split these into separate action boundaries:
+
+- `DRAIN_PEER_CONTROL_SEND_CQ`: resource/lifetime release for locally posted
+  control/response WRs
+- `COLLECT_PEER_RESPONSE_MAILBOX`: response arrival collection that unblocks
+  `LOCAL_CONTROL_REQUEST_MACHINE` or `PEER_CONTROL_OP_MACHINE`
+- `COLLECT_PEER_REQUEST_MAILBOX`: incoming peer request dispatch, replacing the
+  generic `PEER_MAILBOX` meaning
+
+Do this split early. Otherwise the machine facts would encode a special case
+where one action both releases send resources and completes async response waits,
+which would weaken collector demand accounting and baseline policy decisions.
+
+`PEER_CONNECTION_MACHINE` states:
+
+- `INACTIVE`
+- `CM_SETUP_PENDING`
+- `LISTENER_EVENT_PENDING`
+- `ACTIVE_POLLABLE`
+- `RECV_CQ_POLLABLE`
+- `REQUEST_MAILBOX_READY`
+- `RESPONSE_MAILBOX_READY`
+- `SEND_CQ_PENDING`
+- `DISCONNECT_PENDING`
+- `CLOSE_RECLAIM_PENDING`
+- `FAILED_RESET`
+
+Actions: poll listener/CM events, establish outgoing/incoming connection, poll
+recv CQ, dispatch request mailbox, consume response mailbox, drain send CQ,
+handle disconnect, close/reclaim/reset connection.
+
+`MAINTENANCE_MACHINE` states:
+
+- `IDLE`
+- `HEARTBEAT_DUE`
+- `CLEANUP_DUE`
+- `DIAGNOSTIC_DUE`
+
+Actions: publish heartbeat, run bounded cleanup, run bounded diagnostics.
+
+### Current Executor To Action Mapping
+
+The state-machine scheduler should reuse current source executors only where
+they are already bounded, nonblocking, and semantically single-purpose. Any
+executor that currently combines collection, machine advancement, dependent
+retries, or cleanup should be split early. Compatibility wrapping around
+aggregate executors is not a design requirement for this milestone; the goal is a
+clean state-machine boundary rather than a new name for the old flat-source
+behavior.
+
+Current mappings for the first implementation:
+
+- `COLLECT_LOCAL_CONTROL_SLOTS`: split from
+  [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21460).
+  This collector scans request-ready control slots and activates
+  `LOCAL_CONTROL_REQUEST_MACHINE`s. It should not also drive all active async
+  continuations in the same action.
+- `ADVANCE_LOCAL_CONTROL_MACHINE`: refactor from
+  [`TupleSinkServicePumpLocalControlAsyncOps()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20103)
+  and
+  [`TupleSinkServiceProgressLocalControlAsyncOp()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19895).
+  One grant advances a bounded number of async local-control machines by one or a
+  small exact-ready burst.
+- `COLLECT_FRONTEND_COMMAND_RING` and `POST_REMOTE_CLIENT_SQL_COMMAND`: split
+  from
+  [`HomerServiceExecuteRemoteClientSqlCommandProgressPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6794).
+  The collector observes frontend command slots; the machine action posts the
+  RDMA command write/doorbell for a selected `REMOTE_CLIENT_SQL_SENDER_MACHINE`.
+- `COLLECT_BACKEND_COMPLETION_RING`: use
+  [`TupleSinkServiceConsumeCompletionMailbox()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10085)
+  as the bounded collector/action for backend completion records. A consumed
+  completion transitions the owning `COMMAND_SESSION_MACHINE`.
+- `PUBLISH_CLIENT_OR_PEER_COMPLETION`: use
+  [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9054)
+  and peer command completion publication as machine actions. The client publish
+  helper should return `PUBLISHED`, `NOT_READY`, or `FAILED` so blocked
+  completion states become scheduler-visible instead of hidden behind a success
+  bool.
+- `DRAIN_COMMAND_OR_PAYLOAD_SEND_CQ`: reuse
+  [`HomerServiceExecuteCqDrainProgressPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6661)
+  for command-send CQ work, and
+  `TupleSinkServicePollPeerPayloadSendCompletionRdma()` /
+  `HomerServiceApplyTrackedPayloadCompletionFrontier()` for payload send-CQ
+  frontiers. These are collector actions when they refresh facts, and machine
+  actions when a selected machine is known-blocked on the CQ frontier.
+- `ADVANCE_PAYLOAD_STREAM_MACHINE`: split
+  [`HomerServicePumpPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17772)
+  into smaller actions for outgoing publication, incoming consumption,
+  send-CQ/source-release retirement, credit publication, EOS, and close/reclaim.
+  Do not keep the aggregate helper as a scheduler-visible action in the target
+  design.
+- `COLLECT_PEER_RECV_CQ_OR_CM`: use the recv-CQ/listener parts of
+  [`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7288)
+  and the underlying peer event drain helper. This collector updates
+  `PEER_CONNECTION_MACHINE`, peer request-mailbox, payload, and client-command
+  facts.
+- `COLLECT_PEER_REQUEST_MAILBOX`: split from the mailbox branch of
+  `TupleSinkServicePumpPeerRequestsRdma()` and the underlying incoming mailbox
+  pump. It dispatches incoming peer requests and activates local command,
+  payload, or peer-control machines.
+- `COLLECT_PEER_RESPONSE_MAILBOX`: split from
+  [`TupleSinkServiceProgressPeerControlResponses()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6826).
+  It consumes outgoing peer-control responses and unblocks
+  `LOCAL_CONTROL_REQUEST_MACHINE` or `PEER_CONTROL_OP_MACHINE`.
+- `DRAIN_PEER_CONTROL_SEND_CQ`: split from the current
+  `TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ_RESPONSE` branch in
+  `TupleSinkServicePumpPeerRequestsRdma()`. It should drain tagged send CQEs but
+  not also consume response mailbox messages.
+- `ADVANCE_PEER_CONTROL_OP_MACHINE`: use
+  [`TupleSinkServiceStartPeerRequestRdmaForTrafficClass()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:215)
+  and `TupleSinkServicePollPeerRequestRdma()` as machine actions for outgoing
+  peer-control ops.
+- `ADVANCE_PEER_CONNECTION_MACHINE`: use bounded CM setup, disconnect, close, and
+  reclaim pieces from `TupleSinkServicePumpPeerRequestsRdma()`. Split request
+  mailbox, response mailbox, recv-CQ/CM, send-CQ, and close/lifetime actions
+  before wiring peer-control machines into the scheduler.
+- `RUN_MAINTENANCE`: use the existing heartbeat due predicate
+  [`HomerServiceHeartbeatDueForPump()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3958)
+  plus bounded cleanup/diagnostic work as maintenance actions.
+
+### Baseline Machine-Aware Policy
+
+The first policy should be simple, conservative, and measurable. It should be
+called something like `machine-baseline` and should preserve fixed-priority
+behavior where the machine facts are not yet strong enough to reorder safely.
+
+Policy inputs:
+
+- machine candidates with `readyActionMask`, `blockedReasonMask`,
+  `waitingOnMask`, `unblocksMask`, age, traffic class, CPU/liveness class, and
+  byte/object/poll hints
+- collector candidates with due state, known expected work, waiting machine
+  count, oldest waiter age, empty/productive history, and collector cost class
+- per-plan fixed budgets: max collector grants, max machine grants, max total
+  actions, max payload bytes/objects, and max blind polls
+
+Plan construction:
+
+- choose multiple machine grants per plan, not necessarily one machine
+- first include exact/known-expected collectors that unblock waiting foreground
+  machines, then collectors that are due for non-starvation
+- then include runnable foreground command/client-SQL machines
+- then include runnable peer-control/local-control machines whose next action is
+  exact-ready
+- then include bulk/background payload machines subject to byte/object caps
+- then include close/lifetime and maintenance machines under non-starvation
+  budgets
+- grant each machine a small action burst and stop at blocked/external wait,
+  byte/object/poll budget exhaustion, failure, or terminal state
+- continue a machine within the burst only while the next action is exact-ready
+  and nonblocking
+- boost collectors when active machines wait on the event they collect
+- back off collectors with repeated empty polls
+- prioritize foreground command/client-SQL machines over background payload
+  machines, while capping foreground bursts to avoid starving bulk progress
+- keep close/lifetime and maintenance non-starvable but budgeted
+
+Suggested first constants, to be tuned by measurement:
+
+- max plan grants: `16`
+- max collector grants per plan: `4`
+- max machine grants per plan: `12`
+- max actions per machine grant: `2` for foreground/control, `1` for cold
+  maintenance, and payload-specific byte/object caps for bulk streams
+- max blind collector polls per plan: `1` per collector family unless a waiting
+  machine boost or recent productive grant is present
+- unknown-arrival collector backoff: preserve current periodic behavior as the
+  starting policy, then tune by empty/productive feedback
+
+Stop and replan when:
+
+- a collector discovers a new foreground machine or unblocks an old foreground
+  waiter
+- a machine transitions from blocked to exact-ready due to an action result
+- a machine hits blocked/external-wait after consuming less than its grant
+- the plan exhausts collector or machine budget
+- a terminal failure/reset changes ownership or generation
+
+This makes the service-progress scheduler decide how to spend CPU on Homer
+state-machine advancement. The egress scheduler remains responsible for RDMA
+traffic-class resource allocation after an action such as payload publication or
+peer-control send is selected.
+
+### Implementation Milestone Plan
+
+The state-machine scheduler should be implemented as a new milestone rather than
+as another policy tweak on the flat source scheduler. Stage it so each slice has
+a correctness/performance gate. Do not keep compatibility with aggregate
+source-pump behavior as a requirement: this is a prototype milestone, and the
+intended change is to expose async state-machine actions cleanly to the
+scheduler.
+
+1. **Split aggregate executors into action executors.** Split peer-control first:
+   peer request mailbox, peer response mailbox, recv-CQ/CM, peer-control send-CQ,
+   and close/lifetime become separate actions. Then split payload progress into
+   outgoing publication, incoming consumption, send-CQ/source-release retirement,
+   credit publication, EOS, and close/reclaim actions. Then split local-control
+   slot collection from async continuation advancement.
+2. **Machine and collector scaffolding.** Add fixed-table
+   `HomerProgressMachineRef`, machine facts, collector facts, action refs,
+   machine grants, collector grants, action results, and transition results.
+   Initially populate facts from existing session, stream, control, and peer
+   transport state.
+3. **Collector candidate builder.** Replace the conceptual ready-set entrypoint
+   with collector candidates plus machine candidates.
+4. **Machine candidate builder.** Register active machines for local control,
+   remote client SQL sender, command session, payload stream, peer-control op,
+   peer connection, and maintenance. Populate ready action masks, blocked
+   reasons, waiting-on masks, unblocks masks, and budget hints.
+5. **Machine action compiler and executor.** Compile collector and machine grants
+   into the small action executors from Step 1. Convert bool-shaped helpers such
+   as peer-client completion publication into explicit `PUBLISHED` / `NOT_READY`
+   / `FAILED` results where needed.
+6. **Enable `machine-baseline` policy.** Use collector/machine facts to build
+   plans with bounded collector grants, foreground command/client grants,
+   peer/local-control grants, capped payload grants, and non-starvable
+   maintenance. Validate against remote pgbench c1/c4, remote RDMA basebackup,
+   mixed pgbench+basebackup, and Citus tuple COPY.
+7. **Tune and diagnose.** Tune action burst sizes, collector backoff, blind poll
+   caps, payload byte/object caps, and stop/replan triggers. Accept the milestone
+   only after clean correctness, clean process/log preflight, and no meaningful
+   regression versus the current fixed-priority baseline.
+
+## Post-Step-8 Sub-Milestones
+
+Step 8 validated the flat-source scheduler substrate and the adaptive
+compatibility baseline. The state-machine scheduler pivot above supersedes the
+older source-only design as the long-term target. The two sub-milestones below
+remain useful, but should be interpreted as transitional slices toward
+state-machine scheduling:
+
+- move periodic collector work into policy-owned cooldowns
+- expose dependency/fact edges as machine states, blocked reasons, waiting-on
+  masks, and unblocks masks rather than only as source-plan repair rules
+
+### A. Move Periodic Work Into Policy-Owned Cooldowns
+
+Current code has several pre-policy admission gates. Examples include active and
+idle peer-control polling in
+[`HomerServicePeerControlSourceReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4039),
+async local-control continuation polling in
+[`HomerServiceLocalControlSourceReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18917),
+command send-CQ readiness throttling in
+[`HomerServiceCommandSendCqReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6428),
+and heartbeat admission in
+[`HomerServiceHeartbeatDueForPump()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3958).
+Those constants are acceptable as default policy parameters, but the decision to
+spend CPU on a pollable source should belong to the service-progress policy, not
+to the readiness predicate.
+
+The first implementation slice should keep behavior equivalent by moving the
+current intervals into policy-private cooldown state. The fact layer should
+expose whether a source is exact-ready, pollable-live, blocked, or
+non-starvable-maintenance; the policy then decides whether the source is due.
+Executors still re-check authoritative state and report empty/productive/blocked
+feedback.
+
+The fact vocabulary should distinguish three readiness shapes:
+
+- **Known expected work:** local state says work should exist or should soon
+  exist, such as outstanding signaled WRs, source-ring wrap pressure, a
+  request-ready local control slot, outstanding peer response WRs, or a pending
+  close/reclaim item.
+- **Known blocked work:** work exists but cannot currently progress, such as
+  remote-credit blockage, local send-resource pressure, completion publication
+  waiting on payload EOS, or source/lifetime reuse waiting on send-CQ retirement.
+- **Unknown external arrival:** the remote side may have written or signaled
+  work, but the service can only learn that by polling or by consuming a
+  notification/doorbell. These sources need policy-owned cooldown, recent
+  feedback, and dependency boosts rather than a pretend exact predicate.
+
+This is analogous to an interrupt/poll hybrid policy even though the current
+prototype remains polled: repeated empty polls should back off, a non-empty poll
+should make near-future work more likely, known outstanding local WRs should make
+send-CQ polling due soon, and dependency facts can temporarily override cooldown
+when a source is expected to unblock another source.
+
+Facts needed before split peer-control can be used by adaptive policies should
+prefer executor-maintained counters/hints over repeated deep scans:
+
+- `PEER_RECV_CQ`: recent non-empty recv-CQ history, CQEs drained in the last
+  grant, recent incoming doorbell reason, and a cheap "pollable while active"
+  liveness bit for active peer connections where no exact verbs predicate exists.
+  Purpose: distinguish unknown external-arrival polling from recently productive
+  recv-CQ work, and expose when recv-CQ is expected to unblock mailbox, command,
+  or payload processing.
+- `PEER_REQUEST_MAILBOX`: local incoming-mailbox head/tail or sequence-visible
+  dispatch work, plus a hint that a recv-CQ doorbell just made request dispatch
+  likely. Purpose: expose known expected incoming request dispatch instead of
+  treating mailbox as a blind peer-control poll.
+- `PEER_RESPONSE_MAILBOX`: local outgoing async response mailbox head/tail,
+  active response waiters, and recent response consumption count. Purpose:
+  expose response arrivals that unblock local-control continuations without
+  conflating response progress with send-CQ retirement.
+- `PEER_SEND_CQ`: outstanding response/control send WR count, send-CQ completions
+  drained recently, and whether retiring CQEs frees command/response scratch or
+  lifetime state.
+  Purpose: expose known expected CQEs from locally posted control/response WRs
+  and known blocked work waiting on send-CQ retirement.
+- `PEER_CM_SETUP`: active incomplete outgoing setup, accepted-but-not-bootstrapped
+  incoming setup, listener CM event polling due, and recent setup progress.
+  Purpose: separate cold setup liveness from hot active peer transport progress.
+- `PEER_CLOSE_LIFETIME`: pending disconnect, deferred close/reclaim count,
+  retired-but-not-reset connection state, and age of oldest close/lifetime item.
+  Purpose: keep cleanup non-starvable without making it look like hot data-path
+  progress.
+- `LOCAL_CONTROL`: active async continuation count, phase of each active
+  continuation family, request-ready slot count, and whether the continuation is
+  waiting on peer setup, peer response, or local publication.
+  Purpose: distinguish known local control requests from async continuations that
+  are blocked on peer transport progress.
+- `CQ_DRAIN` / command send-CQ: outstanding signaled command WR count, source-ring
+  wrap pressure, and recent CQE/empty-poll feedback.
+  Purpose: expose known expected CQEs and source-slot release pressure rather
+  than letting command send-CQ polling be only a periodic gate.
+- `PAYLOAD_STREAM`: dependent completion count/hint, oldest dependent age,
+  payload EOS/source-release frontier, pending payload send-CQ retirement, remote
+  credit blockage, and local consumer/resource pressure. Purpose: let the policy
+  see when payload work is not only data movement but also the prerequisite that
+  will unblock command-completion publication.
+- `COMPLETION_RING` / peer-client completion publication: completion publication
+  waiting on payload EOS/source-release or prior result send-CQ retirement.
+  Purpose: classify the completion source as known-blocked instead of letting a
+  policy repeatedly grant it while the payload/source-release prerequisite is not
+  satisfied.
+- `HEARTBEAT`: maintenance due state should be represented as a cold
+  non-starvable source with a policy-owned cooldown.
+  Purpose: preserve service liveness diagnostics while keeping heartbeat out of
+  hot plans unless due.
+
+A shallow active-state scan may still be needed for table bounds or active
+connection counts, but deep "is there work?" probing should stay in the executor
+or in maintained facts updated by the executor's last grant.
+
+The adaptive policy design is still open. Candidate policies to discuss and
+measure:
+
+- **Parameter-equivalent cooldown policy:** preserve the current `64`/`1024`
+  behavior, but store counters in policy state. This is the safest first slice
+  because it proves the fact/policy boundary without changing performance goals.
+- **Feedback backoff policy:** reduce grants for sources with repeated empty
+  polls and restore frequency when exact-ready facts, doorbells, completions,
+  request-ready slots, or close/lifetime work appear. This is likely the first
+  useful adaptive policy.
+- **Class-deficit policy:** maintain policy-local deficits for hot data, hot
+  control, close/lifetime, and cold setup/maintenance. Pollable sources consume
+  deficit when granted; productive grants replenish or reset backoff. This makes
+  "foreground hot work first, but maintenance never starves" explicit.
+- **Dependency-boosted cooldown policy:** temporarily lift cooldown for a source
+  that is known to unblock another source, such as recv-CQ before mailbox
+  dispatch or payload EOS before peer completion publication.
+
+The design question to settle before implementation is how aggressive the first
+adaptive policy should be. The recommended sequence is to first land the
+parameter-equivalent cooldown policy, validate no regression, then add feedback
+backoff and class deficits in separate measured slices.
+
+### B. Make Dependency-Aware Planning Explicit
+
+The Step 7 rejection of true class reordering exposed a dependency problem, not
+only a starvation problem. The concrete reproduced path was a terminal client-SQL
+completion being consumed from the backend completion ring, then intentionally
+withheld because payload EOS had not reached the required frontier. The relevant
+ordering check is in
+[`HomerServicePayloadStreamResultEosPosted()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9009),
+called by
+[`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9054).
+Retry currently happens from payload execution through
+[`TupleSinkServicePublishPendingPeerClientCommandCompletions()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10350)
+after the payload source runs in
+[`HomerServiceExecuteProgressSource()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21787).
+
+The dependency *types* are mostly static and should be encoded once in scheduler
+substrate helpers, not rediscovered at runtime and not duplicated by every
+policy. The dependency *instances* and readiness state are dynamic: a particular
+session may or may not currently have terminal completion waiting on a particular
+payload stream, and that stream may be ready, credit-blocked, send-resource
+blocked, or already past EOS. Static rules should therefore consume dynamic
+facts.
+
+Known static dependency rules to encode, after a full code-path inventory:
+
+- terminal peer-client completion with tuple EOS depends on the corresponding
+  payload stream reaching the EOS/source-release frontier before final completion
+  publication
+- payload progress may need command/response send-CQ retirement before producer
+  source bytes can be safely reused
+- peer request-mailbox dispatch is often enabled by recv-CQ doorbells and should
+  not be treated as an unrelated cold poll
+- local-control async continuations waiting on peer responses depend on
+  peer-response-mailbox consumption, not on generic peer mailbox polling
+- close/lifetime progress may depend on send-CQ retirement and must remain
+  non-starvable even when low throughput value
+- local-control async continuations for remote open/start/poll depend on peer
+  setup/request-mailbox/response-mailbox/send-CQ progress, but should not run as
+  unbounded control work
+
+The inventory is itself a subtask. For each dependency, record:
+
+- dependent source and prerequisite source
+- static rule type and dynamic instance facts needed to identify it
+- whether the prerequisite can block or wait
+- whether the dependency is safe to bundle or must be expressed as ordered grants
+- whether the rule participates in an acyclic dependency graph
+- diagnostics needed to tell whether the policy is avoiding the dependency or
+  relying on closure/repair too often
+
+The preferred design is not a large bundled grant. Bundling is only safe when
+all sub-work is short and non-blocking. If a prerequisite can be credit-blocked,
+resource-blocked, or waiting on external progress, the scheduler should preserve
+ordering while allowing other work between attempts.
+
+Likely bundle candidates are small, opportunistic, and bounded:
+
+- after a payload-stream grant, retry pending peer-client completion publication
+  for terminal completions whose payload EOS frontier may now be satisfied
+- after a recv-CQ grant drains peer-control doorbells, dispatch a small bounded
+  peer request-mailbox grant if request dispatch became visible
+- after a send-CQ grant retires control/response WRs, run a small bounded
+  close/reclaim step if the retired CQEs unblock lifetime state
+
+Likely non-bundle dependencies should be handled as ordered grants instead:
+
+- do not let a completion grant spin payload until EOS
+- do not let local-control async spin peer setup/request-mailbox/response-mailbox
+  or send-CQ until a remote response arrives
+- do not let payload progress spin send CQ until all source bytes retire
+
+Current code already has one implicit executor bundle: after executing a payload
+source, the payload executor calls
+[`TupleSinkServicePublishPendingPeerClientCommandCompletions()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10350)
+from the `PAYLOAD_STREAM` branch of
+[`HomerServiceExecuteProgressSource()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21787).
+That means a single scheduler payload grant currently covers both payload
+progress and the terminal-completion publish retry. This retry is not a blocking
+wait: `TupleSinkServicePublishPeerClientCommandCompletion()` returns success
+without publishing when the completion is not ready because payload EOS has not
+reached the required frontier or because prior result-stream send completions
+are still pending. Model this as an async "not ready yet" dependency, not as a
+synchronous completion wait.
+
+The target design should make that deferred state scheduler-visible without
+turning it into heap-allocated scheduler work. Change the publication helper from
+a bool-shaped API to a small result enum, for example `PUBLISHED`, `NOT_READY`,
+and `FAILED`, with `NOT_READY` carrying a generic blocked reason such as
+`COMPLETION_WAITING_ON_PAYLOAD_EOS` or
+`COMPLETION_WAITING_ON_RESULT_SEND_CQ`. The executor can then set the completion
+source's blocked reason and set a dependent-work hint on the prerequisite payload
+source.
+
+The current active-session retry scan is a pragmatic compatibility shape, not the
+desired long-term design. The better design is fixed-table, event-driven
+bookkeeping:
+
+- when completion publication first returns `NOT_READY`, mark the session as
+  having one deferred peer-client completion and record the prerequisite stream
+  index/service stream id plus blocked reason
+- add that session to an intrusive pending list, or update a small fixed-table
+  pending bit/hint, without heap allocation or locks
+- when payload EOS/source-release or result send-CQ retirement advances, retry
+  only the pending sessions for the affected stream or for the small global
+  deferred-completion list
+- clear the pending mark when publication succeeds, fails terminally, or the
+  owning session/stream is reset
+
+This keeps the useful payload->completion locality while avoiding an
+`ActiveSessionScanLimit` walk on every payload grant. Until measurements show the
+scan is visible, the implicit payload retry can remain as a behavior-preserving
+transition; the important design point is that the fact vocabulary and result
+API should no longer hide `NOT_READY` behind a success bool.
+
+For non-bundled dependencies, add a generic dependency-planning pass between
+policy ordering and plan execution:
+
+1. Build current source facts and a ready set.
+2. Let the policy choose a ranked, budgeted source plan using facts and feedback.
+3. Run a substrate dependency-closure helper that applies static dependency
+   rules to the policy plan. It may reorder selected grants or insert a small
+   prerequisite grant when the prerequisite source is visible and runnable.
+   The rule set should be a DAG so closure is deterministic and bounded rather
+   than an unbounded "iterate until fixed" loop.
+4. Execute the repaired/closed plan. Executors still report blocked reason masks
+   when a dependency was not visible or became blocked after planning.
+5. At grant boundaries, stop-and-replan if execution discovers a dependency that
+   the closure pass could not satisfy, for example when a grant consumes a
+   completion and thereby creates a new dynamic dependency instance. In-place
+   insertion/repair at the grant boundary remains a later policy/substrate
+   optimization to evaluate against stop-and-replan.
+
+V1 closure should use stop-and-replan, not in-place repair. In-place insertion
+may become attractive if measurements show full replanning is too expensive, but
+it is future work and must be constrained by substrate helpers so policies do not
+own cursor arithmetic, grant-array mutation, or capacity invariants.
+
+This keeps dependency handling out of individual policy implementations while
+still letting policies learn from dependency facts. A policy should see that a
+payload stream unblocks a completion and rank it earlier on its own; the closure
+helper is a correctness guard and a diagnostics source, not the common fast path
+we want to rely on forever.
+
+Baseline policy behavior should be dependency-aware but conservative:
+
+- do not grant a known-blocked dependent source repeatedly while its blocked
+  reason names an unsatisfied prerequisite
+- boost or admit the prerequisite source when it is exact-ready or recently
+  productive, subject to normal class/traffic budgeting
+- if the prerequisite is an unknown external-arrival source, apply a
+  policy-owned cooldown plus a dependency boost rather than spinning it every
+  pass
+- after a prerequisite grant reports productive progress, make the dependent
+  source eligible again or stop-and-replan so the completion/state-machine step
+  can run promptly
+- record closure/replan counts by dependency reason so a mature policy can be
+  judged by how rarely substrate repair is needed on the hot path
+
+Cheap diagnostics for this sub-milestone:
+
+- dependency-closure insert/reorder count by reason
+- stop-and-replan count by dependency reason
+- prerequisite grant productive/empty/blocked after closure
+- dependent grant blocked count before and after closure
+- age of the oldest dependency-blocked operation
+
+These counters are how we verify whether the scheduler learned to avoid repair:
+after policy tuning, closure and stop-and-replan counts should fall on the hot
+path, while correctness remains protected if a policy experiment misses an edge.
+
 ## Implementation Sequence
 
 The implementation should be staged so each slice preserves correctness and has
 clear validation:
 
 1. Split peer-control source classes before persistent plans. Add first-class
-   progress source refs/facts for setup/listener, recv-CQ, mailbox, send-CQ, and
-   close/lifetime while keeping the old aggregate path as a fallback/default.
+   progress source refs/facts for setup/listener, recv-CQ, request-mailbox,
+   response-mailbox, send-CQ, and close/lifetime while keeping the old aggregate
+   path as a fallback/default.
 2. Inventory and normalize typed grant units for every source executor. Ensure no
    source can only be represented by an abstract CPU token.
 3. Add `HomerProgressExecutionPlan` and `HomerProgressPlanStopState`, but keep
@@ -438,7 +1291,8 @@ clear validation:
    unblocked-first, and cpu-liveness policies behind the pluggable interface.
    Verify correctness and performance before proceeding: this step should be
    interface-only, so any regression means the policy wrapper changed behavior or
-   added measurable overhead.
+   added measurable overhead. Treat a failed correctness run or a sustained
+   performance regression as a blocking issue to diagnose and fix before Step 5.
 5. Add generic plan execution with cursor, grant-boundary stop-state updates, and
    policy callbacks. Start with `STOP_AND_REPLAN`; keep in-place repair disabled.
    Verify correctness and performance again. This is the first step that changes
@@ -449,14 +1303,370 @@ clear validation:
    hot path.
 7. Add the first adaptive bounded class policy using the new interface.
    Verify correctness, performance, and mixed-workload behavior before treating
-   the policy as a candidate default.
+   the policy as a candidate default. Do not tune around correctness failures or
+   accept a policy that regresses the established fixed-priority/default
+   baselines without identifying the cause.
 8. Run final validation and tuning for the full milestone. Confirm tuple COPY,
    remote pgbench c1/c4, remote RDMA basebackup, mixed pgbench+basebackup, clean
    process preflight, clean service logs, and matching binaries across hosts.
    Tune plan length, bulk caps, empty/blocked thresholds, class weights, and
-   preemption thresholds based on these measurements.
+   preemption thresholds based on these measurements. Any correctness break,
+   stale-process contamination, service-log error, binary mismatch, or meaningful
+   throughput/latency regression must be resolved before claiming the milestone
+   complete.
 9. Only after measurement shows replanning overhead matters, enable optional
    constrained in-place repair through `HomerProgressPlanRepairOps`.
+
+## Implementation Progress
+
+### Step 1 Peer-Control Source Split
+
+Started on June 8, 2026. The Citus service now has first-class peer-control
+source kinds for setup/listener, recv-CQ, mailbox, send-CQ, and close/lifetime
+in
+[`HomerProgressSourceKind`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1253).
+Each split source has a stable registry core and feedback slot in
+`HomerServiceProgressRegistry`, and `HomerServiceBuildPeerControlProgressPlan()`
+maps the selected split source back to the existing RDMA peer-pump phase mask.
+
+Important caveat: this first slice deliberately does not add a deep
+transport-private per-phase readiness scan. Split sources still share the old
+coarse periodic peer-control readiness gate from
+`HomerServicePeerControlSourceReadyForScheduler()`. The fixed-priority default
+continues to use the aggregate `HOMER_PROGRESS_SOURCE_PEER_CONTROL`; the split
+sources are exposed to the `cpu-liveness` policy first, because that policy
+already has the hot/cold CPU-class contract needed to use the finer source
+identities. This keeps the default path behavior-preserving while giving later
+persistent-plan/adaptive policies source-local feedback for peer CQ, mailbox,
+send-CQ, setup, and close/lifetime work.
+
+Verification for this slice: `sudo -n -u dbcomm make -j8 service-bin
+client-bin` in `/data/dbcomm/citus-dbcomm` completed successfully. No runtime
+correctness or performance workload was run yet; the staged workload gates remain
+reserved for the policy-interface, persistent-executor, adaptive-policy, and
+final-tuning steps below.
+
+### Step 2 Typed Grant Unit Inventory
+
+Started on June 8, 2026. The existing `HomerProgressGrant` fields are sufficient
+for the first persistent-plan executor: `maxPolls`, `maxItems`, `maxPumpCalls`,
+and source-specific `flags` already cover the CPU-work units currently needed by
+CQ drain, command rings, completion rings, local control, split peer-control
+phases, payload streams, heartbeat, and target completion. The source-local unit
+mapping is now documented beside
+[`HomerProgressGrant`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1417).
+
+Decision: do not introduce a separate grant-unit enum yet. A common enum would
+look cleaner, but the executor still needs typed source-local fields because
+poll batches, mailbox messages, completion entries, local control slots, payload
+pump calls, and egress bytes/objects/WRs are not interchangeable. If a future
+policy wants abstract CPU tokens, it should translate them into these typed grant
+fields before installing an execution plan.
+
+Verification for this slice: the same Citus service/client build command
+completed successfully after formatting. No runtime workload was needed because
+this step only documented/normalized the existing grant contract and did not
+change executor behavior beyond the peer-control split from Step 1.
+
+### Step 3 Execution-Plan Scaffold
+
+Started on June 8, 2026. The code now defines
+[`HomerProgressPlanStopState`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1459)
+and
+[`HomerProgressExecutionPlan`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1474).
+`TupleSinkServicePumpOnce()` still builds the existing source plan, installs it
+into a stack-local execution plan with
+`HomerProgressExecutionPlanInstallSourcePlan()`, and consumes it immediately with
+a cursor.
+
+Important caveat: this is only the persistent-plan scaffold. The installed plan
+currently contains one default grant per selected source, and source-specific
+grant construction still happens inside the selected executor. This preserves the
+current behavior while putting the service loop onto the future list+cursor
+shape. The later policy-interface and plan-executor slices should move more
+typed grant construction into policy/build-plan code and start updating
+`HomerProgressPlanStopState` from grant-boundary feedback.
+
+Verification for this slice: `sudo -n -u dbcomm make -j8 service-bin
+client-bin` completed successfully after formatting. Runtime correctness and
+performance verification should happen after the policy-interface migration and
+again after the persistent executor starts changing plan lifetime/early-stop
+behavior, as recorded in the staged validation plan.
+
+### Step 4 Policy Ops Interface
+
+Started on June 8, 2026. Existing policies now go through
+[`HomerProgressPolicyOps`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1546).
+`HomerProgressPolicy` keeps `kind` for environment selection, logs, and stats,
+but the source-plan builder now calls `progressPolicy->ops->buildPlan` instead
+of switching directly on `kind`. The ops table also includes no-op
+`onGrantResult`, `onPlanEnd`, and `onPlanHint` hooks so later persistent-plan and
+preemption slices can add behavior without changing the policy object shape
+again.
+
+Important caveat: the hint/preemption callback is only part of the interface in
+this slice. It is not invoked yet, and all installed policies use no-op
+callbacks. This keeps Step 4 interface-only; plan lifetime, stop-and-replan, and
+in-place repair remain Step 5+ work.
+
+Implementation detail: `HomerProgressResult` needed a forward declaration for
+the callback surface, so it became a tagged struct while preserving the same
+fields. `HomerServiceReadProgressPolicyEnv()` now installs both `kind` and `ops`
+through `HomerServiceSetProgressPolicy()`.
+
+Verification for this slice:
+
+- `git clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  was run.
+- `sudo -n -u dbcomm make -j8 service-bin client-bin` completed successfully.
+- `sudo -n make install-headers install-service-bin install` completed locally.
+- Installed `citus_tuple_sink_service` and `citus.so` were synced to `farnet0`
+  through a remote staging directory because broad prefix `rsync --delete`
+  encountered root-owned log/header/library permission errors. Final hashes
+  matched on both hosts:
+  `citus_tuple_sink_service=d0bc2c834b3932f6dc0efe220c0ebeca187a2f6d770cd40184c482b1c503228b`,
+  `citus.so=52927dafec8e99e8a6bc6136ff6026872a3e8cb3dc32d5d93b953b42a59e98d0`.
+- Clean runtime preflight before measurement: after restart, `farnet1` had
+  PostgreSQL plus one `citus_tuple_sink_service`; `farnet0` had one
+  `citus_tuple_sink_service`.
+- Remote Homer pgbench c1, default fixed-priority policy, artifacts in
+  `/tmp/homer_step4_pgbench_c1_1780945203`: warmup completed `10000/10000`,
+  zero failures, `2675.981222 TPS`; warmed repeats completed `10000/10000`,
+  zero failures, `4685.150836 TPS` with p99 `0.243 ms`, then `4247.238552 TPS`
+  with p99 `0.285 ms`.
+- Remote RDMA basebackup, artifacts in
+  `/tmp/homer_step4_basebackup_1780945229`: three successful repeats, `5.98s`
+  warmup, then `4.62s` and `4.66s` warmed.
+- Post-run preflight showed only PostgreSQL plus one service on `farnet1` and
+  one service on `farnet0`. Recent service-log checks found no matching
+  failed/error/resetting/broken/timed-out/timeout/invalid/stale signatures.
+
+### Step 5 Generic Execution-Plan Loop
+
+Started on June 8, 2026. The service loop now executes the installed execution
+plan through
+[`HomerServiceExecuteProgressExecutionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21449)
+instead of open-coding the cursor loop inside `TupleSinkServicePumpOnce()`.
+Grant-boundary accounting is centralized in
+`HomerProgressExecutionPlanRecordGrantResult()`, which updates plan-local
+`grantsExecuted`, productive, empty, and blocked streak counters. The executor
+also calls policy `onGrantResult` after each top-level grant and `onPlanEnd`
+when the cursor reaches the end.
+
+Important caveat: this still preserves one-pass behavior. There are no adaptive
+early-stop thresholds yet; the only stop reasons recorded in this slice are
+cursor exhaustion and executor failure. The `onPlanHint` callback remains part of
+the policy interface but is not invoked until the later cheap-hints/preemption
+slice.
+
+Implementation detail: the generic executor passes a stack-local
+`HomerProgressResult` into `HomerServiceExecuteProgressSource()` for each
+top-level grant. Source-specific executors still call `HomerServiceFinishProgressGrant()`
+to update source feedback. The generic executor then uses the local result for
+plan stop-state and policy callbacks, and merges it once into the outer loop
+aggregate. This avoids double-updating per-source feedback while still giving the
+policy source-neutral grant feedback.
+
+Verification for this slice:
+
+- `git clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  was run.
+- `sudo -n -u dbcomm make -j8 service-bin client-bin` completed successfully.
+- `sudo -n make install-service-bin` completed locally.
+- Installed `citus_tuple_sink_service` was synced to `farnet0`; final service
+  hash matched on both hosts:
+  `09a9464fe23d3c0f902bfc9c3752c017e2ea763d07b4873c9f916d97d808efcc`.
+- Remote Homer pgbench c1, default fixed-priority policy, artifacts in
+  `/tmp/homer_step5_pgbench_c1_1780945441`: warmup completed `10000/10000`,
+  zero failures, `2677.830721 TPS`; warmed repeats completed `10000/10000`,
+  zero failures, `4698.157477 TPS` with p99 `0.231 ms`, then `4241.430719 TPS`
+  with p99 `0.262 ms`.
+- Remote RDMA basebackup, artifacts in
+  `/tmp/homer_step5_basebackup_1780945464`: three successful repeats, `6.08s`
+  warmup, then `4.54s` and `4.79s` warmed.
+- Post-run preflight showed only PostgreSQL plus one service on `farnet1` and
+  one service on `farnet0`. Recent service-log checks found no matching
+  failed/error/resetting/broken/timed-out/timeout/invalid/stale signatures.
+
+### Step 6 Cheap Feedback And Hint Diagnostics
+
+Started on June 8, 2026. The scheduler feedback vocabulary now records cheap
+source-local history in
+[`HomerProgressSourceFeedback`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1416):
+consecutive empty/productive/blocked grant streaks, the last granted
+poll/item/pump-call budgets, last grant flags, `lastBlockedTick`, and
+`lastGrantBudgetTick`. These fields are updated at the existing generic
+completion boundary rather than inside payload-, command-, or peer-specific
+executors.
+
+Implementation detail: `HomerServiceUpdateProgressFeedback()` now updates
+source-local streaks and blocked ticks from `HomerProgressResult`, while
+[`HomerServiceRecordProgressGrantBudgetFeedback()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5904)
+records what the scheduler offered for the same selected top-level grant. This
+keeps "work used" and "work granted" comparable without adding heap allocation,
+wall-clock reads, or a new source-table scan.
+
+The execution-plan scaffold also records per-plan hint diagnostics in
+[`HomerProgressPlanStopState`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1478)
+and computes `HomerProgressExecutionPlan.classMask` from the selected sources as
+grants are appended in
+[`HomerProgressExecutionPlanAppendGrant()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4404).
+The class mask uses the current dynamic source core when available, so payload
+streams can carry the CPU/liveness class derived from traffic class.
+
+Important caveat: this slice is still diagnostics/scaffold only. It does not add
+adaptive early-stop thresholds, does not invoke hint/preemption decisions, and
+does not change the default fixed-priority behavior. Those belong to the first
+adaptive bounded-class policy in Step 7.
+
+Verification for this slice:
+
+- `git clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  was run.
+- `sudo -n -u dbcomm make -j8 service-bin client-bin` completed successfully.
+- No runtime performance gate was run for Step 6 because the staged plan only
+  requires blocking correctness/performance gates after Steps 4, 5, 7, and 8.
+
+### Step 7 Adaptive Policy Compatibility Baseline
+
+Started on June 8, 2026. The policy enum and ops table now include opt-in
+`HOMER_PROGRESS_POLICY=adaptive-bounded-class` through
+[`HomerServiceBuildAdaptiveBoundedClassProgressSourcePlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4996)
+and
+[`HomerAdaptiveBoundedClassPolicyPlanEnd()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5139).
+This policy currently preserves fixed ready-set order and records policy-local
+diagnostics (`lastPlanSourceCount`, `lastPlanClassMask`, executed/productive
+grant counts, and stop reason mask).
+
+Important caveat: true class reordering/admission was attempted and rejected by
+the Step 7 gate. Several versions that reordered by CPU/liveness class, bounded
+hot-control/cold classes, or preserved a local/peer-control front segment still
+hung remote c1 pgbench before the first reported result. That is concrete
+evidence that the current source facts are not yet sufficient to make arbitrary
+first-layer class reordering safe: fixed-priority ready-set order is carrying
+hidden liveness dependencies among local control, peer control, command, and
+completion progress. The accepted Step 7 state is therefore a compatibility
+baseline for the pluggable policy and policy-local diagnostics, not a completed
+adaptive bounded-class scheduler.
+
+Diagnostic caveat: `HOMER_PROGRESS_TRACE_PLANS=1` must not be used for acceptance
+measurements. An early plan trace version logged every high-frequency
+local-control continuation and consumed enough service CPU to make remote c1
+pgbench appear hung. The trace filter now ignores single-source heartbeat,
+peer-maintenance, and local-control continuation plans and preserves the bounded
+trace window for multi-source or hot-data decisions in
+[`HomerServiceProgressPlanTraceInteresting()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4382),
+but trace runs remain diagnostic-only.
+
+Implementation detail: adaptive policy does not enable split peer-control
+sources. `HomerServiceUseSplitPeerControlSources()` keeps split peer-control
+limited to the existing `cpu-liveness` policy until peer-control exposes
+stronger per-phase readiness/liveness facts. Adaptive uses the aggregate
+peer-control source to preserve the old all-phase pump semantics.
+
+Verification for this slice:
+
+- `git clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  could not be applied late in the dirty milestone tree because the file already
+  had unstaged changes from earlier slices; the targeted C build was used as the
+  formatting/compile gate for the final Step 7 edit.
+- `sudo -n -u dbcomm make -j8 service-bin client-bin` completed successfully
+  after the explicit compatibility fallback.
+- Installed `citus_tuple_sink_service` was synced to `farnet0` with remote sudo;
+  final service hash matched on both hosts:
+  `2e9410ec592b4e46ecd27e2f1fdb2fa1b98bccb47f9f391ba1b3742e853c7ec2`.
+- Default fixed-priority sanity check after the Step 7 code changes, artifacts
+  in `/tmp/homer_step7_default_pgbench_c1_1780946231`: warmup completed
+  `10000/10000`, zero failures, `2672.759846 TPS`; warmed repeats completed
+  `10000/10000`, zero failures, `4672.508548 TPS` with p99 `0.232 ms`, then
+  `4282.970737 TPS` with p99 `0.257 ms`.
+- Default remote RDMA basebackup sanity check, artifacts in
+  `/tmp/homer_step7_default_basebackup_1780946241`: three successful repeats,
+  `6.09s` warmup, then `4.54s` and `4.72s` warmed.
+- Adaptive compatibility smoke, artifacts in
+  `/tmp/homer_step7_adaptive_smoke5_1780947021`: `1000/1000`, zero failures,
+  p99 `0.333 ms`; the low `550.900750 TPS` was from a short cold run with
+  `1774.641 ms` initial connection time.
+- Adaptive compatibility remote c1, artifacts in
+  `/tmp/homer_step7_adaptive_compat_final_pgbench_c1_1780948757`: `10000/10000`,
+  zero failures on all repeats; `2676.079330 TPS` cold/warmup, then
+  `4658.549300 TPS` with p99 `0.234 ms`, and `4273.005756 TPS` with p99
+  `0.256 ms`.
+- Adaptive compatibility remote RDMA basebackup, artifacts in
+  `/tmp/homer_step7_adaptive_compat_final_basebackup_1780948781`: three
+  successful repeats, `6.35s` warmup, then `4.57s` and `4.58s` warmed.
+- Adaptive compatibility mixed c1 pgbench plus background remote RDMA
+  basebackup, artifacts in `/tmp/homer_step7_adaptive_compat_final_mixed_c1_1780948813`:
+  both commands returned zero; pgbench completed `10000/10000`, zero failures,
+  `3612.352657 TPS`, p95 `0.395 ms`, p99 `0.464 ms`; basebackup completed in
+  `4.91s`.
+- Post-run preflight showed only PostgreSQL plus one service on `farnet1` and
+  one service on `farnet0`. Recent service-log checks found no matching
+  failed/error/resetting/broken/timed-out/timeout/invalid/stale signatures.
+
+### Step 8 Final Validation And Tuning Gate
+
+Completed on June 8, 2026 for the current implementation state. The validation
+ran with `HOMER_PROGRESS_POLICY=adaptive-bounded-class`, but the accepted Step 7
+code path is the adaptive compatibility baseline: it uses the pluggable policy
+interface and policy-local diagnostics while preserving fixed-priority ready-set
+order. True class reordering/admission remains future work because the Step 7
+gate exposed remote c1 liveness failures when arbitrary first-layer reordering
+was enabled.
+
+Final binary hashes matched on `farnet1` and `farnet0`:
+
+- `citus_tuple_sink_service`:
+  `2e9410ec592b4e46ecd27e2f1fdb2fa1b98bccb47f9f391ba1b3742e853c7ec2`
+- `citus.so`:
+  `52927dafec8e99e8a6bc6136ff6026872a3e8cb3dc32d5d93b953b42a59e98d0`
+
+Remote Homer pgbench artifacts were captured in
+`/tmp/homer_step8_pgbench_remote_1780949008`:
+
+- c1: warmup `2678.695797 TPS`, then warmed repeats `4670.448484 TPS`
+  with p99 `0.233 ms`, and `4239.300007 TPS` with p99 `0.258 ms`; every run
+  completed `10000/10000` transactions with zero failures.
+- c4: warmed repeats `11374.642623`, `11418.640474`, and `11199.948480 TPS`;
+  every run completed `40000/40000` transactions with zero failures, with p99 in
+  the `0.563-0.574 ms` band.
+
+Remote RDMA basebackup artifacts were captured in
+`/tmp/homer_step8_basebackup_1780949048`: successful repeats `5.98s` warmup,
+then `4.81s`, `4.57s`, and `4.56s` warmed. Each run completed the base backup.
+
+Mixed foreground pgbench plus background remote RDMA basebackup also passed:
+
+- c1 mixed artifacts in `/tmp/homer_step8_mixed_c1_1780949196`: pgbench
+  completed `10000/10000` transactions with zero failures at `3596.981269 TPS`,
+  p95 `0.387 ms`, p99 `0.451 ms`; basebackup completed in `4.68s`.
+- c4 mixed artifacts in `/tmp/homer_step8_mixed_c4_1780949215`: pgbench
+  completed `10000/10000` transactions with zero failures at `9433.828767 TPS`,
+  p95 `0.561 ms`, p99 `0.679 ms`; basebackup completed in `4.61s`.
+
+Backend-to-backend Citus tuple COPY through Homer passed with artifacts in
+`/tmp/homer_step8_b2b_copy_10m_1780949268`. The table was recreated with one
+shard placed on `10.10.1.100`. All four repeats copied `10,000,000` rows and
+verified `count=10000000`, `min=1`, `max=10000000`, and
+`sum=500000050000000`. The first run was cold at `10.60s`; warmed repeats were
+`5.25s`, `5.09s`, and `5.12s`, which is in the current accepted Homer/vanilla
+Citus parity band. Service logs confirmed this was the Homer service-to-service
+byte-ring path with `published_tail=512005120`.
+
+Final process preflight showed no stale `pgbench`, `pg_basebackup`, `psql`,
+`walsender`, or `postgres: remote exec backend` processes. The only long-lived
+processes were the intended PostgreSQL postmasters and `citus_tuple_sink_service`
+instances on the hosts needed by the final tuple COPY run. Recent service-log
+error-signature checks found no matching
+`failed|error|resetting|broken|timed-out|timeout|invalid|stale` lines.
+
+Acceptance conclusion: the scheduler scaffolding, pluggable policy interface,
+generic execution-plan loop, feedback fields, and adaptive compatibility policy
+are validated as scheduler-ready scaffolding. The milestone should not be read
+as completion of a high-quality adaptive scheduling policy: the next research
+step is to add stronger source dependency/liveness facts and then re-enable
+bounded class reordering or another adaptive policy with the same Step 7/Step 8
+gate discipline.
 
 ## Implementation Details To Settle During Code
 
@@ -480,7 +1690,10 @@ clear validation:
    execution, after the first adaptive policy, and during final tuning. The core
    workload set is tuple COPY, remote pgbench c1/c4, remote RDMA basebackup,
    mixed pgbench+basebackup, clean process preflight, clean service logs, and
-   matching binaries across hosts.
+   matching binaries across hosts. The Step 4, Step 5, Step 7, and Step 8 gates
+   are blocking gates: if they expose correctness or performance issues, pause
+   the implementation sequence, diagnose the specific change that caused the
+   issue, fix it, and rerun the relevant gate before moving on.
 
 ## Related
 
