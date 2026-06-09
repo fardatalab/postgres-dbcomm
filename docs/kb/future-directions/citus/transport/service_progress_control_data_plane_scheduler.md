@@ -1618,6 +1618,20 @@ scheduler.
      setup/close collectors based on coarse session/stream active-work state also
      failed c1 liveness. The accepted design keeps setup/close facts visible and
      bundles only the physical peer pump execution.
+   - Target-completion waits no longer use a special ready-set fallback grant in
+     `machine-baseline`. The policy builder
+     [`HomerServiceBuildMachineBaselineProgressActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6554)
+     now treats the `readySet` parameter as transitional input that was already
+     consumed by the collector/machine candidate bridge. Synchronous target waits
+     are represented by command-session machine facts: the session candidate
+     builder
+     [`HomerServiceBuildSessionMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24730)
+     includes the `targetCompletionSession` even when the pump flags do not ask
+     for a full completion-table scan, and command-session actions publish the
+     completion through the normal `HOMER_PROGRESS_ACTION_PUBLISH_COMMAND_COMPLETION`
+     path. This removes a duplicate target-completion action followed by an empty
+     command-session action and makes the direct policy builder consume only
+     maintained candidate facts after the bridge.
    - Diagnostics: progress stats now record direct action-plan builds through
      [`HomerServiceProgressStatsRecordActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4250),
      so `machine-baseline` does not disappear from plan-build counters when stats
@@ -1670,6 +1684,20 @@ scheduler.
      `sum=500000050000000`, with warm run `5.30 s` in
      `/tmp/homer_peer_bundle_copy_1780983676`. The `6.15 s` basebackup repeat was
      treated as an outlier against the normal `4.5 s` band.
+   - Focused runtime checks after removing the target-completion ready-set
+     fallback passed with `citus_tuple_sink_service`
+     `f2ab60af8df0d09366eb319e8f04bf712e078ba52ed4871e70afb7c539bb7abd`
+     installed on both hosts. Remote c1 Homer pgbench completed `10000/10000`
+     transactions with `0` failures on all repeats: warmup `2597.48 TPS`, then
+     warmed `4629.92` and `4196.20 TPS`; remote c4 Homer pgbench completed
+     `10000/10000`, `0` failures, `10520.26 TPS`; remote RDMA basebackup
+     completed `6.27`, `4.65`, and `4.48 s`; backend-to-backend Homer tuple COPY
+     10M rows completed with `count=10000000`, `min=1`, `max=10000000`,
+     `sum=500000050000000`, with warm run `5.76 s` in
+     `/tmp/homer_machine_no_readyset_target_copy_1780984311`. Post-run process
+     preflight showed only intended PostgreSQL and Homer service processes, and
+     both service logs had no `failed`, `error`, `invalid`, `overrun`, `stale`,
+     `corrupt`, `panic`, or `reset` signatures.
 7. **Tune and diagnose.** Tune action burst sizes, collector backoff, blind poll
    caps, payload byte/object caps, and stop/replan triggers. Accept the milestone
    only after clean correctness, clean process/log preflight, and no meaningful
