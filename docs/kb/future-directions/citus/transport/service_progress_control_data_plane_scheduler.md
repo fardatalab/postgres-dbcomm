@@ -1268,6 +1268,54 @@ scheduler.
      process preflight showed only the intended PostgreSQL and Homer service
      processes, and service logs had no `error`, `failed`, `reset`, `broken`,
      `stale`, `could not`, or `invalid` lines.
+   - Follow-up selected-machine progress: direct
+     `ADVANCE_LOCAL_CONTROL_MACHINE` grants now carry the async control slot
+     identity instead of reusing the aggregate local-control source as an
+     all-active scan. The grant compiler stamps the source ref with
+     `machine.index` and `machine.generation` in
+     [`HomerServiceMachineBaselineAppendMachineAction()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5973).
+     [`HomerServiceExecuteLocalControlProgressPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8753)
+     routes a pure `ADVANCE_ASYNC` grant with a nonzero generation to
+     [`TupleSinkServicePumpLocalControlAsyncOpAt()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22352),
+     while aggregate/legacy zero-generation grants still go through
+     [`TupleSinkServicePumpControlSlots()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23710)
+     and preserve the old "advance all active async ops, then collect slots"
+     behavior. The selected helper treats a low-16-bit generation mismatch as an
+     empty stale grant; full correctness still depends on the authoritative
+     64-bit `requestSequence` and slot-state check before publishing a response.
+     This keeps the state-machine policy honest about selecting one async
+     continuation without making the compact scheduler generation a correctness
+     boundary.
+   - Validation for the selected local-control async slice: `git clang-format
+     HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+     `git diff --cached --check`, `git diff --check`, `sudo -n -u dbcomm make
+     -j8 service-bin client-bin`, and `sudo -n make install-headers
+     install-service-bin install` passed. Runtime artifacts were synced to
+     farnet0 and matched by SHA-256 on both hosts: `citus_tuple_sink_service`
+     `6ac33325f55ccdc64fa7ff1a31a843e71f77a265173f96d820197f34adb91177`,
+     `citus.so`
+     `4212171d5578990e1233234c94bc1e0cd8c67b10c66aca5ccb67335b2ff14030`,
+     and `libhomer_client.a`
+     `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+     Remote Homer pgbench recheck after a clean restart completed with zero
+     failures: c1 warmed `4454.63` and `4139.38 TPS`, c4 warmed `10766.54` and
+     `10650.13 TPS` in
+     `/tmp/homer_lc_async_selected_pgbench_recheck_1780979819`. Remote RDMA
+     basebackup completed `4.50`, `6.23`, and `4.50 s` in
+     `/tmp/homer_lc_async_selected_basebackup_recheck_1780979871`.
+     Backend-to-backend Homer tuple COPY 10M rows completed with `count=10000000`,
+     `min=1`, `max=10000000`, `sum=500000050000000`, cold `9.69 s`, then warmed
+     `5.96`, `6.70`, and `5.65 s` in
+     `/tmp/homer_lc_async_selected_copy_clean_1780979767`. Mixed remote c4
+     pgbench plus remote RDMA basebackup passed at `9991.70 TPS` with basebackup
+     `6.53 s` in `/tmp/homer_lc_async_selected_mixed_c4_bb_1780979851`.
+     A pre-clean COPY attempt in
+     `/tmp/homer_lc_async_selected_copy_1780979546` timed out on its fourth run
+     after earlier experiments had left internal services with old tuple-COPY
+     sessions waiting for command completion; the clean restart did not
+     reproduce it. Treat that artifact as a diagnostic reminder that accepted
+     measurements need a clean internal service state, not just an external
+     process preflight.
 2. **Machine and collector scaffolding.** Add fixed-table
    `HomerProgressMachineRef`, machine facts, collector facts, action refs,
    machine grants, collector grants, action results, and transition results.
