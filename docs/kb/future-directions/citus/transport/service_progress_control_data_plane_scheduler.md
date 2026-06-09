@@ -1269,11 +1269,10 @@ scheduler.
      Existing grants still use zero flags and therefore preserve the previous
      aggregate order: advance async continuations first, then collect new slots.
      The selected-machine follow-up below represents active local-control
-     requests as per-slot machine facts. Remaining local-control cleanup is to
-     remove the flat-ready-set bridge for fresh slot collection; the legacy
-     aggregate predicate still exists as the compatibility discovery gate for new
-     control slots until collectors can be produced directly from maintained
-     facts.
+     requests as per-slot machine facts, and the direct-collector follow-up
+     removes the flat-ready-set gate for fresh local-control slot collection under
+     `machine-baseline`. The legacy aggregate predicate still exists only for
+     source-plan policies.
    - Validation for the local-control action-mask slice: `git diff --check`
      passed. `make -j8 service-bin client-bin` hit only the known output-file
      permission issue, then `sudo -n -u dbcomm make -j8 service-bin client-bin`
@@ -1384,6 +1383,49 @@ scheduler.
      remote c4 pgbench plus remote RDMA basebackup passed with zero failures at
      `8952.39 TPS` and basebackup `4.73 s` in
      `/tmp/homer_peer_async_ready_mixed_c4_bb_1780987817`. Post-run process
+     preflight showed only the intended PostgreSQL and Homer service processes,
+     and service-log signature checks found no `error`, `failed`, `reset`,
+     `broken`, `stale`, `could not`, `invalid`, `timeout`, or `panic` lines.
+   - Follow-up direct local-control collector progress: `machine-baseline` no
+     longer manufactures a flat `LOCAL_CONTROL` ready-set source before it can
+     collect fresh control slots.
+     [`HomerServiceBuildCoarseProgressReadySet()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8131)
+     now skips
+     [`HomerServiceLocalControlSourceReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22015)
+     for the machine-aware policy, while
+     [`HomerServiceBuildProgressCollectorCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25430)
+     scans fresh request-ready slots directly when
+     `TUPLE_SINK_SERVICE_PUMP_LOCAL_CONTROL` is set. This preserves the legacy
+     aggregate source and its
+     [`HomerServiceLocalControlAsyncPumpCountdown`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2394)
+     for source-plan policies, but removes
+     `localControlAsyncPumpCountdown` from
+     [`HomerMachineBaselinePolicyState`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2070).
+     The practical effect is that active async local-control continuations cannot
+     hide new local-control requests behind the old aggregate async cooldown; the
+     scheduler sees fresh slot collectors and selected async machines as separate
+     inputs.
+   - Validation for the direct local-control collector slice: `git clang-format
+     HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+     `git diff --check`, `git diff --cached --check`, and `sudo -n -u dbcomm
+     make -j8 service-bin client-bin` passed; `sudo -n make install-service-bin`
+     passed. Runtime service binaries were synced to farnet0 and matched by
+     SHA-256:
+     `2d445918a6f309b3494815a17c666ffe05248da1e99f3811f1a3a218ca5a820e`.
+     After a clean restart with `HOMER_PROGRESS_POLICY=machine-baseline`, remote
+     c1 Homer pgbench completed with zero failures, warmup `2583.42 TPS`, then
+     warmed `4585.45` and `4165.68 TPS` in
+     `/tmp/homer_direct_lc_collector_pgbench_1780988064`; remote c4 Homer
+     pgbench completed with zero failures at `10651.82` and `10563.06 TPS` in
+     the same artifact directory. Remote RDMA basebackup completed with warmup
+     `5.81 s`, then warmed `4.50` and `4.59 s` in
+     `/tmp/homer_direct_lc_collector_basebackup_1780988090`. Backend-to-backend
+     Homer tuple COPY 10M rows completed with `count=10000000`, `min=1`,
+     `max=10000000`, `sum=500000050000000`, warmup `8.45 s`, then warmed `5.30`
+     and `5.11 s` in `/tmp/homer_direct_lc_collector_copy_10m_1780988105`.
+     Mixed remote c4 pgbench plus remote RDMA basebackup passed with zero
+     failures at `8819.19 TPS` and basebackup `4.62 s` in
+     `/tmp/homer_direct_lc_collector_mixed_c4_bb_1780988135`. Post-run process
      preflight showed only the intended PostgreSQL and Homer service processes,
      and service-log signature checks found no `error`, `failed`, `reset`,
      `broken`, `stale`, `could not`, `invalid`, `timeout`, or `panic` lines.
