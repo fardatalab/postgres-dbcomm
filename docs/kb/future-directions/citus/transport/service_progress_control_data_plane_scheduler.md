@@ -1429,6 +1429,47 @@ scheduler.
      preflight showed only the intended PostgreSQL and Homer service processes,
      and service-log signature checks found no `error`, `failed`, `reset`,
      `broken`, `stale`, `could not`, `invalid`, `timeout`, or `panic` lines.
+   - Follow-up direct peer collector progress: `machine-baseline` no longer
+     manufactures a flat `PEER_CONTROL` ready-set source before it can produce
+     split peer collector candidates.
+     [`HomerServiceBuildCoarseProgressReadySet()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8140)
+     now skips
+     [`HomerServicePeerControlSourceReadyForScheduler()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4921)
+     for the machine-aware policy. Instead,
+     [`HomerServiceMachineBaselinePeerCollectorsDue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25428)
+     evaluates the policy-owned active/idle peer cooldown from the existing
+     active peer work predicate, and
+     [`HomerServiceBuildProgressCollectorCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25454)
+     turns that due decision into split peer collector candidates. Source-plan
+     policies still use the legacy flat peer-control ready-set admission path.
+     This is a boundary cleanup, not a new exact-fact model: due peer candidates
+     produced this way remain blind/pollable work, so feedback backoff and
+     dependency-demand boosts still decide how much CPU to spend on repeatedly
+     empty peer polls. Exact setup/close/lifetime facts remain future work before
+     setup and cleanup can stop using coarse pollable liveness.
+   - Validation for the direct peer collector slice: `git clang-format HEAD --
+     src/backend/distributed/utils/homer/tuple_sink_service_process.c`, `git
+     diff --check`, `git diff --cached --check`, and `sudo -n -u dbcomm make -j8
+     service-bin client-bin` passed; `sudo -n make install-service-bin` passed.
+     Runtime service binaries were synced to farnet0 and matched by SHA-256:
+     `273724a25a36b0959fe2ea4c050912a8b3ee94ad5a879c8a14c740c700005a44`.
+     After a clean restart with `HOMER_PROGRESS_POLICY=machine-baseline`, remote
+     c1 Homer pgbench completed with zero failures, warmup `2573.85 TPS`, then
+     warmed `4614.80` and `4201.05 TPS` in
+     `/tmp/homer_direct_peer_collector_pgbench_1780988374`; remote c4 Homer
+     pgbench completed with zero failures at `10708.58` and `10603.00 TPS` in
+     the same artifact directory. Remote RDMA basebackup completed with warmup
+     `6.32 s`, then warmed `4.58` and `4.50 s` in
+     `/tmp/homer_direct_peer_collector_basebackup_1780988400`. Backend-to-backend
+     Homer tuple COPY 10M rows completed with `count=10000000`, `min=1`,
+     `max=10000000`, `sum=500000050000000`, warmup `8.35 s`, then warmed `5.24`
+     and `5.01 s` in `/tmp/homer_direct_peer_collector_copy_10m_1780988415`.
+     Mixed remote c4 pgbench plus remote RDMA basebackup passed with zero
+     failures at `8987.69 TPS` and basebackup `4.64 s` in
+     `/tmp/homer_direct_peer_collector_mixed_c4_bb_1780988444`. Post-run process
+     preflight showed only the intended PostgreSQL and Homer service processes,
+     and service-log signature checks found no `error`, `failed`, `reset`,
+     `broken`, `stale`, `could not`, `invalid`, `timeout`, or `panic` lines.
 2. **Machine and collector scaffolding.** Add fixed-table
    `HomerProgressMachineRef`, machine facts, collector facts, action refs,
    machine grants, collector grants, action results, and transition results.
