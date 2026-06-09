@@ -1640,6 +1640,17 @@ scheduler.
      executor. Source-plan policies still consume the flat ready-set source
      directly; this change only removes the machine-baseline dependency on that
      synthetic collector admission.
+     Follow-up cleanup: `HOMER_PROGRESS_COLLECTOR_TARGET_COMPLETION_WAIT` has now
+     been removed from the collector enum and registry
+     ([`HomerProgressCollectorKind`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1484),
+     [`HomerServiceInitializeProgressRegistry()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9517)).
+     `HOMER_PROGRESS_WAIT_CLIENT_COMPLETION_MAILBOX` remains as the command-session
+     wait/unblock fact, but
+     [`HomerServiceAppendCollectorDemandForMachineWait()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24595)
+     no longer maps it to a collector because there is no separate collector
+     executor to run. `HOMER_PROGRESS_SOURCE_TARGET_COMPLETION` remains only for
+     source-plan compatibility and is ignored by the collector bridge in
+     [`HomerServiceBuildProgressCollectorCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25009).
    - Diagnostics: progress stats now record direct action-plan builds through
      [`HomerServiceProgressStatsRecordActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4250),
      so `machine-baseline` does not disappear from plan-build counters when stats
@@ -1719,6 +1730,24 @@ scheduler.
      Post-run process preflight showed only intended PostgreSQL and Homer service
      processes, and both service logs had no `failed`, `error`, `invalid`,
      `overrun`, `stale`, `corrupt`, `panic`, or `reset` signatures.
+   - Focused runtime checks after removing the now-inert target-completion
+     collector passed with `citus_tuple_sink_service`
+     `9cd4c91b7474fd68e213028c9e84a2c66e44872b658ca78dd3de1bc9b30491df`
+     installed on both hosts. Formatting/build/install checks were
+     `git clang-format HEAD --
+     src/backend/distributed/utils/homer/tuple_sink_service_process.c`, `git diff
+     --cached --check`, `git diff --check`, `sudo -n -u dbcomm make -j8
+     service-bin client-bin`, and `sudo -n make install-service-bin`.
+     Remote c1 Homer pgbench completed `10000/10000`, `0` failures on all repeats:
+     warmup `2594.32 TPS`, then warmed `4615.42` and `4184.77 TPS`; remote c4
+     Homer pgbench completed `10000/10000`, `0` failures, `10582.46 TPS`; remote
+     RDMA basebackup completed `6.09`, `4.52`, and `4.58 s`; backend-to-backend
+     Homer tuple COPY 10M rows completed with `count=10000000`, `min=1`,
+     `max=10000000`, `sum=500000050000000`, with repeats `9.29` and `5.57 s` in
+     `/tmp/homer_machine_no_target_collector_copy_1780984970`. Post-run process
+     preflight showed only intended PostgreSQL and Homer service processes, and
+     both service logs had no `failed`, `error`, `invalid`, `overrun`, `stale`,
+     `corrupt`, `panic`, or `reset` signatures.
 7. **Tune and diagnose.** Tune action burst sizes, collector backoff, blind poll
    caps, payload byte/object caps, and stop/replan triggers. Accept the milestone
    only after clean correctness, clean process/log preflight, and no meaningful
@@ -2163,13 +2192,16 @@ Implementation progress:
   marked every active async local-control continuation as waiting on both peer
   response mailbox and peer send-CQ, which would have made the new demand bridge
   overpoll peer send-CQ.
-- Boundary/caveat: the wait-mask bridge already maps all generic wait families,
-  but only collectors with concrete source/action mappings can execute today.
+- Boundary/caveat: the wait-mask bridge maps generic wait families only when an
+  independent collector executor exists and can make that event family visible.
   For example, peer response mailbox and peer send-CQ demand can produce real
-  peer-control collector grants, while some broader mappings remain fact-only
-  until those source/action executors are split further. This is intentional:
-  the generic facts can land before every collector has a fully independent
-  action implementation.
+  peer-control collector grants. Client completion mailbox waits do not map to a
+  collector now that target waits are admitted directly as command-session
+  machine facts; adding a collector candidate there would be a synthetic no-op,
+  not useful scheduling work. Some broader wait families remain fact-only until
+  those source/action executors are split further. This is intentional: generic
+  wait facts can land before every event family has a fully independent action
+  implementation.
 - Validation for this slice passed with stats/logging macros off. Formatting and
   build/install: `git clang-format HEAD --
   src/backend/distributed/utils/homer/tuple_sink_service_process.c`, `git diff
