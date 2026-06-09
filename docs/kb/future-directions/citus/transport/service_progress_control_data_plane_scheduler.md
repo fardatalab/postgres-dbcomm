@@ -333,7 +333,10 @@ to be removed before peer-control facts could safely mean either "locally posted
 WRs are expected to retire" or "a local async continuation may now complete".
 
 The existing aggregate phase-grant path can remain as a compatibility fallback
-or default policy behavior while the split-source facts are introduced.
+or default policy behavior while the split-source facts are introduced, but the
+state-machine policy should not treat the aggregate grant as the design boundary.
+Aggregate readiness can still act as a coarse compatibility signal while the
+policy compiles it into explicit collector facts and typed action grants.
 
 Implementation progress: the first peer-control executor split now gives the
 flat-source substrate separate request-mailbox, response-mailbox, and send-CQ
@@ -351,6 +354,30 @@ now has separate `TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ`,
 drains outgoing send CQEs in the send-CQ branch, consumes outgoing async
 peer-control responses in the response-mailbox branch, and dispatches accepted
 incoming mailbox work in the request-mailbox branch.
+
+Implementation progress: the `machine-baseline` policy now extends the split
+collector family to include CM setup and close/lifetime work as
+`HOMER_PROGRESS_COLLECTOR_PEER_CM_SETUP` and
+`HOMER_PROGRESS_COLLECTOR_PEER_CLOSE_LIFETIME` in
+[`HomerProgressCollectorKind`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1484).
+The collector registry maps those to `HOMER_PROGRESS_SOURCE_PEER_CM_SETUP` and
+`HOMER_PROGRESS_SOURCE_PEER_CLOSE_LIFETIME` in
+[`HomerServiceInitializeProgressRegistry()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9668).
+The builder
+[`HomerServiceBuildProgressCollectorCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25038)
+uses an aggregate peer-control ready-set entry only as a coarse admission signal
+and expands it into split peer collector candidates.
+
+Implementation caveat: the peer scheduler facts are split, but the physical
+executor is bundled for now. [`HomerServiceMachineBaselineAppendPeerCollectorBundle()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6285)
+combines selected peer collector facts into a phase mask and emits one
+`HOMER_PROGRESS_ACTION_ADVANCE_PEER_CONNECTION` grant. The selected phase mask is
+carried through the reserved bits of the aggregate peer-control source reference,
+and [`HomerServiceBuildPeerControlProgressPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9325)
+uses that mask instead of the full aggregate phase set. This keeps the scheduler
+boundary explicit while avoiding repeated peer connection-table scans. A pure
+six-action split was correct but regressed mixed pgbench/basebackup throughput by
+repeating the same transport walk.
 
 Caveat: this split is clean at the scheduler/action boundary, but the physical
 inbound peer-control mailbox is still one FIFO ring that can carry both request
@@ -1564,17 +1591,33 @@ scheduler.
      remote-client commands, advances peer-control, publishes target/completion
      results, and finally grants payload progress. This is intentionally a
      baseline machine-aware policy, not the tuned adaptive policy.
-   - Boundary/caveats: dense payload COPY/basebackup streams still preserve the
-     aggregate payload source when the old ready set contains
-     `HOMER_PROGRESS_PAYLOAD_AGGREGATE_INDEX`; otherwise a direct per-stream
-     machine plan would expand hot COPY into many grants before the payload egress
-     layer can batch real transport work. Per-stream payload machine actions now
-     pass exact flags for the already split local-blackhole, outgoing, incoming,
-     close/reclaim, send-CQ retirement, receiver-credit publication, and
-     tuple-view EOS synthesis families.
-     Peer-control uses the aggregate peer-control action when the current ready
-     set admits aggregate peer-control, because setup/close progress is not yet
-     fully represented by collector facts.
+   - Boundary/caveats: dense payload COPY/basebackup streams no longer use the
+     aggregate payload source under `machine-baseline`. The policy selects
+     per-stream payload machine facts in
+     [`HomerServiceMachineBaselineAppendMachineAction()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6464)
+     even when the old ready set contains `HOMER_PROGRESS_PAYLOAD_AGGREGATE_INDEX`.
+     This makes the stream state, credit blockage, completion dependency, and
+     traffic class visible to dependency diagnostics and to later adaptive
+     policies. The older aggregate payload scans remain available to flat-source
+     policies.
+   - Peer-control facts are also split for `machine-baseline`: CM setup,
+     recv-CQ, request mailbox, response mailbox, send-CQ, and close/lifetime are
+     separate collector candidates. The policy still compiles compatible selected
+     peer phases back into one executor grant through
+     [`HomerServiceMachineBaselineAppendPeerCollectorBundle()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6285),
+     because the peer transport naturally scans its connection tables once and
+     applies a phase mask during that scan. This is not a retreat to aggregate
+     scheduler facts; it is a physical execution optimization underneath split
+     facts.
+   - Rejected intermediate designs: omitting CM setup from split peer facts caused
+     remote pgbench c1 to fail session open with an outgoing RDMA setup timeout at
+     phase `3`, because the old aggregate peer-control grant had been the only
+     path that pumped setup/listener CM. Emitting six separate peer actions fixed
+     correctness but regressed mixed remote c4 pgbench plus basebackup to roughly
+     the `8k TPS` band by repeating peer connection-table scans. Suppressing
+     setup/close collectors based on coarse session/stream active-work state also
+     failed c1 liveness. The accepted design keeps setup/close facts visible and
+     bundles only the physical peer pump execution.
    - Diagnostics: progress stats now record direct action-plan builds through
      [`HomerServiceProgressStatsRecordActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4250),
      so `machine-baseline` does not disappear from plan-build counters when stats
@@ -1593,6 +1636,9 @@ scheduler.
      and `libhomer_client.a`
      `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
      Both services logged `HOMER_PROGRESS_POLICY=machine-baseline max_grants=64`.
+     A later peer-bundle slice rebuilt and synced `citus_tuple_sink_service`
+     `e4c68a3a47b547c2f9008bb8314c6cbbcf3b57cf3ac5dd8affec39a01cca7a8b`
+     on both hosts.
    - Focused runtime checks passed after clean process preflight: warmed remote
      c1 Homer pgbench `20000/20000` transactions, `0` failures, `4517.13 TPS`,
      p99 `0.241 ms`; remote c4 Homer pgbench `40000/40000` transactions, `0`
@@ -1614,12 +1660,22 @@ scheduler.
      Post-run process preflight showed only intended PostgreSQL and Homer service
      processes, and both service logs had no `error`, `failed`, `reset`,
      `broken`, `stale`, `could not`, or `invalid` lines.
+   - Focused runtime checks after the peer-bundle slice passed with clean process
+     preflight and no service-log errors: warmed remote c1 Homer pgbench repeats
+     `4534.11`, `4139.15`, and `4164.22 TPS`; remote c4 Homer pgbench
+     `10495.77 TPS`; mixed remote c4 pgbench plus remote RDMA basebackup
+     `10099.38 TPS` with basebackup `6.67 s`; standalone remote RDMA basebackup
+     repeats `4.52`, `4.53`, and `6.15 s`; backend-to-backend Homer tuple COPY
+     10M rows completed with `count=10000000`, `min=1`, `max=10000000`,
+     `sum=500000050000000`, with warm run `5.30 s` in
+     `/tmp/homer_peer_bundle_copy_1780983676`. The `6.15 s` basebackup repeat was
+     treated as an outlier against the normal `4.5 s` band.
 7. **Tune and diagnose.** Tune action burst sizes, collector backoff, blind poll
    caps, payload byte/object caps, and stop/replan triggers. Accept the milestone
    only after clean correctness, clean process/log preflight, and no meaningful
    regression versus the current fixed-priority baseline.
    - Current progress: `machine-baseline` now has tunable plan-budget caps with
-     defaults `max_plan=16`, `max_collectors=4`, `max_machines=12`,
+     defaults `max_plan=16`, `max_collectors=6`, `max_machines=12`,
      `max_payload=2`, and `max_blind_collectors=1`. The defaults live near
      [`HOMER_SERVICE_MACHINE_BASELINE_MAX_GRANTS`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:144),
      env parsing is in
