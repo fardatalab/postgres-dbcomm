@@ -1745,6 +1745,69 @@ Baseline policy behavior should be dependency-aware but conservative:
 - record closure/replan counts by dependency reason so a mature policy can be
   judged by how rarely substrate repair is needed on the hot path
 
+Implementation progress:
+
+- The first dependency-aware baseline slice is now implemented as collector
+  demand derived from machine wait facts. After machine candidates are built,
+  [`HomerServiceAppendCollectorDemandFromMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23752)
+  walks the current machine snapshot and
+  [`HomerServiceAppendCollectorDemandForMachineWait()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23669)
+  maps generic `waitingOnMask` bits to collector candidates through
+  [`HomerServiceAppendProgressCollectorDemandCandidate()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23566).
+  This is a dependency-fact bridge, not a DB-semantic rule: machines name event
+  families such as peer response mailbox, command send-CQ, payload frontier, or
+  remote credit; the bridge names the collector that can make that event family
+  visible.
+- `machine-baseline` now consumes those demand facts before spending the rest of
+  the plan on runnable machines. The policy helper
+  [`HomerServiceMachineBaselineAppendWaitingCollectorActions()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5867)
+  grants collectors with `waitingMachineCount > 0` ahead of local-control,
+  frontend-command, completion, and payload machine bursts. Duplicate collector
+  grants are suppressed by the `collectorPlanned` bitmap in
+  [`HomerServiceBuildMachineBaselineProgressActionPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6018),
+  so a collector that was already admitted for liveness or exact work does not
+  consume another plan slot in the demand pass.
+- Local-control async facts were tightened at the same time:
+  [`HomerServiceLocalControlAsyncPhaseWaitsForPeerResponse()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23624)
+  marks only the `*_WAIT_PEER*` phases as waiting on
+  `HOMER_PROGRESS_WAIT_PEER_RESPONSE_MAILBOX`. Earlier scaffolding conservatively
+  marked every active async local-control continuation as waiting on both peer
+  response mailbox and peer send-CQ, which would have made the new demand bridge
+  overpoll peer send-CQ.
+- Boundary/caveat: the wait-mask bridge already maps all generic wait families,
+  but only collectors with concrete source/action mappings can execute today.
+  For example, peer response mailbox and peer send-CQ demand can produce real
+  peer-control collector grants, while some broader mappings remain fact-only
+  until those source/action executors are split further. This is intentional:
+  the generic facts can land before every collector has a fully independent
+  action implementation.
+- Validation for this slice passed with stats/logging macros off. Formatting and
+  build/install: `git clang-format HEAD --
+  src/backend/distributed/utils/homer/tuple_sink_service_process.c`, `git diff
+  --cached --check`, `git diff --check`, `sudo -n -u dbcomm make -j8
+  service-bin client-bin`, and `sudo -n make install-headers install-service-bin
+  install`. Runtime artifacts were synced to farnet0 and matched by SHA-256:
+  `citus_tuple_sink_service`
+  `0b08da35ed1385962eb010f99c306dc252d716b4f5db3501bffc977ef332b157`,
+  `citus.so`
+  `c6978babd32f117becc281202ab6a4134b02da5854dc18d5017d29f8b9a3cc73`,
+  and `libhomer_client.a`
+  `0de53a829c686a6e55dd3fae1a3d67dcd86a053601f58c5c725552a8a97c8ea7`.
+- Focused runtime gates were clean after service restart and process preflight:
+  remote c1 Homer pgbench warm rerun `20000/20000`, `0` failures, `4650.50
+  TPS`, p99 `0.234 ms`; remote c4 Homer pgbench `40000/40000`, `0` failures,
+  `11106.74 TPS`, p99 `0.588 ms`; remote RDMA basebackup cold/warm repeats
+  `6.01` and `4.68 s` in
+  `/tmp/homer_state_machine_wait_collector_basebackup_1780976149`;
+  backend-to-backend Homer tuple COPY 10M rows completed with
+  `count=10000000`, `min=1`, `max=10000000`, `sum=500000050000000`, warm run
+  `5.05 s` in `/tmp/homer_state_machine_wait_collector_copy_1780976168`;
+  mixed remote c4 pgbench plus remote RDMA basebackup passed with `8535.19 TPS`
+  and basebackup `4.65 s` in
+  `/tmp/homer_state_machine_wait_collector_concurrent_c4_1780976195`.
+  Post-run service logs had no error/reset/stale-owner signatures and process
+  preflight showed only the intended PostgreSQL and Homer service processes.
+
 Cheap diagnostics for this sub-milestone:
 
 - dependency-closure insert/reorder count by reason
