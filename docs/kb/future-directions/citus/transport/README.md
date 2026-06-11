@@ -18,7 +18,7 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 - [peer_service_push_completion_implementation_plan.md](peer_service_push_completion_implementation_plan.md) - Implementation status and cleanup plan for replacing normal service-to-service peer completion polling with a requester-owned peer command completion ring.
 - [rdma_publication_visibility_and_doorbells.md](rdma_publication_visibility_and_doorbells.md) - RDMA publication/visibility rules, including why the tuple-sink prototype now uses WRITE_WITH_IMM doorbells rather than trusting memory polling alone as the responder-visible publish event.
 - [rdma_transport_control_plane_abstraction.md](rdma_transport_control_plane_abstraction.md) - TODO
-- [service_progress_control_data_plane_scheduler.md](service_progress_control_data_plane_scheduler.md) - Next scheduler design for persistent service-progress plans, typed grants, feedback-driven early stop, peer-control phase sources, and the control/data-plane split between planning and plan execution.
+- [service_progress_control_data_plane_scheduler.md](service_progress_control_data_plane_scheduler.md) - Current state-machine service-progress scheduler design, default `machine-baseline` policy, validation gate, known caveats, and future adaptive-policy directions.
 <!-- kb-docs:end -->
 
 ## Related
