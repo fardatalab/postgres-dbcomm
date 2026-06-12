@@ -32,13 +32,154 @@ Current filesystem facts:
 - Avoid syncing live database data directories unless PostgreSQL is stopped and
   replacing that data directory is the explicit goal.
 
-Fast-link addresses used by the current runbooks:
+Fast-link addresses verified on June 12, 2026:
 
 - `farnet0`: `10.10.1.100`
-- `farnet1`: `10.10.1.101`
+- `farnet1`: `10.10.1.102`
+- `farnet0` DPU (`ssh farnet0`, then `ssh dpu`): `10.10.1.200`
+- `farnet1` DPU (`ssh dpu` from `farnet1`): `10.10.1.202`
 
-Confirm with `ip -br addr` before a benchmark if the machines were rebooted or
-renumbered.
+The second fast-link addresses were also configured at that time:
+
+- `farnet0` host: `10.10.1.101`
+- `farnet1` host: `10.10.1.103`
+- `farnet0` DPU: `10.10.1.201`
+- `farnet1` DPU: `10.10.1.203`
+
+Both host fast-link ports and both DPU fast-link ports reported `400000Mb/s`,
+4 lanes, full duplex, and link detected. Because both farnet host fast-link
+addresses are in the same `10.10.1.0/24` subnet, Linux route selection is
+ambiguous without source-policy routing. On June 12, 2026,
+`ip route get 10.10.1.102 from 10.10.1.101` on `farnet0` selected
+`enp33s0f0np0`, which made cross-lane TCP/RDMA setup asymmetric.
+
+For raw reproduction of the current cross-lane failure, leave the host routing
+state unmodified and run the cross-lane `ib_read_bw` commands below. In that
+state the perftest control socket can exchange QP/GID metadata, but the RDMA
+read itself fails with `transport retry counter exceeded`. Use the following
+source-specific routes and ARP controls only as a diagnostic isolation step when
+you explicitly want to remove the host reply-route ambiguity:
+
+```sh
+# farnet1
+sudo -n ip route replace 10.10.1.0/24 dev enp33s0f0np0 src 10.10.1.102 table 1100
+sudo -n ip route replace 10.10.1.0/24 dev enp33s0f1np1 src 10.10.1.103 table 1101
+sudo -n ip rule del priority 1100 2>/dev/null || true
+sudo -n ip rule del priority 1101 2>/dev/null || true
+sudo -n ip rule add priority 1100 from 10.10.1.102/32 table 1100
+sudo -n ip rule add priority 1101 from 10.10.1.103/32 table 1101
+sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_ignore=1
+sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.arp_ignore=1
+sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_announce=2
+sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.arp_announce=2
+sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_filter=1
+sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.arp_filter=1
+sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.rp_filter=0
+sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.rp_filter=0
+
+# farnet0
+ssh farnet0 "sudo -n ip route replace 10.10.1.0/24 dev enp33s0f0np0 src 10.10.1.100 table 1100"
+ssh farnet0 "sudo -n ip route replace 10.10.1.0/24 dev enp33s0f1np1 src 10.10.1.101 table 1101"
+ssh farnet0 "sudo -n ip rule del priority 1100 2>/dev/null || true"
+ssh farnet0 "sudo -n ip rule del priority 1101 2>/dev/null || true"
+ssh farnet0 "sudo -n ip rule add priority 1100 from 10.10.1.100/32 table 1100"
+ssh farnet0 "sudo -n ip rule add priority 1101 from 10.10.1.101/32 table 1101"
+ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_ignore=1"
+ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.arp_ignore=1"
+ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_announce=2"
+ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.arp_announce=2"
+ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_filter=1"
+ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.arp_filter=1"
+ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.rp_filter=0"
+ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.rp_filter=0"
+```
+
+Those commands are runtime state. Revert them with `ip rule del priority
+1100`, `ip rule del priority 1101`, `ip route flush table 1100`, and
+`ip route flush table 1101` on both hosts if the goal is to expose the raw
+`ib_read_bw` failure. If same-subnet multi-NIC testing becomes the default, move
+the chosen policy into persistent host network configuration.
+
+For RDMA/RoCE verification, use `ibdev2netdev`, `show_gids`, and `ib_read_bw`
+with explicit devices and GID indices. On June 12, 2026, `mlx5_0` mapped to
+`enp33s0f0np0`, `mlx5_1` mapped to `enp33s0f1np1`, and IPv4 RoCE v2 used GID
+index `3` on both hosts. Short `ib_read_bw` sanity runs established RC QPs and
+moved data on both links:
+
+- `mlx5_0`, `10.10.1.102 -> 10.10.1.100`: single-QP read reached about
+  `62 Gbit/s`
+- `mlx5_1`, `10.10.1.103 -> 10.10.1.101`: single-QP read reached about
+  `90 Gbit/s`; an 8-QP read run reached about `259 Gbit/s`
+
+Cross-port `ib_read_bw` did **not** pass in the June 12 check:
+
+- `farnet1 mlx5_0 / 10.10.1.102 -> farnet0 mlx5_1 / 10.10.1.101`
+  failed fixed-iteration RDMA reads with `transport retry counter exceeded`
+- `farnet1 mlx5_1 / 10.10.1.103 -> farnet0 mlx5_0 / 10.10.1.100`
+  failed fixed-iteration RDMA reads with `transport retry counter exceeded`
+- retrying the first cross-port direction with GID index `2` also failed, so
+  this was not only a RoCE v2 GID-index issue
+- as a separate diagnostic, applying source-policy routes and ARP controls made
+  the cross-lane test fail earlier at ARP/connectivity level; `tcpdump` on
+  `farnet0` showed the ARP request from `farnet1` port0 for `10.10.1.101`
+  arriving on `farnet0` port0 while `farnet0` port1 saw no packet, and the
+  reverse cross direction showed the symmetric behavior on port1
+
+These numbers prove both RDMA ports are usable, but they are not a line-rate
+acceptance result, and the cross-port failures mean the current setup should not
+be treated as a verified four-port full mesh yet. The current evidence points to
+switch/VLAN/fabric forwarding that keeps same-index lanes in separate L2
+domains. Fix the switch-side L2 domain before expecting cross-lane RDMA to pass.
+The quick runs used active MTU `1024`, short duration, and no CPU/NUMA tuning;
+collect a separate tuned benchmark before making 400G throughput claims.
+
+Confirm with `ip -br addr`, `ip route`, and forced-interface reachability checks
+before a benchmark if the machines were rebooted or renumbered:
+
+```sh
+ip -br addr
+ip route
+ip rule
+ip route get 10.10.1.101 from 10.10.1.102
+ssh farnet0 "ip rule; ip route get 10.10.1.102 from 10.10.1.101"
+ethtool enp33s0f0np0 | egrep 'Speed:|Lanes:|Link detected:'
+ethtool enp33s0f1np1 | egrep 'Speed:|Lanes:|Link detected:'
+ibdev2netdev
+show_gids
+ping -c 1 -W 1 -I 10.10.1.102 10.10.1.100
+ping -c 1 -W 1 -I 10.10.1.103 10.10.1.101
+ping -c 1 -W 1 -I 10.10.1.102 10.10.1.101
+ping -c 1 -W 1 -I 10.10.1.103 10.10.1.100
+ssh farnet0 "ip -br addr; ip route; ip rule"
+ssh dpu "ip -br addr; ip route"
+ssh farnet0 "ssh dpu 'ip -br addr; ip route'"
+```
+
+For a quick RDMA check of the two farnet host links, run the server on `farnet0`
+and the client on `farnet1` with matching devices:
+
+```sh
+# Lane 0: farnet1 10.10.1.102/mlx5_0 to farnet0 10.10.1.100/mlx5_0.
+ssh farnet0 "ib_read_bw -d mlx5_0 -i 1 -x 3 -F --report_gbits -s 1048576 -D 5 -p 18550"
+ib_read_bw -d mlx5_0 -i 1 -x 3 -F --report_gbits -s 1048576 -D 5 \
+  -p 18550 --bind_source_ip 10.10.1.102 10.10.1.100
+
+# Lane 1: farnet1 10.10.1.103/mlx5_1 to farnet0 10.10.1.101/mlx5_1.
+ssh farnet0 "ib_read_bw -d mlx5_1 -i 1 -x 3 -F --report_gbits -s 1048576 -D 5 -p 18551"
+ib_read_bw -d mlx5_1 -i 1 -x 3 -F --report_gbits -s 1048576 -D 5 \
+  -p 18551 --bind_source_ip 10.10.1.103 10.10.1.101
+
+# Cross-lane checks should also pass if the switch is configured as a full mesh.
+# These failed with transport retries on June 12, 2026 and should be rerun after
+# any switch, VLAN, routing, or RoCE configuration change.
+ssh farnet0 "ib_read_bw -d mlx5_1 -i 1 -x 3 -F --report_gbits -s 1048576 -n 1000 -p 18556"
+ib_read_bw -d mlx5_0 -i 1 -x 3 -F --report_gbits -s 1048576 -n 1000 \
+  -p 18556 --bind_source_ip 10.10.1.102 10.10.1.101
+
+ssh farnet0 "ib_read_bw -d mlx5_0 -i 1 -x 3 -F --report_gbits -s 1048576 -n 1000 -p 18557"
+ib_read_bw -d mlx5_1 -i 1 -x 3 -F --report_gbits -s 1048576 -n 1000 \
+  -p 18557 --bind_source_ip 10.10.1.103 10.10.1.100
+```
 
 ## Build and install
 
@@ -212,7 +353,7 @@ Example `farnet1` service for pgbench and local basebackup sender:
 sudo -n -u dbcomm env \
   HOMER_SERVICE_CPU=2 \
   HOMER_REMOTE_EXEC_BACKEND_CPUS=4,5,6,7 \
-  HOMER_SERVICE_PEER_BIND_HOST=10.10.1.101 \
+  HOMER_SERVICE_PEER_BIND_HOST=10.10.1.102 \
   HOMER_SERVICE_PEER_PORT=9717 \
   /data/dbcomm/pg-citus/bin/citus_tuple_sink_service \
   > /data/dbcomm/pg-citus/data/homer_service_farnet1.log 2>&1 &
@@ -287,7 +428,7 @@ done
   opens a local `CLIENT_SQL_SESSION`, and drives a socketless backend on
   farnet1.
 - farnet0-to-farnet1 RDMA: pgbench maps the farnet0 Homer service, passes
-  `--homer-peer-host 10.10.1.101`, and the two Homer services carry commands,
+  `--homer-peer-host 10.10.1.102`, and the two Homer services carry commands,
   completions, and tuple-result payloads over RDMA to the farnet1 PostgreSQL
   backend.
 
@@ -321,7 +462,7 @@ ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
   --homer \
   --homer-database-oid '$DBOID' \
   --homer-user-oid '$USEROID' \
-  --homer-peer-host 10.10.1.101 \
+  --homer-peer-host 10.10.1.102 \
   --homer-peer-port 9717 \
   --homer-peer-node 1 \
   --latency-percentiles \
@@ -350,7 +491,7 @@ ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
   --homer \
   --homer-database-oid '$DBOID' \
   --homer-user-oid '$USEROID' \
-  --homer-peer-host 10.10.1.101 \
+  --homer-peer-host 10.10.1.102 \
   --homer-peer-port 9717 \
   --homer-peer-node 1 \
   --latency-percentiles \
@@ -503,7 +644,7 @@ ssh farnet0 \
      --homer \
      --homer-database-oid 5 \
      --homer-user-oid 10 \
-     --homer-peer-host 10.10.1.101 \
+     --homer-peer-host 10.10.1.102 \
      --homer-peer-port 9717 \
      --homer-peer-node 1 \
      --latency-percentiles \
@@ -546,7 +687,7 @@ ssh farnet0 \
      --homer \
      --homer-database-oid 5 \
      --homer-user-oid 10 \
-     --homer-peer-host 10.10.1.101 \
+     --homer-peer-host 10.10.1.102 \
      --homer-peer-port 9717 \
      --homer-peer-node 1 \
      --latency-percentiles \
