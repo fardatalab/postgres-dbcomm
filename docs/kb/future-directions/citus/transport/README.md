@@ -13,6 +13,8 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 ## Documents
 
 <!-- kb-docs:start -->
+- [doca_dma_ordering_visibility_validation_plan.md](doca_dma_ordering_visibility_validation_plan.md) - Standalone host-DPU validation plan for DMA ordering, visibility, sync-event publication, COMCH wakeups, relaxed ordering, and cache-coherency assumptions before Homer integration.
+- [doca_host_dpu_homer_boundary.md](doca_host_dpu_homer_boundary.md) - DOCA-grounded host-DPU boundary plan for moving the current backend-to-Homer process edge onto BlueField, including DMA, PE batching, COMCH/sync-event notifications, and publication caveats.
 - [homer_payload_control_unification_plan.md](homer_payload_control_unification_plan.md) - Planned unification milestone for Homer byte-ring payload lifecycle, peer command/control lifecycle, and neutral bidirectional payload-stream scheduler facts without rewriting DB-semantic adapters.
 - [homer_transport_scheduler_and_payload_streams.md](homer_transport_scheduler_and_payload_streams.md) - Homer scheduler-ready design and checkpoint, including the completed service-progress/egress scheduler substrate plus remaining policy, traffic-class, multi-QP, peer-poll fallback cleanup, and fragmentation directions.
 - [peer_service_push_completion_implementation_plan.md](peer_service_push_completion_implementation_plan.md) - Implementation status and cleanup plan for replacing normal service-to-service peer completion polling with a requester-owned peer command completion ring.
