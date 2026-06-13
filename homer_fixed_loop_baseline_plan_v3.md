@@ -2036,6 +2036,45 @@ delays unrelated foreground progress. A scheduler should decide when to post
 now, wait briefly, or defer based on current competing work rather than baking
 one static wait into every bulk payload visit.
 
+Figure 2 bridge points after the correctness fix:
+
+```text
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit2048-target8m_mixed-pgbench-c4-basebackup_waitbatch-fig2-limit2048-target8m-bytes64k_20260613_064340
+    ready_spin_limit: 2048
+    ready_spin_target_bytes: 8388608
+    basebackup target:
+        homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=65536
+    run 1: warmup after service restart
+        pgbench 10000/10000, 0 failed, 2614 TPS, p99 1.192 ms
+        basebackup completed, real 9.86 s
+    warmed runs 2-3:
+        pgbench 10000/10000 each, 0 failed
+        TPS 4976-5002, p99 1.153-1.167 ms
+        basebackup real 5.54-5.55 s
+
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit8192-target8m_mixed-pgbench-c4-basebackup_waitbatch-fig2-limit8192-target8m-bytes64k_20260613_064512
+    ready_spin_limit: 8192
+    ready_spin_target_bytes: 8388608
+    basebackup target:
+        homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=65536
+    run 1: warmup after service restart
+        pgbench 10000/10000, 0 failed, 1856 TPS, p99 1.999 ms
+        basebackup completed, real 19.07 s
+    warmed runs 2-3:
+        pgbench 10000/10000 each, 0 failed
+        TPS 2705-2727, p99 2.009-2.023 ms
+        basebackup real 14.86-14.94 s
+```
+
+These two bridge points make the WaitBatch figure less binary. Dropping the
+nearly redundant `ready_spin_limit=8` point and plotting
+`0, 32, 128, 512, 2048, 8192, 16384` shows a clearer monotone-ish degradation
+as the fixed wait becomes large: the service loses foreground TPS first, then
+tail latency and basebackup elapsed time become visibly worse as the wait budget
+continues to grow. The `2048`, `8192`, and `16384` points use the `8 MiB`
+ready-byte target and should stay visually marked as diagnostic, not merged
+silently into the `256 KiB` target sweep.
+
 After the WaitBatch and full medium/large Limited-cap geometry diagnostics, the
 installed runtime was rebuilt, synced to `farnet0`, and restarted back to the
 default non-stats exhaustive service. Both hosts had matching
