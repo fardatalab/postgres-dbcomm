@@ -1840,6 +1840,202 @@ tuple/result streams reported ready-spin attempts too under this branch's
 traffic-class assignment, so a hardcoded wait can spend cycles in places that a
 real scheduler should decide about explicitly.
 
+Non-stats WaitBatch spin-limit performance sweep:
+
+```text
+Common setup:
+    workload: mixed c4 pgbench plus one RDMA basebackup
+    basebackup target:
+        homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=65536
+    ready-spin byte target: 262144
+    runs per point: 3
+    run 1: excluded as cold/setup warmup for every point
+
+/tmp/homer_fixed_loop_fixed-loop-exhaustive_mixed-pgbench-c4-basebackup_waitbatch-sweep-limit0-target256k-bytes64k_20260612_231749
+    service hash:
+        14188b7d91e2a9d4247cb3387d1f910b3a1e988a517ca5fa34475db4a70854f2
+    warmed runs 2-3:
+        pgbench 10000/10000 each, 0 failed
+        TPS 6677-6877, p95 0.755-0.782 ms, p99 0.868-0.915 ms
+        basebackup real 4.54-4.57 s
+
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit8-target256k_mixed-pgbench-c4-basebackup_waitbatch-sweep-limit8-target256k-bytes64k_20260612_231816
+    service hash:
+        860ab4ea6ead479ba04ec2cbc90979d193f3fcce5e311299103036dee37ab2da
+    warmed runs 2-3:
+        pgbench 10000/10000 each, 0 failed
+        TPS 6707-6776, p95 0.763-0.781 ms, p99 0.896-0.909 ms
+        basebackup real 4.57-4.58 s
+
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit32-target256k_mixed-pgbench-c4-basebackup_waitbatch-sweep-limit32-target256k-bytes64k_20260612_231842
+    service hash:
+        288525710f44e96f1dc6ab97ca53898d4bdf9614f849ab7861653b7f35dab189
+    warmed runs 2-3:
+        pgbench 10000/10000 each, 0 failed
+        TPS 6681-6687, p95 0.780-0.782 ms, p99 0.899-0.903 ms
+        basebackup real 4.56-4.57 s
+
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit128-target256k_mixed-pgbench-c4-basebackup_waitbatch-sweep-limit128-target256k-bytes64k_20260612_231909
+    service hash:
+        69eb7e2754d0412d2f61fe96555a6494e4ab9a126f10219fe4137274f36f2dff
+    warmed runs 2-3:
+        pgbench 10000/10000 each, 0 failed
+        TPS 6307-6448, p95 0.815-0.825 ms, p99 0.937-0.952 ms
+        basebackup real 4.17-4.55 s
+
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit512-target256k_mixed-pgbench-c4-basebackup_waitbatch-sweep-limit512-target256k-bytes64k_20260612_231935
+    service hash:
+        ead2e8f49d31c9d842db86c72f1f82ea5ae3bf208292d2293de019040dbd56da
+    warmed runs 2-3:
+        pgbench 10000/10000 each, 0 failed
+        TPS 6120-6128, p95 0.845-0.846 ms, p99 0.976-0.982 ms
+        basebackup real 4.42-4.58 s
+```
+
+The non-stats sweep supports the advisor's narrower paper framing. WaitBatch is
+not a standalone "better baseline": tiny spin windows are roughly neutral here,
+and a large fixed spin window clearly spends service time in the wrong place for
+foreground pgbench. Limit 512 loses about 8-11% foreground TPS relative to the
+default warmed range and pushes p99 from about 0.87-0.92 ms to about
+0.98 ms. Basebackup does not receive a reliable warmed improvement; the one
+4.17 s run at limit 128 is not enough to claim a stable bulk win.
+
+This is enough for a Figure 3b-style tradeoff chart if the caption is careful:
+near-ready batching exists, fixed waiting only partially recovers it, and the
+post-now versus wait/defer choice should be a scheduler decision. It is not
+enough to claim "too much wait makes both foreground and background worse." To
+support that stronger claim, run a longer or more stressed second sweep, for
+example `ready_spin_limit={0,128,512,2048}` crossed with
+`ready_spin_target_bytes={262144,1048576}`, a longer basebackup source, or two
+concurrent basebackup streams so background elapsed time is less dominated by
+short-run variance.
+
+Aggressive "too much wait" diagnostic attempt:
+
+```text
+Control:
+/tmp/homer_fixed_loop_fixed-loop-exhaustive_mixed-pgbench-c4-basebackup_waitbatch-too-much-control-limit0-target1m-bytes64k_20260612_232815
+    service hash:
+        9c2910e4f7883022bca51c97153223527eda4588159f9b3be9e08a976f98f91f
+    warmed runs 2-3:
+        pgbench 10000/10000 each, 0 failed
+        TPS 6377-6390, p95 0.820-0.826 ms, p99 0.958-0.973 ms
+        basebackup real 4.15-4.18 s
+
+All-stream WaitBatch, ready_spin_limit=1024, byte target=1 MiB:
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit1024-target1m_mixed-pgbench-c4-basebackup_waitbatch-too-much-limit1024-target1m-bytes64k_20260612_233021
+    run 1 completed but was badly degraded:
+        TPS 2748, p95 0.978 ms, p99 1.125 ms, basebackup real 8.27 s
+    run 2 failed before a complete measurement:
+        tuple result byte-ring record header mismatch at byte_head=80
+        pgbench processed only 2500/10000 transactions before aborting
+        basebackup completed in 4.13 s
+
+All-stream WaitBatch, ready_spin_limit=4096, byte target=1 MiB:
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit4096-target1m_mixed-pgbench-c4-basebackup_waitbatch-too-much-limit4096-target1m-bytes64k_20260612_232841
+    run 1 completed but was badly degraded:
+        TPS 2142, p95 1.455 ms, p99 1.665 ms, basebackup real 13.68 s
+    run 2 failed before a complete measurement:
+        tuple result byte-ring record header mismatch at byte_head=80
+        command-completion mismatches during abort/close
+        pgbench processed 0/10000 transactions before aborting
+        basebackup completed in 8.92 s
+
+Byte-ring-only WaitBatch attempt, ready_spin_limit=4096, byte target=1 MiB,
+with `HOMER_SERVICE_PAYLOAD_READY_SPIN_TARGET=1` to keep fixed-slot payload
+streams out of the WaitBatch branch:
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-byteonly-limit4096-target1m_mixed-pgbench-c4-basebackup_waitbatch-too-much-byteonly-limit4096-target1m-bytes64k_20260612_233126
+    run 1 completed but was badly degraded:
+        TPS 2140, p95 1.466 ms, p99 1.668 ms, basebackup real 14.17 s
+    run 2 failed before a complete measurement:
+        tuple result byte-ring record header mismatch at byte_head=80
+        command-completion mismatches during abort/close
+        pgbench processed 0/10000 transactions before aborting
+        basebackup completed in 8.99 s
+```
+
+These aggressive points should stay diagnostic-only, not plotted as clean
+performance data. They do answer the qualitative question: yes, making the wait
+large enough creates an obvious bad regime, but in the current prototype it hits
+foreground protocol/correctness instability before producing a stable warmed
+performance band. That instability is itself consistent with the scheduler
+motivation: a fixed service-loop wait can delay unrelated foreground result and
+completion progress so badly that lifecycle assumptions break. For paper text,
+use the correctness-preserving spin-limit sweep above as the main Figure 3b
+evidence, and mention this aggressive attempt only if we want a footnote-style
+guardrail that unbounded fixed waits are unsafe in this prototype.
+
+June 13 correction: the foreground instability above was a real tuple-result
+byte-ring ordering bug, not acceptable WaitBatch behavior. The Citus/Homer
+service now gates tuple-result byte posting on command-specific READY
+preparation and restricts the WaitBatch byte-ring wait to basebackup/bulk
+streams. After that fix, aggressive WaitBatch runs complete correctly and can be
+used as diagnostic performance evidence.
+
+Correctness fix validation, small WaitBatch sanity:
+
+```text
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit128-target256k-fixed_mixed-pgbench-c4-basebackup_waitbatch-fixed-limit128-target256k-bytes64k_20260613_022017
+    ready_spin_limit: 128
+    ready_spin_target_bytes: 262144
+    basebackup target:
+        homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=65536
+    run 1: warmup after service restart
+        pgbench 10000/10000, 0 failed, 3033 TPS, p99 0.950 ms
+        basebackup completed, real 8.37 s
+    warmed runs 2-3:
+        pgbench 10000/10000 each, 0 failed
+        TPS 6301-6381, p99 0.944-0.976 ms
+        basebackup real 4.11-4.14 s
+```
+
+This reproduces the earlier known-good WaitBatch band and shows the correctness
+fix did not poison the ordinary small-wait diagnostic point.
+
+Extreme "too much wait" after correctness fix:
+
+```text
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit65536-target8m-fixed_mixed-pgbench-c4-basebackup_waitbatch-fixed-limit65536-target8m-bytes64k_20260613_021623
+    ready_spin_limit: 65536
+    ready_spin_target_bytes: 8388608
+    basebackup target:
+        homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=65536
+    runs 1-2:
+        pgbench 10000/10000 each, 0 failed
+        TPS 414-443, p99 13.089-13.228 ms
+        basebackup completed, real 92.68-96.59 s
+```
+
+This is correct but too extreme for the main paper figure. It proves that a
+large fixed wait can make both foreground and background much worse, but the
+numbers are so large that they risk looking like an artificial failure instead
+of a useful scheduler-motivation tradeoff.
+
+Middle-ground "too much wait" point after correctness fix:
+
+```text
+/tmp/homer_fixed_loop_fixed-loop-waitbatch-limit16384-target8388608-tune_mixed-pgbench-c4-basebackup_waitbatch-tune-limit16384-target8388608-bytes64k_20260613_022714
+    ready_spin_limit: 16384
+    ready_spin_target_bytes: 8388608
+    basebackup target:
+        homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=65536
+    runs 1-2:
+        pgbench 10000/10000 each, 0 failed
+        TPS 1268-1634, p99 3.392-3.513 ms
+        basebackup completed, real 25.02-28.79 s
+```
+
+This is the cleaner diagnostic point for the "too much wait" story. Compared
+with the small-wait warmed band above, foreground throughput falls from about
+`6.3k TPS` to the `1.3k-1.6k TPS` range, p99 grows from about `0.95 ms` to
+about `3.5 ms`, and basebackup grows from about `4.1 s` to `25-29 s`. The
+result is still intentionally bad, but it is not the 90-second extreme. The
+paper framing should remain modest: hardcoded waiting can expose recoverable
+near-ready batching, but once the wait is too large it burns service cycles and
+delays unrelated foreground progress. A scheduler should decide when to post
+now, wait briefly, or defer based on current competing work rather than baking
+one static wait into every bulk payload visit.
+
 After the WaitBatch and full medium/large Limited-cap geometry diagnostics, the
 installed runtime was rebuilt, synced to `farnet0`, and restarted back to the
 default non-stats exhaustive service. Both hosts had matching
@@ -1849,6 +2045,15 @@ preflight artifact is
 `/tmp/homer_fixed_loop_fixed-loop-exhaustive_preflight_final-after-full-geometry-sweep-restore_20260612_210547`;
 it showed only the intended PostgreSQL postmasters and one Homer service on each
 host.
+
+After the later WaitBatch spin-limit sweep, the Citus/Homer service was rebuilt
+once with WaitBatch to verify the compile-warning cleanup, then rebuilt with
+default `CPPFLAGS='-D_GNU_SOURCE'`, installed, synced to `farnet0`, and restarted
+on both hosts. Both hosts then had matching default-service hash
+`9c2910e4f7883022bca51c97153223527eda4588159f9b3be9e08a976f98f91f`; process
+preflight showed only the intended PostgreSQL postmaster and one Homer service
+on each host. The later aggressive "too much wait" diagnostic attempt was also
+restored to the same default-service hash on both hosts.
 
 Run warmed repeats only after Stage 6 is clean. Compare each result first
 against the Stage -1 reference band to catch fishy numbers before drawing
