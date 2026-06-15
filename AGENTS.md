@@ -187,6 +187,13 @@ When source changes are involved, assume both Postgres and Citus/Homer must be
 rebuilt and reinstalled before validation unless the user explicitly asks for a
 lighter experiment.
 
+First confirm the active source paths for the current task. Some branches use
+`/data/dbcomm/postgres-citus-separate-comm-stack` and
+`/data/dbcomm/citus-dbcomm-separate-comm-stack`; other active worktrees use
+`/data/dbcomm/postgres-citus` and `/data/dbcomm/citus-dbcomm`. Use the checked
+out tree that contains the source changes being validated, and do not assume the
+example path is the active path.
+
 On `farnet1`:
 
 ```sh
@@ -207,7 +214,7 @@ make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
 sudo -n make install-headers install-service-bin install
 
 cd /data/dbcomm/postgres-citus-separate-comm-stack
-env CCACHE_DISABLE=1 ninja -C build src/backend/postgres src/bin/pg_basebackup/pg_basebackup
+env CCACHE_DISABLE=1 ninja -C build src/backend/postgres src/bin/pgbench/pgbench src/bin/pg_basebackup/pg_basebackup
 sudo -n meson install -C build --no-rebuild
 ```
 
@@ -217,12 +224,36 @@ For counter-based diagnosis, rebuild Citus/Homer with:
 CPPFLAGS='-D_GNU_SOURCE -DHOMER_SERVICE_PAYLOAD_STATS=1 -DHOMER_CLIENT_BASEBACKUP_STATS=1'
 ```
 
+For scheduler/action-grant diagnostics, include the service progress and peer
+transport stats switches:
+
+```sh
+CPPFLAGS='-D_GNU_SOURCE -DHOMER_SERVICE_PROGRESS_STATS=1 -DHOMER_SERVICE_PEER_TRANSPORT_STATS=1'
+```
+
+Do not leave a stats-enabled `build/homer/citus_tuple_sink_service` behind before
+performance runs. After a compile-only diagnostic check with stats switches,
+rebuild the service/client binaries again with only `CPPFLAGS='-D_GNU_SOURCE'`
+and reinstall.
+
 If the install prefix is not writable by the current user, run the Postgres
 install command with the same privilege style used for Citus:
 
 ```sh
 sudo -n ninja -C /data/dbcomm/postgres-citus-separate-comm-stack/build install
 ```
+
+If Citus/Homer build artifacts are owned by `dbcomm`, a normal user build may
+fail while linking `build/homer/citus_tuple_sink_service`. In that case build the
+service/client binaries as the owner instead of changing ownership mid-run:
+
+```sh
+sudo -n -u dbcomm make -j8 service-bin client-bin
+```
+
+For forced `make -B` diagnostic rebuilds, configure artifacts may be owned by a
+different user than the build artifacts. Use one consistent privilege style for
+the whole forced rebuild, and then return to the no-stats build for performance.
 
 Important installed artifacts include:
 
@@ -231,6 +262,17 @@ Important installed artifacts include:
 - `/data/dbcomm/pg-citus/bin/pg_basebackup`
 - `/data/dbcomm/pg-citus/bin/citus_tuple_sink_service`
 - `/data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so`
+
+After changing shared Homer protocol headers or client/service control-region
+names, verify the installed binaries agree before running pgbench. A stale
+`pgbench` or `libhomer_client.a` can silently map an old control shared-memory
+name while the service uses the new one.
+
+```sh
+strings /data/dbcomm/pg-citus/bin/pgbench | grep citus_remote_execution_control
+strings /data/dbcomm/pg-citus/bin/citus_tuple_sink_service | grep citus_remote_execution_control
+strings /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/libhomer_client.a | grep citus_remote_execution_control
+```
 
 ## Sync farnet1 artifacts to farnet0
 
@@ -250,7 +292,21 @@ rsync -azn --delete --itemize-changes --exclude data/ \
   farnet0:/data/dbcomm/pg-citus/
 ```
 
-Remove `-n` only after the dry-run looks correct.
+Remove `-n` only after the dry-run looks correct. If the remote install prefix
+is root-owned, use remote sudo for the receiver. Exclude root-owned local logs
+from the sender side; they are not needed for binary/runtime validation and can
+make rsync return code `23` even after the important artifacts copied.
+
+```sh
+rsync -az --delete \
+  --exclude data/ \
+  --exclude '*.log' \
+  --exclude logfile \
+  --exclude stage_tmp/ \
+  --rsync-path='sudo -n rsync' \
+  /data/dbcomm/pg-citus/ \
+  farnet0:/data/dbcomm/pg-citus/
+```
 
 ## Clean runtime baseline
 
@@ -284,6 +340,24 @@ IPC and remove only objects clearly owned by this prototype run:
 ipcs -m
 ls -lh /dev/shm | grep -E 'citus|homer|remote_exec'
 ```
+
+The shared-memory files have different owners in the runtime lifecycle:
+
+- `/dev/shm/citus_remote_execution_control_*` is created by
+  `citus_tuple_sink_service`.
+- `/dev/shm/citus_remote_exec_cmd_*`, `/dev/shm/citus_remote_exec_cpl_*`, and
+  `/dev/shm/citus_remote_exec_client_cpl_*` are per-client/per-session command
+  and completion rings.
+- `/dev/shm/citus_remote_exec_backend_spawn_v*` is created by the PostgreSQL
+  backend bridge when PostgreSQL starts.
+- `/dev/shm/citus_res_*` files are payload/result queues created by active or
+  recently active Homer sessions.
+
+For a hard clean baseline, stop PostgreSQL, stop Homer services, stop clients,
+then remove only the Homer files for this prototype run. If
+`citus_remote_exec_backend_spawn_v*` is removed after PostgreSQL has already
+started, restart PostgreSQL before running `pgbench --homer`; otherwise clients
+will fail to open the backend-spawn region.
 
 Do not remove unrelated shared memory from other users' experiments.
 
@@ -431,6 +505,25 @@ done
   `--homer-peer-host 10.10.1.102`, and the two Homer services carry commands,
   completions, and tuple-result payloads over RDMA to the farnet1 PostgreSQL
   backend.
+
+Treat these as different validation tiers:
+
+- Local farnet1 pgbench validates the local Homer control path, local
+  `CLIENT_SQL_SESSION`, socketless backend spawn, and local result-sink flow.
+  It is useful as a fast smoke test and local scheduler-overhead check.
+- Local farnet1 pgbench does **not** validate farnet0 service startup, artifact
+  sync, RDMA connection setup, peer-control request/response progress,
+  peer-control send-CQ retirement, remote command transport, or remote result
+  payload transport.
+- Any scheduler, peer-control, RDMA, or cross-node command/result change needs at
+  least the farnet0-to-farnet1 RDMA single-client smoke before correctness is
+  claimed. Use the remote multi-client run when the change can affect fairness,
+  resource retirement, batching, or shared transport scaling.
+
+Before a remote RDMA pgbench run, sync the rebuilt Postgres, Citus/Homer, and
+install-prefix artifacts from farnet1 to farnet0 using the rsync section above.
+Then run the process preflight on both hosts and start both Homer services with
+their host-specific bind addresses.
 
 CPU placement matters for the current farnet1-local path because frontend,
 service, and socketless backend busy-poll shared cache lines. On the current
