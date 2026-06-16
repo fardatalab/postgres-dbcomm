@@ -871,6 +871,7 @@ peer-control ownership boundaries are cleaner after each staged split
 - [`service_progress_control_data_plane_scheduler.md`](service_progress_control_data_plane_scheduler.md) is the canonical current-state note for the existing `machine-baseline` scheduler, including the state-machine plus collector milestone history.
 - [`homer_transport_scheduler_and_payload_streams.md`](homer_transport_scheduler_and_payload_streams.md) is the broader transport scheduler and payload-stream future-direction note. This note narrows the next scheduler redesign into the unified aggregate-action milestone.
 - [`homer_payload_control_unification_plan.md`](homer_payload_control_unification_plan.md) covers payload/control lifecycle unification that this scheduler plan depends on but does not replace.
+- [`peer_client_completion_publication_pipeline_plan.md`](peer_client_completion_publication_pipeline_plan.md) is the narrower prerequisite cleanup for cross-node client-SQL completion publication. It should land before the scheduler migration depends on staged `PUBLISH_COMMAND_COMPLETIONS` and source-credit-driven `DRAIN_SEND_CQ` facts.
 - [`rdma_publication_visibility_and_doorbells.md`](rdma_publication_visibility_and_doorbells.md) remains the publication/visibility grounding for local signal and remote notification policy.
 
 ## Open questions / TODO
