@@ -132,13 +132,37 @@ Status as of June 17, 2026 on `homer-state-machine-scheduler-milestone`:
   path. The final WR carries a peer-client-completion WR-id tag routed by
   [`TupleSinkServiceHandleTaggedSendCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1643),
   and the command-send CQ drain retires source slots through
-  [`HomerServiceHandlePeerClientCompletionPublishCqeFromDrain()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10221).
-  Workload validation and performance comparison are still required after
-  install/sync.
+  [`HomerServiceHandlePeerClientCompletionPublishCqeFromDrain()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10247).
+  The first validation exposed and fixed an owner-state bug in
+  [`TupleSinkServiceReservePeerClientCompletionPublishCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3577):
+  the source slot may already be `POSTED` after the body/ready WRs when the
+  final checkpoint owner is attached. With that fix, remote RDMA c1 passed, but
+  remote RDMA c4 failed correctness under pressure; do not treat Slice 4/5 as
+  accepted yet.
 - Part of Slice 6 is already present as scaffolding: candidate construction sees
   staged peer-client completion publication even when the backend completion
   ring is empty, and maps source-credit pressure to command/control send-CQ
   relief rather than payload-frontier wait.
+
+Validation evidence on June 17, 2026:
+
+- Installed Citus/Homer commit `8c5c93628` on both farnet hosts, no-stats build
+  with `CPPFLAGS='-D_GNU_SOURCE'`.
+- Current fast-link validation used `farnet1 10.10.1.101/enp33s0f0np0` to
+  `farnet0 10.10.1.100/enp33s0f0np0`; both links reported `400000Mb/s`, four
+  lanes, link detected.
+- Remote RDMA c1 smoke after the fix completed `1000/1000`, zero failures.
+  Warm repeats completed `20000/20000`, zero failures, at about `4213 TPS`
+  and `3807 TPS`, with p99 about `0.258 ms` and `0.288 ms`.
+- Remote RDMA c4 rejected the slice for multi-client correctness: one run
+  aborted after `15209/40000` transactions with tuple result byte-ring header
+  mismatches and a pushed-completion sequence mismatch
+  `expected sequence=25693 got sequence=25686`. That seven-gap shape matches
+  the known weak publication/visibility issue, not a scheduler-policy decision.
+- Service logs also showed stale peer-client completion checkpoint CQEs after
+  the aborted c4 cleanup. Treat those stale CQEs as cleanup fallout unless they
+  reproduce before any client-side mismatch; the first correctness failure to
+  address is the published completion/result visibility ordering under c4.
 
 ## Implementation plan
 
