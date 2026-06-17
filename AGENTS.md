@@ -6,8 +6,13 @@ This project uses two source trees:
 - Citus/Homer fork: `/data/dbcomm/citus-dbcomm-separate-comm-stack`
 
 The installed runtime prefix is `/data/dbcomm/pg-citus`. The runtime user is
-`dbcomm`. Build or install commands may need to run as `dbcomm`, or with
-`sudo -n`, depending on file ownership in the current checkout.
+`dbcomm`. The intended steady state is that build directories, installed
+executables/libraries/headers, and workload-created runtime files are owned by
+`dbcomm`. Run build, install, service, and workload commands as `dbcomm`; if the
+interactive shell is another user, use `sudo -n -u dbcomm ...` only to switch to
+`dbcomm`, not to produce root-owned build or install artifacts. If root-owned or
+developer-user-owned build artifacts appear, fix ownership before continuing
+instead of mixing privilege styles.
 
 The project is a database systems research prototype for communication-stack
 efficiency and offload. New Homer code should live under an appropriate
@@ -32,26 +37,32 @@ Current filesystem facts:
 - Avoid syncing live database data directories unless PostgreSQL is stopped and
   replacing that data directory is the explicit goal.
 
-Fast-link addresses verified on June 12, 2026:
+Fast-link addresses verified on June 17, 2026:
 
 - `farnet0`: `10.10.1.100`
-- `farnet1`: `10.10.1.102`
+- `farnet1`: `10.10.1.101`
 - `farnet0` DPU (`ssh farnet0`, then `ssh dpu`): `10.10.1.200`
 - `farnet1` DPU (`ssh dpu` from `farnet1`): `10.10.1.202`
 
-The second fast-link addresses were also configured at that time:
+The second host fast-link addresses were also configured at that time:
 
-- `farnet0` host: `10.10.1.101`
-- `farnet1` host: `10.10.1.103`
+- `farnet0` host: `10.10.2.100`
+- `farnet1` host: `10.10.2.101`
 - `farnet0` DPU: `10.10.1.201`
 - `farnet1` DPU: `10.10.1.203`
 
 Both host fast-link ports and both DPU fast-link ports reported `400000Mb/s`,
-4 lanes, full duplex, and link detected. Because both farnet host fast-link
-addresses are in the same `10.10.1.0/24` subnet, Linux route selection is
-ambiguous without source-policy routing. On June 12, 2026,
-`ip route get 10.10.1.102 from 10.10.1.101` on `farnet0` selected
-`enp33s0f0np0`, which made cross-lane TCP/RDMA setup asymmetric.
+4 lanes, full duplex, and link detected. The current host setup uses separate
+subnets for the two fast-link host lanes:
+
+- lane 0: `farnet1 10.10.1.101/enp33s0f0np0/mlx5_0` to
+  `farnet0 10.10.1.100/enp33s0f0np0/mlx5_0`
+- lane 1: `farnet1 10.10.2.101/enp33s0f1np1/mlx5_1` to
+  `farnet0 10.10.2.100/enp33s0f1np1/mlx5_1`
+
+Older notes in this file may mention the June 12 same-subnet shape
+`10.10.1.102/10.10.1.103` on `farnet1`; that setup is stale for current
+validation runs.
 
 For raw reproduction of the current cross-lane failure, leave the host routing
 state unmodified and run the cross-lane `ib_read_bw` commands below. In that
@@ -62,12 +73,12 @@ you explicitly want to remove the host reply-route ambiguity:
 
 ```sh
 # farnet1
-sudo -n ip route replace 10.10.1.0/24 dev enp33s0f0np0 src 10.10.1.102 table 1100
-sudo -n ip route replace 10.10.1.0/24 dev enp33s0f1np1 src 10.10.1.103 table 1101
+sudo -n ip route replace 10.10.1.0/24 dev enp33s0f0np0 src 10.10.1.101 table 1100
+sudo -n ip route replace 10.10.2.0/24 dev enp33s0f1np1 src 10.10.2.101 table 1101
 sudo -n ip rule del priority 1100 2>/dev/null || true
 sudo -n ip rule del priority 1101 2>/dev/null || true
-sudo -n ip rule add priority 1100 from 10.10.1.102/32 table 1100
-sudo -n ip rule add priority 1101 from 10.10.1.103/32 table 1101
+sudo -n ip rule add priority 1100 from 10.10.1.101/32 table 1100
+sudo -n ip rule add priority 1101 from 10.10.2.101/32 table 1101
 sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_ignore=1
 sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.arp_ignore=1
 sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_announce=2
@@ -79,11 +90,11 @@ sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.rp_filter=0
 
 # farnet0
 ssh farnet0 "sudo -n ip route replace 10.10.1.0/24 dev enp33s0f0np0 src 10.10.1.100 table 1100"
-ssh farnet0 "sudo -n ip route replace 10.10.1.0/24 dev enp33s0f1np1 src 10.10.1.101 table 1101"
+ssh farnet0 "sudo -n ip route replace 10.10.2.0/24 dev enp33s0f1np1 src 10.10.2.100 table 1101"
 ssh farnet0 "sudo -n ip rule del priority 1100 2>/dev/null || true"
 ssh farnet0 "sudo -n ip rule del priority 1101 2>/dev/null || true"
 ssh farnet0 "sudo -n ip rule add priority 1100 from 10.10.1.100/32 table 1100"
-ssh farnet0 "sudo -n ip rule add priority 1101 from 10.10.1.101/32 table 1101"
+ssh farnet0 "sudo -n ip rule add priority 1101 from 10.10.2.100/32 table 1101"
 ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_ignore=1"
 ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f1np1.arp_ignore=1"
 ssh farnet0 "sudo -n sysctl -w net.ipv4.conf.enp33s0f0np0.arp_announce=2"
@@ -101,27 +112,28 @@ Those commands are runtime state. Revert them with `ip rule del priority
 the chosen policy into persistent host network configuration.
 
 For RDMA/RoCE verification, use `ibdev2netdev`, `show_gids`, and `ib_read_bw`
-with explicit devices and GID indices. On June 12, 2026, `mlx5_0` mapped to
-`enp33s0f0np0`, `mlx5_1` mapped to `enp33s0f1np1`, and IPv4 RoCE v2 used GID
-index `3` on both hosts. Short `ib_read_bw` sanity runs established RC QPs and
-moved data on both links:
+with explicit devices and GID indices. In the current June 17, 2026 address
+plan, `mlx5_0` maps to `enp33s0f0np0`, `mlx5_1` maps to `enp33s0f1np1`, and
+IPv4 RoCE v2 uses GID index `3` on both hosts. Short `ib_read_bw` sanity runs
+on the earlier June 12 address plan established RC QPs and moved data on both
+links:
 
-- `mlx5_0`, `10.10.1.102 -> 10.10.1.100`: single-QP read reached about
+- `mlx5_0`, farnet1 lane 0 -> farnet0 lane 0: single-QP read reached about
   `62 Gbit/s`
-- `mlx5_1`, `10.10.1.103 -> 10.10.1.101`: single-QP read reached about
+- `mlx5_1`, farnet1 lane 1 -> farnet0 lane 1: single-QP read reached about
   `90 Gbit/s`; an 8-QP read run reached about `259 Gbit/s`
 
-Cross-port `ib_read_bw` did **not** pass in the June 12 check:
+Cross-port `ib_read_bw` did **not** pass in the June 12 same-subnet check:
 
-- `farnet1 mlx5_0 / 10.10.1.102 -> farnet0 mlx5_1 / 10.10.1.101`
+- farnet1 lane 0 -> farnet0 lane 1
   failed fixed-iteration RDMA reads with `transport retry counter exceeded`
-- `farnet1 mlx5_1 / 10.10.1.103 -> farnet0 mlx5_0 / 10.10.1.100`
+- farnet1 lane 1 -> farnet0 lane 0
   failed fixed-iteration RDMA reads with `transport retry counter exceeded`
 - retrying the first cross-port direction with GID index `2` also failed, so
   this was not only a RoCE v2 GID-index issue
 - as a separate diagnostic, applying source-policy routes and ARP controls made
   the cross-lane test fail earlier at ARP/connectivity level; `tcpdump` on
-  `farnet0` showed the ARP request from `farnet1` port0 for `10.10.1.101`
+  `farnet0` showed the ARP request from `farnet1` port0 for the peer lane-1 IP
   arriving on `farnet0` port0 while `farnet0` port1 saw no packet, and the
   reverse cross direction showed the symmetric behavior on port1
 
@@ -140,16 +152,18 @@ before a benchmark if the machines were rebooted or renumbered:
 ip -br addr
 ip route
 ip rule
-ip route get 10.10.1.101 from 10.10.1.102
-ssh farnet0 "ip rule; ip route get 10.10.1.102 from 10.10.1.101"
+ip route get 10.10.1.100 from 10.10.1.101
+ip route get 10.10.2.100 from 10.10.2.101
+ssh farnet0 "ip rule; ip route get 10.10.1.101 from 10.10.1.100"
+ssh farnet0 "ip rule; ip route get 10.10.2.101 from 10.10.2.100"
 ethtool enp33s0f0np0 | egrep 'Speed:|Lanes:|Link detected:'
 ethtool enp33s0f1np1 | egrep 'Speed:|Lanes:|Link detected:'
 ibdev2netdev
 show_gids
-ping -c 1 -W 1 -I 10.10.1.102 10.10.1.100
-ping -c 1 -W 1 -I 10.10.1.103 10.10.1.101
-ping -c 1 -W 1 -I 10.10.1.102 10.10.1.101
-ping -c 1 -W 1 -I 10.10.1.103 10.10.1.100
+ping -c 1 -W 1 -I 10.10.1.101 10.10.1.100
+ping -c 1 -W 1 -I 10.10.2.101 10.10.2.100
+ping -c 1 -W 1 -I 10.10.1.101 10.10.2.100
+ping -c 1 -W 1 -I 10.10.2.101 10.10.1.100
 ssh farnet0 "ip -br addr; ip route; ip rule"
 ssh dpu "ip -br addr; ip route"
 ssh farnet0 "ssh dpu 'ip -br addr; ip route'"
@@ -159,26 +173,26 @@ For a quick RDMA check of the two farnet host links, run the server on `farnet0`
 and the client on `farnet1` with matching devices:
 
 ```sh
-# Lane 0: farnet1 10.10.1.102/mlx5_0 to farnet0 10.10.1.100/mlx5_0.
+# Lane 0: farnet1 10.10.1.101/mlx5_0 to farnet0 10.10.1.100/mlx5_0.
 ssh farnet0 "ib_read_bw -d mlx5_0 -i 1 -x 3 -F --report_gbits -s 1048576 -D 5 -p 18550"
 ib_read_bw -d mlx5_0 -i 1 -x 3 -F --report_gbits -s 1048576 -D 5 \
-  -p 18550 --bind_source_ip 10.10.1.102 10.10.1.100
+  -p 18550 --bind_source_ip 10.10.1.101 10.10.1.100
 
-# Lane 1: farnet1 10.10.1.103/mlx5_1 to farnet0 10.10.1.101/mlx5_1.
+# Lane 1: farnet1 10.10.2.101/mlx5_1 to farnet0 10.10.2.100/mlx5_1.
 ssh farnet0 "ib_read_bw -d mlx5_1 -i 1 -x 3 -F --report_gbits -s 1048576 -D 5 -p 18551"
 ib_read_bw -d mlx5_1 -i 1 -x 3 -F --report_gbits -s 1048576 -D 5 \
-  -p 18551 --bind_source_ip 10.10.1.103 10.10.1.101
+  -p 18551 --bind_source_ip 10.10.2.101 10.10.2.100
 
 # Cross-lane checks should also pass if the switch is configured as a full mesh.
 # These failed with transport retries on June 12, 2026 and should be rerun after
 # any switch, VLAN, routing, or RoCE configuration change.
 ssh farnet0 "ib_read_bw -d mlx5_1 -i 1 -x 3 -F --report_gbits -s 1048576 -n 1000 -p 18556"
 ib_read_bw -d mlx5_0 -i 1 -x 3 -F --report_gbits -s 1048576 -n 1000 \
-  -p 18556 --bind_source_ip 10.10.1.102 10.10.1.101
+  -p 18556 --bind_source_ip 10.10.1.101 10.10.2.100
 
 ssh farnet0 "ib_read_bw -d mlx5_0 -i 1 -x 3 -F --report_gbits -s 1048576 -n 1000 -p 18557"
 ib_read_bw -d mlx5_1 -i 1 -x 3 -F --report_gbits -s 1048576 -n 1000 \
-  -p 18557 --bind_source_ip 10.10.1.103 10.10.1.100
+  -p 18557 --bind_source_ip 10.10.2.101 10.10.1.100
 ```
 
 ## Build and install
@@ -198,11 +212,11 @@ On `farnet1`:
 
 ```sh
 cd /data/dbcomm/postgres-citus-separate-comm-stack
-ninja -C build install
+sudo -n -u dbcomm ninja -C build install
 
 cd /data/dbcomm/citus-dbcomm-separate-comm-stack
-make -j8
-sudo -n make install-headers install-service-bin install
+sudo -n -u dbcomm make -j8
+sudo -n -u dbcomm make install-headers install-service-bin install
 ```
 
 For Homer performance measurements, build the service/client library without
@@ -210,12 +224,12 @@ the stats macros:
 
 ```sh
 cd /data/dbcomm/citus-dbcomm-separate-comm-stack
-make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
-sudo -n make install-headers install-service-bin install
+sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make install-headers install-service-bin install
 
 cd /data/dbcomm/postgres-citus-separate-comm-stack
-env CCACHE_DISABLE=1 ninja -C build src/backend/postgres src/bin/pgbench/pgbench src/bin/pg_basebackup/pg_basebackup
-sudo -n meson install -C build --no-rebuild
+sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build src/backend/postgres src/bin/pgbench/pgbench src/bin/pg_basebackup/pg_basebackup
+sudo -n -u dbcomm meson install -C build --no-rebuild
 ```
 
 For counter-based diagnosis, rebuild Citus/Homer with:
@@ -236,24 +250,43 @@ performance runs. After a compile-only diagnostic check with stats switches,
 rebuild the service/client binaries again with only `CPPFLAGS='-D_GNU_SOURCE'`
 and reinstall.
 
-If the install prefix is not writable by the current user, run the Postgres
-install command with the same privilege style used for Citus:
+The normal ownership invariant is:
+
+- `/data/dbcomm/postgres-citus*/build` is owned by `dbcomm:dbcomm`.
+- `/data/dbcomm/citus-dbcomm*/build` is owned by `dbcomm:dbcomm`.
+- `/data/dbcomm/pg-citus` installed artifacts are owned by `dbcomm:dbcomm`.
+
+Do not fix a build failure by running install as root. That leaves root-owned
+`build/.ninja_log`, Meson metadata, binaries, libraries, or headers, and later
+normal `dbcomm` builds fail while writing the build log or replacing installed
+artifacts. If ownership drift occurs, normalize it explicitly:
 
 ```sh
-sudo -n ninja -C /data/dbcomm/postgres-citus-separate-comm-stack/build install
+sudo -n chown -R dbcomm:dbcomm \
+  /data/dbcomm/postgres-citus*/build \
+  /data/dbcomm/citus-dbcomm*/build \
+  /data/dbcomm/pg-citus
 ```
 
-If Citus/Homer build artifacts are owned by `dbcomm`, a normal user build may
-fail while linking `build/homer/citus_tuple_sink_service`. In that case build the
-service/client binaries as the owner instead of changing ownership mid-run:
+Then rerun the failing build or install command as `dbcomm`. If you are already
+logged in as `dbcomm`, omit the `sudo -n -u dbcomm` prefix. If you are logged in
+as another user, use `sudo -n -u dbcomm` consistently for the whole forced
+rebuild/install:
 
 ```sh
-sudo -n -u dbcomm make -j8 service-bin client-bin
+cd /data/dbcomm/citus-dbcomm-separate-comm-stack
+sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make install-headers install-service-bin install
+
+cd /data/dbcomm/postgres-citus-separate-comm-stack
+sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build src/bin/pgbench/pgbench
+sudo -n -u dbcomm meson install -C build --no-rebuild
 ```
 
-For forced `make -B` diagnostic rebuilds, configure artifacts may be owned by a
-different user than the build artifacts. Use one consistent privilege style for
-the whole forced rebuild, and then return to the no-stats build for performance.
+For forced `make -B` diagnostic rebuilds, configure artifacts and build
+artifacts must have the same owner. Use one consistent `dbcomm` privilege style
+for the whole forced rebuild, and then return to the no-stats build for
+performance.
 
 Important installed artifacts include:
 
@@ -292,10 +325,11 @@ rsync -azn --delete --itemize-changes --exclude data/ \
   farnet0:/data/dbcomm/pg-citus/
 ```
 
-Remove `-n` only after the dry-run looks correct. If the remote install prefix
-is root-owned, use remote sudo for the receiver. Exclude root-owned local logs
-from the sender side; they are not needed for binary/runtime validation and can
-make rsync return code `23` even after the important artifacts copied.
+Remove `-n` only after the dry-run looks correct. The installed prefix should be
+owned by `dbcomm` on both hosts, so the receiver should also run as `dbcomm`.
+Exclude local logs from the sender side; they are not needed for binary/runtime
+validation and can make rsync return code `23` even after the important
+artifacts copied.
 
 ```sh
 rsync -az --delete \
@@ -303,7 +337,7 @@ rsync -az --delete \
   --exclude '*.log' \
   --exclude logfile \
   --exclude stage_tmp/ \
-  --rsync-path='sudo -n rsync' \
+  --rsync-path='sudo -n -u dbcomm rsync' \
   /data/dbcomm/pg-citus/ \
   farnet0:/data/dbcomm/pg-citus/
 ```
@@ -424,25 +458,25 @@ Use code-level pinning instead of `taskset`. Keep CPU sets disjoint across:
 Example `farnet1` service for pgbench and local basebackup sender:
 
 ```sh
-sudo -n -u dbcomm env \
+sudo -n -u dbcomm sh -c 'env \
   HOMER_SERVICE_CPU=2 \
   HOMER_REMOTE_EXEC_BACKEND_CPUS=4,5,6,7 \
-  HOMER_SERVICE_PEER_BIND_HOST=10.10.1.102 \
+  HOMER_SERVICE_PEER_BIND_HOST=10.10.1.101 \
   HOMER_SERVICE_PEER_PORT=9717 \
   /data/dbcomm/pg-citus/bin/citus_tuple_sink_service \
-  > /data/dbcomm/pg-citus/data/homer_service_farnet1.log 2>&1 &
+  > /data/dbcomm/pg-citus/data/homer_service_farnet1.log 2>&1 &'
 ```
 
 Example `farnet0` receiver service for RDMA basebackup:
 
 ```sh
-ssh farnet0 "sudo -n -u dbcomm env \
+ssh farnet0 "sudo -n -u dbcomm sh -c 'env \
   HOMER_SERVICE_CPU=2 \
   HOMER_REMOTE_EXEC_BACKEND_CPUS=4,5,6,7 \
   HOMER_SERVICE_PEER_BIND_HOST=10.10.1.100 \
   HOMER_SERVICE_PEER_PORT=9717 \
   /data/dbcomm/pg-citus/bin/citus_tuple_sink_service \
-  > /data/dbcomm/pg-citus/data/homer_service_farnet0.log 2>&1 &"
+  > /data/dbcomm/pg-citus/data/homer_service_farnet0.log 2>&1 &'"
 ```
 
 Two hosts can both listen on port `9717`. If two services are started on the
@@ -502,7 +536,7 @@ done
   opens a local `CLIENT_SQL_SESSION`, and drives a socketless backend on
   farnet1.
 - farnet0-to-farnet1 RDMA: pgbench maps the farnet0 Homer service, passes
-  `--homer-peer-host 10.10.1.102`, and the two Homer services carry commands,
+  `--homer-peer-host 10.10.1.101`, and the two Homer services carry commands,
   completions, and tuple-result payloads over RDMA to the farnet1 PostgreSQL
   backend.
 
@@ -555,7 +589,7 @@ ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
   --homer \
   --homer-database-oid '$DBOID' \
   --homer-user-oid '$USEROID' \
-  --homer-peer-host 10.10.1.102 \
+  --homer-peer-host 10.10.1.101 \
   --homer-peer-port 9717 \
   --homer-peer-node 1 \
   --latency-percentiles \
@@ -584,7 +618,7 @@ ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
   --homer \
   --homer-database-oid '$DBOID' \
   --homer-user-oid '$USEROID' \
-  --homer-peer-host 10.10.1.102 \
+  --homer-peer-host 10.10.1.101 \
   --homer-peer-port 9717 \
   --homer-peer-node 1 \
   --latency-percentiles \
@@ -737,7 +771,7 @@ ssh farnet0 \
      --homer \
      --homer-database-oid 5 \
      --homer-user-oid 10 \
-     --homer-peer-host 10.10.1.102 \
+     --homer-peer-host 10.10.1.101 \
      --homer-peer-port 9717 \
      --homer-peer-node 1 \
      --latency-percentiles \
@@ -780,7 +814,7 @@ ssh farnet0 \
      --homer \
      --homer-database-oid 5 \
      --homer-user-oid 10 \
-     --homer-peer-host 10.10.1.102 \
+     --homer-peer-host 10.10.1.101 \
      --homer-peer-port 9717 \
      --homer-peer-node 1 \
      --latency-percentiles \
