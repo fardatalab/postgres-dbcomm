@@ -107,15 +107,15 @@ Status as of June 17, 2026 on `homer-state-machine-scheduler-milestone`:
   mailbox has slot-local `readyEpochSlots`, version/size/slot-count gating, and
   client-side stable slot reads. Workload validation is still required after
   install/sync.
-- Slice 2 is partially implemented and compile-checked: peer-client completion
+- Slice 2 is implemented and compile-checked: peer-client completion
   publication now owns a per-session registered source ring and posts the
   completion body, ready epoch, and aggregate published epoch from that ring.
-  The immediate cleanup decision is that
-  [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12681)
-  should reserve a source slot first and fill `sourceSlot->completion` directly,
-  not build a separate scratch completion and copy it into the source slot. This
-  is not true zero copy, but it removes the avoidable intermediate completion
-  image while preserving service-side transformation and source-slot ownership.
+  [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12980)
+  now reserves a source slot first and fills `sourceSlot->completion` directly,
+  rather than building a separate scratch completion and copying it into the
+  source slot. This is not true zero copy, but it removes the avoidable
+  intermediate completion image while preserving service-side transformation
+  and source-slot ownership.
 - Slice 3 is implemented in code and compile-checked: the session has staged
   publication metadata (`peerClientCompletionPublishPending`,
   `peerClientCompletionPublishPendingSequence`,
@@ -124,13 +124,21 @@ Status as of June 17, 2026 on `homer-state-machine-scheduler-milestone`:
   backend completion-ring record. Source-credit blockage is represented as
   `HOMER_PROGRESS_REASON_COMPLETION_PUBLISH_SOURCE_CREDIT` and is not added to
   the payload semantic deferred list.
+- Slice 4 and Slice 5 are implemented and compile-checked at the code level:
+  peer-client completion publication now posts the final aggregate epoch with
+  [`TupleSinkServicePostPeerRegisteredClientCompletionBytesRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5847)
+  instead of the blocking
+  [`TupleSinkServiceWriteConnectionBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4509)
+  path. The final WR carries a peer-client-completion WR-id tag routed by
+  [`TupleSinkServiceHandleTaggedSendCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1643),
+  and the command-send CQ drain retires source slots through
+  [`HomerServiceHandlePeerClientCompletionPublishCqeFromDrain()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10221).
+  Workload validation and performance comparison are still required after
+  install/sync.
 - Part of Slice 6 is already present as scaffolding: candidate construction sees
   staged peer-client completion publication even when the backend completion
   ring is empty, and maps source-credit pressure to command/control send-CQ
   relief rather than payload-frontier wait.
-- Slice 4 and Slice 5 are not complete: the final aggregate epoch write still
-  uses a blocking signaled helper on this path, and source slots are still
-  released after that blocking write instead of by tagged send-CQ retirement.
 
 ## Implementation plan
 
@@ -268,10 +276,10 @@ Acceptance:
 
 ### Slice 4: asynchronous post helper
 
-Status: replaces the blocking helper on this path only.
+Status: implemented and compile-checked; workload validation pending.
 
-1. Keep [`TupleSinkServiceWriteConnectionBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4433) and
-   [`TupleSinkServiceWritePeerUint64Rdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6258) synchronous.
+1. Keep [`TupleSinkServiceWriteConnectionBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4509) and
+   [`TupleSinkServiceWritePeerUint64Rdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6359) synchronous.
 2. Add a dedicated helper such as
    `TupleSinkServiceTryPostPeerClientCompletionAsync()` with explicit result
    values:
@@ -302,7 +310,7 @@ Acceptance:
 
 ### Slice 5: tagged send-CQ retirement
 
-Status: completes local source-lifetime cleanup.
+Status: implemented and compile-checked; workload validation pending.
 
 1. Add a tagged WR kind for peer-client completion publication checkpoints in the
    same tagged completion dispatch family as command/payload completions.
