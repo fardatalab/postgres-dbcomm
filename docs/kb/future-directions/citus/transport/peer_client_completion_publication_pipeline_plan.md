@@ -124,21 +124,69 @@ Status as of June 17, 2026 on `homer-state-machine-scheduler-milestone`:
   backend completion-ring record. Source-credit blockage is represented as
   `HOMER_PROGRESS_REASON_COMPLETION_PUBLISH_SOURCE_CREDIT` and is not added to
   the payload semantic deferred list.
-- Slice 4 and Slice 5 are implemented and compile-checked at the code level:
-  peer-client completion publication now posts the final aggregate epoch with
-  [`TupleSinkServicePostPeerRegisteredClientCompletionBytesRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5847)
-  instead of the blocking
-  [`TupleSinkServiceWriteConnectionBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4509)
-  path. The final WR carries a peer-client-completion WR-id tag routed by
-  [`TupleSinkServiceHandleTaggedSendCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1643),
-  and the command-send CQ drain retires source slots through
-  [`HomerServiceHandlePeerClientCompletionPublishCqeFromDrain()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10247).
+- Slice 4 and Slice 5 were implemented first as a three-WR memory-polled
+  variant: peer-client completion publication posted the completion body,
+  slot-local ready epoch, and aggregate published epoch with async one-sided
+  writes instead of the blocking
+  [`TupleSinkServiceWriteConnectionBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4675)
+  path. The final WR carried a peer-client-completion WR-id tag routed by
+  [`TupleSinkServiceHandleTaggedSendCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1777),
+  and the command-send CQ drain retired source slots through
+  [`HomerServiceHandlePeerClientCompletionPublishCqeFromDrain()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10332).
   The first validation exposed and fixed an owner-state bug in
-  [`TupleSinkServiceReservePeerClientCompletionPublishCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3577):
+  [`TupleSinkServiceReservePeerClientCompletionPublishCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3660):
   the source slot may already be `POSTED` after the body/ready WRs when the
   final checkpoint owner is attached. With that fix, remote RDMA c1 passed, but
-  remote RDMA c4 failed correctness under pressure; do not treat Slice 4/5 as
-  accepted yet.
+  remote RDMA c4 failed correctness under pressure.
+- The remote RDMA c4 failure invalidated the earlier plan ordering that treated
+  the three-WR memory-polled completion path as the correctness baseline and
+  postponed `RDMA_WRITE_WITH_IMM` to a later policy experiment. Slice 4b is now
+  implemented as a correctness bridge for a responder-visible
+  `WRITE_WITH_IMM` publication gate. The normal path in
+  [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13091)
+  posts one fixed-size `RDMA_WRITE_WITH_IMM` through
+  [`TupleSinkServicePostPeerRegisteredClientCompletionBytesWithImmediateRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6052).
+  The receiver handles the immediate in
+  [`TupleSinkServiceHandlePeerClientCompletionDoorbell()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18776)
+  and publishes receiver-local `readyEpochSlots[]` and `publishedEpoch` with CPU
+  stores. This validates the ordering idea, but it is not the final hot-path
+  design because it puts receiver-service CQ parsing, token demux, session lookup,
+  and CPU publication in front of the frontend client's normal memory polling.
+- The next target is Slice 4c: a host-fast-path self-publishing WIMM ready-word
+  path implemented as one body `RDMA_WRITE` followed by one
+  `RDMA_WRITE_WITH_IMM` whose payload is the 8-byte
+  `readyEpochSlots[slotIndex]` word that the frontend client already polls. This
+  is the implementation target because same-message body-before-ready visibility
+  is not established as a usable invariant on the current farnet setup. A future
+  one-WR `[body][ready]` WIMM slot remains possible only after the target MR/MKey
+  and QP ordering contract proves it safe. In both cases, the frontend client
+  does not consume the immediate and normal completion visibility must not depend
+  on receiver-service token decode or session demux.
+- Slice 4b validation exposed a second ownership bug: shared send-CQ drains can
+  consume a peer-client completion checkpoint before the completion-publish owner
+  callback is installed. Command/payload paths already had stash handling for
+  this shape; peer-client completion publication now stashes and replays such
+  CQEs rather than treating them as fatal or leaving the source ring full.
+- Slice 4c is implemented as the host-fast-path two-WR publication shape:
+  [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13105)
+  posts the completion body with RDMA WRITE and then posts
+  `readyEpochSlots[slotIndex]` with RDMA WRITE WITH IMM through
+  [`TupleSinkServicePostPeerRegisteredClientCompletionBytesWithImmediateRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6018).
+  The recv-CQ parser drains the immediate for receive-credit/repost progress, but
+  it no longer queues or CPU-publishes peer-client completion visibility. The
+  frontend polling gate is the WIMM-written ready word.
+- The client library has a temporary defensive terminal replay key in
+  [`HomerClientRememberTerminalCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1021)
+  and
+  [`HomerClientReplayTerminalCompletionIfPresent()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1036).
+  This was added after GDB showed a client stuck with pgbench command-pending
+  state even though the same terminal completion epoch had already been consumed.
+  It is a guardrail, not the final explanation of the long-run c4 wedge.
+- Machine-baseline send-CQ readiness now accounts for peer-client completion
+  publish checkpoints in
+  [`HomerMachineBaselinePolicyCommandSendCqDue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:5800).
+  Without this, source-credit pressure for completion publication could fail to
+  schedule the shared command/control send-CQ drain promptly.
 - Part of Slice 6 is already present as scaffolding: candidate construction sees
   staged peer-client completion publication even when the backend completion
   ring is empty, and maps source-credit pressure to command/control send-CQ
@@ -151,18 +199,95 @@ Validation evidence on June 17, 2026:
 - Current fast-link validation used `farnet1 10.10.1.101/enp33s0f0np0` to
   `farnet0 10.10.1.100/enp33s0f0np0`; both links reported `400000Mb/s`, four
   lanes, link detected.
-- Remote RDMA c1 smoke after the fix completed `1000/1000`, zero failures.
+- Three-WR Slice 4/5 remote RDMA c1 smoke completed `1000/1000`, zero failures.
   Warm repeats completed `20000/20000`, zero failures, at about `4213 TPS`
   and `3807 TPS`, with p99 about `0.258 ms` and `0.288 ms`.
-- Remote RDMA c4 rejected the slice for multi-client correctness: one run
+- Three-WR Slice 4/5 remote RDMA c4 rejected the slice for multi-client
+  correctness: one run
   aborted after `15209/40000` transactions with tuple result byte-ring header
   mismatches and a pushed-completion sequence mismatch
   `expected sequence=25693 got sequence=25686`. That seven-gap shape matches
   the known weak publication/visibility issue, not a scheduler-policy decision.
-- Service logs also showed stale peer-client completion checkpoint CQEs after
-  the aborted c4 cleanup. Treat those stale CQEs as cleanup fallout unless they
-  reproduce before any client-side mismatch; the first correctness failure to
-  address is the published completion/result visibility ordering under c4.
+- Slice 4b receiver-service WIMM validation rebuilt and reinstalled no-stats Citus/Homer on both
+  hosts, then restarted PostgreSQL and both Homer services from a clean process
+  baseline. Remote c1 smoke completed `1000/1000`, zero failures, at about
+  `492 TPS` with cold setup included in max latency. Warm remote c1 completed
+  `20000/20000`, zero failures, at about `3640 TPS`, p95 `0.289 ms`, p99
+  `0.299 ms`.
+- Remote c4 after the WIMM gate and peer-client completion CQE stash fix
+  completed two warmed runs without failures: `40000/40000` at about
+  `8988 TPS`, p95 `0.579 ms`, p99 `0.674 ms`; and `40000/40000` at about
+  `8746 TPS`, p95 `0.590 ms`, p99 `0.690 ms`. Service logs on both hosts had
+  no `error`, `failed`, `mismatch`, `stale`, `ring full`, `checkpoint`, `fatal`,
+  or `panic` messages after these runs.
+- This accepts the WIMM publication gate for c1/c4 correctness, but the current
+  c4 band is still below the older roughly `11k TPS` target. Follow-up discussion
+  concluded that the likely regression is not "WIMM is slow" by itself, but the
+  receiver-service publication shape: the frontend still polls memory, while the
+  service must first poll recv CQ, parse an immediate, queue/pop a token, decode
+  session identity, and CPU-store the words that let the frontend polling path
+  succeed. Slice 4c should remove that extra receiver-service publication hop.
+- Slice 4c no-stats validation on June 17, 2026 used the same
+  `homer-state-machine-scheduler-milestone(sha: 8c5c93628)` base plus dirty
+  WIMM/replay changes. Remote c1 completed `1000/1000`, zero failures; the cold
+  run included setup latency, but p50/p95 stayed around `0.250/0.266 ms`.
+  Short remote c4 repeats completed correctly: warm `-c4 -j4 -t2500` runs were
+  about `10.36k` to `10.40k TPS`, with p95 around `0.51 ms` and p99 around
+  `0.57-0.60 ms`.
+- Slice 4c is not accepted for long-run c4 correctness/performance yet. A
+  `-c4 -j4 -t10000` run wedged after the short repeats. GDB showed one remaining
+  pgbench client in `CSTATE_WAIT_RESULT`, waiting for `TX_COMMIT` sequence
+  `58522`; the frontend session had `lastConsumedCompletionEpoch=66882`, while
+  the farnet1 service session had already published sequence `58522` at epoch
+  `66882`. The client replay key still pointed at an earlier terminal sequence
+  (`58515`), so the current failure is no longer a simple missing RDMA
+  publication; it is a frontend completion consumption/application ordering bug
+  or an untracked consumer path. Do not claim performance recovery until this
+  long-run c4 wedge is fixed.
+
+Handoff diagnosis after the rejected Slice 4c long-run validation:
+
+- The planned Slice 4c changes are the two-WR sender-side publication shape,
+  client-polled slot-local `readyEpochSlots[]`, and prompt recv-CQ credit
+  draining without receiver-service token demux on the host-client visibility
+  path.
+- The peer-client completion send-CQ owner accounting and shared-CQ stash work
+  are adjacent ownership fixes exposed by Slice 4c validation. They are not the
+  central publication model, but they are consistent with the current shared CQ
+  design because completion-publish checkpoints use the same connection send CQ
+  as command/control traffic.
+- The `lastTerminalCompletion*` replay fields in
+  [`HomerClientSession`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:53)
+  and helpers in
+  [`homer_client.c`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1021)
+  are an improvised diagnostic/guardrail, not part of the intended Slice 4c
+  design. They try to recover if a frontend terminal completion is already
+  acknowledged but the pgbench state machine still asks for that same command.
+  The final long-run failure showed that this guardrail is insufficient and may
+  be the wrong abstraction to keep.
+- The likely root problem is a destructive-consumption boundary in
+  [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2447):
+  it advances `lastConsumedCompletionEpoch` and remote `consumedEpoch`, while
+  [`receiveHomerCommand()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3665)
+  and
+  [`HomerApplyCommandCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3497)
+  separately apply that event to pgbench state. If any helper consumes/skips an
+  event without the pgbench state transition, the event is gone and the client
+  can wait forever for a later terminal event that will never exist.
+- The most suspicious client-side behavior is the recursive older no-result
+  completion skip branch in
+  [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2561).
+  It lets the client library decide that a visible event is not useful to the
+  current pgbench command and acknowledges it internally. That may be valid only
+  after a clearer event ownership model proves which completions are ignorable.
+- Next design discussion should prefer replacing replay with an explicit
+  peek/apply/ack contract: copy and validate one frontend completion event
+  without advancing the consumed epoch, let pgbench or a higher-level client
+  state machine apply it, then acknowledge exactly the event that was applied.
+  An alternative is to move command-state application fully into the Homer client
+  library so `TryCommandCompletion()` never exposes a consumed-but-unapplied
+  event boundary. Do not continue adding replay/skipping cases until this
+  ownership boundary is settled.
 
 ## Implementation plan
 
@@ -300,10 +425,11 @@ Acceptance:
 
 ### Slice 4: asynchronous post helper
 
-Status: implemented and compile-checked; workload validation pending.
+Status: implemented and compile-checked; remote c4 rejected the three-WR
+memory-polled variant.
 
-1. Keep [`TupleSinkServiceWriteConnectionBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4509) and
-   [`TupleSinkServiceWritePeerUint64Rdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6359) synchronous.
+1. Keep [`TupleSinkServiceWriteConnectionBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4675) and
+   [`TupleSinkServiceWritePeerUint64Rdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6568) synchronous.
 2. Add a dedicated helper such as
    `TupleSinkServiceTryPostPeerClientCompletionAsync()` with explicit result
    values:
@@ -332,9 +458,126 @@ Acceptance:
 - Reusing a mailbox slot after a previous descriptor-heavy completion cannot
   expose stale cold fields to the reader.
 
+### Slice 4b: receiver-service WIMM publication bridge
+
+Status: implemented and remote c1/c4 correctness-validated on June 17, 2026,
+but not accepted as the final performance shape.
+
+The three-WR peer-client completion publisher writes the completion body, a
+slot-local `readyEpoch`, and aggregate `publishedEpoch` as separate one-sided
+RDMA writes. That shape is too expensive for the hot command-completion path and
+still leaves the frontend client polling memory-resident DMA state as the
+publication gate. Remote c4 validation exposed this weakness as stale/mismatched
+completion visibility.
+
+Implemented bridge:
+
+1. Keep the registered multi-slot source ring and tagged local send-CQ
+   retirement from Slices 4 and 5.
+2. Replace the body/ready/aggregate RDMA sequence in
+   [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13091)
+   with one fixed-size `RDMA_WRITE_WITH_IMM` into the remote
+   `completionSlots[slotIndex]` when the connection supports the normal Homer
+   WIMM publication rule.
+3. The immediate data is a compact receiver-local doorbell token. It identifies
+   the receiver service session whose already-written completion slot should be
+   published; it is not the 64-bit epoch value.
+4. The receiver service handles the recv-CQ immediate and publishes local shared
+   memory with CPU release stores to `readyEpochSlots[slotIndex]` and
+   `publishedEpoch`. After this point the frontend client still uses the
+   slot-local stable-copy protocol, but it is polling receiver-local CPU
+   publication state instead of treating peer DMA memory polling as the remote
+   visibility gate.
+5. The sender source slot is retired only by its local tagged send CQE. The
+   receiver-side WIMM CQE proves receiver-visible publication; it does not prove
+   source-buffer lifetime on the sender.
+6. Receiver-side progress is explicit peer transport recv-CQ work. Do not hide
+   it inside peer-control op helpers or completion-publish retry helpers.
+
+Acceptance:
+
+- Peer-client completion publication posts one network WR per completion in the
+  normal path.
+- Receiver-local `readyEpochSlots[]` and `publishedEpoch` are advanced only from
+  the WIMM recv-CQ handler for peer-client completions.
+- Remote c1 and remote c4 complete without command-completion sequence mismatch.
+- Local source slots still retire through the tagged send-CQ path with a
+  signaled interval greater than one.
+
+### Slice 4c: two-WR self-publishing WIMM ready word
+
+Status: next implementation target.
+
+The lesson from Slice 4b is that `WRITE_WITH_IMM` should provide the publication
+gate without forcing the receiver service to become the per-completion publisher
+for a frontend client that is already polling shared memory. The fast path should
+deliver the gate into the same memory word the client polls. Because
+same-message body-before-ready visibility is not established as a usable current
+invariant, this slice deliberately uses two ordered WRs.
+
+Target design:
+
+1. Keep the registered multi-slot source ring and tagged local send-CQ
+   retirement from Slices 4 and 5.
+2. Use two ordered WRs on the same RC QP for each peer-client completion:
+   - an RDMA WRITE of the fixed-size `CitusRemoteExecCommandCompletion` body into
+     `completionSlots[slotIndex]`
+   - a following `RDMA_WRITE_WITH_IMM` of the 8-byte `nextEpoch` value into
+     `readyEpochSlots[slotIndex]`
+3. The WIMM-written ready word, not receiver-service CPU publication, is the
+   frontend-visible publication gate. The immediate value is optional
+   routing/debug metadata for the receiver service; normal frontend visibility
+   must not depend on immediate parsing, token demux, session lookup, or a CPU
+   store in `TupleSinkServiceHandlePeerClientCompletionDoorbell()`.
+4. The frontend client should poll the expected slot-local ready word directly.
+   `publishedEpoch` may remain a local-path hint or diagnostic counter, but peer
+   client completion consumption must not wait for receiver-service advancement of
+   aggregate `publishedEpoch`.
+5. The client still performs the cheap stable-copy validation:
+   `readyEpochSlots[slotIndex] == expectedEpoch`, copy the completion, re-check
+   the same ready word, then validate protocol, command sequence, command kind,
+   command state, and flag-dependent descriptor fields. The client does not get
+   the immediate value on this host fast path.
+6. Ordering prerequisite: the publication gate must not become visible before the
+   completion body. For this two-WR slice, that requires same-QP ordered WR
+   visibility and a target mailbox MR/MKey whose ordering policy does not permit
+   the ready-word WIMM to pass the prior body WRITE. If relaxed-ordering MKeys can
+   violate that contract, the mailbox MR must be registered without relaxed
+   ordering or this fast path must be disabled.
+7. The receiver service still drains recv CQ and reposts notification receives
+   promptly to preserve transport receive credit and to keep future diagnostics or
+   scheduler facts current. That prompt handling is not what makes the host client
+   observe completion readiness; the client observes the WIMM-written host memory
+   gate directly.
+8. Future DPU/offload design remains open. If the host client continues polling a
+   host-resident completion mailbox, the final publication boundary must still
+   write host-visible memory eventually. Two plausible offload shapes remain:
+   - mixed host/DPU RDMA, where some fast-path publications can still target
+     host memory directly when ordering and isolation allow it
+   - DPU-first ingress, where peer RDMA lands on the DPU, the DPU consumes the
+     WIMM/CQ event, and the DPU later publishes into the host-visible client ABI
+     at the boundary
+9. Future one-WR host optimization is explicitly out of scope for this slice.
+   A single `RDMA_WRITE_WITH_IMM` that writes `[body][readyEpoch footer]` can be
+   revisited only after the target MR/MKey and QP ordering contract proves that
+   ready visibility implies prior body visibility for the same WR.
+
+Acceptance:
+
+- Remote c1/c4 correctness passes without command-completion sequence mismatch.
+- Warmed c1 returns to the previous `4.5k-4.8k TPS` band, and warmed c4 returns
+  to the previous roughly `11k TPS` band, within normal run variance.
+- The normal peer-client completion visibility path performs no receiver-service
+  token queue/pop, session demux, or CPU publication store.
+- The two-WR path's hardware/MR ordering evidence is recorded, including whether
+  the target mailbox MR must be registered without relaxed ordering.
+- Source slots still retire only through tagged local send-CQ checkpoints.
+
 ### Slice 5: tagged send-CQ retirement
 
-Status: implemented and compile-checked; workload validation pending.
+Status: implemented and accepted for the WIMM c1/c4 validation band. Further
+performance work should still measure CQ retirement batch size and source-credit
+pressure under longer c4/concurrent runs.
 
 1. Add a tagged WR kind for peer-client completion publication checkpoints in the
    same tagged completion dispatch family as command/payload completions.
@@ -361,7 +604,9 @@ Acceptance:
 ### Slice 6: scheduler-visible candidate facts
 
 Status: partially implemented as scaffolding; full scheduler feedback still
-depends on Slice 4 and Slice 5 retirement facts.
+needs explicit candidate/policy cleanup. Treat Slice 4c as a performance
+prerequisite before using the current receiver-service WIMM bridge as a scheduler
+policy baseline.
 
 1. Candidate construction must emit `PUBLISH_COMMAND_COMPLETIONS` for staged
    pending completions even when `HomerServiceCompletionRingReadyCount()` is
@@ -401,23 +646,29 @@ Acceptance:
 - Completion publication can make progress without new backend completion-ring
   input once the staged state exists.
 
-### Slice 8: remote publication policy experiment
+### Slice 8: remote publication policy cleanup
 
-Status: performance experiment after the memory-polled path is correct.
+Status: no longer the first WIMM implementation point. Slice 4b proved the WIMM
+ordering idea but also showed that receiver-service CQ dispatch is the wrong host
+fast path. Slice 4c is the required two-WR self-publishing WIMM ready-word path;
+this later slice is only for policy cleanup or optional A/B variants after Slice
+4c is stable.
 
-1. Keep memory-polled slot-local validation as the default policy.
-2. Add a `remoteNotifyPolicy` experiment only after slices 1 through 7 are
-   stable. `WRITE_WITH_IMM` must prove that the receiver-side CQ/notification
-   path is actually useful for this frontend-visible completion path; otherwise
-   it is just extra remote work.
-3. Compare policies with the same local source ring and local CQ retirement
-   scheme.
+1. Keep the frontend stable slot-copy validation as a defensive local protocol
+   check.
+2. Treat the WIMM-written ready word as the normal remote visibility gate for
+   peer-client completions on host-polled client/backend paths.
+3. Keep receiver-service WIMM CQ handling for transport progress, receive repost,
+   diagnostics, optional wakeups, and future offload/scheduler facts, not as the
+   normal host client publication step.
+4. Compare future variants only if a new design preserves the body-before-ready
+   gate and the same local source-ring retirement scheme.
 
 Acceptance:
 
-- The memory-polled policy remains the correctness baseline.
-- Any `WRITE_WITH_IMM` variant must beat or match memory polling on remote c1/c4
-  p95/p99 without adding hidden receiver-side progress requirements.
+- The two-WR WIMM ready-word path remains correct on remote c1/c4.
+- Any alternative policy must match WIMM correctness and must not reintroduce
+  hidden receiver-side progress requirements.
 
 ## Verification plan
 
@@ -445,8 +696,9 @@ Performance checks:
 4. Acceptance for the first async source-ring version is correctness plus no
    remote c1/c4 regression. The target is to remove the per-completion blocking
    local CQ wait and improve c1 latency/TPS while preserving c4 stability.
-5. Compare memory-polled slot validation and any `WRITE_WITH_IMM` variant only
-   after both use the same batched local source-retirement machinery.
+5. Keep Slice 4b as the accepted remote correctness bridge, not as the accepted
+   performance baseline. The next performance baseline is Slice 4c: body WRITE
+   plus WIMM ready-word self-publication.
 
 ## Pitfalls, caveats, and hidden constraints
 
@@ -460,13 +712,28 @@ Performance checks:
   payload/result semantic retry, not local CQ/resource retry.
 - Do not assume `publishedEpoch` is a remote visibility fence by itself. The
   reader must validate the slot-local ready word and command identity.
+- Do not require the frontend client to consume an RDMA immediate on the host
+  fast path. The client polls memory; the immediate belongs to the receiver
+  service's transport CQ path unless a separate client CQ/event path is explicitly
+  designed.
+- Do not put receiver-service token decode/session demux on the normal
+  peer-client completion visibility path. If the WIMM WR already writes the
+  slot-local ready word, the frontend can observe completion readiness without a
+  receiver CPU store.
+- Do not describe recv-CQ handling as the host-client publication mechanism in
+  Slice 4c. The receiver should drain CQEs promptly for credit/repost and
+  diagnostics, but host-client visibility comes from the WIMM-written memory gate.
+- Do not collapse the fallback two-WR path into one `[body][ready]` WIMM unless
+  the target MR/MKey and QP ordering evidence proves that ready visibility implies
+  prior body visibility for the same WR.
 - Do not retire source slots from an unrelated CQE. Range retirement is valid
   only for older WRs on the same RC QP as the signaled checkpoint, and the chosen
   implementation uses a connection-local FIFO of posted source-slot refs to avoid
   scanning unrelated sessions.
 - Do not judge the `WRITE_WITH_IMM` policy until receiver-side progress ownership
   is explicit. A remote CQE that the frontend client does not consume may add
-  work without improving the client-visible polling path.
+  work without improving the client-visible polling path; this is exactly why
+  Slice 4c moves the publication gate into the polled ready word.
 - Do not confuse direct-fill source slots with true zero copy. Direct fill means
   the Homer service materializes the final `CitusRemoteExecCommandCompletion`
   directly into a registered source slot. True zero copy would mean the
