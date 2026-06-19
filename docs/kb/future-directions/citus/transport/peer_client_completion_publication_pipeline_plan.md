@@ -288,6 +288,24 @@ Handoff diagnosis after the rejected Slice 4c long-run validation:
   library so `TryCommandCompletion()` never exposes a consumed-but-unapplied
   event boundary. Do not continue adding replay/skipping cases until this
   ownership boundary is settled.
+- June 19 follow-up: the clean fix is the explicit peek/apply/ack contract. The
+  Slice 4c transport shape is not the next thing to rewrite. The long-run wedge
+  evidence shows that publication can reach the client mailbox and still leave
+  pgbench waiting because the frontend event can be acknowledged separately from
+  pgbench state application. Treat this as a pre-existing pushed-completion API
+  ownership bug that Slice 4c exposed by making publication faster and less
+  serialized.
+- Important caveat: the current measured pgbench hot path usually enters
+  [`HomerClientStartDirectCommand()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2040)
+  from
+  [`HomerClientStartCommandWithCompletionFlags()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2177)
+  once the direct command/completion mailboxes are mapped. Therefore
+  [`HomerClientMarkPushedCompletionConsumedIfPresent()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1100)
+  is an unsafe helper and should be removed from the start-command path, but it
+  is not necessarily the exact consumer responsible for the final captured
+  direct-mailbox wedge. The generic destructive-consumption contract in
+  [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2447)
+  and its internal skip branch remain the primary root-cause target.
 
 ## Implementation plan
 
@@ -506,7 +524,8 @@ Acceptance:
 
 ### Slice 4c: two-WR self-publishing WIMM ready word
 
-Status: next implementation target.
+Status: implemented as a dirty prototype and short-run c4 validated, but not
+accepted. Long-run c4 is blocked by Slice 4d frontend completion ownership.
 
 The lesson from Slice 4b is that `WRITE_WITH_IMM` should provide the publication
 gate without forcing the receiver service to become the per-completion publisher
@@ -572,6 +591,177 @@ Acceptance:
 - The two-WR path's hardware/MR ordering evidence is recorded, including whether
   the target mailbox MR must be registered without relaxed ordering.
 - Source slots still retire only through tagged local send-CQ checkpoints.
+
+### Slice 4d: frontend completion peek/apply/ack ownership
+
+Status: required next implementation target before any more Slice 4c performance
+claims.
+
+The current pushed-completion client API is destructive: reading a completion can
+also advance `lastConsumedCompletionEpoch` and remote `consumedEpoch`. That is
+unsafe for pgbench because
+[`receiveHomerCommand()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3665)
+still has to apply the event in
+[`HomerApplyCommandCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3497)
+after the library call returns. The clean ownership contract is:
+
+1. **Peek**: copy and validate the next frontend completion event without
+   acknowledging it.
+2. **Apply**: let pgbench apply the copied event to its command/result-sink state.
+3. **Ack**: advance the consumed epoch only after the event has been applied.
+
+Immediate cleanup before adding the new API:
+
+1. Remove the call to
+   [`HomerClientMarkPushedCompletionConsumedIfPresent()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1100)
+   from the control-slot path in
+   [`HomerClientStartCommandWithCompletionFlags()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2177).
+   A start-command helper must not consume pushed mailbox events behind the
+   caller's state machine. If the helper remains for a compatibility path, it
+   should become debug-only or be deleted after the new API lands.
+2. Remove or disable the recursive older no-result skip branch in
+   [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2561).
+   In the one-command-in-flight pgbench path, a sequence/kind mismatch should be
+   a non-destructive mismatch result or protocol error. The client library must
+   not acknowledge an event merely because it believes the current caller will
+   not use it.
+3. Keep `lastTerminalCompletion*` replay fields only as temporary diagnostics
+   during this slice. Do not add new replay cases. Delete replay after long c4
+   passes with peek/apply/ack.
+
+New client API shape:
+
+```c
+typedef enum HomerClientCompletionPeekStatus
+{
+    HOMER_CLIENT_COMPLETION_PEEK_NOT_READY = 0,
+    HOMER_CLIENT_COMPLETION_PEEK_READY,
+    HOMER_CLIENT_COMPLETION_PEEK_OVERRUN,
+    HOMER_CLIENT_COMPLETION_PEEK_MISMATCH
+} HomerClientCompletionPeekStatus;
+
+typedef struct HomerClientCompletionEvent
+{
+    uint64_t epoch;
+    uint32_t slotIndex;
+    CitusRemoteExecCommandCompletion completion;
+} HomerClientCompletionEvent;
+```
+
+1. Add `HomerClientPeekCommandCompletion(session, expectedKind,
+   expectedSequence, event, status, errorMessage, errorMessageBytes)`.
+   The function must:
+   - compute `expectedEpoch = session->lastConsumedCompletionEpoch + 1`
+   - stable-copy the expected slot using `readyEpochSlots[slotIndex]`
+   - validate protocol version, command kind, command sequence, command state,
+     and flag-dependent descriptor fields
+   - return `NOT_READY`, `READY`, `OVERRUN`, or `MISMATCH`
+   - not store `consumedEpoch`
+   - not update `lastConsumedCompletionEpoch`
+   - not recurse
+   - not skip or coalesce visible events
+2. Add `HomerClientAckCommandCompletion(session, eventEpoch, errorMessage,
+   errorMessageBytes)`. The function must:
+   - require `eventEpoch == session->lastConsumedCompletionEpoch + 1`
+   - release-store the mailbox `consumedEpoch`
+   - update `session->lastConsumedCompletionEpoch`
+   - update terminal diagnostic fields only after the caller confirms the event
+     was applied
+3. Keep the old destructive
+   [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2447)
+   as a compatibility wrapper only after the new API exists. It may internally
+   call peek and ack for non-pgbench callers that intentionally want the old
+   semantics, but pgbench must not use it on the measured path.
+
+Pgbench conversion:
+
+1. Convert
+   [`receiveHomerCommand()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3665)
+   to call `HomerClientPeekCommandCompletion()`.
+2. If peek returns `NOT_READY`, keep the existing running-result-sink drain
+   behavior and return `commandComplete=false`.
+3. If peek returns `READY`, call
+   [`HomerApplyCommandCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3497)
+   with the copied event. Only after successful event application should pgbench
+   call `HomerClientAckCommandCompletion()` with the event epoch.
+4. Refine `HomerApplyCommandCompletion()`'s result contract so pgbench can
+   distinguish:
+   - event application succeeded and the command remains running
+   - event application succeeded and the command completed successfully
+   - event application succeeded and the backend reported command failure
+   - event application failed locally while opening/draining the result sink
+
+   Backend `FAILED` is still an applied terminal event and should be acked before
+   pgbench transitions to error. A local frontend failure while applying the
+   event should not silently ack; it should mark the Homer session/connection
+   broken or take a deliberate cleanup path.
+5. Duplicate STARTED/sink-ready events must be handled explicitly and
+   idempotently. If a STARTED event was already observed through the immediate
+   start response and later appears in the pushed mailbox, pgbench should apply
+   the duplicate to the extent needed, then ack that exact mailbox epoch. It must
+   not consume a later terminal completion just because it has the same command
+   sequence.
+
+Temporary server-side simplification for this slice:
+
+1. Disable the result-descriptor flag stripping optimization in
+   [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13105)
+   while validating peek/apply/ack. If a terminal completion has result-sink
+   state, allow it to carry `TUPLE_SINK_READY` again. Repeating the descriptor is
+   acceptable because pgbench already checks
+   `!homer_pending_result_sink_bound` before opening a result sink.
+2. Re-enable descriptor stripping only after STARTED/sink-ready events are proven
+   impossible to acknowledge without being applied.
+
+Acceptance:
+
+- `HomerClientTryCommandCompletion()` is no longer used by pgbench's measured
+  Homer path.
+- No frontend completion event advances `lastConsumedCompletionEpoch` or mailbox
+  `consumedEpoch` before pgbench has applied that event.
+- The recursive older-completion skip branch is gone from the measured path.
+- The `lastTerminalCompletion*` replay path is either removed or remains
+  diagnostic-only with a counter/log proving it is not used during accepted c1/c4
+  runs.
+- Remote c1 passes.
+- Remote c4 `-t2500` short repeats pass.
+- Remote c4 `-t10000` long repeats pass at least three times from a clean
+  process baseline, with no client stuck in `CSTATE_WAIT_RESULT`.
+- Warmed c4 performance returns to the previous roughly `11k TPS` target band
+  before the Slice 4c transport work is accepted as recovered.
+
+### Slice 4e: partial-post failure and source-retirement cleanup
+
+Status: required cleanup after Slice 4d, but not the primary cause of the
+captured long-run c4 wedge.
+
+Slice 4c posts a multi-WR publication sequence. If the body WRITE posts but the
+ready WIMM post fails, the source slot may still be referenced by an unsignaled
+WR and cannot be safely released or retried as normal work. The current
+`FAILED_OR_INFLIGHT` state is not explicit enough for clean recovery.
+
+1. Split source slot states into at least:
+   `FREE`, `RESERVED`, `BODY_POSTED`, `READY_POSTED`, `RETIRED`, and
+   `FAILED_NEEDS_QP_RESET`.
+2. If failure happens before any WR posts, clear the owner entry and release the
+   source slot normally.
+3. If failure happens after the body WR posts but before the ready WIMM posts,
+   mark the source/owner as `FAILED_NEEDS_QP_RESET`, mark the peer
+   connection/session failed, and prevent retry on that QP.
+4. Cleanup of `FAILED_NEEDS_QP_RESET` state must happen through connection reset
+   or QP teardown, not normal source-ring reuse.
+5. Replace the current global peer-client completion CQ owner scan with the
+   connection-local FIFO described in Slice 2 when practical. The global table is
+   acceptable for prototype evidence, but the connection FIFO is the cleaner
+   same-QP range-retirement model.
+
+Acceptance:
+
+- A forced failure before the body post releases source state normally.
+- A forced failure after body post but before ready WIMM marks the connection
+  failed/reset-required and never reuses that source slot on the live QP.
+- Normal c1/c4 runs retire source slots through send-CQ checkpoints exactly as
+  before.
 
 ### Slice 5: tagged send-CQ retirement
 
