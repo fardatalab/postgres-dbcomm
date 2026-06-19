@@ -8,9 +8,11 @@
   facts.
 - **What this doc does NOT cover**: the full unified aggregate-action scheduler
   migration, service-to-service peer command completion rings, the full payload
-  byte-ring lifecycle redesign, or DOCA/DPU offload. This note does record the
-  tuple-result byte-ring EOS/command-boundary bug exposed during peer-client
-  completion validation because it currently blocks this publication pipeline.
+  byte-ring lifecycle redesign, broad hot-path optimization, or DOCA/DPU offload.
+  This note does record the tuple-result byte-ring EOS/command-boundary bug
+  exposed during peer-client completion validation because it currently blocks
+  this publication pipeline. The follow-on optimization plan lives in
+  [`homer_transport_hot_path_optimization_plan.md`](homer_transport_hot_path_optimization_plan.md).
 - **Primary directory**: `docs/kb/future-directions/citus/transport/`
 - **Doc type**: `future-direction`
 
