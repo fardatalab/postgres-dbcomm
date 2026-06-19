@@ -309,6 +309,26 @@ Handoff diagnosis after the rejected Slice 4c long-run validation:
   [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2447)
   and its internal skip branch remain the primary root-cause target.
 
+June 19 accepted follow-up after implementing Slice 4d and Slice 4d-r:
+
+- Slice 4d's peek/apply/ack direction remains accepted for frontend completion
+  ownership. The subsequent c1 failure was not solved by more command-completion
+  replay/dedup logic; it was a tuple-result byte-ring generation/EOS ownership
+  bug exposed by the cleaner pushed-completion path.
+- Slice 4d-r is now implemented and validated. Tuple-result records carry an
+  explicit result generation, physical byte-ring frontiers remain monotonic
+  across persistent queue reuse, and EOS is backend-owned as an immutable
+  in-band record rather than a post-publication mutation or service-side repair.
+- The remaining local-blackhole basebackup stall was a separate scheduler
+  admission hole: local blackhole streams are producer-side byte-ring smoke
+  streams and must be admitted even when remote-payload reason masks are empty.
+  The scheduler now admits them before the blackhole pump checks byte-ring
+  readiness.
+- Current accepted validation band on the fixed tree: remote c1 passed at about
+  `4.17k` and `3.76k TPS`; remote c4 passed at about `10.47k` and
+  `10.39k TPS`; local blackhole basebackup passed in `10.44s`; remote RDMA
+  basebackup warmed repeats passed in `4.43s` and `4.32s`.
+
 June 19 validation update after implementing Slice 4d:
 
 - Slice 4d was implemented and pushed on
@@ -376,11 +396,39 @@ June 19 validation update after implementing Slice 4d:
   the last already-published record or by publishing an extra terminal record;
   under backend/service timing this can leave the next command's frontend drain
   positioned at a record whose sequence is not command-local `1`.
-- Current direction: stop adding client-side tolerance cases. The next design
-  discussion should remove the dual terminal-result publication shape or make it
-  explicitly owned and idempotent. There should be exactly one rule for
-  tuple-result EOS/frontier advancement at command boundaries before c1/c4
-  performance validation resumes.
+- June 19 source review promotes several parts of that diagnosis from suspicion
+  to confirmed protocol defects:
+  - Published tuple-result records are mutable. `SubmitCitusTupleSinkBatch()`
+    publishes `publishedTail` after filling the record, but
+    [`MarkCitusTupleSinkLastRecordEos()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1686)
+    can later set `transportHeader->flags |=
+    CITUS_TUPLE_SINK_TRANSPORT_FLAG_EOS` on that already-published record.
+  - EOS has multiple semantic producers.
+    [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1801)
+    first mutates the last record via
+    [`MarkCitusTupleSinkLastRecordEos()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1686),
+    then falls back to
+    [`SubmitCitusTupleSinkEmptyEosRecord()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1720).
+    The service also has
+    [`HomerServiceAppendTupleViewEosRecordToProducerByteRing()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19532)
+    to repair the race where it copied the final data record before seeing the
+    backend's post-publication EOS mutation.
+  - The producer resets a shared byte-ring control block across commands.
+    [`RemoteExecResetResultQueueControl()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:388)
+    clears both `publishedTail` and `consumedHead`, and
+    [`RemoteExecEnsureSessionResultQueue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:755)
+    invokes that reset when reusing a persistent result queue for a compatible
+    result shape. A local reset is not a distributed reclamation barrier for
+    service-side posted state, RDMA-visible receiver rings, or frontend mappings.
+  - [`CitusTupleSinkTransportHeader`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:373)
+    has only `protocolVersion`, `payloadBytes`, `sinkSequence`, `flags`, and
+    `reserved0`; it has no command/result generation. Therefore
+    `sinkSequence=1` cannot answer "sequence 1 of which command?"
+- Current direction: stop adding client-side tolerance cases. The next repair
+  slice must make tuple-result records immutable after publication, assign one
+  backend-owned in-band EOS object per result generation, keep physical byte-ring
+  frontiers monotonic for the mapping lifetime, and tag every tuple-result record
+  with a result generation before c1/c4 performance validation resumes.
 
 ## Implementation plan
 
@@ -669,12 +717,11 @@ Acceptance:
 
 ### Slice 4d: frontend completion peek/apply/ack ownership
 
-Status: implemented and compile-checked on June 19, 2026, but remote c1
-correctness validation is rejected. The peek/apply/ack ownership fix removed
-destructive frontend completion consumption from pgbench's measured path, but
-validation exposed a separate tuple-result byte-ring EOS/command-boundary
-ownership bug. Do not claim Slice 4c performance recovery until this result-ring
-bug is fixed and remote c1/c4 correctness passes from a clean baseline.
+Status: implemented and accepted as the frontend completion ownership repair on
+June 19, 2026. The first validation of this slice exposed, rather than caused, a
+separate tuple-result byte-ring EOS/command-boundary ownership bug. Slice 4d-r
+fixes that result-ring bug; only the combined Slice 4d + Slice 4d-r state should
+be used for performance claims.
 
 The current pushed-completion client API is destructive: reading a completion can
 also advance `lastConsumedCompletionEpoch` and remote `consumedEpoch`. That is
@@ -910,21 +957,22 @@ Implementation progress:
 - Kept remote mailbox credit enforcement as Slice 4f; this implementation still
   relies on the current normal mailbox geometry rather than a sender-side remote
   consumed-epoch mirror.
-- Validation rejected the current state before performance measurement. Remote
-  c1 first failed at `byte_head=80 expected_sequence=2 sink_sequence=1`; after a
-  diagnostic previous-sequence terminal-marker tolerance in
-  [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2875),
+- Initial validation rejected the Slice 4d-only state before performance
+  measurement. Remote c1 first failed at
+  `byte_head=80 expected_sequence=2 sink_sequence=1`; after a diagnostic
+  previous-sequence terminal-marker tolerance in
+  [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2904),
   it progressed to `10596/20000` transactions and then failed at
   `byte_head=1695712 expected_sequence=1 sink_sequence=2`. This is now tracked
-  as a tuple-result EOS/command-boundary ownership blocker, not as an accepted
-  completion-publication performance result.
+  as the tuple-result EOS/command-boundary ownership blocker fixed by Slice
+  4d-r, not as a completion-publication performance result.
 - The service-side helper
   [`HomerServiceTupleViewNextEosSequenceFromProducerBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19445)
   and client-side previous-sequence terminal-marker handling are diagnostic
   hardening from the failed validation, not final architecture. They should not
   grow into a broad "tolerate malformed result stream" policy.
 
-Current blocker and next design question:
+Resolved blocker that forced Slice 4d-r:
 
 - The tuple-result EOS fallback in
   [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1801)
@@ -935,6 +983,244 @@ Current blocker and next design question:
   This should be treated as a design bug until proven otherwise. The next slice
   should define one owner and one command-boundary rule for tuple-result EOS and
   byte-frontier advancement before further c4 performance work.
+
+### Slice 4d-r: tuple-result generation and immutable EOS repair
+
+Status: implemented and accepted for remote pgbench c1/c4 plus local/remote
+basebackup validation on June 19, 2026. This slice supersedes the diagnostic
+service-side EOS scan and frontend previous-sequence EOS tolerance.
+
+The Slice 4d completion lease is still the right ownership model for command
+completion events. The blocker is the tuple-result payload stream: it does not
+provide stable identity, single ownership, immutable publication, or exact
+generation acknowledgement. Fix this before returning to c4 performance work.
+
+Target invariants:
+
+1. Bytes below a tuple-result ring's `publishedTail` are immutable until the
+   consumer advances `consumedHead` past them.
+2. The backend producer appends exactly one semantic EOS record per result
+   generation. The service transports DATA/EOS records and gates terminal
+   completion on EOS visibility; it does not create or repair semantic EOS.
+3. Physical byte-ring frontiers are monotonic for the mapping lifetime. Do not
+   reset `publishedTail` or `consumedHead` between commands on a reused
+   queue/mapping.
+4. Every tuple-result DATA/EOS record carries a result generation. The initial
+   generation can be the command sequence already used by
+   [`RemoteExecInitResultSinkKey()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:375).
+5. Frontend result draining binds to a descriptor that names the generation and
+   start frontier. The client validates generation before command-local sequence.
+6. Queue/session lifetime close, transport failure, and per-command result EOS
+   are distinct states. Do not encode per-command EOS only as
+   `CITUS_HOMER_PAYLOAD_BYTE_RING_FLAG_PEER_CLOSED` when the queue remains open
+   for later commands.
+
+Rejected mitigations:
+
+- accepting previous-sequence EOS in
+  [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2875);
+- retry-spinning on a valid but semantically mismatched tuple-result header;
+- scanning producer bytes to infer a synthetic EOS sequence in
+  [`HomerServiceTupleViewNextEosSequenceFromProducerBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19445);
+- appending service-side semantic EOS in
+  [`HomerServiceAppendTupleViewEosRecordToProducerByteRing()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19532);
+- republishing a data record as a terminal record;
+- full shared-control-block resets in
+  [`RemoteExecResetResultQueueControl()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:388)
+  for a persistent queue.
+
+Implementation outcome:
+
+- The tuple-sink transport ABI is now protocol version `9` and
+  [`CitusTupleSinkTransportHeader`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:380)
+  carries `headerBytes`, `recordKind`, `resultGeneration`,
+  `ringRecordOrdinal`, and `generationSequence`.
+- [`RemoteExecPrepareResultQueueGeneration()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:405)
+  assigns the per-command tuple-result generation and records the producer
+  `startByteTail`. [`RemoteExecEnsureSessionResultQueue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:792)
+  no longer treats reused persistent result queues as command-local frontier
+  resets.
+- [`ResetCitusTupleSinkSendHandle()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1200)
+  retargets logical tuple-sink state for the new generation without resetting
+  the physical byte-ring control block.
+- [`MarkCitusTupleSinkLastRecordEos()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1767)
+  is intentionally disabled for byte-ring publication, and
+  [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1863)
+  appends an explicit backend-owned EOS record through
+  [`SubmitCitusTupleSinkEmptyEosRecord()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1781).
+  Published DATA records are no longer mutated into terminal records.
+- [`HomerServicePrepareTupleResultStreamForCommand()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17626)
+  binds the service-side stream to the backend descriptor's generation and
+  source start tail before publishing the peer-visible result descriptor.
+- [`HomerServicePayloadTransportHeaderReady()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21679)
+  validates the new transport envelope and generation/sequence identity before
+  tuple-result or basebackup records are considered ready.
+- [`HomerClientOpenResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2727)
+  binds frontend draining to the descriptor's `resultGeneration` and
+  `startByteTail`; [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2904)
+  validates generation before command-local sequence and no longer accepts
+  previous-sequence EOS as a tolerance path.
+- Basebackup records also fill the v9 transport fields in
+  [`HomerClientSubmitBaseBackupRecord()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1697)
+  with `resultGeneration = 0`. This is deliberate: basebackup is not a reused
+  client-SQL tuple-result generation, but it still uses the same transport header
+  shape.
+
+Implementation correction discovered during validation:
+
+- The first post-implementation local basebackup blackhole validation stalled
+  after the producer filled the byte ring. The generation/header work was not
+  the cause. The scheduler admission path skipped local blackhole streams when
+  the generic remote-payload reason masks were empty, before
+  [`HomerServicePopulatePayloadMachineFacts()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26980)
+  could mark `PAYLOAD_LOCAL_BLACKHOLE` ready. The fix admits local blackhole
+  streams even with empty generic masks at
+  [`tuple_sink_service_process.c:27101`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:27101),
+  then lets the existing pump
+  [`HomerServicePumpLocalBaseBackupBlackhole()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21045)
+  consume/release the producer byte ring. This does not change remote RDMA
+  payload readiness.
+- Why the scheduler was involved at all: local Homer blackhole basebackup is not
+  an RDMA sender and does not look like ordinary peer-bound outgoing payload.
+  Its work is a service-side drain of the backend producer byte ring so
+  PostgreSQL can keep publishing archive/basebackup chunks. In the current
+  `machine-baseline` policy, payload work is run only after a payload stream is
+  admitted as a machine candidate and converted into a payload grant. The
+  blackhole path had an always-ready action in
+  [`HomerServicePopulatePayloadMachineFacts()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:27012),
+  but [`HomerServiceBuildPayloadStreamMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:27084)
+  filtered out streams with no generic `readyReasonMask` or
+  `blockedReasonMask` before that action could be attached. As a result, the
+  blackhole pump was never scheduled, the producer byte ring was never released,
+  and the `pg_basebackup TARGET 'homer:mode=blackhole,...'` workload stalled
+  after a small amount of data.
+- The fix is deliberately narrow: compute `localBlackholeReady =
+  HomerServicePayloadStreamIsLocalBaseBackupBlackhole(streamEntry)` during
+  candidate construction and bypass the empty-reason-mask filter only for that
+  local smoke path. Remote RDMA payload streams still require their normal
+  outgoing/incoming/CQ/credit reason masks. This keeps the scheduler model honest:
+  local blackhole is an explicit payload action that must be granted, not hidden
+  progress inside some unrelated service loop.
+
+Historical implementation steps, now completed:
+
+1. Add narrow compile-gated tracing before changing semantics. Record command
+   sequence/result generation, record kind, command-local sequence, physical
+   byte start/tail, published/consumed frontiers, EOS decision, and service post
+   frontier at:
+   - [`SubmitCitusTupleSinkBatch()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1582)
+   - [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1801)
+   - [`RemoteExecEnsureSessionResultQueue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:755)
+   - the tuple-view branch in
+     [`HomerServicePostOutgoingPayloadByteRing()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19740)
+   - [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2875)
+2. Bump the tuple-result transport ABI and reject mixed binaries. Extend
+   [`CitusTupleSinkTransportHeader`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:373)
+   with `headerBytes`, `recordKind`, `resultGeneration`,
+   `ringRecordOrdinal`, and `generationSequence`. Keep
+   `generationSequence` as the command-local 1..N validator and make
+   `ringRecordOrdinal` monotonic for the physical ring.
+3. Replace post-publication EOS mutation with explicit backend-appended EOS:
+   - remove the published-record mutation path in
+     [`MarkCitusTupleSinkLastRecordEos()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1686);
+   - make [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1801)
+     always append an immutable EOS record for row-producing tuple results;
+   - canonicalize zero-row results as `EOS sequence 1`, one-row results as
+     `DATA sequence 1` plus `EOS sequence 2`, and N-batch results as
+     `DATA 1..N` plus `EOS N+1`.
+4. Remove service-side semantic EOS synthesis. The service may observe missing
+   EOS as a protocol error and fail the stream, but it must not manufacture a
+   replacement EOS after forwarding data.
+5. Stop per-command control-block reset for persistent result queues. Replace
+   [`RemoteExecResetResultQueueControl()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:388)
+   reuse with generation-open initialization that records:
+   `resultGeneration`, `startByteTail`, `firstRingRecordOrdinal`, and
+   `nextGenerationSequence=1`. Only initialize `publishedTail`/`consumedHead`
+   when creating a fresh queue mapping or after full producer/service/frontend
+   teardown.
+6. Carry the result-generation descriptor in STARTED/sink-ready completion
+   metadata, and terminal completion metadata if needed:
+
+   ```c
+   typedef struct CitusRemoteExecResultStreamDescriptor
+   {
+       uint64_t resultGeneration;
+       uint64_t startByteTail;
+       uint64_t firstRingRecordOrdinal;
+   } CitusRemoteExecResultStreamDescriptor;
+   ```
+
+   The frontend must open/bind a result sink to this descriptor before draining.
+7. Update [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2875)
+   to validate `resultGeneration` first, then `generationSequence`. A wrong
+   generation is a hard protocol error unless it is before `startByteTail` and
+   can be skipped by an explicit wrap-gap rule. Do not consume a mismatched
+   generation as a tolerance path.
+8. Add service-side generation state for tuple-view streams:
+   `GENERATION_OPEN`, `DATA_COLLECTED`, `EOS_COLLECTED`, `EOS_POSTED`,
+   `EOS_SEND_CQE_RETIRED`, `TERMINAL_COMPLETION_PUBLISHED`, and
+   `GENERATION_RECLAIMABLE`. Terminal command completion must not be published
+   until the backend-owned EOS record for the same generation reaches the
+   required payload visibility/source-release frontier.
+9. For the first robust version, keep one command in flight per session and
+   require the previous generation to be reclaimable before opening the next
+   result generation. Later, generation tags can allow multiple generations in
+   one physical byte ring once remote credit/reclamation is measured.
+10. Delete diagnostic-only scaffolding after the generation protocol passes c1:
+    previous-sequence EOS acceptance, synthetic EOS sequence scans, service-side
+    semantic EOS append, and any long header-mismatch retry loop that treats a
+    semantically wrong record as a visibility delay.
+
+Validation checkpoints:
+
+- Compile-gated trace confirms the old failure interleaving or an equivalent
+  violation before semantic changes land; if tracing shows a different
+  interleaving, the invariants above still remain required unless disproven.
+- Fault-injection or targeted sleeps at these points cannot produce duplicate
+  terminal records or cross-generation sequence aliasing:
+  after DATA tail publication, after service collection but before RDMA post,
+  before backend EOS append, before terminal completion publication, before the
+  next command begins, and near byte-ring wrap.
+- Asserted invariants:
+  - published tuple-result bytes never mutate;
+  - producer code never writes consumer-owned `consumedHead` on queue reuse;
+  - exactly one EOS exists per result generation;
+  - EOS sequence is N+1 after N DATA records;
+  - terminal completion references the same generation as EOS;
+  - frontend-consumed records always match the bound generation.
+- Remote RDMA c1 correctness passes from a clean process baseline.
+- Remote c4 short and long correctness passes from a clean process baseline.
+- Only after correctness passes, warmed c4 performance is compared against the
+  previous roughly `11k TPS` target band. Any remaining gap must be attributed
+  with counters before moving on to broader scheduler-policy work.
+
+June 19 validation evidence after Slice 4d-r plus the local-blackhole scheduler
+admission fix:
+
+- Rebuilt Citus/Homer no-stats binaries with `CPPFLAGS='-D_GNU_SOURCE'`,
+  reinstalled into `/data/dbcomm/pg-citus`, relinked the Postgres server where
+  needed, synced the installed prefix to `farnet0`, and verified matching
+  service/client-library hashes on both hosts.
+- Remote RDMA pgbench c1 correctness passed:
+  - `20000/20000`, zero failures, `4166.78 TPS`, p50 `0.238 ms`,
+    p95 `0.250 ms`, p99 `0.264 ms`;
+  - repeat `20000/20000`, zero failures, `3758.97 TPS`, p50 `0.264 ms`,
+    p95 `0.279 ms`, p99 `0.294 ms`.
+- Remote RDMA pgbench c4 correctness and performance recovered to the expected
+  near-11k band:
+  - `40000/40000`, zero failures, `10473.76 TPS`, p50 `0.371 ms`,
+    p95 `0.533 ms`, p99 `0.618 ms`;
+  - repeat `40000/40000`, zero failures, `10388.04 TPS`, p50 `0.372 ms`,
+    p95 `0.533 ms`, p99 `0.603 ms`.
+- Local Homer blackhole basebackup validated the generation-zero basebackup
+  transport path: `RC=0`, `real 10.44s`.
+- Remote RDMA basebackup validated correctness and did not regress: warmup
+  `6.78s`, warmed repeats `4.43s` and `4.32s`.
+- A false lead during validation was rejected: increasing basebackup
+  `recordBytes` by `sizeof(CitusRemoteBaseBackupMessageHeader)` failed
+  immediately with `basebackup record is too large`. This proved
+  `slotReservedPrefixBytes` already includes the semantic basebackup header, so
+  the final code keeps `recordBytes = slotReservedPrefixBytes + payloadBytes`.
 
 ### Slice 4e: partial-post failure and source-retirement cleanup
 
@@ -1137,9 +1423,10 @@ Performance checks:
 4. Acceptance for the first async source-ring version is correctness plus no
    remote c1/c4 regression. The target is to remove the per-completion blocking
    local CQ wait and improve c1 latency/TPS while preserving c4 stability.
-5. Keep Slice 4b as the accepted remote correctness bridge, not as the accepted
-   performance baseline. The next performance baseline is Slice 4c: body WRITE
-   plus WIMM ready-word self-publication.
+5. The current accepted performance baseline is Slice 4c plus Slice 4d/4d-r:
+   body WRITE plus WIMM ready-word self-publication, frontend peek/apply/ack,
+   immutable generation-tagged tuple-result records, and the local-blackhole
+   scheduler admission fix.
 
 ## Pitfalls, caveats, and hidden constraints
 
@@ -1235,5 +1522,6 @@ send-CQ retirement are correct and measurable.
   FIFO for same-QP retirement.
 - Decide whether to add a dedicated `HOMER_PROGRESS_WAIT_COMPLETION_PUBLISH_SEND_CQ`
   enum or reuse command/control send-CQ wait with a specific blocked-reason flag.
-- Decide whether slot-local ready words should be a parallel array or a wrapped
-  completion-slot struct before editing the shared protocol header.
+- Measure whether remaining c4 variance is mostly scheduler/source-retirement
+  noise, send-CQ retirement interval, remote mailbox credit behavior, or
+  foreground/backend CPU placement before broad scheduler-policy changes.
