@@ -7,8 +7,10 @@
   source lifetime, send-CQ retirement, and scheduler-visible retry/resource
   facts.
 - **What this doc does NOT cover**: the full unified aggregate-action scheduler
-  migration, service-to-service peer command completion rings, payload byte-ring
-  lifecycle cleanup, or DOCA/DPU offload.
+  migration, service-to-service peer command completion rings, the full payload
+  byte-ring lifecycle redesign, or DOCA/DPU offload. This note does record the
+  tuple-result byte-ring EOS/command-boundary bug exposed during peer-client
+  completion validation because it currently blocks this publication pipeline.
 - **Primary directory**: `docs/kb/future-directions/citus/transport/`
 - **Doc type**: `future-direction`
 
@@ -307,6 +309,79 @@ Handoff diagnosis after the rejected Slice 4c long-run validation:
   [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2447)
   and its internal skip branch remain the primary root-cause target.
 
+June 19 validation update after implementing Slice 4d:
+
+- Slice 4d was implemented and pushed on
+  `homer-state-machine-scheduler-milestone`: `postgres-citus` commit
+  `555862ee997` and `citus-dbcomm` commit `8befe12df`.
+- No-stats Citus/Homer and relinked `pgbench` were rebuilt, installed, synced to
+  `farnet0`, and verified with matching hashes for
+  `/data/dbcomm/pg-citus/bin/pgbench`,
+  `/data/dbcomm/pg-citus/bin/citus_tuple_sink_service`, and
+  `/data/dbcomm/pg-citus/lib/x86_64-linux-gnu/libhomer_client.a`.
+- Remote RDMA c1 still failed correctness, so no performance result should be
+  claimed from this state. The first failure happened before any successful
+  transaction:
+
+  ```text
+  tuple result byte-ring record header mismatch at byte_head=80
+  expected_sequence=2 protocol=8 sink_sequence=1 payload_bytes=56
+  ```
+
+- A live `farnet0` result-ring dump showed two tuple-result records at byte
+  offsets `0` and `80`, both with `sinkSequence=1`. Later dumps showed that the
+  second record can be the previous row record republished with EOS, not only a
+  zero-row synthetic EOS marker.
+- The "fallback" involved here is not a desired recovery path in the completion
+  publication pipeline. It is the tuple-result EOS fallback in
+  [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1801):
+  first
+  [`MarkCitusTupleSinkLastRecordEos()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1686)
+  tries to mutate the last already-published tuple record to mark it terminal;
+  if that fails,
+  [`SubmitCitusTupleSinkEmptyEosRecord()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1720)
+  appends a separate terminal record. This dual terminal-result shape is now
+  suspect because it creates two representations of result EOS and lets backend
+  mutation timing race service-side payload publication.
+- A service-side hardening attempt added
+  [`HomerServiceTupleViewNextEosSequenceFromProducerBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19445)
+  and used it from
+  [`HomerServiceAppendTupleViewEosRecordToProducerByteRing()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19532)
+  so synthetic EOS sequence selection scans producer byte-ring records instead
+  of trusting `payloadSenderPostedTail + 1`. This did not remove the duplicate
+  previous-row terminal marker because the duplicate can be produced by the
+  backend/local tuple-sink EOS path before the service fallback is the decisive
+  code path.
+- A client-side diagnostic tolerance was added in
+  [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2875):
+  if the next visible record is a previous-sequence EOS/terminal marker, consume
+  it without counting its tuple payload again. This improved progress but is not
+  the target design and should not be extended into a general tolerance scheme.
+- After that tolerance, remote RDMA c1 progressed to `10596/20000` transactions
+  before failing:
+
+  ```text
+  tuple result byte-ring record header mismatch at byte_head=1695712
+  expected_sequence=1 protocol=8 sink_sequence=2 payload_bytes=40
+  transactions actually processed: 10596/20000
+  tps = 2840.750670
+  ```
+
+  The TPS number is diagnostic-only because the run aborted.
+- Current suspected cause: peer-client completion publication now reaches the
+  frontend reliably enough to expose result-drain correctness. The persistent
+  tuple-result byte ring is reused across commands, while tuple-view
+  `sinkSequence` is command-local. EOS publication and command-boundary draining
+  do not have one clean owner. Result termination can be represented by mutating
+  the last already-published record or by publishing an extra terminal record;
+  under backend/service timing this can leave the next command's frontend drain
+  positioned at a record whose sequence is not command-local `1`.
+- Current direction: stop adding client-side tolerance cases. The next design
+  discussion should remove the dual terminal-result publication shape or make it
+  explicitly owned and idempotent. There should be exactly one rule for
+  tuple-result EOS/frontier advancement at command boundaries before c1/c4
+  performance validation resumes.
+
 ## Implementation plan
 
 ### Slice 0: baseline and diagnostic surface
@@ -594,9 +669,12 @@ Acceptance:
 
 ### Slice 4d: frontend completion peek/apply/ack ownership
 
-Status: implemented and compile-checked on June 19, 2026. Remote c1/c4
-correctness and performance validation are still pending before accepting Slice
-4c performance recovery.
+Status: implemented and compile-checked on June 19, 2026, but remote c1
+correctness validation is rejected. The peek/apply/ack ownership fix removed
+destructive frontend completion consumption from pgbench's measured path, but
+validation exposed a separate tuple-result byte-ring EOS/command-boundary
+ownership bug. Do not claim Slice 4c performance recovery until this result-ring
+bug is fixed and remote c1/c4 correctness passes from a clean baseline.
 
 The current pushed-completion client API is destructive: reading a completion can
 also advance `lastConsumedCompletionEpoch` and remote `consumedEpoch`. That is
@@ -832,6 +910,31 @@ Implementation progress:
 - Kept remote mailbox credit enforcement as Slice 4f; this implementation still
   relies on the current normal mailbox geometry rather than a sender-side remote
   consumed-epoch mirror.
+- Validation rejected the current state before performance measurement. Remote
+  c1 first failed at `byte_head=80 expected_sequence=2 sink_sequence=1`; after a
+  diagnostic previous-sequence terminal-marker tolerance in
+  [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2875),
+  it progressed to `10596/20000` transactions and then failed at
+  `byte_head=1695712 expected_sequence=1 sink_sequence=2`. This is now tracked
+  as a tuple-result EOS/command-boundary ownership blocker, not as an accepted
+  completion-publication performance result.
+- The service-side helper
+  [`HomerServiceTupleViewNextEosSequenceFromProducerBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19445)
+  and client-side previous-sequence terminal-marker handling are diagnostic
+  hardening from the failed validation, not final architecture. They should not
+  grow into a broad "tolerate malformed result stream" policy.
+
+Current blocker and next design question:
+
+- The tuple-result EOS fallback in
+  [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1801)
+  chooses between mutating the last already-published record via
+  [`MarkCitusTupleSinkLastRecordEos()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1686)
+  and appending a separate terminal record via
+  [`SubmitCitusTupleSinkEmptyEosRecord()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1720).
+  This should be treated as a design bug until proven otherwise. The next slice
+  should define one owner and one command-boundary rule for tuple-result EOS and
+  byte-frontier advancement before further c4 performance work.
 
 ### Slice 4e: partial-post failure and source-retirement cleanup
 
