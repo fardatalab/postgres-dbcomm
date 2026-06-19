@@ -3485,6 +3485,15 @@ clearHomerPendingCommand(CState *st)
 	st->homer_pending_operation_name = NULL;
 }
 
+typedef enum HomerCompletionApplyResult
+{
+	HOMER_COMPLETION_APPLIED_CONTINUE = 0,
+	HOMER_COMPLETION_APPLIED_TERMINAL_SUCCESS,
+	HOMER_COMPLETION_APPLIED_TERMINAL_FAILURE,
+	HOMER_COMPLETION_NOT_APPLIED_RETRY,
+	HOMER_COMPLETION_APPLY_FATAL
+} HomerCompletionApplyResult;
+
 /*
  * HomerApplyCommandCompletion consumes one command completion observed either
  * as the immediate START_COMMAND response or as a later pushed completion from
@@ -3493,10 +3502,8 @@ clearHomerPendingCommand(CState *st)
  * only point where pgbench advances its command state and updates the
  * transaction attachment flag.
  */
-static bool
-HomerApplyCommandCompletion(CState *st,
-							const CitusRemoteExecCommandCompletion *completion,
-							bool *commandComplete)
+static HomerCompletionApplyResult
+HomerApplyCommandCompletion(CState *st, const CitusRemoteExecCommandCompletion *completion, bool *commandComplete)
 {
 	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
 	HomerClientResultSink *resultSink = &st->homer_result_sink;
@@ -3520,7 +3527,7 @@ HomerApplyCommandCompletion(CState *st,
 							 st->id, operationName, errorMessage);
 				st->estatus = ESTATUS_OTHER_SQL_ERROR;
 				clearHomerPendingCommand(st);
-				return false;
+				return HOMER_COMPLETION_APPLY_FATAL;
 			}
 
 			/*
@@ -3550,14 +3557,14 @@ HomerApplyCommandCompletion(CState *st,
 				HomerClientCloseResultSink(resultSink, false);
 				st->homer_result_sink_open = false;
 				clearHomerPendingCommand(st);
-				return false;
+				return HOMER_COMPLETION_APPLY_FATAL;
 			}
 		}
 	}
 
 	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED ||
 		completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_PENDING)
-		return true;
+		return HOMER_COMPLETION_APPLIED_CONTINUE;
 
 	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED)
 	{
@@ -3575,7 +3582,7 @@ HomerApplyCommandCompletion(CState *st,
 					 (unsigned long long) completion->processedRowCount);
 		clearHomerPendingCommand(st);
 		*commandComplete = true;
-		return true;
+		return HOMER_COMPLETION_APPLIED_TERMINAL_SUCCESS;
 	}
 
 	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_FAILED)
@@ -3591,14 +3598,14 @@ HomerApplyCommandCompletion(CState *st,
 			st->homer_result_sink_open = false;
 		}
 		clearHomerPendingCommand(st);
-		return false;
+		return HOMER_COMPLETION_APPLIED_TERMINAL_FAILURE;
 	}
 
 	pg_log_error("client %d Homer %s returned unexpected command state %u",
 				 st->id, operationName, completion->commandState);
 	st->estatus = ESTATUS_OTHER_SQL_ERROR;
 	clearHomerPendingCommand(st);
-	return false;
+	return HOMER_COMPLETION_APPLY_FATAL;
 }
 
 /*
@@ -3652,7 +3659,20 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 	st->homer_pending_drained_rows = 0;
 	st->homer_pending_operation_name = operationName;
 
-	return HomerApplyCommandCompletion(st, &completion, &commandComplete);
+	switch (HomerApplyCommandCompletion(st, &completion, &commandComplete))
+	{
+	case HOMER_COMPLETION_APPLIED_CONTINUE:
+	case HOMER_COMPLETION_APPLIED_TERMINAL_SUCCESS:
+		return true;
+	case HOMER_COMPLETION_APPLIED_TERMINAL_FAILURE:
+	case HOMER_COMPLETION_NOT_APPLIED_RETRY:
+	case HOMER_COMPLETION_APPLY_FATAL:
+		return false;
+	}
+
+	pg_log_error("client %d Homer %s produced an unknown apply result", st->id, operationName);
+	st->estatus = ESTATUS_OTHER_SQL_ERROR;
+	return false;
 }
 
 /*
@@ -3665,8 +3685,9 @@ static bool
 receiveHomerCommand(CState *st, bool *commandComplete)
 {
 	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
-	CitusRemoteExecCommandCompletion completion;
-	bool		completionReady = false;
+	const HomerClientCompletionLease *lease = NULL;
+	HomerClientCompletionPeekStatus peekStatus = HOMER_CLIENT_COMPLETION_PEEK_NOT_READY;
+	HomerCompletionApplyResult applyResult;
 
 	if (!st->homer_command_pending)
 	{
@@ -3674,13 +3695,8 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 		return true;
 	}
 
-	if (!HomerClientTryCommandCompletion(&st->homer_session,
-										 st->homer_pending_command_kind,
-										 st->homer_pending_command_sequence,
-										 &completion,
-										 &completionReady,
-										 errorMessage,
-										 sizeof(errorMessage)))
+	if (!HomerClientPeekNextCompletionEvent(&st->homer_session, &lease, &peekStatus, errorMessage,
+											sizeof(errorMessage)))
 	{
 		pg_log_error("client %d failed to read pushed Homer completion for %s: %s",
 					 st->id,
@@ -3692,7 +3708,8 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 		return false;
 	}
 
-	if (!completionReady)
+	if (peekStatus == HOMER_CLIENT_COMPLETION_PEEK_NOT_READY ||
+		peekStatus == HOMER_CLIENT_COMPLETION_PEEK_BODY_VISIBILITY_PENDING)
 	{
 		if (st->homer_pending_result_sink_bound)
 		{
@@ -3723,8 +3740,69 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 		*commandComplete = false;
 		return true;
 	}
+	if (peekStatus != HOMER_CLIENT_COMPLETION_PEEK_READY || lease == NULL)
+	{
+		pg_log_error("client %d got unexpected Homer completion peek status %u for %s", st->id,
+					 (unsigned int)peekStatus,
+					 st->homer_pending_operation_name ? st->homer_pending_operation_name : "unknown");
+		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		clearHomerPendingCommand(st);
+		return false;
+	}
+	if (lease->completion.commandKind != st->homer_pending_command_kind ||
+		lease->completion.commandSequence != st->homer_pending_command_sequence)
+	{
+		/*
+		 * The mailbox is an ordered session event stream. With one command in
+		 * flight per pgbench Homer session, a mismatched head event is a
+		 * protocol violation; do not skip or acknowledge it.
+		 */
+		pg_log_error(
+			"client %d Homer completion mismatch for %s: expected kind=%u sequence=%llu got kind=%u sequence=%llu",
+			st->id, st->homer_pending_operation_name ? st->homer_pending_operation_name : "unknown",
+			st->homer_pending_command_kind, (unsigned long long)st->homer_pending_command_sequence,
+			lease->completion.commandKind, (unsigned long long)lease->completion.commandSequence);
+		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		clearHomerPendingCommand(st);
+		return false;
+	}
 
-	return HomerApplyCommandCompletion(st, &completion, commandComplete);
+	applyResult = HomerApplyCommandCompletion(st, &lease->completion, commandComplete);
+	if (applyResult == HOMER_COMPLETION_NOT_APPLIED_RETRY)
+	{
+		*commandComplete = false;
+		return true;
+	}
+	if (applyResult != HOMER_COMPLETION_APPLY_FATAL)
+	{
+		if (!HomerClientAckCommandCompletion(&st->homer_session, lease->epoch, lease->sessionGeneration, errorMessage,
+											 sizeof(errorMessage)))
+		{
+			pg_log_error("client %d failed to acknowledge Homer completion for %s: %s", st->id,
+						 st->homer_pending_operation_name ? st->homer_pending_operation_name : "unknown", errorMessage);
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+			clearHomerPendingCommand(st);
+			return false;
+		}
+	}
+
+	switch (applyResult)
+	{
+	case HOMER_COMPLETION_APPLIED_CONTINUE:
+	case HOMER_COMPLETION_APPLIED_TERMINAL_SUCCESS:
+		return true;
+	case HOMER_COMPLETION_APPLIED_TERMINAL_FAILURE:
+	case HOMER_COMPLETION_APPLY_FATAL:
+		return false;
+	case HOMER_COMPLETION_NOT_APPLIED_RETRY:
+		return true;
+	}
+
+	pg_log_error("client %d Homer %s produced an unknown apply result", st->id,
+				 st->homer_pending_operation_name ? st->homer_pending_operation_name : "unknown");
+	st->estatus = ESTATUS_OTHER_SQL_ERROR;
+	clearHomerPendingCommand(st);
+	return false;
 }
 
 /*

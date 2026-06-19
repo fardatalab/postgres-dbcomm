@@ -594,8 +594,9 @@ Acceptance:
 
 ### Slice 4d: frontend completion peek/apply/ack ownership
 
-Status: required next implementation target before any more Slice 4c performance
-claims.
+Status: implemented and compile-checked on June 19, 2026. Remote c1/c4
+correctness and performance validation are still pending before accepting Slice
+4c performance recovery.
 
 The current pushed-completion client API is destructive: reading a completion can
 also advance `lastConsumedCompletionEpoch` and remote `consumedEpoch`. That is
@@ -605,10 +606,19 @@ still has to apply the event in
 [`HomerApplyCommandCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3497)
 after the library call returns. The clean ownership contract is:
 
-1. **Peek**: copy and validate the next frontend completion event without
-   acknowledging it.
+1. **Peek/lease**: acquire and validate the next frontend completion event into
+   session-owned client storage without acknowledging it.
 2. **Apply**: let pgbench apply the copied event to its command/result-sink state.
 3. **Ack**: advance the consumed epoch only after the event has been applied.
+
+Long-term target: remove dual semantic delivery. The measured async pgbench path
+should not treat the `START_COMMAND` return value and the pushed mailbox as two
+independent representations of the same command state. Either start submission
+returns only command-submission facts and all state transitions arrive through
+the ordered completion stream, or any inline start result must carry the exact
+completion epoch/event identity that pgbench later applies and acknowledges. A
+helper that scans the pushed mailbox by only `commandKind + commandSequence` is
+not a valid deduplication protocol.
 
 Immediate cleanup before adding the new API:
 
@@ -636,82 +646,137 @@ typedef enum HomerClientCompletionPeekStatus
 {
     HOMER_CLIENT_COMPLETION_PEEK_NOT_READY = 0,
     HOMER_CLIENT_COMPLETION_PEEK_READY,
+    HOMER_CLIENT_COMPLETION_PEEK_BODY_VISIBILITY_PENDING,
     HOMER_CLIENT_COMPLETION_PEEK_OVERRUN,
     HOMER_CLIENT_COMPLETION_PEEK_MISMATCH
 } HomerClientCompletionPeekStatus;
 
-typedef struct HomerClientCompletionEvent
+typedef struct HomerClientCompletionLease
 {
     uint64_t epoch;
+    uint64_t sessionGeneration;
     uint32_t slotIndex;
     CitusRemoteExecCommandCompletion completion;
-} HomerClientCompletionEvent;
+} HomerClientCompletionLease;
 ```
 
-1. Add `HomerClientPeekCommandCompletion(session, expectedKind,
-   expectedSequence, event, status, errorMessage, errorMessageBytes)`.
-   The function must:
+1. Add one session-owned pending completion lease to
+   [`HomerClientSession`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:53),
+   for example `completionLeaseActive` plus `completionLease`. The lease is the
+   client library's durable copy of the mailbox event until pgbench applies and
+   acknowledges it.
+2. Add `HomerClientPeekNextCompletionEvent(session, lease, status,
+   errorMessage, errorMessageBytes)`. The function must:
    - compute `expectedEpoch = session->lastConsumedCompletionEpoch + 1`
+   - if a lease is already active, return that same lease without rereading or
+     modifying the mailbox
    - stable-copy the expected slot using `readyEpochSlots[slotIndex]`
-   - validate protocol version, command kind, command sequence, command state,
-     and flag-dependent descriptor fields
-   - return `NOT_READY`, `READY`, `OVERRUN`, or `MISMATCH`
+   - require the body-resident epoch described below to equal `expectedEpoch`
+   - validate protocol version and command state
+   - return `NOT_READY`, `READY`, `BODY_VISIBILITY_PENDING`, `OVERRUN`, or
+     `MISMATCH`
+   - activate the session lease only for a valid `READY` event
    - not store `consumedEpoch`
    - not update `lastConsumedCompletionEpoch`
    - not recurse
    - not skip or coalesce visible events
-2. Add `HomerClientAckCommandCompletion(session, eventEpoch, errorMessage,
+3. Pgbench may validate the leased event against its pending command kind and
+   sequence after peek. A mismatch is a non-destructive protocol error in the
+   current one-command-in-flight model; it must not be treated as a reason to
+   skip or acknowledge the event.
+4. Add `HomerClientAckCommandCompletion(session, eventEpoch, sessionGeneration,
    errorMessageBytes)`. The function must:
+   - require an active lease
    - require `eventEpoch == session->lastConsumedCompletionEpoch + 1`
+   - require the epoch and session generation to match the active lease
    - release-store the mailbox `consumedEpoch`
    - update `session->lastConsumedCompletionEpoch`
+   - clear the active lease
    - update terminal diagnostic fields only after the caller confirms the event
      was applied
-3. Keep the old destructive
+5. Session reset invalidates the active lease. ACK of a stale, future,
+   non-leased, or wrong-generation epoch should fail a debug assertion and
+   return a hard error in non-assert builds.
+6. Keep the old destructive
    [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2447)
    as a compatibility wrapper only after the new API exists. It may internally
    call peek and ack for non-pgbench callers that intentionally want the old
    semantics, but pgbench must not use it on the measured path.
 
+Publication epoch in the body:
+
+1. Add a body-resident publication epoch to the frontend client completion slot,
+   for example:
+
+   ```c
+   typedef struct CitusRemoteExecClientCompletionSlot
+   {
+       uint64_t bodyEpoch;
+       CitusRemoteExecCommandCompletion completion;
+   } CitusRemoteExecClientCompletionSlot;
+   ```
+
+   This may replace the current bare `completionSlots[]` element type in
+   [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:491).
+2. The sender writes `bodyEpoch = nextEpoch` together with the completion body,
+   then writes the slot-local ready word with WIMM.
+3. The reader accepts a slot only when
+   `ready1 == expectedEpoch`, `bodyEpoch == expectedEpoch`, and
+   `ready2 == expectedEpoch`. If the ready word is new but the body epoch is old
+   or different, return `BODY_VISIBILITY_PENDING`, increment a diagnostic
+   counter, and retry without ACK. Do not classify the stale body as a legitimate
+   older command completion.
+4. This does not remove the Slice 4c ordering requirement. It gives validation
+   evidence and a non-destructive retry path if body visibility trails the ready
+   gate.
+
 Pgbench conversion:
 
 1. Convert
    [`receiveHomerCommand()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3665)
-   to call `HomerClientPeekCommandCompletion()`.
+   to call `HomerClientPeekNextCompletionEvent()`.
 2. If peek returns `NOT_READY`, keep the existing running-result-sink drain
    behavior and return `commandComplete=false`.
-3. If peek returns `READY`, call
+3. If peek returns `BODY_VISIBILITY_PENDING`, do not apply or acknowledge
+   anything. Return incomplete after optional result-sink drain and count the
+   event separately from ordinary not-ready polls.
+4. If peek returns `READY`, validate the leased event against
+   `homer_pending_command_kind` and `homer_pending_command_sequence`, then call
    [`HomerApplyCommandCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3497)
-   with the copied event. Only after successful event application should pgbench
-   call `HomerClientAckCommandCompletion()` with the event epoch.
-4. Refine `HomerApplyCommandCompletion()`'s result contract so pgbench can
+   with the leased event. Only after event application should pgbench call
+   `HomerClientAckCommandCompletion()` with the lease epoch and generation.
+5. Refine `HomerApplyCommandCompletion()`'s result contract so pgbench can
    distinguish:
    - event application succeeded and the command remains running
    - event application succeeded and the command completed successfully
    - event application succeeded and the backend reported command failure
+   - event application chose not to apply yet and should retry without ACK
    - event application failed locally while opening/draining the result sink
 
    Backend `FAILED` is still an applied terminal event and should be acked before
    pgbench transitions to error. A local frontend failure while applying the
    event should not silently ack; it should mark the Homer session/connection
    broken or take a deliberate cleanup path.
-5. Duplicate STARTED/sink-ready events must be handled explicitly and
+6. Duplicate STARTED/sink-ready events must be handled explicitly and
    idempotently. If a STARTED event was already observed through the immediate
    start response and later appears in the pushed mailbox, pgbench should apply
    the duplicate to the extent needed, then ack that exact mailbox epoch. It must
    not consume a later terminal completion just because it has the same command
    sequence.
 
-Temporary server-side simplification for this slice:
+Terminal event invariant:
 
-1. Disable the result-descriptor flag stripping optimization in
+1. Disable and do not plan to restore the result-descriptor flag stripping
+   optimization in
    [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13105)
-   while validating peek/apply/ack. If a terminal completion has result-sink
-   state, allow it to carry `TUPLE_SINK_READY` again. Repeating the descriptor is
-   acceptable because pgbench already checks
+   for the fixed-size publication path. If a terminal completion has result-sink
+   state, it should carry `TUPLE_SINK_READY` and the descriptor as a
+   self-contained final snapshot. Repeating the descriptor is acceptable because
+   pgbench already checks
    `!homer_pending_result_sink_bound` before opening a result sink.
-2. Re-enable descriptor stripping only after STARTED/sink-ready events are proven
-   impossible to acknowledge without being applied.
+2. If descriptor bandwidth later matters, add an explicit persistent descriptor
+   id/version. Do not encode dependency on an earlier STARTED event merely by
+   clearing the descriptor flag on a terminal event.
 
 Acceptance:
 
@@ -719,21 +784,60 @@ Acceptance:
   Homer path.
 - No frontend completion event advances `lastConsumedCompletionEpoch` or mailbox
   `consumedEpoch` before pgbench has applied that event.
+- Every acknowledged epoch has exactly one corresponding applied-event record in
+  the pgbench/Homer diagnostic counters.
+- Repeated peek before ACK returns the same session-owned lease.
+- ACK of a stale, future, non-leased, or wrong-generation epoch fails.
+- Backend `FAILED` completions are acknowledged after pgbench applies the failure
+  transition.
+- `readyEpoch == expected && bodyEpoch != expected` retries without consuming and
+  increments a distinct diagnostic counter.
+- Mismatched command kind or sequence is never acknowledged.
 - The recursive older-completion skip branch is gone from the measured path.
 - The `lastTerminalCompletion*` replay path is either removed or remains
   diagnostic-only with a counter/log proving it is not used during accepted c1/c4
   runs.
+- Terminal result completions are self-contained and do not depend on an earlier
+  STARTED/sink-ready event for descriptor state.
 - Remote c1 passes.
 - Remote c4 `-t2500` short repeats pass.
 - Remote c4 `-t10000` long repeats pass at least three times from a clean
   process baseline, with no client stuck in `CSTATE_WAIT_RESULT`.
 - Warmed c4 performance returns to the previous roughly `11k TPS` target band
   before the Slice 4c transport work is accepted as recovered.
+- Slice 4b and Slice 4c both pass the same long-c4 ownership test. Slice 4c
+  additionally reports zero persistent body-epoch mismatches.
+
+Implementation progress:
+
+- Added a session-owned frontend completion lease in
+  [`HomerClientSession`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:38)
+  and exposed
+  [`HomerClientPeekNextCompletionEvent()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2330)
+  plus
+  [`HomerClientAckCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2465).
+- Converted
+  [`receiveHomerCommand()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3685)
+  to peek, validate the leased event, apply it through
+  [`HomerApplyCommandCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3506),
+  and ACK only after application.
+- Removed the terminal replay/dedup path from
+  [`homer_client.c`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1019)
+  and removed START-response mailbox consumption from
+  [`HomerClientStartCommandWithCompletionFlags()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2250).
+- Added a body-resident epoch to frontend completion slots in
+  [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:485)
+  and made the peer RDMA publisher write `bodyEpoch + completion` before the
+  ready WIMM.
+- Kept remote mailbox credit enforcement as Slice 4f; this implementation still
+  relies on the current normal mailbox geometry rather than a sender-side remote
+  consumed-epoch mirror.
 
 ### Slice 4e: partial-post failure and source-retirement cleanup
 
 Status: required cleanup after Slice 4d, but not the primary cause of the
-captured long-run c4 wedge.
+captured long-run c4 wedge. This is a correctness gate before treating
+multi-WR publication failure as retryable work.
 
 Slice 4c posts a multi-WR publication sequence. If the body WRITE posts but the
 ready WIMM post fails, the source slot may still be referenced by an unsignaled
@@ -747,7 +851,8 @@ WR and cannot be safely released or retried as normal work. The current
    source slot normally.
 3. If failure happens after the body WR posts but before the ready WIMM posts,
    mark the source/owner as `FAILED_NEEDS_QP_RESET`, mark the peer
-   connection/session failed, and prevent retry on that QP.
+   connection/session failed, and prevent retry on that QP. This is a terminal
+   transport state for that connection, not a normal blocked-publication state.
 4. Cleanup of `FAILED_NEEDS_QP_RESET` state must happen through connection reset
    or QP teardown, not normal source-ring reuse.
 5. Replace the current global peer-client completion CQ owner scan with the
@@ -762,6 +867,49 @@ Acceptance:
   failed/reset-required and never reuses that source slot on the live QP.
 - Normal c1/c4 runs retire source slots through send-CQ checkpoints exactly as
   before.
+
+### Slice 4f: remote mailbox credit enforcement
+
+Status: required after Slice 4d/4e for a complete long-term protocol; may be
+implemented before 4e if validation shows mailbox pressure before partial-post
+fault injection.
+
+Peek/apply/ack intentionally holds a frontend completion event unconsumed until
+the semantic consumer has applied it. That makes the ownership boundary correct,
+but it also means the peer-side producer must enforce the existing mailbox credit
+contract before it chooses a remote slot. The frontend client completion mailbox
+already has a fixed slot count and explicit `consumedEpoch`; local producers can
+load those words directly. The missing piece is the cross-node producer's mirror
+or refresh path for the remote `consumedEpoch`. Multiple slots provide slack,
+but they are not by themselves a credit protocol unless the producer knows which
+slots the remote client has acknowledged. One command can produce multiple
+visible events, so overwrite protection cannot be inferred from local source-ring
+availability.
+
+1. Maintain a sender-side mirror of remote `consumedEpoch` for the peer-client
+   completion mailbox.
+2. Publish optimistically while
+   `publishedEpoch - knownRemoteConsumedEpoch` is comfortably below
+   `CITUS_REMOTE_EXEC_CLIENT_COMPLETION_MAILBOX_SLOTS`.
+3. Near a high-water mark, refresh known remote credit by RDMA READ or an
+   explicit receiver-to-sender credit update.
+4. Block peer-client completion publication before
+   `publishedEpoch - knownRemoteConsumedEpoch == slotCount`.
+5. Report this as `BLOCKED_REMOTE_CREDIT`, separate from local source-ring credit
+   and semantic payload dependency waits.
+6. Feed this fact into the scheduler as command/completion resource relief,
+   not as payload-frontier blockage.
+
+Acceptance:
+
+- A tiny completion mailbox blocks on `BLOCKED_REMOTE_CREDIT` before overwrite.
+- Source-ring-credit exhaustion and remote-mailbox-credit exhaustion are counted
+  and scheduled separately.
+- Holding an active client lease cannot cause the sender to overwrite the leased
+  slot.
+- Remote c1/c4 correctness and performance runs show no steady-state remote
+  credit stalls with the normal mailbox geometry, or the stalls are measurable
+  and explainable.
 
 ### Slice 5: tagged send-CQ retirement
 
