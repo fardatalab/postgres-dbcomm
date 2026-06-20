@@ -3558,6 +3558,77 @@ Add a dedicated replication QP/CQ only if, after Stage 7b budget tuning,
 concurrent basebackup increases foreground pgbench p99 by more than `10%` or CQ
 / payload counters show bulk head-of-line blocking.
 
+### Trigger measurement - June 20, 2026
+
+Artifact: `/tmp/stage7d_trigger_20260620_084912`
+
+Stage 7d is triggered, but implementation should not start until the concurrent
+c4 correctness failure below is discussed and either fixed or deliberately
+separated from the isolation work.
+
+No-stats setup evidence:
+
+- Installed artifacts matched on `farnet1` and `farnet0`.
+- Stats marker grep was empty.
+- Process preflight was clean before the run; cleanup after the run left no
+  matching PostgreSQL/Homer/pgbench/basebackup processes.
+
+Standalone reference from the same measurement session:
+
+```text
+remote RDMA pgbench c1 warmed p99:
+    0.248 ms, 0.273 ms, 0.275 ms
+
+remote RDMA pgbench c4 warmed p99:
+    0.551 ms, 0.549 ms, 0.573 ms
+
+standalone remote RDMA basebackup warmed wall time:
+    4.12 s, 4.24 s, 4.24 s
+```
+
+Concurrent c1 result with one background remote RDMA basebackup:
+
+```text
+foreground remote RDMA pgbench c1 warmed p99:
+    0.304 ms, 0.339 ms, 0.338 ms
+
+foreground correctness:
+    10000/10000 transactions, 0 failed, all warmed runs
+
+background basebackup wall time:
+    4.14 s, 4.26 s, 4.13 s
+```
+
+The median concurrent c1 p99 was `0.338 ms`, which is about `+23.8%` versus
+the same-session standalone c1 median `0.273 ms`, and about `+24.7%` versus the
+previous accepted Stage 7c upper-band p99 `0.271 ms`. This exceeds the `10%`
+trigger threshold, while basebackup wall time stayed in the expected band.
+
+Concurrent c4 caveat:
+
+```text
+concurrent_c4_pgbench_1.log:
+    client 3 Homer completion mismatch for sql_execute:
+        expected kind=6 sequence=2170 got kind=6 sequence=2162
+    client 3 Homer completion mismatch for tx_abort_during_session_finish:
+        expected kind=4 sequence=2171 got kind=6 sequence=2162
+    client 3 could not close Homer session:
+        completion mismatch: expected command=client_sql_session_close
+        sequence=2172 got command=6 sequence=2162
+    processed: 7809/10000
+```
+
+The c4 interference shape is therefore diagnostic-only, not a valid performance
+acceptance run. This is a correctness failure in the concurrent foreground
+transaction path under background basebackup load. Per the optimization-plan
+rules, do not proceed directly into a large Stage 7d topology change on top of
+this failure. The next implementation session should first decide whether the
+mismatch is a known peer-completion/session sequencing issue exposed by
+interference, or whether it is itself caused by bulk/foreground CQ sharing. If it
+is caused by shared transport ownership, the Stage 7d QP/CQ isolation design
+should include a correctness acceptance gate that reproduces and eliminates this
+c4 mismatch.
+
 ### Acceptance
 
 - Foreground pgbench with background remote RDMA basebackup improves p95/p99
