@@ -3452,6 +3452,101 @@ Wrap cases:
 - Direct-MR teardown and QP reset do not release a source range still readable
   by the NIC.
 
+### Accepted Stage 7c checkpoint - June 20, 2026
+
+Stage 7c is implemented in `citus-dbcomm` commit `063253166` as a
+source-lifetime cleanup of the existing direct byte-ring sender, not as a second
+sender or staging fallback.
+
+Implemented code shape:
+
+- [`TupleSinkServiceEnsureSendQueueMemoryRegion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13412)
+  now documents and validates the sender source mapping explicitly. Fixed-slot
+  streams register the slot queue mapping; byte-ring streams register the
+  complete producer-owned byte-ring mapping, including the control page and
+  storage bytes. There is no byte-ring staging fallback: registration failure is
+  a stream-open/pump error.
+- [`TupleSinkServiceProgressStreamOpenAsyncOp()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26129)
+  now registers that source mapping in `STREAM_REGISTER_MIRROR`, before the peer
+  open request is sent. The existing pump-side ensure remains an idempotent
+  guard.
+- [`HomerServiceBindPeerToPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18895)
+  remains the source-frontier reset point. Byte-ring source reuse is still gated
+  by `payloadSourceByteCompletedHead`, which advances only from send-CQ
+  retirement.
+- [`TupleSinkServicePostPeerRegisteredPayloadBatchWithTailImmediateRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6205)
+  still validates every payload write range against the registered source handle
+  before posting. That range check is the immediate guard that the direct sender
+  is using the registered producer mapping rather than an unregistered scratch
+  buffer.
+
+Design correction:
+
+- The original Stage 7c notes allowed local source-ring wrap to use multiple
+  SGEs. The current producer contract already avoids splitting a producer record
+  across the local ring wrap: producers leave the trailing gap and publish the
+  next record at offset zero. The accepted Stage 7c shape therefore keeps the
+  existing gap-skip semantics and validates direct registered contiguous records.
+  Two-SGE local source-wrap support is a future producer-format change, not a
+  prerequisite for this stage.
+- The original notes also said registration failure could fall back to the old
+  registered staging path. That path is no longer part of the intended
+  byte-ring design. The accepted behavior is fail-fast stream error rather than
+  reintroducing dual delivery or a copied source path.
+
+Validation evidence:
+
+```text
+artifact: /tmp/homer_stage7c_20260620_083757
+
+remote RDMA pgbench c1 warmed runs 2-4:
+    TPS: 4431.8, 4094.2, 4103.9
+    p95: 0.235-0.256 ms
+    p99: 0.250-0.271 ms
+    failed transactions: 0
+
+remote RDMA pgbench c4 warmed runs 2-4:
+    TPS: 10973.6, 11001.5, 10898.3
+    p95: 0.496-0.506 ms
+    p99: 0.555-0.576 ms
+    failed transactions: 0
+
+local Homer blackhole basebackup warmed runs 2-4:
+    3.99 s, 4.04 s, 3.99 s
+
+remote RDMA basebackup warmed runs 2-4:
+    4.24 s, 4.11 s, 4.13 s
+
+stats run 2 on farnet1 sender:
+    producer_to_registered_source_copy_bytes=0
+    sender_batches=4736
+    sender_objects=6629
+    sender_bytes=23321714876
+    sender_wrs=4738
+    payload_records_per_wimm=6629
+    payload_bytes_per_wimm=23321714876
+    payload_wrs_per_wimm=9474
+```
+
+Acceptance result:
+
+- Stage 7c passes. The service payload stats show
+  `producer_to_registered_source_copy_bytes=0` for the accepted remote RDMA
+  basebackup path, and pgbench/basebackup correctness held with no failed
+  transactions.
+- The validation worker restored the no-stats service/client build, synced the
+  install prefix to `farnet0`, verified no stats marker strings in installed
+  service/client artifacts on both hosts, verified matching final hashes for
+  `citus_tuple_sink_service`, `pgbench`, `pg_basebackup`, `citus.so`, and
+  `libhomer_client.a`, and ended with a clean process preflight on both hosts.
+
+Caveat:
+
+- The stats-enabled `libhomer_client.a` contained the client basebackup stats
+  string, but the installed `pg_basebackup` binary did not expose or emit that
+  client stats string after relink. Stage 7c acceptance is based on service
+  payload stats, which directly measure the sender-side registered-source path.
+
 ## Stage 7d: optional replication QP/CQ isolation
 
 Goal: isolate bulk basebackup from foreground latency only when measurement
