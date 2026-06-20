@@ -2536,6 +2536,43 @@ stats-only short remote c1:
         remote_command_failures=0
 ```
 
+Current-branch revalidation, June 20, 2026: after the later basebackup
+semantic-header work was present, the current no-stats runtime was rebuilt,
+installed, and synced to `farnet0` again. This was not a new Stage 4d code
+change; it verifies that the Stage 4d command-publication contract still holds
+on the current `homer-state-machine-scheduler-milestone` heads
+`citus-dbcomm` `053101f75` and `postgres-citus` `ba36bfa7aaf`, with installed
+control ABI `/citus_remote_execution_control_v24`.
+
+```text
+artifact: /tmp/homer_stage4d_validate_1781955556
+
+remote RDMA pgbench c1:
+    smoke: failed=0, TPS=1128.614034, p95=0.240 ms, p99=0.261 ms, max=1322.967 ms
+    run 1 warmed: failed=0, TPS=4508.402648, p95=0.231 ms, p99=0.244 ms, max=5.670 ms
+    run 2 warmed: failed=0, TPS=4038.101914, p95=0.257 ms, p99=0.275 ms, max=5.632 ms
+    run 3 warmed: failed=0, TPS=4051.585598, p95=0.256 ms, p99=0.271 ms, max=5.588 ms
+
+remote RDMA pgbench c4:
+    run 1: failed=0, TPS=11194.272115, p95=0.504 ms, p99=0.587 ms, max=15.259 ms
+    run 2: failed=0, TPS=11079.663333, p95=0.506 ms, p99=0.592 ms, max=15.266 ms
+    run 3: failed=0, TPS=11019.626782, p95=0.508 ms, p99=0.597 ms, max=15.266 ms
+
+local Homer blackhole basebackup:
+    4.10s, 4.08s
+
+remote RDMA basebackup:
+    warmup 5.48s; warmed 4.13s, 4.23s
+```
+
+Service-log diagnostics checked as `dbcomm` on both hosts did not show invalid
+command slots, reset-required command owner errors, CQ errors, visibility or
+mismatch diagnostics, `FATAL`, `PANIC`, or `ERROR`. The first validation
+harness attempt in `/tmp/homer_stage4d_validate_1781955504` aborted before any
+workload ran because a broad `pkill -f` cleanup pattern matched the long shell
+command that contained future `pgbench` invocations; the successful artifact
+above used process-name cleanup and should be the accepted evidence.
+
 This completes the planned Stage 4d command-publication work for the current
 milestone: compact command records, stable backend reads, accepted-versus-retired
 source ownership, typed CQ retirement for registered-source commands, and true
