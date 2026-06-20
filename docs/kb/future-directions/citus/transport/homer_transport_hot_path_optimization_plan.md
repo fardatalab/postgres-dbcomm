@@ -3245,7 +3245,7 @@ instead of duplicating it.
 ### Substeps
 
 1. Verify that current basebackup uses the existing range descriptor path around
-   [`HomerServiceAppendOutgoingBaseBackupFragmentWrite()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12421).
+   [`HomerServiceAppendOutgoingBaseBackupFragmentWrite()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13163).
 2. Measure:
 
    ```text
@@ -3272,6 +3272,148 @@ instead of duplicating it.
 
 - `bytesPerWimm` and `bytesPerSignaledCqe` increase.
 - Remote RDMA basebackup warmed wall time improves or stays flat.
+
+### Accepted Stage 7b checkpoint - June 20, 2026
+
+Stage 7b is implemented in `citus-dbcomm` commit `eb29d1667` and validated as
+tuning of the existing byte-ring range publication path, not as a duplicate
+sender. The byte-ring sender still consumes producer records as soon as they are
+published; batching now happens only in the downstream bulk transport range
+builder.
+
+Implemented code shape:
+
+- The payload batch descriptor hard cap is raised from 16 to 32 at
+  [`CITUS_REMOTE_EXEC_PEER_PAYLOAD_BATCH_MAX_WRITES`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:50).
+  This did not by itself improve batching, but it removes the descriptor cap as
+  the near-term limit.
+- The byte-ring basebackup sender now has a bulk-only, bounded producer-frontier
+  spin controlled by
+  [`HOMER_SERVICE_BYTE_RING_READY_SPIN_LIMIT`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:308)
+  and
+  [`HOMER_SERVICE_BYTE_RING_READY_SPIN_TARGET`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:311).
+  The accepted target is `2`, not `4`: validation showed that chasing a larger
+  range reduced WIMM count but spent too much busy-wait time.
+- Diagnostic-only range-stop attribution is recorded with
+  [`HomerPayloadRangeBuildStopReason`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1364).
+  The stats line emitted by
+  [`HomerServiceLogPayloadStats()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2919)
+  now includes `payload_wrs_per_wimm`,
+  `payload_bytes_per_signaled_cqe`, `payload_signaled_cqes`, and
+  `range_stop[...]` counters.
+- The ready-spin branch is scoped inside
+  [`HomerServicePumpOutgoingByteRingPayload()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21392):
+  it requires at least one write descriptor already in the range, skips EOS, and
+  applies only to basebackup streams in `BULK_PAYLOAD`. It does not change
+  foreground command publication or fixed-slot foreground payload handling.
+
+Validation evidence:
+
+```text
+descriptor-only artifact: /tmp/homer_stage7b_validate_1781956091
+
+remote RDMA basebackup:
+    warmup 5.58s; warmed 4.25s, 4.19s, 4.24s
+
+stats:
+    sender_batches=6469
+    recordsPerWimm=1.023806
+    bytesPerWimm=3604537.096460
+    range_stop[producer]=6468
+    range_stop[wr]=0
+```
+
+The descriptor-only checkpoint passed correctness but proved that descriptor
+count was not the real limiter: almost every range stopped at the producer
+frontier, not WR budget.
+
+```text
+target-4 ready-spin artifact: /tmp/homer_stage7b_readyspin_validate_1781956901
+
+remote RDMA basebackup:
+    warmup 6.06s; warmed 4.23s, 4.31s, 4.33s
+
+stats:
+    sender_batches=3769
+    recordsPerWimm=1.756965
+    bytesPerWimm=6185510.197135
+    bytesPerSignaledCqe=6185510.197135
+    ready_spin_attempts=5580
+    ready_spin_loops=7027843
+    ready_spin_gained=2705
+    range_stop[producer]=3768
+```
+
+The target-4 checkpoint passed correctness and improved batching counters, but
+it is rejected as the accepted policy because warmed remote basebackup time did
+not improve or clearly stay flat. The spin loop count was too high for the
+measured gain.
+
+```text
+target-2 no-stats artifact: /tmp/homer_stage7b_target2_readyspin_validate_1781957630
+target-2 stats artifact:    /tmp/homer_stage7b_target2_stats_1781958528
+
+remote RDMA pgbench c1:
+    warmup/run1: failed=0, TPS=3465.948014, p99=0.245 ms, max=1328.618 ms
+    run 2:       failed=0, TPS=4516.677153, p99=0.240 ms, max=5.571 ms
+    run 3:       failed=0, TPS=4072.439744, p99=0.276 ms, max=5.657 ms
+    run 4:       failed=0, TPS=4041.485036, p99=0.276 ms, max=5.653 ms
+
+remote RDMA pgbench c4:
+    run 1: failed=0, TPS=11233.216171, p95=0.499 ms, p99=0.565 ms
+    run 2: failed=0, TPS=11294.473755, p95=0.498 ms, p99=0.556 ms
+    run 3: failed=0, TPS=10834.541385, p95=0.490 ms, p99=0.544 ms
+    run 4: failed=0, TPS=11027.206323, p95=0.504 ms, p99=0.572 ms
+
+local Homer blackhole basebackup:
+    warmup 4.06s; warmed 4.07s, 3.94s, 4.00s
+
+remote RDMA basebackup:
+    warmup 6.32s; warmed 4.12s, 4.11s, 4.17s
+
+stats:
+    sender_batches=4678
+    sender_objects=6623
+    sender_wrs=4682
+    recordsPerWimm=1.415776
+    bytesPerWimm=4984430.039761
+    WRsPerWimm=2.000855
+    bytesPerSignaledCqe=4984430.039761
+    ready_spin_attempts=4657
+    ready_spin_loops=6593195
+    ready_spin_gained=1797
+    range_stop[producer]=4677
+    range_stop[wr]=0
+    range_stop[object]=1
+    range_stop[local_resource]=1
+```
+
+The accepted target-2 policy satisfies the Stage 7b acceptance condition:
+`bytesPerWimm` and `bytesPerSignaledCqe` rise from about `3.60 MB` to about
+`4.98 MB`, while remote RDMA basebackup warmed time stays in the previous
+accepted band and slightly improves versus the descriptor-only warmed set. The
+dominant stop reason remains producer frontier, so future bulk work should
+focus on producer/consumer cadence or deeper byte-ring zero-copy rather than a
+larger WR descriptor cap.
+
+Validation caveats:
+
+- Two validation workers stalled after producing useful partial artifacts. The
+  accepted no-stats target-2 workload came from the dedicated validation worker,
+  while the missing target-2 stats pass and no-stats restore were completed
+  manually in `/tmp/homer_stage7b_target2_stats_1781958528`.
+- `pkill -x citus_tuple_sink_service` does not reliably stop the service because
+  Linux truncates the `comm` name to `citus_tuple_sin`. Later cleanup used a
+  `comm == citus_tuple_sin` filter; the validation services were stopped after
+  evidence collection.
+- The no-stats runtime was restored and synced to `farnet0`; final local and
+  remote hashes for `pg_basebackup`, `citus_tuple_sink_service`, and
+  `libhomer_client.a` matched. Final installed service binaries did not contain
+  the stats marker strings.
+- Strict log scans did not find invalid command slots, reset-required command
+  owner errors, CQ errors, real `FATAL`/`PANIC`/`ERROR`, basebackup errors, or
+  stale payload progress grants. The broad string `kind_objects[error]=0` is a
+  stats field, not a runtime error.
 
 ## Stage 7c: direct-register producer byte rings
 
