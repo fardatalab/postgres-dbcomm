@@ -2883,6 +2883,135 @@ set for the next pass. This avoids the clear-after-publish lost-wakeup race.
   `schedulerCandidatesBuilt / transaction` drop materially.
 - No fallback discoveries in normal warmed c1/c4/basebackup runs.
 
+### Stage 6a command-ready bitmap checkpoint - June 20, 2026
+
+Stage 6a implements only the remote client-SQL command-ready bitmap. Completion
+and resource-pressure bitmap lines are present in the ABI as reserved follow-up
+storage, but no producer drives them yet.
+
+Implemented code shape:
+
+- The control protocol is now v24 at
+  [`CITUS_REMOTE_EXEC_CONTROL_PROTOCOL_VERSION`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:28),
+  with v24 control/client-completion/peer-completion shared-memory names. The
+  protocol adds
+  [`CitusRemoteExecOpenSessionResponse.serviceSessionIndex`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:376)
+  so producers use the fixed session-table index directly instead of inferring
+  it from opaque `serviceSessionId`.
+- [`CitusRemoteExecReadyBitmapLine`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:960)
+  cache-line isolates each 64-session bitmap word, and
+  [`CitusRemoteExecControlRegion.commandReadySessions`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:973)
+  carries the command-ready word. The same ABI block also reserves
+  `completionReadySessions` and `resourcePressureSessions` for later slices.
+- The client stores the returned fixed session index in
+  [`HomerClientSession.serviceSessionIndex`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:66),
+  validates it in
+  [`HomerClientOpenSqlSession()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1201),
+  and clears it on session close.
+- [`HomerClientMarkCommandReady()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:350)
+  sets the command-ready bit only after
+  [`HomerClientStartDirectCommand()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2256)
+  has release-stored the command slot `readySeq` and mailbox
+  `publishedEpoch`. The bit is a scheduler hint; the service still validates
+  mailbox epochs before forwarding.
+- [`TupleSinkServiceSetOpenSessionIdentity()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3529)
+  fills both the opaque service id and explicit session index in every
+  open-session response.
+- [`HomerServiceAppendRemoteClientSqlCommandBitmapSources()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9489)
+  consumes command-ready bits with one `atomic_exchange`, validates each named
+  session with the normal command-mailbox readiness predicate, and appends the
+  direct `REMOTE_CLIENT_SQL_COMMAND` source. If the ready set overflows after
+  the exchange, it re-sets the unappended bits so ready work is not lost.
+- [`HomerServiceBuildCoarseProgressReadySet()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9916)
+  now uses the bitmap helper when the progress registry is initialized; the old
+  broad command-source scan remains only in the non-registry fallback path.
+- [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:16025)
+  re-sets the command-ready bit when a session still has more published commands
+  after forwarding one command, preserving the lost-wakeup protocol across
+  multi-ready mailboxes.
+
+Validation evidence from the no-stats runtime rebuilt, installed, and synced to
+`farnet0` on June 20, 2026:
+
+```text
+artifact: /tmp/homer_stage6a_validate_1781952600
+
+installed string check:
+    pgbench, citus_tuple_sink_service, and libhomer_client.a all carry
+    /citus_remote_execution_control_v24
+
+remote RDMA pgbench c1:
+    warmup:   failed=0, TPS=3400.417911, p99=0.252 ms, max=1314.104 ms
+    measured: failed=0, TPS=4405.278581, p99=0.246 ms, max=5.583 ms
+
+remote RDMA pgbench c4:
+    warmup:   failed=0, TPS=11020.070027, p95=0.494 ms, p99=0.565 ms
+    measured: failed=0, TPS=11170.338729, p95=0.485 ms, p99=0.560 ms
+
+local Homer blackhole basebackup:
+    rc=0, real=4.21s
+
+remote RDMA basebackup:
+    warmup: rc=0, real=5.48s
+    measured: rc=0, real=4.35s
+```
+
+The service-log tail scan on both hosts did not show reset-required, stash,
+send-CQ drain, fallback, `ERROR`, `FATAL`, or `PANIC` patterns for this run.
+The first c1 warmup retained the expected cold setup outlier; warmed c1/c4 and
+remote basebackup are in the previously accepted performance band.
+
+Independent clean verifier run:
+
+```text
+artifact: /tmp/homer_stage6a_verify_clean_1781952680
+
+build/deploy:
+    no-stats Citus/Homer rebuild with CPPFLAGS='-D_GNU_SOURCE'
+    Postgres postgres, pgbench, and pg_basebackup rebuilt/installed
+    /data/dbcomm/pg-citus synced to farnet0
+    local and remote pgbench, citus_tuple_sink_service, and libhomer_client.a
+    all carry /citus_remote_execution_control_v24
+    no HOMER_SERVICE_PROGRESS_STATS marker in checked installed artifacts
+    checked installed artifacts are dbcomm:dbcomm on both hosts
+
+remote RDMA pgbench c1:
+    run 1 warmup: failed=0, TPS=3419.88, max=1315.539 ms
+    run 2 warmed: failed=0, TPS=4446.65, max=5.536 ms
+    run 3 warmed: failed=0, TPS=3992.42, max=6.071 ms
+    run 4 warmed: failed=0, TPS=3990.77, max=6.077 ms
+
+remote RDMA pgbench c4:
+    run 1: failed=0, TPS=11124.30, max=15.563 ms
+    run 2: failed=0, TPS=10967.25, max=15.381 ms
+    run 3: failed=0, TPS=11062.15, max=15.564 ms
+    run 4: failed=0, TPS=11004.21, max=15.207 ms
+
+basebackup:
+    local Homer blackhole: 4.02s, 4.02s, 4.17s, all rc=0
+    remote RDMA: 5.94s warmup, then 4.21s and 4.16s, all rc=0
+```
+
+The clean verifier excluded an earlier contaminated attempt where another
+validation shell issued `pg_ctl stop`. Its current log scan found no invalid
+command slot, reset-required, source-credit/reuse, CQ, `FATAL`, `PANIC`, or
+`ERROR` hits. It did find the already-known PostgreSQL maintenance warnings for
+`10.10.1.100:5432` while farnet0 PostgreSQL was intentionally stopped, plus
+three `stale payload progress grant` cleanup lines after basebackup.
+
+Limitations and follow-up:
+
+- This checkpoint removes the remote client-SQL command-source active-table scan
+  from the normal registered-policy path only. Completion visibility,
+  send-resource pressure, recv-CQ doorbells, and payload ready facts still need
+  their own typed producers in later Stage 6 work.
+- The no-stats performance run did not collect
+  `commandReadyBitmapFallbackDiscoveries`. The counter path is present behind
+  `HOMER_SERVICE_PROGRESS_STATS` in
+  [`HomerServiceLogProgressStats()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6089),
+  but a separate stats-enabled diagnostic pass is still needed if the next
+  review requires direct proof that fallback discoveries remain zero.
+
 ## Stage 7a: basebackup semantic-header shrinkage
 
 Goal: stop repeating object name and static object metadata in every basebackup
