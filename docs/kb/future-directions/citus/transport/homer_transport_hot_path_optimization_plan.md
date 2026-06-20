@@ -2452,6 +2452,42 @@ Remaining follow-up:
   workload outputs and absence of reset/invalid-command diagnostics, not on a
   full inline-vs-registered command counter breakdown.
 
+Revalidation note, June 20, 2026: after later Stage 5a/5b working-tree changes
+were present, the no-stats runtime was rebuilt, installed, and synced again from
+the active `postgres-citus` and `citus-dbcomm` worktrees. This is not an isolated
+Stage 4d-only binary, but it rechecks that the Stage 4d command-publication
+contract still holds under the current implementation state:
+
+```text
+artifact: /tmp/homer_stage4d_validate_1781951407
+
+remote RDMA pgbench c1:
+    run 1 warmup: failed=0, TPS=3514.161544, max=1310.634 ms
+    run 2 warmed: failed=0, TPS=4535.251261, max=5.396 ms
+    run 3 warmed: failed=0, TPS=4133.062287, max=5.460 ms
+    run 4 warmed: failed=0, TPS=4120.644222, max=5.412 ms
+
+remote RDMA pgbench c4:
+    run 1: failed=0, TPS=11303.142076, max=15.711 ms
+    run 2: failed=0, TPS=11279.520620, max=15.319 ms
+    run 3: failed=0, TPS=11110.067999, max=15.332 ms
+
+local Homer blackhole basebackup:
+    4.01s, 4.07s, 4.06s
+
+remote RDMA basebackup:
+    warmup 5.72s; warmed 4.12s, 4.28s
+```
+
+The installed `pgbench`, `citus_tuple_sink_service`, and `libhomer_client.a`
+all carried `/citus_remote_execution_control_v23`, and `git diff --check` was
+clean in both repos. Current-run service/PostgreSQL log tails did not show
+invalid command slots, reset-required command owner errors, CQ/source-credit
+errors, `FATAL`, `PANIC`, or `ERROR`. The only matching service-tail diagnostics
+were the known `stale payload progress grant` lines after payload/basebackup
+cleanup, which remains a payload scheduler cleanup caveat rather than a Stage 4d
+command-publication failure.
+
 Do not proceed from Stage 4d to Stage 5a in the same implementation series if
 Stage 4d is the active question. Stage 5a is logically independent, but jumping
 to it would leave the command-publication ownership bug unresolved and would
@@ -2557,6 +2593,93 @@ the error.
 - Service-side tuple-view EOS repair is deleted or unreachable on accepted
   paths.
 
+### Accepted Stage 5a success-path checkpoint - June 20, 2026
+
+Stage 5a success-path tuple-result finalization is implemented and validated.
+The normal row-producing SQL result path now finalizes an unpublished partial
+batch as one immutable DATA+EOS record instead of submitting DATA and then
+requiring a separate zero-row EOS record.
+
+Implemented code shape:
+
+- [`SubmitCitusTupleSinkBatchInternal()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1662)
+  is the shared publication helper for tuple-result DATA records. It fills the
+  immutable transport header, including terminal flags, before advancing the
+  byte-ring `publishedTail`.
+- [`SubmitCitusTupleSinkBatch()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1726)
+  remains the nonterminal DATA publication API.
+- [`FinalizeCitusTupleSinkGeneration()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1865)
+  is the new command/result-generation finalization API. If given an unpublished
+  `terminalBatchHandle`, it publishes that batch with
+  `CITUS_TUPLE_SINK_TRANSPORT_FLAG_EOS`; if there is no active batch, it
+  publishes the existing compact zero-row EOS record for empty results or
+  exact-full results whose final DATA record was already visible.
+- [`MarkCitusTupleSinkPeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1904)
+  is now only the compatibility spelling for older callers and delegates to
+  `FinalizeCitusTupleSinkGeneration(..., NULL)`.
+- [`RemoteExecSqlResultFlushBatch()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1307)
+  now takes a `terminal` flag. Normal full-batch flushes call
+  `SubmitCitusTupleSinkBatch()`, while
+  [`RemoteExecSqlDestShutdown()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1394)
+  calls `RemoteExecSqlResultFlushBatch(receiver, true)` so a final partial
+  result batch becomes DATA+EOS before publication.
+- Service-side tuple-view EOS synthesis remains unreachable on accepted paths:
+  [`HomerServiceTupleViewEosAppendReady()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9375)
+  returns `false`, so the service does not create a second semantic EOS delivery
+  path.
+
+Validation was run by a dedicated verification worker using a no-stats
+`CPPFLAGS='-D_GNU_SOURCE'` rebuild/install/sync on both farnet hosts. The worker
+also checked that installed `pgbench`, `citus_tuple_sink_service`, and
+`libhomer_client.a` carried the current `/citus_remote_execution_control_v23`
+string and that local/farnet0 hashes matched for `postgres`, `pgbench`,
+`pg_basebackup`, `citus_tuple_sink_service`, `citus.so`, and
+`libhomer_client.a`.
+
+```text
+remote RDMA pgbench c1:
+    run 1 warmup: failed=0, TPS=3496.377578, p95=0.230 ms, p99=0.241 ms, max=1308.432 ms
+    run 2 warmed: failed=0, TPS=4540.589923, p95=0.230 ms, p99=0.241 ms, max=6.545 ms
+    run 3 warmed: failed=0, TPS=4080.743218, p95=0.253 ms, p99=0.267 ms, max=6.272 ms
+    run 4 warmed: failed=0, TPS=4064.814277, p95=0.255 ms, p99=0.271 ms, max=6.416 ms
+
+remote RDMA pgbench c4:
+    run 1 warmup: failed=0, TPS=11040.278524, p95=0.490 ms, p99=0.545 ms, max=18.550 ms
+    run 2 warmed: failed=0, TPS=10973.398014, p95=0.490 ms, p99=0.542 ms, max=18.288 ms
+    run 3 warmed: failed=0, TPS=11064.596776, p95=0.503 ms, p99=0.564 ms, max=18.388 ms
+    run 4 warmed: failed=0, TPS=10989.986199, p95=0.505 ms, p99=0.579 ms, max=24.864 ms
+
+local Homer blackhole basebackup:
+    run 1 warmup: rc=0, real=4.09s
+    run 2 warmed: rc=0, real=3.98s
+    run 3 warmed: rc=0, real=4.05s
+    run 4 warmed: rc=0, real=4.18s
+
+remote RDMA basebackup:
+    run 1 warmup: rc=0, real=5.71s
+    run 2 warmed: rc=0, real=4.34s
+    run 3 warmed: rc=0, real=4.22s
+    run 4 warmed: rc=0, real=4.30s
+```
+
+Log checks did not find Stage 5a failure signatures in farnet1/farnet0 service
+tails: no invalid tuple-result headers, EOS/PEER_CLOSED errors,
+reset-required errors, basebackup errors, `ERROR`, `FATAL`, or `PANIC`.
+PostgreSQL still logged expected Citus maintenance-daemon warnings for
+`dbcomm@10.10.1.100:5432` because farnet0 PostgreSQL is intentionally not part
+of these blackhole/RDMA validation runs.
+
+Remaining caveats:
+
+- The failed-query wire semantics in this section remain future work. The
+  current accepted Stage 5a checkpoint covers successful empty/partial/exact-full
+  result finalization. It does not yet add an explicit tuple-result
+  ERROR+EOS record ABI for queries that fail after publishing some result data.
+- The verifier saw four `stale payload progress grant` lines after local
+  basebackup reclamation. The workloads completed cleanly, so this is not a
+  Stage 5a correctness failure, but it should remain visible for later payload
+  scheduler cleanup.
+
 ## Stage 5b: bounded record/byte/WR/CQ work budgets
 
 Goal: improve batching through explicit executor budgets without introducing a
@@ -2598,6 +2721,98 @@ Every executor stops when any bound is reached and reports `moreReady`.
 - Payload records and bytes per grant increase for ready adjacent work.
 - Foreground SQL includes adjacent DATA/EOS in one grant when possible.
 - Basebackup throughput does not regress when foreground work is absent.
+
+### Accepted Stage 5b bounded-grant checkpoint - June 20, 2026
+
+Stage 5b is implemented as a bounded executor-grant cleanup, not a new fairness
+policy. The implementation preserves the current scheduler ordering and
+round-robin behavior, but removes one important hidden-progress shape: selected
+payload egress grants no longer loop internally to post multiple RDMA batches
+after the scheduler admitted one payload source.
+
+Implemented code shape:
+
+- [`HomerProgressBudget`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1779)
+  and
+  [`HomerProgressUsage`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1788)
+  are the source-neutral vocabulary for bounded executor work. The current grant
+  structs still carry existing source-specific fields, but executors now have
+  explicit record/byte/WR/CQ-poll dimensions to report against.
+- [`HomerPayloadProgressDelta`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1228)
+  and
+  [`HomerProgressResult`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2555)
+  now carry `budgetExhausted`. This is currently feedback/diagnostic state, not
+  a new plan-stop policy input.
+- [`HomerServicePayloadProgressMarkBudgetExhausted()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11904)
+  marks `stillReady` plus `budgetExhausted` when a selected payload grant stops
+  because it consumed its granted coalescing window while more source data
+  remains.
+- [`HomerServicePumpOutgoingByteRingPayload()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20704)
+  now posts at most one bounded adjacent byte-ring RDMA batch for a selected
+  grant. If the source still has bytes beyond that batch, it reports
+  `budgetExhausted`/`stillReady` instead of silently expanding the selected
+  grant in an executor-local loop.
+- [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21446)
+  applies the same one-bounded-batch rule for the older slot-ring payload path.
+- [`HomerProgressResultMergePayloadDelta()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6514)
+  and
+  [`HomerProgressResultMergeResult()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6587)
+  propagate `budgetExhausted` through aggregate progress results.
+
+Validation was run by a dedicated verification worker with no-stats
+`CPPFLAGS='-D_GNU_SOURCE'` rebuild/install/sync on both farnet hosts. The worker
+checked matching local/farnet0 hashes for `postgres`, `pgbench`,
+`pg_basebackup`, `citus_tuple_sink_service`, `citus.so`, and
+`libhomer_client.a`; `pgbench`, service, and `libhomer_client.a` all carried the
+current `/citus_remote_execution_control_v23` string. Raw artifacts were stored
+under `/tmp/stage5b_verify_1781950851`.
+
+```text
+remote RDMA pgbench c1:
+    run 1 warmup: failed=0, TPS=3508.868578, p95=0.230 ms, p99=0.244 ms, max=1308.986 ms
+    run 2 warmed: failed=0, TPS=4574.132276, p95=0.227 ms, p99=0.238 ms, max=5.484 ms
+    run 3 warmed: failed=0, TPS=4093.401600, p95=0.252 ms, p99=0.267 ms, max=5.562 ms
+    run 4 warmed: failed=0, TPS=4064.876238, p95=0.255 ms, p99=0.274 ms, max=5.534 ms
+
+remote RDMA pgbench c4:
+    run 1: failed=0, TPS=11193.194538, p95=0.483 ms, p99=0.540 ms, max=16.405 ms
+    run 2: failed=0, TPS=11265.466782, p95=0.495 ms, p99=0.558 ms, max=15.330 ms
+    run 3: failed=0, TPS=11038.514481, p95=0.487 ms, p99=0.543 ms, max=15.130 ms
+    run 4: failed=0, TPS=11142.446146, p95=0.497 ms, p99=0.566 ms, max=15.452 ms
+
+local Homer blackhole basebackup:
+    run 1: rc=0, real=3.93s
+    run 2: rc=0, real=3.89s
+    run 3: rc=0, real=3.89s
+    run 4: rc=0, real=3.89s
+
+remote RDMA basebackup:
+    run 1 warmup: rc=0, real=5.83s
+    run 2 warmed: rc=0, real=4.29s
+    run 3 warmed: rc=0, real=4.14s
+    run 4 warmed: rc=0, real=4.22s
+```
+
+The important performance result is that c4 stayed around the accepted 11k TPS
+band and warmed remote RDMA basebackup stayed in the recent 4.2-4.3s band, so
+the one-bounded-batch grant boundary did not introduce the feared payload
+throughput regression.
+
+Log checks found no payload publish stalls, invalid tuple-result headers,
+EOS/PEER_CLOSED errors, reset-required errors, basebackup errors, `ERROR`,
+`FATAL`, or `PANIC` in the service tails. The same expected PostgreSQL Citus
+maintenance-daemon warnings for `dbcomm@10.10.1.100:5432` remain because farnet0
+PostgreSQL is intentionally not part of this validation shape.
+
+Remaining caveat:
+
+- The verifier again saw four `stale payload progress grant` lines after local
+  blackhole basebackup reclamation. This was also observed in Stage 5a and did
+  not affect correctness or throughput. It likely reflects a stack-local plan
+  that still contains a payload source after the close/reclaim path has retired
+  or reused the stream slot in the same service pass. Treat it as scheduler
+  cleanup work for the payload lifetime/reclaim path, not as a Stage 5b
+  rejection.
 
 ## Stage 6: producer-set ready bitmaps and typed CQ ready facts
 
