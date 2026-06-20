@@ -2363,10 +2363,11 @@ Before implementing Stage 4d again, settle the following ownership contract:
 
 ### Accepted Stage 4d registered-source checkpoint - June 20, 2026
 
-Stage 4d now has an accepted registered-source implementation checkpoint. This
-does not yet include the true verbs-inline fast-retire path from 4d-3, but it
-does complete the direct registered-source correctness work that previously
-blocked compact command publication.
+Stage 4d now has an accepted compact-command implementation checkpoint. It
+first landed the direct registered-source correctness work that previously
+blocked compact command publication, and then added the true verbs-inline
+fast-retire path for compact commands that fit the negotiated QP inline
+capacity.
 
 Implemented code shape:
 
@@ -2398,6 +2399,19 @@ Implemented code shape:
   [`TupleSinkServiceRetireClientSqlCommandWriteCompletionEntry()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4427)
   advances frontend-visible `consumedEpoch` only after the typed command send-CQ
   owner retires the source range.
+- The RDMA transport now exposes
+  [`TupleSinkServicePeerConnectionCanInlineWriteRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5556)
+  so command publication can tell whether a single-SGE WR will be posted with
+  `IBV_SEND_INLINE`. The compact-command branch in
+  [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:16220)
+  uses that predicate only when there are no older registered command sources
+  awaiting CQ retirement (`acceptedEpoch == retiredEpoch`). If both the compact
+  body and ready word fit inline, the sender posts both WRs, immediately advances
+  `clientSqlRemoteCommandAcceptedEpoch`, `clientSqlRemoteCommandRetiredEpoch`,
+  and frontend `consumedEpoch`, and avoids allocating a command send-CQ owner.
+  Commands that do not satisfy this exact all-inline predicate stay on the
+  registered-source path and release frontend credit only through typed send-CQ
+  retirement.
 - [`TupleSinkServiceClearClientSqlCommandWriteCompletionsForSession()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4687)
   no longer clears active posted command owners to make teardown look clean. If
   session cleanup still sees active command owners, it is a reset-required
@@ -2444,13 +2458,13 @@ is not a Homer command-mailbox failure.
 
 Remaining follow-up:
 
-- Stage 4d-3 true verbs-inline handling is still a performance follow-up. The
-  current accepted checkpoint still treats registered-source storage as reusable
-  only after command send-CQ retirement.
-- Add the proposed compact-command counters before using this path for a deeper
-  microbenchmark. The correctness/performance acceptance above is based on
-  workload outputs and absence of reset/invalid-command diagnostics, not on a
-  full inline-vs-registered command counter breakdown.
+- Registered-source commands still intentionally treat the frontend source slot
+  as reusable only after command send-CQ retirement. Do not relax that path
+  without another ownership proof.
+- The inline path is active, but the observed mix is workload dependent. Use the
+  diagnostic-only `remote_command_inline_posts` and
+  `remote_command_registered_posts` counters before drawing microbenchmark
+  conclusions about command-kind coverage or inline capacity sensitivity.
 
 Revalidation note, June 20, 2026: after later Stage 5a/5b working-tree changes
 were present, the no-stats runtime was rebuilt, installed, and synced again from
@@ -2488,10 +2502,50 @@ were the known `stale payload progress grant` lines after payload/basebackup
 cleanup, which remains a payload scheduler cleanup caveat rather than a Stage 4d
 command-publication failure.
 
-Do not proceed from Stage 4d to Stage 5a in the same implementation series if
-Stage 4d is the active question. Stage 5a is logically independent, but jumping
-to it would leave the command-publication ownership bug unresolved and would
-make future validation harder to attribute.
+True-inline completion note, June 20, 2026: the Stage 4d-3 fast-retire path was
+added on top of the accepted registered-source checkpoint. The no-stats runtime
+was rebuilt, installed, and synced to `farnet0`, then restored again after a
+stats-only diagnostic pass. The restored normal service binary had SHA-256
+`c1eeddacaa18462edacf4e6d57d011ed5e1655d260348c36da406af60817a53b` on both
+hosts and no `HOMER_SERVICE_*_STATS` marker strings.
+
+```text
+artifact: /tmp/homer_stage4d_inline_validate_1781953448
+
+remote RDMA pgbench c1:
+    run 1 warmup: failed=0, TPS=2780.127758, p99=0.255 ms, max=1316.451 ms
+    run 2 warmed: failed=0, TPS=4413.865186, p99=0.251 ms, max=5.544 ms
+    run 3 warmed: failed=0, TPS=3947.238058, p99=0.302 ms, max=5.617 ms
+
+remote RDMA pgbench c4:
+    run 1: failed=0, TPS=11154.464798, p95=0.492 ms, p99=0.572 ms
+    run 2: failed=0, TPS=10991.221312, p95=0.482 ms, p99=0.547 ms
+    run 3: failed=0, TPS=10907.251550, p95=0.483 ms, p99=0.550 ms
+
+local Homer blackhole basebackup:
+    4.19s, 4.14s
+
+remote RDMA basebackup:
+    warmup 5.46s; warmed 4.31s, 4.15s
+
+stats-only short remote c1:
+    failed=0, TPS=1124.096929
+    farnet0 command sender counters:
+        remote_command_inline_posts=6003
+        remote_command_registered_posts=8000
+        remote_command_failures=0
+```
+
+This completes the planned Stage 4d command-publication work for the current
+milestone: compact command records, stable backend reads, accepted-versus-retired
+source ownership, typed CQ retirement for registered-source commands, and true
+verbs-inline fast retirement for commands that satisfy the all-inline predicate.
+
+Historical sequencing note: while Stage 4d was still unresolved, Stage 5a was
+not allowed to proceed in the same implementation series because that would have
+left the command-publication ownership bug unresolved and made future validation
+harder to attribute. With the accepted inline checkpoint above, that specific
+Stage 4d blocker is closed.
 
 ### Earlier-stage followups from the Stage 4d review
 
