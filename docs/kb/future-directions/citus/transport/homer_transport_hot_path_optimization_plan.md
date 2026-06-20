@@ -3629,6 +3629,53 @@ is caused by shared transport ownership, the Stage 7d QP/CQ isolation design
 should include a correctness acceptance gate that reproduces and eliminates this
 c4 mismatch.
 
+Current suspicion to review before implementation:
+
+- No Stage 7d isolation code has been added yet, so the failure is not a new
+  Stage 7d implementation regression. Stage 7d merely exposed it under the
+  foreground-plus-background workload.
+- The mismatch has a strong stale-slot signature: expected command sequence
+  `2170`, observed sequence `2162`, and the delta is exactly `8`, matching
+  `CITUS_REMOTE_EXEC_LOCAL_COMPLETION_MAILBOX_SLOTS` in
+  [`remote_execution_backend_protocol.h`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:35).
+  That suggests the frontend saw a completion body from the previous use of the
+  same modulo mailbox slot, not a random command kind.
+- The most likely area I introduced this bug is the peer-client completion
+  publication pipeline, not the Stage 7c direct-MR producer-source change. The
+  code to audit is:
+  - [`HomerClientCopyClientCompletionSlotStable()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1112),
+    which treats `readyEpochSlots[slot]` as the frontend-visible gate and then
+    checks `completionSlots[slot].bodyEpoch`.
+  - [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14195),
+    which fills a registered source slot, posts a completion-body RDMA WRITE,
+    then posts a ready-epoch WRITE_WITH_IMM.
+  - [`TupleSinkServicePeerClientCompletionPublishSourceSlot`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:856),
+    where `bodyEpoch` is stored immediately before the hot completion body and
+    `readyEpoch` follows it.
+  - [`TupleSinkServiceRetirePeerClientCompletionPublishCompletionsThrough()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4251),
+    which range-retires source slots behind a signaled CQ checkpoint.
+- The client did not report `BODY_VISIBILITY_PENDING`, which means the frontend
+  likely saw `bodyEpoch == expectedEpoch` while the hot completion body still
+  carried the older command sequence. That points toward either source-slot
+  fill/reuse/retirement corruption or a publication ordering bug in the
+  peer-client completion WIMM path. One plausible way I could have introduced it
+  is by making peer-client completion publication pipelined and signaled
+  intermittently: if an unsignaled source slot is retired or reused before the
+  RNIC has finished reading its body WR, a later publication could pair a newer
+  epoch word with an older or mixed hot completion body.
+- Stage 7c can still be an exposure vector by changing timing: it moved producer
+  source registration to stream open and slightly changes setup/pump timing, but
+  its data path is payload byte-ring source memory. It does not write the
+  frontend client completion mailbox, so it is not the primary suspect for a
+  stale client-completion slot.
+- Before implementing Stage 7d topology isolation, reproduce this with narrow
+  diagnostics around peer-client completion publication: log or count source-slot
+  index, remote mailbox slot, `publishedEpoch`, `bodyEpoch`,
+  `completion.commandSequence`, `readyEpoch`, signal/checkpoint ownership, and
+  source-slot release. The immediate invariant to prove is: a source slot must
+  not be cleared or reused until the signaled CQ checkpoint that covers both its
+  body WRITE and ready WIMM has retired.
+
 ### Acceptance
 
 - Foreground pgbench with background remote RDMA basebackup improves p95/p99
