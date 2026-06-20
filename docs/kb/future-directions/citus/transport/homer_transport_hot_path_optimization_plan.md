@@ -2044,18 +2044,66 @@ Goal: apply the same hot/cold principle to frontend command publication.
 
 ### Substeps
 
-1. Define a compact command envelope with command sequence, command kind, flags,
-   payload bytes, and protocol version.
-2. Post `sizeof(envelope) + actual payloadBytes`, not the maximum command slot,
-   for COMMIT, BEGIN, short SQL, and TX attach payloads.
-3. Preserve source lifetime through the Stage 2 owner FIFO. The local maximum
-   slot may remain for allocation simplicity, but the RDMA write length and hot
-   memset/copy must use actual bytes.
+Stage 4d is no longer "shorten the RDMA SGE over the legacy command slot".
+It is a small command-publication protocol migration. The first accepted
+implementation must do these in order:
+
+1. Add publication correctness before byte reduction:
+   - define a compact command header with protocol/version, `headerBytes`,
+     `commandBytes`, `payloadBytes`, command kind, command flags, command
+     sequence, target sink id, and a body identity such as `bodyEpoch`;
+   - bump the backend command protocol version so mixed old/new binaries reject
+     the command slot before execution;
+   - teach the backend command reader to stable-copy a command into
+     backend-local storage before dispatch rather than executing from a borrowed
+     command-ring slot after one `readySeq` observation.
+2. Fix body/ready partial-post behavior:
+   - command publication owner state is
+     `FREE -> RESERVED -> BODY_POSTED -> READY_POSTED -> RETIRED`;
+   - failure before `BODY_POSTED` rolls back normally;
+   - failure after `BODY_POSTED` but before `READY_POSTED` marks the QP/session
+     reset-required and leaves cleanup to teardown;
+   - failure after `READY_POSTED` is owned by CQ retirement or QP teardown.
+3. Split frontend command progress into accepted and retired frontiers while
+   keeping the frontend command mailbox as the registered source:
+   - service collection uses a service-owned accepted cursor, not shared
+     `consumedEpoch`;
+   - after body/ready WRs are successfully posted, advance accepted epoch only;
+   - advance frontend-visible `consumedEpoch` only when the typed send-CQ owner
+     retires the command WR/source range.
+4. Only then serialize command-kind-specific bytes:
+   - COMMIT, ABORT, and SESSION_CLOSE are header-only;
+   - CLIENT_SQL_TX_BEGIN carries only transaction-mode fields;
+   - SQL_EXECUTE carries a compact SQL payload header plus `sqlBytes`;
+   - TX_BEGIN_ATTACH carries fixed attach fields plus `replayTextBytes`.
+5. Add a true verbs-inline fast path after the registered-source path is
+   correct:
+   - query/store the QP inline capacity during connection setup;
+   - use `IBV_SEND_INLINE` only when `commandBytes <= maxInlineData`;
+   - treat true inline source storage as reusable after successful
+     `ibv_post_send`; keep registered-source storage reusable only after CQ
+     retirement.
+6. Remove the rejected service-owned source ring from the target path. It needs
+   extra staged/post/retire cursors and teardown invariants, and provides no
+   first-order benefit for small commands if direct registered source plus true
+   inline are available.
 
 ### Acceptance
 
-- `commandBytesPosted` drops for pgbench transactions.
-- No command source-ring reuse occurs before send-CQ retirement.
+- Backend execution uses a stable copied command image. A ready/body visibility
+  race can produce bounded `VISIBILITY_PENDING` diagnostics, but not immediate
+  FATAL on the first complete-looking mismatch.
+- `commandBytes` is authoritative and kind-specific validation rejects malformed
+  compact commands.
+- `commandBytesPosted` drops for pgbench transactions after the correctness
+  substeps are accepted.
+- Frontend command credit advances only on command send-CQ retirement unless the
+  command was sent with true verbs inline.
+- Partial body/ready post failures enter reset-required state instead of
+  clearing local ownership and retrying on the live QP.
+- Repeat-run remote RDMA pgbench c1 and c4 pass warmed correctness/performance
+  runs, and session teardown reports zero outstanding command owners before
+  deregistration/reuse.
 
 ### Rejected implementation attempt - June 20, 2026
 
@@ -2067,10 +2115,16 @@ directly from the frontend command mailbox slot in
 Validation artifact:
 `/tmp/homer_stage4d_compact_rdma_validation_20260619_221520`.
 
-The attempt is rejected for source-ownership reasons. The sender posted RDMA
-from the frontend command slot, then immediately advanced the frontend
-`consumedEpoch` after the WR was posted. That released the source slot to
-pgbench before the local send CQE proved the NIC had consumed the source bytes.
+The attempt is rejected for two reasons. The more direct explanation for the
+captured invalid-slot failure is a remote body/ready visibility race introduced
+by compacting bytes while retaining the legacy command-slot reader. The sender
+reduced the body WRITE to a command-kind-specific prefix of
+[`CitusRemoteExecLocalCommandRecord`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:122),
+but the legacy command slot publishes
+[`readySeq`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:152)
+after the full maximum-sized record. A prefix-only write cannot include that
+ready footer without transmitting the intervening unused bytes.
+
 During remote c1 validation, the backend later FATALed with:
 
 ```text
@@ -2079,12 +2133,27 @@ slot_count=64 protocol=10 command_sequence=113759
 expected_sequence=113759 ready_sequence=113759
 ```
 
-The detail looked valid by the time the error was formatted, which is consistent
-with a visibility/source-lifetime race: the backend observed `readySeq` while
-some command-body fields were transient, then a later read of the same slot saw
-the expected values. This is not a proof that compact command bytes are wrong;
-it proves that Stage 4d cannot use the frontend mailbox slot as the RDMA source
-unless frontend source credit is tied to send-CQ retirement.
+The backend reader at
+[`remote_execution_backend_bridge.c:2254`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2254)
+polls `readySeq`, breaks as soon as it equals the expected sequence, borrows
+`commandSlot->record`, validates once, and FATALs immediately on mismatch at
+[`remote_execution_backend_bridge.c:2281`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2281).
+The error detail then reads the same shared fields again. That explains the
+observed shape where `readySeq` was expected, validation failed, and the detail
+printed expected protocol/sequence values by the time the error was formatted.
+This is a proof that Stage 4d cannot be implemented as a sender-only byte-prefix
+optimization over the legacy slot; it needs a compact publication ABI and a
+stable backend reader.
+
+The attempt also exposed a real source-lifetime defect. The sender posted RDMA
+from the frontend command slot, then advanced frontend `consumedEpoch` after
+posting the WR in
+[`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15992),
+before a send CQE proved the NIC had consumed the source bytes. In the measured
+one-command-in-flight pgbench path, semantic command completion makes immediate
+frontend overwrite unlikely, so this is probably not the proximate cause of the
+captured invalid-slot FATAL. It is still not a valid long-term source-credit
+contract for non-inline RDMA writes.
 
 Current corrective decision:
 
@@ -2185,22 +2254,26 @@ previous accepted fixed-slot checkpoint.
 
 ### Current Stage 4d diagnosis and discussion boundary - June 20, 2026
 
-Stage 4d should not be resumed as another local byte-packing patch. The symptom
-set points to an unresolved command-publication ownership design, not to a
-simple compact-envelope encoding bug:
+Stage 4d should not be resumed as another local byte-packing patch. The current
+diagnosis separates two defects that were conflated in the first note:
 
-- The direct compact-write attempt reduced the RDMA source to a byte prefix, but
-  still used the frontend command mailbox slot as the NIC source. The service
-  released frontend command credit by advancing `consumedEpoch` after posting
-  the WR, before the send CQE retired that exact source range. That made command
-  slot reuse possible while the NIC could still be reading the old source bytes.
-- The service-owned source-ring attempt fixed that specific source-lifetime
-  violation by copying into service-owned registered storage, but it introduced
-  a new publication frontier: frontend command slot consumed, service source
-  slot reserved/copied, RDMA WR posted, send-CQE retired, remote backend slot
-  made visible, and service source slot released. The repeat-run c1 stall means
-  that frontier did not yet have a sufficiently explicit progress/credit
-  invariant.
+- The captured invalid-slot FATAL is most directly explained by a remote
+  body-versus-ready visibility race. Stage 4d shortened the body bytes but kept
+  the legacy command slot and legacy reader, where `readySeq` is a footer after
+  the maximum-sized record and the backend does one borrowed read after seeing
+  `readySeq == expected`. That is a protocol mismatch, not merely an ownership
+  bookkeeping bug.
+- Source lifetime is still wrong for non-inline RDMA writes. Advancing frontend
+  `consumedEpoch` after post means "service accepted the command", not "the NIC
+  no longer needs the source slot". That must be replaced by accepted-versus-
+  retired command frontiers.
+- The service-owned source-ring attempt fixed the immediate direct-source
+  lifetime issue by copying into service-owned registered storage, but it did not
+  fix the reader/publication ABI problem. It also introduced a new staged source
+  state machine: frontend accepted, service source reserved/copied, body posted,
+  ready posted, CQ-retired, and source released. The repeat-run c1 stall makes
+  session teardown, generation reuse, owner cleanup, or a leaked staged source
+  frontier especially suspicious.
 - The live fixed-slot checkpoint avoids the Stage 4d races by treating the
   frontend command mailbox as the registered source and by keeping compact
   command writes disabled at
@@ -2211,31 +2284,208 @@ simple compact-envelope encoding bug:
 
 Before implementing Stage 4d again, settle the following ownership contract:
 
-1. **Source owner**: decide whether command bytes are sent directly from
-   frontend-owned command storage, from a service-owned registered source ring,
-   or from a redesigned true-zero-copy command ring whose producer credit is
-   retired by send-CQ ownership.
-2. **Credit owner**: define the exact event that allows each source slot to be
-   reused. For frontend-owned direct zero-copy, frontend `consumedEpoch` cannot
-   mean "service has posted the WR"; it must mean "the RDMA source range is no
-   longer needed by the NIC", or there must be a second source-credit frontier.
-3. **CQ owner**: command WR retirement must flow through the typed shared-CQ
+1. **Publication ABI**: compact command publication must not be a prefix of
+   `CitusRemoteExecLocalCommandRecord`. Define a compact header, authoritative
+   `commandBytes`, body identity, and kind-specific payload validation.
+2. **Backend reader**: add a stable-copy reader that treats the first
+   ready/body mismatch as visibility pending, retries while observed body
+   identity/fingerprint changes, and escalates a stable repeated mismatch after
+   a bounded number of event-loop passes.
+3. **Partial-post state**: command publication must have explicit body-posted
+   and ready-posted states. Clearing a reserved owner after body post but before
+   ready post is invalid; that state is reset-required.
+4. **Source/credit owner**: keep the frontend command mailbox as the first
+   registered source design, but add service-owned accepted and retired cursors.
+   Shared `consumedEpoch` advances only when CQ retirement or true inline post
+   makes the frontend source reusable.
+5. **CQ owner**: command WR retirement must flow through the typed shared-CQ
    dispatcher/owner FIFO rather than hidden polling or ad hoc per-path waits.
    Stage 4d should not add another CQ-consumer path.
-4. **Remote visibility gate**: if the command is split into body and ready
-   publication WRs, the ready/publish WR remains the remote visibility gate. If
-   whole-message WRITE is relied on, the device/connection capability and memory
-   ordering requirement must be explicit in the connection setup and counters.
-5. **Instrumentation**: the next attempt needs counters for command source
-   reservations, source-credit stalls, posted command WRs, retired command WRs,
-   remote-ready publications, and source-slot reuse distance. Without those,
-   the run-2 stall cannot be distinguished between lost scheduling, source
-   credit leak, CQ retirement leak, and remote backend visibility.
+6. **Fast path**: after correctness is accepted, add true `IBV_SEND_INLINE`
+   for small compact commands that fit the QP's real inline capacity. Do not
+   call registered scratch/source copies "inline".
+7. **Instrumentation**: the next attempt needs counters for command source
+   reservations, reservation stalls, body posts, ready posts, inline posts,
+   registered posts, CQ retirements, accepted/retired epochs, frontend credit
+   advances, body visibility-pending retries, persistent body mismatches,
+   partial body-post failures, owner FIFO high water, close-time outstanding
+   owners, and source reuse before retirement.
+
+### Concrete Stage 4d implementation sequence
+
+1. **4d-0 publication correctness**
+   - Add the compact command header and protocol/version fields, but initially
+     allow fixed-size body copies if that makes the stable reader easier to
+     land.
+   - Replace the backend borrowed-slot dispatch in
+     [`remote_execution_backend_bridge.c:2254`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2254)
+     with stable-copy/read/validate logic.
+   - Add bounded visibility-pending diagnostics instead of immediate FATAL for
+     first ready/body mismatches.
+   - Fix body/ready partial-post handling in the command owner path around
+     [`TupleSinkServiceReserveClientSqlCommandWriteCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4342)
+     and the failure branches in
+     [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15964).
+
+2. **4d-1 direct-source ownership**
+   - Add per-session accepted and retired command epochs in
+     `TupleSinkServiceSessionState`.
+   - Collect commands with `publishedEpoch > acceptedEpoch`, not
+     `publishedEpoch > consumedEpoch`.
+   - Move frontend-visible `consumedEpoch` advancement from the post path at
+     [`tuple_sink_service_process.c:15992`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15992)
+     to the typed command send-CQ retirement callback around
+     [`TupleSinkServiceRetireClientSqlCommandWriteCompletionEntry()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4426).
+   - Add session generation and QP/post generation facts to command owners.
+   - On session close, do not clear active posted command owners with
+     [`TupleSinkServiceClearClientSqlCommandWriteCompletionsForSession()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4682)
+     merely to empty the table. Drain them or mark/reset the QP/session, then
+     deregister memory only after posted owners are retired or teardown-owned.
+
+3. **4d-2 compact body**
+   - Serialize the compact command header plus kind-specific payload into the
+     existing frontend command storage shape or a versioned compact slot.
+   - Use the frontend command mailbox as the non-inline registered source; do
+     not revive the service-owned source ring as the primary path.
+   - Keep the body/ready gate explicit for the general variable-length path.
+
+4. **4d-3 true inline fast path**
+   - Query and record actual `maxInlineData` on the command QP.
+   - Use real `IBV_SEND_INLINE` for compact commands that fit.
+   - Count inline vs registered command posts and bytes separately.
+
+5. **4d-4 cleanup and acceptance**
+   - Delete or fence the sender-only prefix helper once the compact ABI exists.
+   - Remove temporary compact gates only after the direct-source and inline
+     paths pass correctness/performance validation.
+   - Validate remote RDMA pgbench c1/c4 warmed repeats, basebackup
+     non-regression, stats counters, and repeat-run session teardown.
+
+### Accepted Stage 4d registered-source checkpoint - June 20, 2026
+
+Stage 4d now has an accepted registered-source implementation checkpoint. This
+does not yet include the true verbs-inline fast-retire path from 4d-3, but it
+does complete the direct registered-source correctness work that previously
+blocked compact command publication.
+
+Implemented code shape:
+
+- The backend command protocol is now v11 at
+  [`CITUS_REMOTE_EXEC_BACKEND_PROTOCOL_VERSION`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:27).
+  [`CitusRemoteExecLocalCommandRecord`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:122)
+  carries authoritative `headerBytes`, `commandBytes`, `payloadBytes`, and
+  `bodyEpoch`, with
+  [`CITUS_REMOTE_EXEC_LOCAL_COMMAND_HEADER_BYTES`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:161)
+  defining the compact header boundary.
+- Backend dispatch no longer borrows the command slot after one `readySeq`
+  observation. [`RemoteExecBackendReadStableCommandRecord()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:353)
+  stable-copies the command image, uses
+  [`RemoteExecBackendValidateCommandRecord()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:272)
+  for kind-specific byte validation, and only then hands the copied record to
+  the dispatch loop at
+  [`ExecuteRemoteExecBackendCommand()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2435).
+- The service fills byte-counted frontend command records through
+  [`TupleSinkServiceFinalizeLocalCommandRecordBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13559)
+  before publication. The direct registered-source path remains enabled by
+  [`HOMER_SERVICE_COMPACT_CLIENT_SQL_COMMAND_RDMA`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:397).
+- The remote command sender now separates service-accepted and source-retired
+  command frontiers with
+  `clientSqlRemoteCommandAcceptedEpoch` and
+  `clientSqlRemoteCommandRetiredEpoch` in
+  [`TupleSinkServiceSessionState`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:994).
+  [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15835)
+  advances the accepted epoch after body/ready posts succeed, while
+  [`TupleSinkServiceRetireClientSqlCommandWriteCompletionEntry()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4427)
+  advances frontend-visible `consumedEpoch` only after the typed command send-CQ
+  owner retires the source range.
+- [`TupleSinkServiceClearClientSqlCommandWriteCompletionsForSession()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4687)
+  no longer clears active posted command owners to make teardown look clean. If
+  session cleanup still sees active command owners, it is a reset-required
+  prototype violation, not a safe local retry.
+- The standalone Homer client now computes the same v11 command byte facts in
+  [`HomerClientFinalizeCommandRecordBytes()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2018)
+  before committing frontend command slots through
+  [`HomerClientInitializeCommandRecord()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2065).
+
+Validation evidence from the no-stats runtime rebuilt, installed, and synced to
+`farnet0` on June 20, 2026:
+
+```text
+remote RDMA pgbench c1 smoke:
+    2000/2000 transactions, failed=0
+    TPS=1158.866050, p99=0.263 ms, max=1265.960 ms
+    note: this was a cold setup smoke; the max includes first-use setup cost
+
+remote RDMA pgbench c1 warmed repeats:
+    run 1: failed=0, TPS=4554.369724, p99=0.240 ms, max=6.285 ms
+    run 2: failed=0, TPS=4062.262294, p99=0.277 ms, max=6.411 ms
+    run 3: failed=0, TPS=4094.392116, p99=0.275 ms, max=6.285 ms
+
+remote RDMA pgbench c4 warmed repeats:
+    run 1: failed=0, TPS=11199.597262, p95=0.503 ms, p99=0.584 ms
+    run 2: failed=0, TPS=11223.426434, p95=0.502 ms, p99=0.590 ms
+
+remote RDMA basebackup:
+    run 1: rc=0, real=6.19s
+    run 2: rc=0, real=4.33s
+
+local Homer blackhole basebackup:
+    run 1: rc=0, real=4.15s
+    run 2: rc=0, real=4.16s
+```
+
+The important Stage 4d performance result is the remote c4 recovery back to the
+roughly 11k TPS band while compact command publication is enabled. Service log
+tails did not show `refusing to reset`, `reset required`, or invalid-command
+diagnostics during these runs. The PostgreSQL log did contain repeated Citus
+maintenance-daemon warnings about `10.10.1.100:5432` because farnet0 PostgreSQL
+was intentionally not running for this pgbench/basebackup validation shape; that
+is not a Homer command-mailbox failure.
+
+Remaining follow-up:
+
+- Stage 4d-3 true verbs-inline handling is still a performance follow-up. The
+  current accepted checkpoint still treats registered-source storage as reusable
+  only after command send-CQ retirement.
+- Add the proposed compact-command counters before using this path for a deeper
+  microbenchmark. The correctness/performance acceptance above is based on
+  workload outputs and absence of reset/invalid-command diagnostics, not on a
+  full inline-vs-registered command counter breakdown.
 
 Do not proceed from Stage 4d to Stage 5a in the same implementation series if
 Stage 4d is the active question. Stage 5a is logically independent, but jumping
 to it would leave the command-publication ownership bug unresolved and would
 make future validation harder to attribute.
+
+### Earlier-stage followups from the Stage 4d review
+
+- **Stage 2**: typed CQ dispatch is still the right direction, but command
+  body/ready partial-post reset semantics are an unfinished correctness item.
+  Posted owners may be released only by CQ retirement or completed QP teardown,
+  not by table cleanup. Audit the clear-on-close behavior above before
+  reattempting Stage 4d.
+- **Stage 3a**: nonblocking result drain should keep the visibility-pending
+  behavior that avoided false FATALs, but it needs bounded escalation for stable
+  repeated header mismatches. Track mismatch head bytes, published tail,
+  generation, a small header fingerprint, and retry count; retry while those
+  observations change and hard-error once they are stable for a bounded window.
+- **Stage 3b/4a**: compact completion plus descriptor table is accepted, but the
+  client still reconstructs a full legacy completion image. Long-term client APIs
+  should pass hot completion plus cached descriptor reference/version rather than
+  rebuilding the large legacy completion object on the hot path.
+- **Stage 4b**: pre-arm currently synthesizes a full
+  `CitusRemoteExecCommandCompletion` in
+  [`HomerTryPrearmStableResultBinding()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3557)
+  and re-enters
+  [`HomerClientOpenResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2900).
+  Replace that later with a narrow `HomerClientRebindResultSink()` helper that
+  updates only descriptor version, result generation, start tail, first record
+  ordinal, and consumed frontier.
+- **Stage 4c**: the explicit pre-arm flag is sound, but sequence prediction at
+  [`HomerClientPredictNextCommandSequence()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2127)
+  relies on the current single-producer command mailbox. The cleaner Stage 4d
+  API should reserve command sequence/slot first, pre-arm the exact reserved
+  sequence, fill the compact command, then commit publication.
 
 ## Stage 5a: final partial DATA+EOS publication
 
