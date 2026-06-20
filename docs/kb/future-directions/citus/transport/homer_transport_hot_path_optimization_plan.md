@@ -54,15 +54,15 @@ without making each patch rediscover the ABI, ownership, and failure behavior.
   [`receiveHomerCommand()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3685),
   [`HomerApplyCommandCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3506),
   and
-  [`HomerClientAckCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2452)
+  [`HomerClientAckCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2468)
   are the accepted measured frontend completion ownership path.
-- [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2500)
+- [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2526)
   is still a destructive compatibility wrapper: it peeks, copies, validates, and
   ACKs internally. Stateful measured clients should not use it.
 - [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2904)
   still has terminal-drain retry/spin behavior; the target is a bounded
   nonblocking drain API.
-- [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13072)
+- [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13139)
   publishes backend-node client-SQL completions into the peer frontend mailbox
   and currently gates terminal completion on tuple-result payload dependencies.
 - [`TupleSinkServiceReservePeerClientCompletionPublishCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3668)
@@ -136,6 +136,135 @@ without making each patch rediscover the ABI, ownership, and failure behavior.
    delayed `publishedTail` for basebackup or tuple-result streams merely to
    improve batch counters. Prefer publishing ready producer work promptly and
    batching at the transport range / CQ / scheduler-budget layer.
+4. **Descriptor storage is not the hot completion mailbox.** The completion
+   mailbox remains the multi-slot hot event ring polled by the host client. The
+   Stage 4 descriptor structure is a cold versioned side table for large queue
+   attachment and tuple-shape metadata. Do not turn descriptor publication into
+   a second hot FIFO/event mailbox. A two-slot descriptor side table is only
+   valid with explicit reuse credit proving that no completion can still
+   reference the overwritten descriptor version; the first implementation uses
+   four append-only descriptor slots to avoid that credit path.
+
+## June 20 review reconciliation
+
+The latest external review is accepted with these concrete plan decisions:
+
+- **Compact completion sizing**: the hot completion record uses
+  `HOMER_COMPLETION_INLINE_DETAIL_BYTES = 128` and keeps `detail` byte-counted.
+  A larger `detail[256]` would violate the `sizeof(...) <= 256` target once the
+  fixed header fields are included. The target label is "bounded compact
+  completion", not "single cache-line completion".
+- **Stage 3a is independently implementable**: its drain target has
+  `hasRequiredFrontier = false` until the compact completion ABI exists. The
+  exact `requiredTail` and `requiredEosOrdinal` become authoritative only after
+  the Stage 3b/4a protocol bundle lands.
+- **Stage 3b and Stage 4a are one deployable ABI bundle**: compact completions
+  that reference descriptor versions must not be installed without the versioned
+  descriptor table, descriptor publisher, and client stable-read/cache path.
+- **Descriptor publication ownership is settled for the first implementation**:
+  the frontend-side Homer service publishes the frontend-visible descriptor side
+  table. The backend produces tuple shape/result metadata, and the client only
+  caches and validates descriptor versions.
+- **STARTED suppression depends on pre-armed binding, not result-size
+  prediction**: terminal-only delivery is safe only after the frontend already
+  has the descriptor, queue attachment, generation, and start tail needed to
+  drain payload before terminal completion.
+- **QP send ownership is physical and typed**: the long-term owner FIFO is
+  QP-global, carries an owner kind, and uses partial-post reset-required rules.
+  Namespace-specific FIFOs from Stage 2b/2c are stepping stones, not the final
+  ownership model.
+- **Performance acceptance is tolerance-based**: c1, c4, p99, and basebackup
+  comparisons use warmed medians and tolerances instead of accepting or
+  rejecting a stage based on one outlier run.
+- **Nonblocking drain statuses are settled**: Stage 3a/3b uses the
+  `NOT_READY`, `PROGRESS`, `COMPLETE`, `VISIBILITY_PENDING`, and `ERROR`
+  contract. `VISIBILITY_PENDING` is a bounded retry condition, not an internal
+  spin; persistent malformed records escalate outside the hot helper after
+  bounded event-loop retries.
+- **Failed-query result termination is explicit**: Stage 5a must publish an
+  immutable `ERROR+EOS` frontier, either as sequence `1` when no data was
+  published or as `N+1` after already-published data. The terminal failure
+  completion names that frontier, and the frontend drains/discards through it
+  before applying the command failure.
+- **Ready bitmaps must not create a new cache-line bottleneck**: Stage 6 uses
+  cache-line isolated bitmap words and records already-set/exchange/fallback
+  counters so the active-table scan replacement is measurable.
+- **Direct-MR wrap handling distinguishes source and destination wrap**: local
+  source-ring wrap may use SGEs, remote destination-ring wrap requires multiple
+  WRs, and the tail WIMM remains last.
+
+### June 20 follow-up review clarification
+
+The follow-up review is accepted as a tightening of the same plan, not a new
+direction. In particular:
+
+- The phrase "two-slot mailbox" must not be used for the current client
+  completion mailbox. The hot host-client completion mailbox is already the
+  multi-slot SPSC event ring in
+  [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:772),
+  with
+  [`CITUS_REMOTE_EXEC_CLIENT_COMPLETION_MAILBOX_SLOTS`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:757)
+  currently set to eight.
+- If someone says "two-slot mailbox" in the Stage 4 descriptor discussion, the
+  only coherent interpretation is a double-buffered cold descriptor side table.
+  That is rejected for the first implementation because descriptor-slot reuse
+  needs explicit proof that no completion can still reference the overwritten
+  descriptor version.
+- Two descriptor slots would be sufficient only under a stricter reuse model:
+  one descriptor version may still be referenced while the next descriptor body
+  is being prepared, and the publisher receives explicit credit proving that the
+  older physical slot is no longer referenced before wrapping. That could be
+  true for a single-command-in-flight prototype or for a future
+  `consumedDescriptorVersion` protocol, but it is extra ownership machinery and
+  should not be smuggled into the first descriptor split.
+- The first implementation therefore keeps the current
+  [`HOMER_RESULT_DESCRIPTOR_SLOTS`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:483)
+  value of four and treats descriptor slots as append-only until session
+  teardown. If descriptor churn ever exceeds four versions in one session, fail
+  explicitly instead of adding an unplanned remote descriptor-credit protocol or
+  silently falling back to descriptor-heavy completions.
+- The middle-stage ordering remains:
+
+  ```text
+  3a  bounded nonblocking drain with optional target
+  3b  compact completion + required frontier
+  4a  versioned descriptor side table, publisher, and client stable read/cache
+       ---------------------------------------------------------------
+       one protocol/deployment acceptance unit for row-producing completions
+
+  4b  stable-binding pre-arm
+  4c  STARTED suppression guarded by pre-arm
+  4d  variable-length command publication, only after the live completion
+      ownership path is stable enough to avoid conflating failures
+  ```
+
+  The Stage 3b/4a deployment bundle has these concrete checkpoints:
+
+  1. Define the compact hot completion layout, the four-slot descriptor side
+     table, the stable-read helpers, and the optional drain target fields under
+     one protocol version.
+  2. Embed the descriptor side table in the existing frontend completion mailbox
+     shared-memory object. Do not create a second hot event mailbox.
+  3. Add frontend-service-owned descriptor publication: cache the current
+     queue attachment and tuple contract per session, publish a new descriptor
+     version only on shape or queue replacement, and fail explicitly if the
+     four append-only descriptor slots are exhausted.
+  4. Teach the client stable-read path to reconstruct the legacy completion
+     view from the compact hot completion plus the referenced descriptor
+     version, and to return descriptor-not-ready as a bounded retry condition.
+  5. Fill `requiredResultTail` and `requiredEosRecordOrdinal` for terminal
+     row-result completions from the frontend-visible byte-ring frontier after
+     the payload tail publication WR has been successfully posted.
+  6. Switch local and peer frontend completion publication to the compact record
+     only after descriptor publication and client stable reads are in place.
+  7. Validate mixed-binary failure, descriptor cache hit/miss counters,
+     descriptor exhaustion, remote c1/c4 correctness, p99, and local/remote
+     basebackup non-regression before accepting the protocol version.
+
+This clarification is especially important for Stage 4d: compact command
+publication should not be used to mask or debug descriptor/completion lifecycle
+problems. It is an independent byte-reduction optimization and should be
+validated only against a stable live completion publication path.
 
 ## Stage Template
 
@@ -195,7 +324,7 @@ that would mislead implementers.
    is dead, delete it. If it is still reachable, fence it as rejected
    compatibility code and create the Stage 5 removal task before optimizing EOS.
 5. Rename or document
-   [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2500)
+   [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2526)
    as a destructive read-and-ack wrapper. New measured/stateful clients should
    use the peek/apply/ack path:
    [`HomerClientPeekNextCompletionEvent()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2338)
@@ -204,7 +333,7 @@ that would mislead implementers.
    ->
    [`HomerApplyCommandCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3506)
    ->
-   [`HomerClientAckCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2452).
+   [`HomerClientAckCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2468).
 
 ### Acceptance
 
@@ -213,6 +342,97 @@ that would mislead implementers.
 - Stats build reports the counters above with consistent definitions.
 - Residual EOS synthesis and destructive completion wrapper semantics are no
   longer ambiguous to implementers.
+
+### Implementation progress and acceptance - June 19, 2026
+
+- Stage 0 instrumentation landed in the Citus/Homer source tree for the
+  counters that correspond to current code paths:
+  - [`HomerClientTryCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2526)
+    and its public declaration now explicitly document the destructive
+    copy-and-ACK behavior. Measured stateful clients should keep using
+    [`HomerClientPeekNextCompletionEvent()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2338)
+    and
+    [`HomerClientAckCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2468)
+    instead of the wrapper.
+  - `HOMER_CLIENT_COMPLETION_STATS` adds a frontend diagnostic aggregate for
+    `completion_events_acked`, incremented in
+    [`HomerClientAckCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2468)
+    and printed during
+    [`HomerClientCloseSession()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1181).
+  - `HOMER_SERVICE_CLIENT_SQL_STATS` now logs Stage-0 aliases
+    `completion_events_published`, `completion_bytes_posted`, and
+    `command_bytes_posted`. The publish counters are updated only after
+    successful peer-client completion READY-WIMM publication in
+    [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13139);
+    command bytes are updated after successful remote client-SQL command WR
+    posting in
+    [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14987).
+  - Terminal completion dependency waits use a per-session diagnostic latch so
+    `terminal_completion_payload_waits` and
+    `terminal_completion_result_send_cq_waits` count transitions into blocked
+    state, not scheduler retry iterations. The latch is tied to the existing
+    deferred peer-client completion state around
+    [`TupleSinkServiceMarkDeferredPeerClientCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3493).
+  - `HOMER_SERVICE_PAYLOAD_STATS` now logs `payload_records_per_wimm`,
+    `payload_bytes_per_wimm`, and `producer_to_registered_source_copy_bytes`.
+    The first two are updated at successful payload visibility WIMM posts in
+    [`HomerServicePumpOutgoingByteRingPayload()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19777)
+    and
+    [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20506).
+    `producer_to_registered_source_copy_bytes` is currently expected to remain
+    zero for the direct registered-source paths; future staging copies must
+    increment it at the copy site.
+- Residual tuple-view EOS synthesis is not dead. It is still selected through
+  [`HomerServiceAppendTupleViewEosForStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19732),
+  so Stage 0 fenced the helper comment instead of deleting it. Stage 5 still
+  owns removal by moving to immutable backend-produced EOS records.
+- No-stats acceptance workloads were run by the verification subagent after a
+  clean build/install/sync on both `farnet1` and `farnet0`; raw logs are under
+  `/tmp/homer_stage0_no_stats_acceptance_20260619_191849`.
+  - Remote RDMA pgbench c1 processed all transactions with rc `0`. Warmed
+    repeats were `4166.214459`, `3724.086179`, and `3739.058580 TPS`; p99 was
+    `0.259 ms`, `0.291 ms`, and `0.290 ms`.
+  - Remote RDMA pgbench c4 processed all transactions with rc `0`. Warmed
+    repeats were `10441.781326` and `10324.384415 TPS`; p99 was `0.591 ms` and
+    `0.594 ms`.
+  - Local Homer blackhole basebackup completed with rc `0` in `4.18s` and
+    `4.17s`.
+  - Remote RDMA blackhole basebackup completed with rc `0`; after warmup
+    `5.74s`, warmed repeats were `4.12s`, `4.30s`, and `4.31s`.
+  - Verification caveats: the first cleanup attempt used an over-broad
+    `pkill -f` and killed its own shell, then the runner reran cleanup safely;
+    `pkill -x` missed the truncated service process name on `farnet0`, so the
+    dbcomm-owned service was killed by argv path. Final preflight was clean
+    except for expected PostgreSQL and Homer service processes.
+- Stats-counter acceptance was run by the verification subagent with a
+  stats-enabled build/install/sync, short correctness workloads, and a final
+  no-stats rebuild/install/sync restore; raw logs are under
+  `/tmp/homer_stage0_stats_acceptance_20260619_192511`.
+  - Remote RDMA pgbench c1 `-t 2000` and remote RDMA basebackup blackhole both
+    returned rc `0`.
+  - Required field evidence is in
+    `/tmp/homer_stage0_stats_acceptance_20260619_192511/31_required_field_evidence.txt`.
+    It shows frontend `completion_events_acked=16003`, backend-node
+    `completion_events_published=16003`,
+    `completion_bytes_posted=541029424`,
+    `terminal_completion_payload_waits=1994`,
+    `terminal_completion_result_send_cq_waits=0`, frontend-node
+    `command_bytes_posted=700374048`, pgbench payload
+    `payload_records_per_wimm=4000` and `payload_bytes_per_wimm=416000`, and
+    basebackup payload `payload_records_per_wimm=6578` and
+    `payload_bytes_per_wimm=23294957061`. The direct registered-source paths
+    reported `producer_to_registered_source_copy_bytes=0`, as expected.
+  - Service logs contained NUL bytes, so the runner used `rg -a` for counter
+    extraction.
+  - After diagnostics, the no-stats runtime was restored. Final hashes matched
+    on both hosts for `postgres`, `pgbench`, `pg_basebackup`,
+    `citus_tuple_sink_service`, `libhomer_client.a`, and `citus.so`; string
+    probes confirmed stats strings were absent from the restored runtime.
+- Stage 0 is accepted for current-code diagnostics and no-stats workload
+  correctness/performance. Counters for later mechanisms such as descriptor
+  publication/cache hits and nonblocking result-drain statuses remain planned
+  under their corresponding future stages and are not expected to be nonzero
+  before those mechanisms exist.
 
 ## Stage 1: common transport identity and basebackup lifecycle split
 
@@ -264,6 +484,37 @@ tuple result generation, tuple batch fields, and result descriptor assumptions.
 Basebackup validation must not execute tuple-result descriptor, sequence, or EOS
 generation checks.
 
+### Protocol/version changes
+
+Stage 1 is a transport-header ABI migration, not an additive fourth identity
+layer. The implementation choice is:
+
+```text
+resultGeneration  -> streamGeneration
+ringRecordOrdinal -> recordOrdinal
+sinkSequence      -> removed from the common transport envelope, or renamed to
+                     a reserved field that producers set to zero and validators
+                     ignore
+generationSequence remains tuple-result-only command-local DATA/EOS sequence
+```
+
+The implementation must bump the tuple-sink transport protocol version, return
+the service-issued nonzero basebackup stream generation at stream open, and
+propagate that generation in peer-open metadata. Current basebackup producer
+behavior writes `resultGeneration = 0` and duplicates sequence into multiple
+fields; Stage 1 should eliminate that duplication rather than adding another
+identity representation.
+
+Basebackup validation after the migration uses:
+
+```text
+transport.streamGeneration == opened backup stream generation
+transport.recordOrdinal + 1 == basebackupHeader.streamSequence
+```
+
+It must not check tuple-result `generationSequence`, descriptor state, STARTED
+state, or tuple-view EOS generation.
+
 ### State transitions and ownership
 
 - SQL tuple-result generation remains command/result owned.
@@ -272,6 +523,10 @@ generation checks.
 - `OBJECT_END` and `OBJECT_ERROR` may carry transport EOS when they terminate
   the stream; do not add an extra empty terminal record unless the semantic
   object model requires it.
+- Distinguish basebackup semantic endings:
+  - `BACKUP_OBJECT_END`: ends one archive or manifest object.
+  - `BACKUP_STREAM_END`: ends the whole backup and carries transport EOS.
+  - `BACKUP_STREAM_ERROR`: terminal failure and carries transport EOS.
 
 ### Acceptance
 
@@ -280,6 +535,83 @@ generation checks.
   RDMA band.
 - Basebackup hot path no longer depends on SQL result STARTED/terminal lifecycle
   or tuple-view EOS repair.
+
+### Implementation progress and acceptance - June 19, 2026
+
+- Stage 1 transport-header ABI migration is implemented in the Citus/Homer
+  source tree and cross-machine workload accepted.
+  [`CITUS_TUPLE_SINK_PROTOCOL_VERSION`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:21)
+  is now `10`.
+- [`CitusTupleSinkTransportHeader`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:386)
+  now uses `streamGeneration` and `recordOrdinal`. `generationSequence` remains
+  tuple-result-only until the Stage 5 EOS cleanup, and `reservedSequence` is
+  zero on new basebackup records.
+- The queue descriptor still uses the historical field name
+  `resultGeneration`. This is intentional until the Stage 4 descriptor split:
+  for SQL tuple results it remains the result generation, while basebackup
+  stream opens use it to return the service-issued nonzero stream generation
+  [tuple_sink_protocol.h](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:233).
+- Basebackup local producer open now rejects zero stream generation, and
+  producer records use `stream->queueDescriptor.resultGeneration` as the common
+  transport `streamGeneration` while keeping the semantic stream sequence in
+  `CitusRemoteBaseBackupMessageHeader.streamSequence`
+  [homer_client.c](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1500)
+  [homer_client.c](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1766).
+- The service returns `streamEntry->stream.serviceStreamId` as the basebackup
+  stream generation in the local send queue descriptor
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23009).
+  Remote basebackup receive validates the sender's stream generation using the
+  peer stream id recorded during peer open, because unfragmented byte-ring
+  records are forwarded without rewriting their common transport header
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19151).
+- Common payload-header readiness now checks protocol, expected stream
+  generation, `recordOrdinal + 1`, header size, and object-family-specific
+  fields. Tuple-result validation checks `generationSequence`; basebackup
+  validation rejects nonzero tuple-only sequence fields and validates semantic
+  ordering through the basebackup payload header
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21830).
+- Tuple-result producer/consumer code no longer uses the demoted common-header
+  duplicate sequence. The backend-local tuple sink fills `streamGeneration`,
+  `recordOrdinal`, and tuple-only `generationSequence`
+  [tuple_sink_service.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:278),
+  and receive-side tuple validation relies on `generationSequence` plus the
+  tuple batch header
+  [tuple_sink_service.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1938).
+- Caveat: for the current forced-fragmentation debug path, `recordOrdinal` is
+  still the basebackup object ordinal on all fragments of one object, not a
+  unique physical fragment ordinal. This preserves the existing reassembly
+  contract and keeps unfragmented hot-path records direct-copyable. A true
+  physical fragment ordinal would require one more receiver-side reassembly
+  frontier and is not part of this Stage 1 implementation.
+- Build evidence so far: no-stats `make -B -j8 service-bin client-bin
+  CPPFLAGS='-D_GNU_SOURCE'` passed after formatting; stats-enabled `make -B -j8
+  service-bin client-bin CPPFLAGS='-D_GNU_SOURCE
+  -DHOMER_SERVICE_PAYLOAD_STATS=1 -DHOMER_SERVICE_CLIENT_SQL_STATS=1
+  -DHOMER_CLIENT_COMPLETION_STATS=1'` also passed after formatting.
+- No-stats build/install/sync and workload validation were run by the dedicated
+  validation subagent; raw logs are under
+  `/tmp/homer_stage1_validation_20260619_194551`, with the summarized verdict in
+  `/tmp/homer_stage1_validation_20260619_194551/17_acceptance_verdict.txt`.
+  - Build/install, rsync to `farnet0`, binary hash matching, installed protocol
+    version `10`, and absence of stats strings all passed.
+  - Remote RDMA pgbench c1 returned rc `0` with zero failures. Warmed repeats
+    were `4159.162844`, `3727.666386`, and `3724.548762 TPS`; p95 was
+    `0.250`, `0.280`, and `0.278 ms`; p99 was `0.261`, `0.296`, and
+    `0.293 ms`.
+  - Remote RDMA pgbench c4 returned rc `0` with zero failures. Warmed repeats
+    were `10442.449182`, `10292.221911`, and `10237.237748 TPS`; p95 was
+    `0.536`, `0.536`, and `0.539 ms`; p99 was `0.611`, `0.593`, and
+    `0.607 ms`.
+  - Local Homer blackhole basebackup completed with rc `0` in `3.96s` and
+    `3.88s`.
+  - Remote RDMA blackhole basebackup completed with rc `0`; after warmup
+    `6.17s`, warmed repeats were `4.21s`, `4.29s`, and `4.19s`.
+  - Service-log scan reported no obvious error/mismatch/failure strings. Final
+    process preflight showed only expected PostgreSQL and Homer services.
+- Stage 1 is accepted for correctness and performance. The only caveat is that
+  remote c4 warmed repeats 2 and 3 are slightly below the Stage 0
+  `10.3k-10.4k` band, but still within a small tolerance and with no correctness
+  failures or service-log errors.
 
 ## Stage 2: lane-owned send-CQ dispatcher and per-QP FIFOs
 
@@ -309,6 +641,47 @@ Current send-CQ poll sites to audit include:
 - peer-pump send CQ draining at
   [`remote_execution_peer_transport_rdma.c:8236`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:8236)
 
+### Current topology audit - June 19, 2026
+
+- Each `TupleSinkServicePeerConnectionState` owns one `sendCompletionQueue` and
+  one `recvCompletionQueue`
+  [remote_execution_peer_transport_rdma.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:446).
+  [`TupleSinkServiceInitConnectionResources()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2387)
+  creates both CQs, then assigns them as `qpInitAttr.send_cq` and
+  `qpInitAttr.recv_cq`
+  [remote_execution_peer_transport_rdma.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2413).
+  Therefore the physical ownership unit for Stage 2 is one lane/QP send CQ, not
+  one semantic command, payload, completion, or control source.
+- Current WR-ID namespaces are still tag based:
+  payload uses the top bit and encodes payload completion kind, sink id, and
+  frontier; command uses the command tag plus outstanding index; control uses
+  control tag plus response flag, op/slot index, and generation; peer-client
+  completion publish uses its own tag plus outstanding index
+  [remote_execution_peer_transport_rdma.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:76).
+- Current send-CQ consumers are still mixed:
+  - bootstrap setup polls one CQE at a time through
+    [`TupleSinkServicePollCompletionOnce()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1270);
+  - cold blocking waits use
+    [`TupleSinkServiceWaitForSendCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1927);
+  - the generic tagged drain polls in
+    [`TupleSinkServiceDrainTaggedSendCompletionsInternal()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2053);
+  - legacy semantic payload and command pollers still poll the same
+    `sendCompletionQueue`
+    [remote_execution_peer_transport_rdma.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6851)
+    [remote_execution_peer_transport_rdma.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7037);
+  - peer-control helpers still call the legacy tagged drain as hidden progress
+    while publishing or polling peer-control ops
+    [remote_execution_peer_transport_rdma.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7764)
+    [remote_execution_peer_transport_rdma.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7994);
+  - peer-pump `SEND_CQ` progress also calls the legacy tagged drain
+    [remote_execution_peer_transport_rdma.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:8347).
+- The current stashes are still live for payload, command, and peer-client
+  completion-publish CQEs in `TupleSinkServicePeerConnectionState`
+  [remote_execution_peer_transport_rdma.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:504).
+  Stashing remains the compatibility mechanism for callback-absent or
+  semantic-owner-specific drains. Stage 2 is not complete until steady-state
+  scheduler drains no longer need these stashes.
+
 ### New data structures/API
 
 ```c
@@ -327,6 +700,7 @@ typedef struct HomerSendCqDrainResult
     uint32_t completionRefsRetired;
     uint32_t payloadRefsRetired;
     uint32_t controlRefsRetired;
+    uint32_t stashCqes;
     uint32_t readyReasonMask;
 } HomerSendCqDrainResult;
 
@@ -340,10 +714,11 @@ bool HomerServiceDrainPeerSendLane(
 ```c
 typedef struct HomerPeerSendOwnerRef
 {
-    uint64_t qpGeneration;
     uint64_t postOrdinal;
     uint32_t ownerIndex;
     uint32_t sourceGeneration;
+    uint16_t ownerKind;
+    uint16_t reserved;
 } HomerPeerSendOwnerRef;
 
 typedef struct HomerPeerSendOwnerFifo
@@ -368,6 +743,17 @@ typedef struct HomerPeerSendOwnerFifo
    retirement.
 7. A stale-generation CQE on a live QP is fatal. A teardown flush CQE is handled
    by the teardown state machine.
+8. A QP-global FIFO is preferred over one FIFO per semantic namespace because a
+   signaled checkpoint proves completion of all prior WRs on that QP. The
+   `ownerKind` dispatches retired refs to `COMMAND_SOURCE`,
+   `CLIENT_COMPLETION_SOURCE`, `PAYLOAD_SOURCE`, or `CONTROL_SOURCE`.
+9. `qpGeneration` may live in the lane/FIFO instead of every ref, but the
+   checkpoint WR-ID must carry enough generation information to reject stale CQEs.
+10. If an owner ref is reserved and zero WRs are posted, roll back the FIFO tail.
+    If one or more WRs are posted and the sequence later fails, leave the owner
+    teardown-owned and mark the QP reset-required.
+11. FIFO capacity must cover the maximum logical source owners that can be
+    outstanding under `max_send_wr` and all source-ring geometries.
 
 ### Migration commits
 
@@ -375,7 +761,7 @@ typedef struct HomerPeerSendOwnerFifo
   handlers underneath.
 - `2b`: migrate peer-client completion publish retirement from the global table
   and scan in
-  [`TupleSinkServiceRetirePeerClientCompletionPublishCompletionsThrough()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3840)
+  [`TupleSinkServiceRetirePeerClientCompletionPublishCompletionsThrough()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4047)
   to per-QP FIFO prefix retirement.
 - `2c`: migrate command-send retirement to per-QP FIFO.
 - `2d`: move payload and control send-CQ handling into direct dispatcher paths.
@@ -383,6 +769,370 @@ typedef struct HomerPeerSendOwnerFifo
 
 Preserve existing WR-ID encodings until the corresponding FIFO namespace is
 working.
+
+### Implementation progress - Stage 2a
+
+- Stage 2a now adds the canonical send-CQ accounting surface
+  `HomerSendCqBudget` and `HomerSendCqDrainResult`
+  [remote_execution_peer_transport_rdma.h](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:173).
+  `stashCqes` is intentionally explicit: it records CQEs that were consumed
+  from the physical CQ but deferred into the legacy stash instead of retired
+  through the eventual owner FIFO.
+- [`TupleSinkServiceDrainPeerSendCqRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2169)
+  is the new canonical Stage-2 send-CQ drain entry point. It accepts
+  `HomerSendCqBudget`, reports polls, empty polls, CQEs, typed retired refs, and
+  stash CQEs, and currently delegates to the existing tagged-CQE router. This is
+  scaffolding, not ownership migration.
+- [`TupleSinkServiceHandleTaggedSendCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1742)
+  now increments typed result fields only when a callback/direct owner actually
+  retires that namespace. If a CQE falls back to legacy stash, it increments
+  `stashCqes` instead of pretending owner retirement occurred.
+- [`HomerServiceDrainOnePeerSendCq()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10470)
+  now uses `TupleSinkServiceDrainPeerSendCqRdma()` with a one-poll-batch budget.
+  The scheduler grant policy is unchanged; this only routes the existing
+  scheduler-owned CQ drain through the canonical result surface.
+- Caveat: Stage 2a does not yet remove `TupleSinkServicePollPeerCommandSendCompletionRdma()`,
+  `TupleSinkServicePollPeerPayloadSendCompletionRdma()`, peer-control hidden
+  tagged drains, or the stash arrays. Those are the actual ownership migrations
+  for `2b` through `2e`.
+
+### Implementation progress - Stage 2b
+
+- Stage 2b migrates peer-client completion-publish retirement from a global
+  outstanding-table scan to a per-connection FIFO. The existing outstanding
+  table remains the owner metadata store and WR-ID namespace for this slice, but
+  steady-state checkpoint retirement no longer scans all
+  `HOMER_SERVICE_PEER_CLIENT_COMPLETION_PUBLISH_OUTSTANDING_WRITES` entries.
+- `TupleSinkServicePeerClientCompletionPublishLaneFifo` stores outstanding table
+  indexes in post order per `TupleSinkServicePeerConnectionHandle`
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1026).
+  This is intentionally namespace-specific for peer-client completion publish;
+  the generic `HomerPeerSendOwnerFifo` still belongs to the later shared owner
+  migration.
+- `TupleSinkServiceReservePeerClientCompletionPublishCompletion()` now enqueues
+  the reserved outstanding index into that lane FIFO before marking the entry
+  active
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3932).
+  If body posting fails before the ready-WIMM, the existing clear path removes
+  the FIFO entry while clearing the outstanding table entry
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3962).
+- `TupleSinkServiceRetirePeerClientCompletionPublishCompletionsThrough()` now
+  finds the checkpoint entry's connection FIFO and pops the FIFO prefix through
+  the checkpoint index
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4047).
+  A missing FIFO for an active checkpoint is treated as a fatal ownership
+  inconsistency, not as a fallback to the global scan.
+- Caveat: this removes the global scan for peer-client completion publish only.
+  Command sends still use their existing global table/prefix retirement, and
+  payload/control CQE ownership still depends on the legacy tagged drain plus
+  stash compatibility. Those remain `2c` and `2d`.
+
+### Implementation progress - Stage 2c
+
+- Stage 2c migrates remote client-SQL command-send retirement from a global
+  outstanding-table scan to a per-connection FIFO. The existing outstanding
+  table remains the WR-ID metadata store for command sends, but signaled
+  checkpoint CQE retirement no longer scans all
+  `HOMER_SERVICE_CLIENT_SQL_COMMAND_OUTSTANDING_WRITES` entries.
+- `TupleSinkServiceClientSqlCommandWriteLaneFifo` stores command outstanding
+  indexes in post order per `TupleSinkServicePeerConnectionHandle`
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1013).
+  This mirrors the Stage 2b completion-publish FIFO, but it is still
+  namespace-specific. The later shared `HomerPeerSendOwnerFifo` migration will
+  unify command, completion, payload, and control owners under one QP-global
+  owner FIFO.
+- `TupleSinkServiceReserveClientSqlCommandWriteCompletion()` now fills the
+  command outstanding-table entry, enqueues its index into the lane FIFO, and
+  only then marks the entry active and updates active/signaled counts
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4295).
+  If FIFO enqueue fails before any WR is posted, the partially filled entry is
+  cleared and no source ownership is published.
+- `TupleSinkServiceRetireClientSqlCommandWriteCompletionsThrough()` now finds
+  the checkpoint entry's connection FIFO, verifies that the checkpoint index is
+  present, and pops only the FIFO prefix through that checkpoint
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4505).
+  A missing FIFO or missing checkpoint is treated as a fatal ownership
+  inconsistency, not as a fallback to the old global scan.
+- `TupleSinkServiceClearClientSqlCommandWriteCompletionIndex()` removes active
+  command outstanding indexes from the lane FIFO before clearing their table
+  entry
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4583).
+  This keeps zero-WR post failures and session cleanup from leaving stale FIFO
+  references.
+- Initial Stage 2c validation exposed a remaining no-callback send-CQ owner:
+  aggregate peer-control progress and the explicit peer-control `SEND_CQ`
+  action could still call the RDMA-layer peer pump, which invokes
+  `TupleSinkServiceDrainTaggedSendCompletionsInternal()` without command or
+  peer-client-completion callbacks. On a shared command/control QP that path
+  consumed command CQEs into the legacy command stash until it filled with
+  `command send-completion stash is full`. The fix is to exclude send-CQ
+  retirement from aggregate peer-control phase masks
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11253)
+  and to route `HOMER_PROGRESS_ACTION_DRAIN_PEER_CONTROL_SEND_CQ` through the
+  typed Stage-2 send-CQ drain before falling back to the legacy peer-control
+  send-CQ pump only when there is no command/payload ownership to retire
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28198).
+  This is a concrete ownership correction: peer-control progress must not drain
+  a shared physical send CQ without the callbacks needed for all WR-ID
+  namespaces that can appear on that CQ.
+- Caveat: Stage 2c preserves the pre-existing two-WR command fallback failure
+  behavior. If the command-record WR succeeds but the ready-word WR fails, the
+  current code still clears local ownership through the generic failure path
+  rather than marking the QP reset-required. The Stage 2 partial-post invariant
+  still needs to be enforced when payload/control/direct dispatcher cleanup is
+  completed; this FIFO slice does not introduce that issue, but it also does not
+  solve it.
+- Build evidence so far: no-stats Citus/Homer
+  `make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'` passed after
+  `git clang-format`, and `git diff --check` passed in `citus-dbcomm`.
+  Full cross-machine workload validation is being rerun after the no-callback
+  peer-control send-CQ correction.
+
+### Rejected Stage 2c intermediate state
+
+- Validation artifact
+  `/tmp/homer_stage2c_validation_20260619_202228/14_acceptance_verdict.txt`
+  rejected the first Stage 2c implementation. Build/install/sync succeeded, but
+  remote RDMA pgbench c1 stalled before producing TPS. The farnet0 service log
+  showed
+  `resetting outgoing peer transport ... send-CQ drain failure detail=command send-completion stash is full`
+  followed by repeated `remote client SQL command path is not ready session=1`.
+  This rejected the idea that command FIFO migration alone was sufficient while
+  peer-control `SEND_CQ` still had a no-callback drain path on the same physical
+  CQ.
+
+### Validation - Stage 2c
+
+- Dedicated validation agent accepted Stage 2c after the no-callback
+  peer-control send-CQ correction. Raw artifacts are under
+  `/tmp/homer_stage2c_validation_rerun_20260619_203426`; the verdict is
+  `/tmp/homer_stage2c_validation_rerun_20260619_203426/09_acceptance_verdict.txt`.
+- Build/deploy passed as `dbcomm`: no-stats Citus/Homer `service-bin
+  client-bin`, Citus/Homer install, targeted Postgres build/install, installed
+  ownership, no stats-marker strings, protocol version `10U`, and farnet1/farnet0
+  hash match for `postgres`, `pgbench`, `pg_basebackup`,
+  `citus_tuple_sink_service`, `libhomer_client.a`, and `citus.so`.
+- Remote RDMA pgbench c1 from `farnet0` to `farnet1` completed all runs with
+  zero failed transactions. Warmed TPS was `4094.682993`, `3723.058783`, and
+  `3720.202803`; p99 was `0.275`, `0.297`, and `0.294 ms`.
+- Remote RDMA pgbench c4 completed all runs with zero failed transactions.
+  Warmed TPS was `10388.450121`, `10384.377742`, and `10292.921095`; p99 was
+  `0.596`, `0.593`, and `0.600 ms`. This is within tolerance versus Stage 2b
+  and shows no c4 regression from command-send FIFO migration.
+- Local Homer blackhole basebackup completed with rc `0`; after warmup `4.20s`,
+  warmed runs were `4.16s`, `4.14s`, and `3.98s`.
+- Remote RDMA blackhole basebackup completed with rc `0`; after warmup `6.04s`,
+  warmed runs were `4.13s`, `4.19s`, and `4.13s`.
+- Focused log scan found no Stage-2c ownership or previous-stall errors in the
+  fresh service/workload logs: no `command send-completion stash is full`, no
+  `send-CQ drain failure`, no `remote client SQL command path is not ready`, no
+  `command write checkpoint`, no `command write lane FIFO`, no
+  `command write clear could not remove lane FIFO`, and no
+  `stale command write checkpoint`.
+- Validation caveats:
+  - the tree was dirty by design, so this validates the current working tree,
+    not a committed SHA;
+  - pgbench/basebackup per-run timeouts were used only to bound recurrence of
+    the prior stall, and no timeout fired;
+  - one Postgres `FATAL` in the archived tail came from the earlier rejected
+    validation run before the accepted rerun setup began.
+
+### Implementation progress - Stage 2d
+
+- Stage 2d moves scheduler-visible payload and ACK send-CQ retirement away from
+  payload-only CQ pollers and through the typed Stage-2 drain dispatcher.
+- `HomerServiceExecutePayloadProgressPlan()` now treats
+  `HOMER_PAYLOAD_PROGRESS_ACTION_SEND_CQ` as physical lane ownership: it first
+  calls `HomerServiceDrainTypedPeerSendCq()` and clears the payload-local
+  `SEND_CQ` bit before invoking
+  `HomerServicePumpPayloadStream()`
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10450).
+  The dense aggregate payload scan likewise excludes `SEND_CQ` from its
+  per-stream action mask and drains the typed CQ path once before scanning active
+  payload streams
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10496).
+- `HomerServiceDrainTypedPeerSendCq()` is the local service helper that builds a
+  CQ-drain plan with
+  `HomerServiceBuildCqDrainProgressPlan()` and executes it through
+  `HomerServiceExecuteCqDrainProgressPlan()`
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11292).
+  This keeps command-send, peer-client-completion publish, payload-data, ACK,
+  and control WR-ID namespaces visible to one drain path instead of requiring
+  payload-specific callbacks.
+- The outgoing byte-ring sender and older slot-ring sender now use
+  `HomerServiceDrainTypedPeerSendCq()` when they opportunistically retire local
+  send completions before source reuse or wait under local source-window
+  pressure
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20327)
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20410)
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21060)
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21140).
+  The wait predicates are stream-local frontier movement, not merely "some CQE
+  drained", so a command CQE or another stream's CQE cannot release the current
+  stream's source storage.
+- Receiver consumed-head ACK retirement now also uses the typed drain through
+  `HomerServiceDrainReceiverHeadAckCompletions()`, which is threaded through
+  credit publication, incoming byte-ring payload, incoming slot-ring payload,
+  and close/reclaim paths
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21761)
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21888)
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22158)
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22527)
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22936).
+- The old service-level selected payload send-CQ helper
+  `HomerServiceDrainPayloadSendCqForStream()` was deleted because it became dead
+  after routing selected and aggregate `SEND_CQ` work through the typed drain.
+  The lower-level RDMA payload-only pollers still exist in
+  `remote_execution_peer_transport_rdma.c`; Stage 2e still owns deleting or
+  fencing the remaining stash/callback-absent compatibility layer after Stage 2d
+  validation.
+- Build evidence so far: after `git clang-format`, no-stats Citus/Homer
+  `make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'` passed and
+  `git diff --check` passed in both `citus-dbcomm` and `postgres-citus`.
+
+### Validation - Stage 2d
+
+- Dedicated validation agent accepted Stage 2d. Raw artifacts are under
+  `/tmp/homer_stage2d_validation_20260619_205313`; the verdict is
+  `/tmp/homer_stage2d_validation_20260619_205313/43_acceptance_verdict.txt`.
+- Build/deploy passed as `dbcomm`: no-stats Citus/Homer `service-bin
+  client-bin`, Citus/Homer install, targeted Postgres build/install, installed
+  prefix rsync to `farnet0`, no stats-marker strings, and farnet1/farnet0 hash
+  match for `postgres`, `pgbench`, `pg_basebackup`,
+  `citus_tuple_sink_service`, `libhomer_client.a`, and `citus.so`.
+- Remote RDMA pgbench c1 from `farnet0` to `farnet1` completed all warmed runs
+  with zero failed transactions. Warmed median was `3667.106658 TPS`, average
+  latency `0.273 ms`, p95 `0.282 ms`, p99 `0.298 ms`, and max `6.328 ms`.
+  Warmed TPS varied across runs `2-4` as `4027`, `3667`, and `3666`; treat this
+  as measurement variance unless repeated runs show a trend.
+- Remote RDMA pgbench c4 completed all warmed runs with zero failed
+  transactions. Warmed median was `10297.099642 TPS`, average latency
+  `0.388 ms`, p95 `0.533 ms`, p99 `0.607 ms`, and max `17.775 ms`. This is
+  within the Stage 2 tolerance band and does not show a c4 regression from
+  payload/ACK CQ routing.
+- Local Homer blackhole basebackup completed with rc `0`; warmed median real
+  time was `4.05s`.
+- Remote RDMA blackhole basebackup completed with rc `0`; warmed median real
+  time was `4.14s`.
+- Focused runtime scans were clean for Stage-2d CQ ownership failures and old
+  stash/full symptoms: no `payload send-completion stash is full`, no
+  `command send-completion stash is full`, no
+  `peer-client completion publish stash is full`, no `send-CQ drain failure`, no
+  `typed send-CQ drain failed`, no `typed send-CQ wait failed`, no
+  `payload-typed-completion`, no `byte-ring-typed-completion`, no
+  `receiver head-ACK completion drain failed`, and no
+  `remote client SQL command path is not ready`.
+- Validation caveats:
+  - the first cleanup attempt exited `143` because a broad `pkill -f` pattern
+    matched the cleanup shell; cleanup was rerun with bracketed patterns and the
+    accepted results were collected after a clean process preflight;
+  - `farnet1`'s data directory is not readable by the interactive user, so the
+    validation agent collected the local service log via
+    `sudo -n -u dbcomm cat`.
+
+### Implementation progress - Stage 2e
+
+- Stage 2e removes the RDMA-layer stash storage and semantic-specific send-CQ
+  poller APIs from the Citus/Homer source tree. The stash slot constants,
+  payload/command stash records, and per-connection stash fields were removed
+  from
+  [`TupleSinkServicePeerConnectionState`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:474).
+- [`TupleSinkServiceHandleTaggedSendCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1551)
+  now requires typed owner callbacks for payload, command, and peer-client
+  completion-publish WR-ID namespaces. A callback-absent drain may still retire
+  control WR-IDs, but if it sees command, payload, or completion-publish CQEs it
+  fails with an explicit ownership error instead of hiding the CQE for a later
+  semantic poller.
+- [`TupleSinkServiceDrainTaggedSendCompletionsInternal()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1802)
+  no longer replays peer-client-completion publish CQEs from a side buffer. The
+  public header no longer declares
+  `TupleSinkServicePollPeerPayloadSendCompletionRdma()`,
+  `TupleSinkServicePollPeerReceiverHeadAckCompletionRdma()`,
+  `TupleSinkServicePollPeerCommandSendCompletionRdma()`, or
+  `TupleSinkServicePeerCommandCompletionPollResult`
+  [remote_execution_peer_transport_rdma.h](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:720).
+- The selected command path now threads `HomerServicePayloadStreamEntry` through
+  [`HomerServiceExecuteRemoteClientSqlCommandProgressPlan()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10998)
+  into
+  [`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15344).
+  Its opportunistic command source-retirement helper
+  [`TupleSinkServiceDrainRemoteClientSqlCommandWriteCompletions()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:4773)
+  now calls
+  [`HomerServiceDrainTypedPeerSendCq()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11255)
+  instead of the removed command-only RDMA poller. This is the key ownership
+  fix: command-source progress can still release local command slots before
+  posting more commands, but it can also resolve payload and ACK CQEs if those
+  arrive on the same physical CQ.
+- Build and static hygiene evidence: no-stats
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`
+  passed; `git diff --check` passed in `citus-dbcomm`; a focused source grep for
+  the removed stash symbols and old semantic-specific poller APIs returned no
+  matches in `remote_execution_peer_transport_rdma.c`,
+  `remote_execution_peer_transport_rdma.h`, and
+  `tuple_sink_service_process.c`.
+- Validation status: accepted by cross-machine validation on June 19, 2026.
+  Artifacts are under `/tmp/homer_stage2e_validation_20260619_211642`; the main
+  script is `validate_stage2e.sh`, the command transcript is `commands.log`, and
+  the corrected service-log scan commands are in
+  `manual_service_log_scan_commands.txt`.
+- Validation evidence: no-stats Citus/Homer build/install, targeted Postgres
+  build/install, install-prefix rsync to `farnet0`, and installed hash
+  comparison all passed; `deploy/sha256.diff` is empty. Warmed workload results:
+  remote RDMA pgbench c1 `4197.10`, `3772.36`, `3733.26` TPS, median
+  `3772.36` TPS; remote RDMA pgbench c4 `10294.24`, `10298.13`, `10279.52` TPS,
+  median `10294.24` TPS; local Homer blackhole basebackup `4.15`, `4.16`,
+  `4.15` seconds, median `4.15` seconds; remote RDMA blackhole basebackup
+  `4.12`, `4.20`, `4.27` seconds, median `4.20` seconds. All workload commands
+  returned success and pgbench reported zero failed transactions.
+- Focused validation scan result: clean. The corrected scan included service
+  logs from both hosts and found no ownership/stash/fallback/error patterns such
+  as `send-CQ drain received`, `without payload owner callback`,
+  `without command owner callback`, `without owner callback`,
+  `send-CQ drain failure`, `typed command send-CQ drain failed`,
+  `remote client SQL command path is not ready`, old stash strings, CQ reset
+  strings, failed transactions, or timeouts.
+- Remaining caveat after validation: callback-absent send-CQ drains still exist
+  in the
+  RDMA peer-control/control-resource paths, but they are now fenced as
+  control-only paths. If real workload validation reports
+  `send-CQ drain received ... without ... owner callback`, that is evidence that
+  a remaining peer-control helper is still making hidden physical send-CQ
+  progress and must be moved behind the service-owned typed drain.
+
+### Validation - Stage 2b
+
+- Dedicated validation agent accepted Stage 2b with no-stats build/install/sync
+  and cross-machine workloads. Raw artifacts are under
+  `/tmp/homer_stage2b_validation_20260619_200606`; the verdict is
+  `/tmp/homer_stage2b_validation_20260619_200606/19_acceptance_verdict.txt`.
+- Build/deploy passed as `dbcomm`: Citus/Homer `service-bin client-bin`,
+  Citus/Homer install, targeted Postgres build/install, installed ownership,
+  no stats-marker strings, protocol version `10U`, and farnet1/farnet0 hash
+  match for `postgres`, `pgbench`, `pg_basebackup`, `citus_tuple_sink_service`,
+  `libhomer_client.a`, and `citus.so`.
+- Remote RDMA pgbench c1 from `farnet0` to `farnet1` completed all runs with
+  zero failed transactions. Warmed TPS was `4187.687111`, `3760.545038`, and
+  `3726.895345`; p99 was `0.259`, `0.293`, and `0.298 ms`.
+- Remote RDMA pgbench c4 completed all runs with zero failed transactions.
+  Warmed TPS was `10509.033960`, `10425.596298`, and `10388.120976`; p99 was
+  `0.597`, `0.589`, and `0.613 ms`. This is within tolerance versus Stage 1
+  and shows no c4 regression from the peer-client completion FIFO migration.
+- Local Homer blackhole basebackup completed with rc `0` in `4.02s`, `4.01s`,
+  and `4.19s`.
+- Remote RDMA blackhole basebackup completed with rc `0`; after warmup `5.34s`,
+  warmed runs were `4.33s`, `4.30s`, and `4.33s`.
+- Focused service-log scan found no Stage-2b ownership errors: no
+  `peer-client completion checkpoint index`, `lane FIFO`, `no lane FIFO`,
+  `did not contain checkpoint`, or `send-CQ drain failed`.
+- Validation caveats:
+  - farnet1 PostgreSQL logged repeated Citus warnings about connecting to
+    `dbcomm@10.10.1.100:5432`; farnet0 PostgreSQL was intentionally not running
+    for this pgbench/basebackup validation shape, so this is not a Homer
+    transport failure.
+  - farnet1 service log shows non-fatal `stale payload progress grant` lines
+    after local basebackup cleanup. Workloads completed correctly and these are
+    not Stage-2b FIFO/checkpoint/drain failures, but they remain worth tracking
+    when scheduler cleanup resumes.
 
 ### Targeted tests
 
@@ -412,8 +1162,8 @@ typedef enum HomerClientResultDrainStatus
 {
     HOMER_RESULT_DRAIN_NOT_READY = 0,
     HOMER_RESULT_DRAIN_PROGRESS,
-    HOMER_RESULT_DRAIN_FRONTIER_REACHED,
-    HOMER_RESULT_DRAIN_EOS,
+    HOMER_RESULT_DRAIN_COMPLETE,
+    HOMER_RESULT_DRAIN_VISIBILITY_PENDING,
     HOMER_RESULT_DRAIN_ERROR
 } HomerClientResultDrainStatus;
 
@@ -423,13 +1173,20 @@ typedef struct HomerClientResultDrainBudget
     uint64_t maxBytes;
 } HomerClientResultDrainBudget;
 
+typedef struct HomerClientResultDrainTarget
+{
+    bool hasRequiredFrontier;
+    uint64_t requiredGeneration;
+    uint64_t requiredTail;
+    uint64_t requiredEosOrdinal;
+} HomerClientResultDrainTarget;
+
 bool HomerClientDrainResultSinkUntil(
     HomerClientResultSink *sink,
-    uint64_t requiredGeneration,
-    uint64_t requiredTail,
-    uint64_t requiredEosOrdinal,
+    const HomerClientResultDrainTarget *target,
     const HomerClientResultDrainBudget *budget,
     HomerClientResultDrainStatus *status,
+    uint64_t *drainedRowCount,
     char *errorMessage,
     size_t errorMessageBytes);
 ```
@@ -437,11 +1194,29 @@ bool HomerClientDrainResultSinkUntil(
 ### State transitions and ownership
 
 - `HomerClientDrainResultSinkUntil()` must never spin internally.
-- If the required tail is not visible, return `HOMER_RESULT_DRAIN_NOT_READY`.
+- Stage 3a uses `target->hasRequiredFrontier = false` because the old completion
+  ABI does not yet carry `requiredTail` or `requiredEosOrdinal`. It implements
+  bounded, non-spinning drain using current EOS semantics.
+- Stage 3b sets `target->hasRequiredFrontier = true`, making the terminal
+  frontier authoritative.
+- `HOMER_RESULT_DRAIN_NOT_READY` means no complete next record is currently
+  published.
+- `HOMER_RESULT_DRAIN_PROGRESS` means records were consumed, but the budget was
+  exhausted before the target was reached.
+- `HOMER_RESULT_DRAIN_COMPLETE` means the required tail was reached and the exact
+  EOS ordinal was consumed, or current EOS semantics completed when no explicit
+  target exists yet.
+- `HOMER_RESULT_DRAIN_VISIBILITY_PENDING` means the tail gate is visible but the
+  record body is not yet stable; increment a separate counter and return to the
+  event loop.
 - Pgbench retains the terminal completion lease and retries later; it does not
   ACK the completion until apply succeeds.
 - Running-command opportunistic drain may use small budgets, but terminal apply
   must be bounded and retryable.
+- `maxRecords == 0` means no record-count limit. `maxBytes == 0` means no byte
+  limit.
+- If the next valid record exceeds `maxBytes` and no record has yet been
+  processed, process that one record anyway to avoid budget livelock.
 
 ### Targeted tests
 
@@ -456,7 +1231,92 @@ bool HomerClientDrainResultSinkUntil(
 - Pgbench can hold a terminal completion lease across `NOT_READY` result-drain
   returns without ACKing it.
 
-## Stage 3b/4a: one compact completion ABI with required frontier
+### Implementation progress - Stage 3a
+
+- The public client API now includes
+  [`HomerClientResultDrainStatus`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:101),
+  [`HomerClientResultDrainBudget`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:110),
+  [`HomerClientResultDrainTarget`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:116),
+  and
+  [`HomerClientDrainResultSinkUntil()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:297).
+  The implemented function includes a `uint64_t *drainedRowCount` out parameter
+  so existing pgbench row accounting can remain tied to the result-sink drain
+  frontier without requiring a second API call.
+- [`HomerClientResultSink`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:81)
+  now records `eosRecordOrdinal` beside `eosSeen`. Stage 3a still calls the
+  drain target with `hasRequiredFrontier = false`, but carrying the ordinal now
+  keeps the implementation shape compatible with the Stage 3b explicit frontier
+  target.
+- [`HomerClientDrainResultSinkUntil()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2960)
+  is the non-spinning parser. It drains only already-published complete records,
+  returns `NOT_READY` when no complete next record is available, returns
+  `VISIBILITY_PENDING` when a published frontier names a record whose full body
+  is not yet available, and returns `PROGRESS` when it consumed records or a
+  wrap gap but did not reach EOS/target. Validation rejected the tempting
+  shortcut of treating a complete-looking malformed header as immediate
+  corruption: a stale header can still contain plausible size fields while the
+  published tail is already visible. Stage 3a therefore returns
+  `VISIBILITY_PENDING` for header-envelope mismatch and lets the pgbench event
+  loop retry the leased completion without ACKing it.
+- `HOMER_CLIENT_COMPLETION_STATS` now also reports
+  `result_drain_visibility_pending_events` from
+  [`HomerClientCloseSession()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1271),
+  incremented when
+  [`HomerClientDrainResultSinkUntil()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2960)
+  returns `VISIBILITY_PENDING`. The counter compiles out of no-stats
+  performance builds.
+- [`HomerClientDrainResultSink()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:3194)
+  remains as a compatibility wrapper around the new API. It may still block when
+  legacy callers pass `requireEos = true`, but the measured pgbench path no
+  longer uses that wrapper.
+- Pgbench now drains result payload through
+  [`HomerDrainPendingResultSink()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3503).
+  Terminal apply in
+  [`HomerApplyCommandCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3558)
+  returns `HOMER_COMPLETION_NOT_APPLIED_RETRY` if the drain status is
+  `NOT_READY`, `PROGRESS`, or `VISIBILITY_PENDING`.
+  [`receiveHomerCommand()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3733)
+  already preserves the active mailbox lease on that retry result and therefore
+  does not ACK the terminal completion until the result drain reaches current
+  EOS semantics.
+- Build/static evidence before workload validation: no-stats
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`
+  passed in `citus-dbcomm`; `sudo -n -u dbcomm make install-headers
+  install-service-bin install` refreshed the installed client header/library for
+  the Postgres link; `sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build
+  src/bin/pgbench/pgbench` passed in `postgres-citus`; `git diff --check`
+  passed for the touched Citus/Homer client files and `pgbench.c`.
+- Validation status: accepted by cross-machine validation on June 19, 2026.
+- Rejected validation attempt: `/tmp/homer_stage3a_validation_20260619_213005`
+  rebuilt/installed/synced successfully and produced acceptable warmed
+  performance (`c1` median `3729.458376 TPS`, `c4` median `10288.605678 TPS`,
+  local basebackup median `4.13s`, remote RDMA basebackup median `4.14s`), but
+  the c4 warmup aborted after `30198/40000` transactions with
+  `failed to drain Homer result sink for sql_execute: tuple result byte-ring
+  record header mismatch`. The failure showed that Stage 3a must classify this
+  timing window as `VISIBILITY_PENDING`, not a fatal header mismatch.
+- Accepted validation retry: `/tmp/homer_stage3a_validation_retry_20260619_213911`
+  rebuilt/installed/synced no-stats Citus/Homer and targeted Postgres artifacts
+  as `dbcomm`; installed hashes matched across `farnet1` and `farnet0` for
+  `postgres`, `pgbench`, `pg_basebackup`, `citus_tuple_sink_service`,
+  `libhomer_client.a`, and `citus.so`. Warmups completed successfully,
+  including c4 warmup `rc=0`, `40000/40000`, zero failed transactions,
+  `10344.824 TPS`, p95 `0.513 ms`, and p99 `0.576 ms`.
+- Accepted warmed workload results: remote RDMA pgbench c1 `4120.634`,
+  `3704.433`, `3709.128` TPS with p99 `0.263`, `0.298`, `0.300 ms`; remote RDMA
+  pgbench c4 `10301.913`, `10231.911`, `10181.832` TPS with p99 `0.583`,
+  `0.586`, `0.591 ms`; local Homer blackhole basebackup `4.06`, `4.18`,
+  `4.03` seconds; remote RDMA blackhole basebackup `4.31`, `4.12`, `4.34`
+  seconds.
+- Accepted scan result: the final complete scan found no requested
+  rejection/error patterns, including no `tuple result byte-ring record header
+  mismatch`; the broader failed-transaction scan only found expected
+  `number of failed transactions: 0 (0.000%)` lines. The only caveat was
+  non-fatal `stale payload progress grant` service-log messages after local
+  basebackup cleanup; validation runtime was stopped afterward and the final
+  process preflight was clean on both hosts.
+
+## Stage 3b: one compact completion ABI with required frontier
 
 Goal: avoid two consecutive completion protocol migrations. Introduce one new
 completion hot record that carries both the required result frontier and the
@@ -502,13 +1362,18 @@ typedef struct CitusRemoteExecCommandCompletionHot
 First target:
 
 ```c
+#define HOMER_COMPLETION_INLINE_DETAIL_BYTES 128
+
 _Static_assert(sizeof(CitusRemoteExecCommandCompletionHot) <= 256,
-               "completion hot record must stay cache-local");
+               "completion hot record must stay bounded");
 ```
 
-The inline detail budget may start at 256 bytes if separating error text is not
-worth the first migration. The essential change is removing the full tuple
-contract from every completion event.
+`detailBytes` must be `<= HOMER_COMPLETION_INLINE_DETAIL_BYTES`. Treat `detail`
+as byte-counted data; publishers may NUL-terminate for convenience, but readers
+must use `detailBytes` as authoritative. A 128-byte inline detail keeps the hot
+record under the 256-byte target on normal 64-bit layouts. The essential change
+is removing the full tuple contract from every completion event; the resulting
+record is bounded and compact, though not literally one cache line.
 
 ### Required-frontier state machine
 
@@ -526,9 +1391,27 @@ been successfully posted, not after its local send CQE retires the source. If
 payload posting partially fails before the remote tail WIMM is posted, terminal
 completion must not be published.
 
+`requiredResultTail` is the absolute published tail in the frontend-visible
+receive byte ring. It is not the backend producer-ring tail, the service
+source-ring posted tail, the local source-retirement frontier, or a modulo ring
+offset.
+
+Failure behavior:
+
+```text
+No payload WR posted:
+    release reserved ownership normally.
+
+One or more payload WRs posted, but tail WIMM not posted:
+    mark payload lane/QP reset-required;
+    do not publish terminal completion;
+    do not reuse source storage normally.
+```
+
 ### Protocol/version changes
 
-- Bump the completion mailbox protocol/version.
+- Bump the completion mailbox protocol/version once for the compact completion
+  plus descriptor-table deployment unit.
 - Mixed old/new `pgbench`, `libhomer_client.a`, and
   `citus_tuple_sink_service` must fail fast.
 - Keep the old `CitusRemoteExecCommandCompletion` only as an explicitly named
@@ -541,10 +1424,45 @@ completion must not be published.
   the frontend applies/ACKs only after draining the named required frontier.
 - Remote c1/c4 correctness remains stable.
 
-## Stage 4b: versioned cold descriptor mailbox
+### Implementation progress - Stage 3b/4a ABI scaffolding
+
+- The compact completion constants and future hot record are now compile-visible
+  in
+  [`remote_execution_control_protocol.h`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:482):
+  [`CitusRemoteExecCommandCompletionHot`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:507)
+  carries `requiredResultTail`, `requiredEosRecordOrdinal`, and
+  `resultDescriptorVersion`, and the `_Static_assert` keeps the record within
+  the bounded `<= 256` byte target
+  [remote_execution_control_protocol.h](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:553).
+- The live local/backend/client/peer completion mailboxes still use the legacy
+  [`CitusRemoteExecCommandCompletion`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:452).
+  This is intentional: Stage 3b and Stage 4a are a single deployable protocol
+  bundle, so this sub-step does not bump the live protocol version or switch the
+  mailbox layout.
+- Header-only conversion helpers are present for the later migration:
+  [`CitusRemoteExecFillHotCompletionFromLegacy()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:609)
+  maps the current completion image into the compact hot record while accepting
+  the future required frontier and descriptor version as explicit arguments.
+  These helpers are inert until the live mailbox migration calls them, so they
+  do not add hot-path work to the accepted Stage 3a runtime.
+- Compile/static evidence for this scaffolding: no-stats
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`
+  passed in `citus-dbcomm`; `sudo -n -u dbcomm make install-headers
+  install-service-bin` refreshed the installed header/library for downstream
+  compilation; `sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build
+  src/bin/pgbench/pgbench` passed in `postgres-citus`; `git diff --check`
+  passed for the touched protocol header. Full cross-machine workload validation
+  is deferred until the live compact completion/descriptor publication path is
+  wired, because this sub-step does not change the runtime mailbox behavior.
+
+## Stage 4a: versioned cold descriptor side table
 
 Goal: publish queue attachment and tuple shape once per descriptor version, then
-reference that version from compact completions.
+reference that version from compact completions. This is part of the same
+completion protocol deployment unit as Stage 3b: compact completion,
+descriptor table, publisher, and client stable-read/cache may be developed in
+separate commits, but there is no supported installed state where compact
+row-producing completions exist without a usable descriptor table.
 
 ### New data structures/API
 
@@ -575,10 +1493,10 @@ The immutable descriptor contains queue attachment, tuple contract, descriptor
 version, actual descriptor bytes, and shape fingerprint. The hot completion
 contains per-command binding.
 
-First descriptor mailbox:
+First descriptor table:
 
 ```c
-#define HOMER_RESULT_DESCRIPTOR_SLOTS 2
+#define HOMER_RESULT_DESCRIPTOR_SLOTS 4
 
 typedef struct HomerResultDescriptorSlot
 {
@@ -589,12 +1507,18 @@ typedef struct HomerResultDescriptorSlot
     CitusTupleViewContract contract;
 } HomerResultDescriptorSlot;
 
-typedef struct HomerResultDescriptorMailbox
+typedef struct HomerResultDescriptorTable
 {
     uint64_t readyVersion[HOMER_RESULT_DESCRIPTOR_SLOTS];
     HomerResultDescriptorSlot slots[HOMER_RESULT_DESCRIPTOR_SLOTS];
-} HomerResultDescriptorMailbox;
+} HomerResultDescriptorTable;
 ```
+
+This descriptor side table is separate from
+[`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:485).
+The existing completion mailbox is a multi-slot hot event ring. The descriptor
+table is a cold side table for large queue/tuple-shape descriptors referenced by
+compact completion events.
 
 Publication order:
 
@@ -603,6 +1527,71 @@ write bodyVersion + descriptor body
 write readyVersion last
 completion references descriptorVersion
 ```
+
+Reader protocol:
+
+```text
+slot = descriptorVersion & (HOMER_RESULT_DESCRIPTOR_SLOTS - 1)
+ready1 = readyVersion[slot]
+copy bodyVersion + descriptorBytes + body
+ready2 = readyVersion[slot]
+
+accept only when:
+    ready1 == expectedVersion
+    bodyVersion == expectedVersion
+    ready2 == expectedVersion
+```
+
+First retention model:
+
+```text
+Descriptor slots are append-only until session teardown.
+If more than HOMER_RESULT_DESCRIPTOR_SLOTS descriptor versions are needed in one
+session, fail fast with an explicit descriptor-exhaustion error.
+```
+
+Four full fixed-capacity contracts are roughly `~130 KiB` per session, which is
+acceptable for the benchmark-oriented first implementation and avoids adding
+remote descriptor-credit propagation before there is evidence that descriptor
+churn matters.
+
+Do not describe this as a two-slot mailbox. If that phrase appears in design
+discussion, it usually means a double-buffered descriptor side table with
+stable-read slots, not the existing hot completion mailbox. The hot completion
+mailbox is already an eight-slot SPSC event ring in
+[`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:485).
+The descriptor structure is a separate cold versioned side table. The first
+implementation uses four append-only descriptor slots, not two slots, because
+four fixed-capacity tuple contracts are still small enough for a session-local
+side table and avoid remote descriptor-credit protocol work.
+
+A literal two-slot descriptor mailbox is rejected for the first implementation:
+it would require either a tight reuse credit from the client ACK path or careful
+proof that no completion can still reference the older physical slot. Because
+current measured client-SQL has at most one command completion in flight but the
+descriptor object is large and cold, a four-slot append-only table gives simpler
+debuggability without adding hot-path credit traffic.
+
+In other words, the "two slots" idea is a double-buffering proposal for the
+cold descriptor body, not a sizing proposal for the host-client completion
+mailbox. Two physical descriptor slots are enough only if the publisher can
+prove that the older slot's descriptor version is no longer referenced by any
+unapplied completion. The current first implementation intentionally avoids
+that proof and its remote-credit plumbing by using four non-reused descriptor
+versions per session.
+
+Descriptor publication ownership:
+
+```text
+The frontend-side Homer service owns frontend-visible descriptor publication.
+The backend produces tuple shape and result metadata.
+The service owns queue allocation/translation and publishes the descriptor.
+The peer/backend completion publisher references the resulting descriptorVersion.
+The client library caches and validates descriptors only.
+```
+
+Descriptor publication is cold, so receiver-service CPU publication is
+acceptable. The hot completion path remains one-sided and client-polled.
 
 Later, the fixed-capacity tuple contract can become variable-sized using:
 
@@ -617,16 +1606,305 @@ offsetof(CitusTupleViewContract, attributes)
   descriptor publication.
 - Shape change and queue replacement publish a new descriptor version.
 - Mixed-binary descriptor protocol mismatches fail fast.
+- Descriptor exhaustion fails explicitly; it must not silently re-enable the old
+  descriptor-heavy completion path on measured runs.
 
-## Stage 4c: stable-descriptor STARTED suppression
+### Implementation progress - Stage 4a ABI scaffolding
+
+- The first descriptor-table layouts are now compile-visible:
+  [`CitusTupleSinkQueueAttachment`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:488),
+  [`CitusResultStreamBinding`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:499),
+  [`HomerResultDescriptorSlot`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:538),
+  and
+  [`HomerResultDescriptorTable`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:547).
+  `HOMER_RESULT_DESCRIPTOR_SLOTS` is fixed at four and checked as a power of
+  two.
+- Header-only helpers
+  [`CitusRemoteExecFillQueueAttachmentFromDescriptor()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:572)
+  and
+  [`CitusRemoteExecFillStreamBindingFromDescriptor()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:594)
+  preserve the intended split between cold queue attachment and per-command
+  binding. They are not yet connected to service-owned descriptor publication or
+  client-side stable descriptor reads.
+- The descriptor-table stable-read protocol is also represented in header-only
+  helper form:
+  [`HomerResultDescriptorReadStatus`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:553),
+  [`CitusRemoteExecPublishResultDescriptor()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:672),
+  and
+  [`CitusRemoteExecReadResultDescriptorStable()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:695)
+  implement the planned `readyVersion/bodyVersion/readyVersion` shape. These
+  helpers currently use ordinary header-level loads/stores; the live service and
+  client migration should wrap publication and reads with the existing
+  service/client atomic helper conventions when wiring the shared-memory table.
+- Runtime acceptance is still future work for the Stage 3b/4a bundle. The next
+  implementation step must add a frontend-side service-owned descriptor table,
+  publish descriptor versions with the stable-read protocol, and make compact
+  completions reference those versions before the live mailbox protocol can be
+  switched and benchmarked.
+
+### Implementation progress - Stage 4a live mailbox ABI
+
+- The frontend completion mailbox shared-memory ABI now reserves space for the
+  cold descriptor side table by embedding
+  [`HomerResultDescriptorTable`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:547)
+  as
+  [`CitusRemoteExecClientCompletionMailbox::resultDescriptorTable`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:799).
+  This makes the descriptor table address stable for later service-owned
+  descriptor publication without introducing a second shared-memory object.
+- Because the mailbox layout changed, the Homer control protocol and shared
+  memory names were bumped from `v21` to `v22`:
+  [`CITUS_REMOTE_EXEC_CONTROL_PROTOCOL_VERSION`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:28),
+  [`CITUS_REMOTE_EXEC_CONTROL_SHM_NAME`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:29),
+  [`CITUS_REMOTE_EXEC_CLIENT_COMPLETION_SHM_PREFIX`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:37),
+  and
+  [`CITUS_REMOTE_EXEC_PEER_COMMAND_COMPLETION_SHM_PREFIX`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:39).
+- This is a live ABI step, but not yet a live descriptor-data-path step.
+  Runtime publication and frontend consumption still use legacy
+  [`CitusRemoteExecCommandCompletion`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:452)
+  records. The descriptor side table is present, zeroed with the mailbox, and
+  mapped by clients, but it is not yet populated or referenced by completions.
+- Compile/static evidence: no-stats
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`
+  passed in `citus-dbcomm`; `sudo -n -u dbcomm make install-headers
+  install-service-bin` installed the v22 headers and service/client library;
+  `sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build src/backend/postgres
+  src/bin/pgbench/pgbench src/bin/pg_basebackup/pg_basebackup` passed in
+  `postgres-citus`; and `sudo -n -u dbcomm meson install -C build --no-rebuild`
+  installed the rebuilt Postgres tree. Cross-machine workload validation is
+  required for acceptance because stale binaries or stale shared-memory names
+  would fail at runtime despite the source-level compile passing.
+- Validation exposed one concrete install prerequisite: after a Homer control
+  ABI bump, `citus.so` must also be rebuilt and installed with
+  `sudo -n -u dbcomm make install`, not only `install-headers
+  install-service-bin`. The first local and remote attempts failed because
+  `/data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so` still
+  contained `citus_remote_execution_control_v21` while `pgbench`, the service,
+  headers, and `libhomer_client.a` were on v22. The symptom was
+  `completion mailbox published unsupported protocol=21` on local pgbench and
+  remote c1 timeout followed by RDMA peer-control/send-CQ flush errors. After
+  `make install`, `strings citus.so` reported only
+  `citus_remote_execution_control_v22`; restarting PostgreSQL was required to
+  unload the stale shared object.
+- Runtime acceptance for this live ABI step passed after the full install,
+  PostgreSQL restart, install-prefix sync to `farnet0`, and clean v22 shared
+  memory baseline. Raw logs are under
+  `/tmp/homer_stage4a_mailbox_descriptor_validation_20260619_220733`.
+  - ABI string checks showed v22 names in local and remote `pgbench`,
+    `citus_tuple_sink_service`, and `citus.so`.
+  - Local pgbench smoke after reinstall completed `1000/1000` transactions at
+    `6171.011058 TPS` with p99 `0.197 ms`
+    (`/tmp/homer_stage4a_local_smoke_after_citus_install_20260619_220629`).
+  - Remote RDMA c1 processed all transactions with rc `0`. Warmup was
+    `2744.473591 TPS`; warmed repeats were `4165.823087` and
+    `3740.921718 TPS`.
+  - Remote RDMA c4 processed all transactions with rc `0`. Warmup/repeats were
+    `10575.329659`, `10566.379050`, and `10495.745550 TPS`.
+  - Local Homer blackhole basebackup completed in `3.90s`, `3.88s`, and
+    `3.88s`.
+  - Remote RDMA blackhole basebackup completed with cold/warmup `6.34s`, then
+    warmed repeats `4.25s` and `4.25s`.
+  - Current service-log scan had no v21/protocol-mismatch/RDMA failure lines.
+    The farnet1 service log did include three `stale payload progress grant`
+    diagnostics during basebackup; treat that as residual scheduler diagnostic
+    noise for a later cleanup, not as a Stage 4a ABI failure.
+
+### Implementation progress - Stage 3b/4a live hot completion
+
+- The Stage 3b/4a deployment bundle is now live in the Citus/Homer source tree
+  as control protocol `v23`. The frontend completion mailbox slots now carry
+  [`CitusRemoteExecCommandCompletionHot`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:507)
+  instead of the descriptor-heavy legacy completion record, while
+  [`CitusRemoteExecClientCompletionMailbox::resultDescriptorTable`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:831)
+  keeps the cold four-slot descriptor side table in the same shared-memory
+  object.
+- Descriptor publication is service-owned. The service caches the current queue
+  attachment and tuple contract in
+  `TupleSinkServiceClientCompletionMailboxState`, builds compact completions
+  through
+  [`TupleSinkServiceBuildClientHotCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13380),
+  and publishes descriptors with
+  [`TupleSinkServicePublishResultDescriptorLocal()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13307)
+  on the local path or descriptor-body/ready-version RDMA writes in
+  [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13730)
+  on the peer path.
+- The client stable-read path reconstructs the legacy completion view from the
+  compact hot record plus descriptor side table in
+  [`HomerClientCopyHotCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:986).
+  Descriptor-not-ready and descriptor-body visibility races remain bounded
+  retry conditions through
+  [`HomerClientCopyClientCompletionSlotStable()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1070)
+  and
+  [`HomerClientPeekNextCompletionEvent()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2451);
+  mismatches and overruns still fail fast.
+- Terminal row-result completions carry the exact frontend-visible drain target.
+  [`TupleSinkServiceFillHotCompletionRequiredFrontier()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13418)
+  fills `requiredResultTail` from the frontend-visible byte-ring posted tail and
+  `requiredEosRecordOrdinal` from the posted EOS transport ordinal. Pgbench
+  stores that target from the completion lease before applying the terminal
+  event in
+  [`receiveHomerCommand()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3815).
+- Dedicated no-stats cross-machine validation accepted the live hot-record
+  migration. Raw artifacts are under
+  `/tmp/homer_stage3b4a_hot_completion_validation_20260619_225540`.
+  - Rebuilt and installed no-stats Citus/Homer with
+    `CPPFLAGS='-D_GNU_SOURCE'`, rebuilt the relevant Postgres targets,
+    installed the prefix, and synced `/data/dbcomm/pg-citus/` to `farnet0`.
+  - Installed hash checks matched between `farnet1` and `farnet0` for
+    `pgbench`, `pg_basebackup`, `citus_tuple_sink_service`, `citus.so`, and
+    `libhomer_client.a`.
+  - String checks found `citus_remote_execution_control_v23` and the v23
+    client/peer completion shared-memory names in the expected binaries and
+    libraries.
+  - Remote RDMA pgbench c1 passed with zero failed transactions: cold/warmup
+    `3415.298797 TPS`, warmed `4330.552830` and `3899.867775 TPS`.
+  - Remote RDMA pgbench c4 passed with zero failed transactions:
+    `10708.873908`, `10673.793915`, and `10658.580357 TPS`.
+  - Local Homer blackhole basebackup completed in `4.17s`, `3.98s`, and
+    `4.02s`.
+  - Remote RDMA blackhole basebackup completed with cold/warmup `6.21s`, then
+    warmed `4.10s`, `4.08s`, and `4.32s`.
+  - The validation-window log scan found no protocol mismatch, hot-record or
+    descriptor mismatch, `FATAL`, RDMA failure, invalid command-ring slot,
+    tuple-result byte-ring header mismatch, or nonzero failed-transaction
+    lines. Final local and remote process preflights were clean.
+  - Caveat: two early cleanup wrapper attempts self-matched broad `pkill -f`
+    patterns and exited with code `143` before validation started. The validator
+    reran cleanup with split safe commands; those early logs are diagnostic-only
+    and outside the measurement window.
+- Descriptor-counter acceptance also passed in a focused stats-enabled
+  diagnostic run. Raw artifacts are under
+  `/tmp/homer_stage3b4a_descriptor_stats_validation_20260619_230448`.
+  - Stats runtime was built with
+    `CPPFLAGS='-D_GNU_SOURCE -DHOMER_SERVICE_CLIENT_SQL_STATS=1 -DHOMER_CLIENT_COMPLETION_STATS=1 -DHOMER_SERVICE_PAYLOAD_STATS=1'`,
+    installed, and synced to `farnet0`; relevant installed hashes matched
+    across hosts.
+  - Remote RDMA pgbench c1 `-t 5000` completed `5000/5000` transactions with
+    zero failures. TPS was `2075.271767`, but this was a cold, short,
+    stats-enabled diagnostic run and is not a performance acceptance number.
+  - Publishing-side descriptor counters on `farnet1` showed exactly the desired
+    stable-shape behavior:
+    `result_descriptor_publishes=1`, `result_descriptor_bytes=33464`,
+    `result_descriptor_cache_hits=9999`,
+    `result_descriptor_cache_misses=1`, and
+    `result_descriptor_exhaustions=0`. The receiver side on `farnet0` reported
+    zero descriptor counters, as expected for this direction because descriptor
+    publication happens on `farnet1`.
+  - Context counters were `completion_events_published=40003` and
+    `completion_bytes_posted=10560792`.
+  - After the diagnostic run, Citus/Homer was rebuilt, reinstalled, and synced
+    with no-stats `CPPFLAGS='-D_GNU_SOURCE'`. Restored hashes matched across
+    hosts, `citus_tuple_sink_service` no longer contained the stats-only
+    descriptor/client-SQL strings, and final process preflights were clean.
+  - Caveat: two early cleanup attempts self-selected transient wrapper PIDs
+    before the measurement window; the validator switched to process-name-based
+    cleanup and the actual validation/runtime window was clean.
+- Stage 3b/4a is accepted for the live frontend completion hot-record migration.
+  The next implementation stage should be Stage 4b stable-binding pre-arm, not
+  Stage 4d compact command publication; Stage 4d remains deferred until the
+  live completion ownership path is no longer moving.
+
+## Stage 4b: stable-binding pre-arm
+
+Goal: make the frontend able to drain a known result binding before terminal
+completion, so STARTED suppression is a correctness-preserving optimization
+rather than a prediction about result size.
+
+### Rule
+
+```text
+Pre-arm only when all of the following are true:
+
+    descriptor version is already cached;
+    queue attachment is unchanged;
+    previous generation was completely drained;
+    new result generation is deterministically commandSequence;
+    new startByteTail equals the previous generation's drained tail;
+    frontend records the binding at command submission.
+```
+
+When these hold, the frontend has the queue attachment, descriptor, generation,
+and start tail needed to drain records that arrive before the terminal
+completion. When any condition fails, the command must use the descriptor-ready
+STARTED path before payload can create producer backpressure.
+
+### Acceptance
+
+- Pgbench can arm a stable one-column SELECT binding at command submission
+  after descriptor warmup.
+- Descriptor miss, queue replacement, incomplete previous-generation drain, or
+  nondeterministic binding falls back to STARTED/DESCRIPTOR_READY before payload
+  can block.
+- No correctness rule depends on predicting that a query result is small.
+
+### Implementation progress and acceptance - Stage 4b
+
+- Stage 4b stable-binding pre-arm is implemented in pgbench without suppressing
+  STARTED. The frontend caches only the stable proof facts in
+  [`CState`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:667):
+  `homer_stable_result_binding_valid` and
+  `homer_stable_result_drained_tail`. It does not copy another full completion
+  image; the already-open
+  [`HomerClientResultSink`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:90)
+  remains the owner of the queue descriptor and tuple contract.
+- The pre-arm predicate is implemented by
+  [`HomerTryPrearmStableResultBinding()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3557).
+  It only runs for `SQL_EXECUTE` tuple results, requires an already-open sink,
+  requires the previous generation to have reached EOS, requires the current
+  consumed head to equal the remembered drained tail, then rebinds the sink to
+  `resultGeneration = commandSequence` and
+  `startByteTail = homer_stable_result_drained_tail`.
+- The cache is learned only after terminal result drain succeeds through
+  [`HomerRememberStableResultBinding()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3535).
+  Real STARTED/TUPLE_SINK_READY completions still validate any pre-armed binding
+  through
+  [`HomerPrearmedResultBindingMatchesCompletion()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3518)
+  before the completion event is ACKed. A mismatch is a protocol error, not a
+  fallback, because pre-arm may already have allowed early byte-ring drain.
+- Pre-arm failure before STARTED is treated as an optimization miss: pgbench
+  logs a debug message, invalidates the cached stable binding, and waits for the
+  normal STARTED descriptor path. Failure, result-sink close, and session close
+  invalidate the cache through
+  [`HomerInvalidateStableResultBinding()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3502).
+- Dedicated no-stats cross-machine validation accepted Stage 4b. Raw artifacts
+  are under `/tmp/homer_stage4b_prearm_validation_20260619_231539`.
+  - Build/install/sync passed: Citus/Homer no-stats rebuild with
+    `CPPFLAGS='-D_GNU_SOURCE'`, Postgres target rebuild/install, install-prefix
+    sync to `farnet0`, matching hashes for `pgbench`, `pg_basebackup`,
+    `citus_tuple_sink_service`, `citus.so`, and `libhomer_client.a`, v23
+    control/mailbox strings present, and stats-only strings absent.
+  - A short remote RDMA pgbench debug smoke passed and captured pre-arm evidence
+    in `pgbench_remote_c1_debug_prearm_evidence.txt`, including
+    `client 0 pre-armed Homer result sink for sql_execute sequence=12 tail=208`
+    and repeated later command sequences.
+  - Remote RDMA pgbench c1 passed with zero failed transactions:
+    `4369.720285`, `3893.968029`, and `3912.369190 TPS`.
+  - Remote RDMA pgbench c4 passed with zero failed transactions:
+    `10795.918279`, `10725.456469`, and `10655.999301 TPS`.
+  - Local Homer blackhole basebackup completed in `4.02s`, `4.15s`, and
+    `4.07s`.
+  - Remote RDMA blackhole basebackup completed with warmup `5.66s` and warmed
+    repeats `4.31s`, `5.36s`, `4.14s`, and `4.34s`. The `5.36s` warmed repeat
+    is an outlier; the warmed median remains about `4.31s`, consistent with the
+    previous acceptance band.
+  - Log scans found no protocol mismatch, pre-arm binding mismatch,
+    hot-record/descriptor mismatch, `FATAL`, RDMA failure, invalid command-ring
+    slot, tuple-result byte-ring header mismatch, or nonzero failed transaction
+    lines. Final process preflights on both hosts were clean.
+- Stage 4b is accepted. Stage 4c may now suppress STARTED only when this
+  pre-arm predicate succeeds; descriptor miss, queue replacement, incomplete
+  previous-generation drain, and nondeterministic binding must continue to use
+  STARTED/DESCRIPTOR_READY.
+
+## Stage 4c: STARTED suppression
 
 Goal: avoid STARTED events whose only purpose is descriptor readiness.
 
 ### Rule
 
 ```text
-If the result queue and tuple-shape fingerprint match the frontend-cached
-descriptor version:
+Suppress STARTED only when Stage 4b has pre-armed the result binding.
+
+If Stage 4b pre-arm succeeds:
     do not publish STARTED solely for descriptor readiness.
 
 If the descriptor version changes:
@@ -634,12 +1912,13 @@ If the descriptor version changes:
     publish STARTED/DESCRIPTOR_READY only if the frontend may need to drain
     before terminal completion.
 
-If no rows can fill the result ring before terminal:
-    terminal may be the first event referencing the new descriptor.
+For descriptor miss or queue replacement:
+    publish descriptor-ready/STARTED before payload can create backpressure.
 ```
 
 For pgbench's stable one-column SELECT, STARTED should go to zero after the
-first descriptor publication.
+first descriptor publication and pre-arm setup. Correctness must not depend on
+predicting whether a result is small.
 
 ### Targeted tests
 
@@ -649,6 +1928,115 @@ first descriptor publication.
 - Descriptor version wrap.
 - Mixed binaries.
 - Stable pgbench shape emits no STARTED after cache warmup.
+
+### Implementation progress - Stage 4c
+
+- Stage 4c is implemented in the current working tree and accepted for the
+  current no-stats cross-machine validation tier.
+- The frontend now marks commands whose result binding was pre-armed with
+  `CITUS_REMOTE_EXEC_COMMAND_FLAG_RESULT_BINDING_PREARMED`
+  [remote_execution_control_protocol.h](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:176).
+  This flag is intentionally an explicit contract from the frontend; the service
+  must not infer pre-arm from descriptor-cache state alone.
+- Pgbench predicts the direct command-ring sequence with
+  [`HomerClientPredictNextCommandSequence()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2128)
+  before command publication. The helper is direct-mailbox-only and checks that
+  the command ring is not full before returning `publishedEpoch + 1`.
+- [`HomerStartCommand()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3797)
+  sets `CITUS_REMOTE_EXEC_COMMAND_FLAG_RESULT_BINDING_PREARMED` only when
+  [`HomerTryPrearmStableResultBinding()`](/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:3557)
+  succeeds for the predicted sequence. If the actual sequence differs, pgbench
+  treats it as a protocol error; that should not happen for the current
+  single-producer direct command mailbox.
+- The service suppression predicate is
+  [`TupleSinkServiceShouldSuppressPrearmedStartedCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13324).
+  It requires all of:
+  `STARTED`, `SQL_EXECUTE`, the explicit pre-armed command flag,
+  `TUPLE_SINK_READY`, and a cached descriptor/contract match against the
+  frontend-visible queue attachment.
+- Local completion publication suppresses only the descriptor-readiness STARTED
+  event after building the legacy completion image
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13710).
+  Peer completion publication evaluates the same predicate only after backend
+  result descriptors have been translated to the frontend receive queue
+  [tuple_sink_service_process.c](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14030).
+  This keeps descriptor-cache equality in the same namespace the frontend
+  pre-armed.
+- Suppression updates the per-session last-published state through
+  [`TupleSinkServiceMarkSuppressedClientCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13341)
+  so the scheduler does not keep retrying a deliberately omitted STARTED event.
+  Terminal completion is still published and still carries the required result
+  frontier.
+- `HOMER_SERVICE_CLIENT_SQL_STATS` now records
+  `local_started_completions_suppressed` and
+  `peer_started_completions_suppressed` in the wide `client_sql_stats` service
+  log line. These counters are diagnostic-only and are expected to be absent
+  from no-stats performance binaries.
+- First validation rejected the initial implementation even though the no-stats
+  workloads passed. Raw artifacts are under
+  `/tmp/homer_stage4c_validation_20260619_233214`.
+  - No-stats remote RDMA pgbench passed with zero failed transactions: c1 warmed
+    repeats `4261.760755`, `3742.929606`, and `3795.352325 TPS`; c4 warmed
+    repeats `10503.352145`, `10374.918427`, and `10462.185347 TPS`.
+  - Local Homer blackhole basebackup passed with warmed repeats `4.14s`,
+    `4.06s`, and `4.15s`; remote RDMA basebackup passed with warmed repeats
+    `4.35s`, `4.18s`, and `4.34s`.
+  - The stats diagnostic failed the Stage 4c-specific proof:
+    `peer_started_completions_suppressed=0` on `farnet1` despite
+    `result_descriptor_cache_hits=39999` and `result_descriptor_cache_misses=1`.
+    This means descriptor caching and pre-arm shape were present, but the service
+    suppression predicate never observed the explicit pre-arm command flag.
+- Root-cause correction after the rejected run: remote direct-RDMA client-SQL
+  command forwarding writes
+  [`CitusRemoteExecLocalCommandRecord.commandFlags`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:126)
+  to the backend command mailbox, but the backend-to-service completion image did
+  not echo the flags back. On the backend-node service,
+  [`TupleSinkServiceConsumeOneCompletionMailbox()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15193)
+  restored `currentCommandKind`, `currentCommandState`, and
+  `currentCommandSequence` from the backend completion, while
+  `currentCommandFlags` stayed zero for the direct-RDMA remote path. The fix is
+  to carry `commandFlags` in
+  [`CitusRemoteExecCommandCompletion`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:460),
+  populate it in
+  [`PublishCompletionToMailbox()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1408),
+  and restore it before evaluating the suppression predicate. The compact hot
+  frontend completion intentionally does not carry `commandFlags`; adding that
+  field there violated the bounded `<= 256` byte hot-record assertion, and the
+  frontend does not need the flag.
+- Static/build evidence so far: `git clang-format` was applied to the touched C
+  files; no-stats Citus/Homer
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`
+  passed; `sudo -n -u dbcomm make install-headers install-service-bin install`
+  passed; Postgres
+  `sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build src/backend/postgres src/bin/pgbench/pgbench src/bin/pg_basebackup/pg_basebackup`
+  passed; targeted `git diff --check` passed in both trees.
+- Focused retry artifact `/tmp/homer_stage4c_suppression_retry_20260619_234954`
+  showed the command-flag correction made the suppression predicate fire:
+  `peer_started_completions_suppressed=10569`,
+  `result_descriptor_cache_hits=10570`, and
+  `result_descriptor_cache_misses=1`. That run was still rejected because the
+  remote pgbench process did not complete cleanly before service teardown, so it
+  was mechanism evidence, not an acceptance run.
+- Accepted validation artifact:
+  `/tmp/homer_stage4c_correctness_20260620_000900`.
+  No-stats runtime passed remote RDMA pgbench c1 correctness and warmed
+  performance with zero failed transactions: c1 repeats `3823.201404`,
+  `3841.397900`, and `4233.117797 TPS`; c4 repeats `10611.993675`,
+  `10448.046176`, and `10485.972390 TPS`. Local Homer blackhole basebackup
+  passed with `4.20s`, `4.14s`, and `4.03s`; remote RDMA basebackup passed
+  with `5.69s` cold/warmup then `4.19s` and `4.14s` warmed.
+- The completed stats-enabled c1 run in the same artifact provides the Stage 4c
+  counter success signal: `completions_consumed=160003`,
+  `peer_started_completions_suppressed=19999`, and
+  `completion_events_published=140004`. The equality
+  `completion_events_published == completions_consumed -
+  peer_started_completions_suppressed` proves descriptor-readiness STARTED
+  completions were omitted while terminal and other completion events continued
+  to publish. `result_descriptor_cache_hits=20000` and
+  `result_descriptor_cache_misses=1` show the stable descriptor path warmed once
+  and was reused. After the stats run, no-stats runtime was restored, synced to
+  `farnet0`, and marker scans on both hosts found no stats strings in
+  `pgbench`, `citus_tuple_sink_service`, or `libhomer_client.a`.
 
 ## Stage 4d: compact variable-length command publication
 
@@ -668,6 +2056,186 @@ Goal: apply the same hot/cold principle to frontend command publication.
 
 - `commandBytesPosted` drops for pgbench transactions.
 - No command source-ring reuse occurs before send-CQ retirement.
+
+### Rejected implementation attempt - June 20, 2026
+
+A first Stage 4d attempt made
+[`TupleSinkServiceLocalCommandRecordRdmaBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13266)
+return command-kind-specific byte prefixes and enabled compact RDMA writes
+directly from the frontend command mailbox slot in
+[`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15348).
+Validation artifact:
+`/tmp/homer_stage4d_compact_rdma_validation_20260619_221520`.
+
+The attempt is rejected for source-ownership reasons. The sender posted RDMA
+from the frontend command slot, then immediately advanced the frontend
+`consumedEpoch` after the WR was posted. That released the source slot to
+pgbench before the local send CQE proved the NIC had consumed the source bytes.
+During remote c1 validation, the backend later FATALed with:
+
+```text
+remote exec backend received invalid command ring slot
+slot_count=64 protocol=10 command_sequence=113759
+expected_sequence=113759 ready_sequence=113759
+```
+
+The detail looked valid by the time the error was formatted, which is consistent
+with a visibility/source-lifetime race: the backend observed `readySeq` while
+some command-body fields were transient, then a later read of the same slot saw
+the expected values. This is not a proof that compact command bytes are wrong;
+it proves that Stage 4d cannot use the frontend mailbox slot as the RDMA source
+unless frontend source credit is tied to send-CQ retirement.
+
+Current corrective decision:
+
+```text
+HOMER_SERVICE_COMPACT_CLIENT_SQL_COMMAND_RDMA = 0
+HOMER_SERVICE_COMPACT_PEER_CLIENT_COMPLETION_RDMA = 0
+```
+
+The compact command byte helper remains in the source tree for the next attempt
+as
+[`TupleSinkServiceLocalCommandRecordRdmaBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13539),
+but the live measured path must stay on the accepted fixed-slot behavior. The
+active code gate documents this at
+[`HOMER_SERVICE_COMPACT_CLIENT_SQL_COMMAND_RDMA`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:397),
+and
+[`TupleSinkServicePumpRemoteClientSqlCommands()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:15768)
+again posts from the registered frontend command mailbox source slot rather than
+from a service-owned command source ring.
+
+The remaining long-term candidate is true zero-copy frontend command storage
+whose producer credit is not released until the send-CQ owner path retires the
+RDMA source range. A service-owned intermediate source ring may still be useful
+as a diagnostic design, but it is no longer an accepted straightforward next
+step: the first implementation of that model failed repeat-run liveness
+validation, documented below.
+
+The same rule applies to legacy compact peer-client completion prefix writes:
+do not measure an unaccepted partial compact-completion layout before the
+compact completion and descriptor side table are deployed as one protocol unit.
+
+Corrective validation after disabling both compact gates used artifact
+`/tmp/homer_stage4d_disabled_validation_manual_20260619_223906`. The normal
+fixed-slot command path and fixed-layout completion path passed remote RDMA
+pgbench and basebackup again:
+
+```text
+remote c1 pgbench:
+    warmup: 3312.766574 TPS
+    warmed: 4100.748838 TPS, 3697.707255 TPS
+
+remote c4 pgbench:
+    warmed: 10381.663698 TPS, 10310.219025 TPS, 10350.686432 TPS
+
+local Homer blackhole basebackup:
+    4.20s, 4.03s, 4.01s
+
+remote RDMA basebackup:
+    warmup: 5.51s
+    warmed: 4.27s, 4.08s, 4.29s
+```
+
+This checkpoint restores the previous accepted performance band and preserves
+the Stage 4d lesson without treating the failed compact attempt as a regression
+in the already-accepted transport stages. Two subagent validation attempts for
+this checkpoint stalled before producing workload logs, so the accepted evidence
+is the manual no-stats validation artifact above.
+
+### Rejected service-owned command source-ring attempt - June 20, 2026
+
+A second Stage 4d attempt tried to fix the frontend-source lifetime race by
+copying each frontend command into a service-owned registered source slot ring,
+then posting RDMA writes from that service-owned storage. The implementation
+renamed `clientSqlCommandScratchRegionHandle` to
+`clientSqlCommandSourceRegionHandle`, replaced the single scratch record with
+`clientSqlCommandSourceSlots[]`, registered that source-slot ring during
+`CLIENT_SQL_SESSION` peer open, copied commands with a new
+`TupleSinkServiceCopyLocalCommandRecordForRdma()` helper, and set
+`HOMER_SERVICE_COMPACT_CLIENT_SQL_COMMAND_RDMA = 1`.
+
+Validation artifact:
+`/tmp/homer_stage4d_validation_20260620_003329`, with verdict in
+`/tmp/homer_stage4d_validation_20260620_003329/VERDICT.md`.
+
+The no-stats rebuild/install/sync passed and marker scans found no stats strings,
+but remote RDMA pgbench c1 failed liveness before c4, basebackup, or stats-counter
+diagnostics were run:
+
+```text
+remote-c1 warmup: 20000/20000, failed=0, TPS=3631.121617, p99=0.232 ms
+remote-c1 run=1:  20000/20000, failed=0, TPS=4674.301671, p99=0.234 ms
+remote-c1 run=2:  started but produced no completion summary within the expected envelope
+```
+
+The stall-time service log tails did not show an explicit invalid-slot,
+source-credit, send-CQ, or command failure error. This rejects the implementation
+as a safe Stage 4d checkpoint, but it does not by itself prove that compact
+command bytes are impossible. The leading interpretation is that the extra
+service-owned source ring added another command-publication ownership frontier
+without a sufficiently explicit progress/credit invariant. Until that invariant
+is redesigned and instrumented, Stage 4d should not continue by adding small
+surface fixes to the source-ring attempt.
+
+After the failed validation, the source-ring code path was backed out of the live
+working tree and the no-stats fixed-slot runtime was rebuilt, installed, and
+synced to `farnet0`. The current code keeps both compact gates disabled and uses
+the registered frontend command mailbox as the command RDMA source, matching the
+previous accepted fixed-slot checkpoint.
+
+### Current Stage 4d diagnosis and discussion boundary - June 20, 2026
+
+Stage 4d should not be resumed as another local byte-packing patch. The symptom
+set points to an unresolved command-publication ownership design, not to a
+simple compact-envelope encoding bug:
+
+- The direct compact-write attempt reduced the RDMA source to a byte prefix, but
+  still used the frontend command mailbox slot as the NIC source. The service
+  released frontend command credit by advancing `consumedEpoch` after posting
+  the WR, before the send CQE retired that exact source range. That made command
+  slot reuse possible while the NIC could still be reading the old source bytes.
+- The service-owned source-ring attempt fixed that specific source-lifetime
+  violation by copying into service-owned registered storage, but it introduced
+  a new publication frontier: frontend command slot consumed, service source
+  slot reserved/copied, RDMA WR posted, send-CQE retired, remote backend slot
+  made visible, and service source slot released. The repeat-run c1 stall means
+  that frontier did not yet have a sufficiently explicit progress/credit
+  invariant.
+- The live fixed-slot checkpoint avoids the Stage 4d races by treating the
+  frontend command mailbox as the registered source and by keeping compact
+  command writes disabled at
+  [`HOMER_SERVICE_COMPACT_CLIENT_SQL_COMMAND_RDMA`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:397).
+  It still releases frontend credit after post, so it is a tolerated current
+  checkpoint because validation restored the accepted performance band, not the
+  target ownership model.
+
+Before implementing Stage 4d again, settle the following ownership contract:
+
+1. **Source owner**: decide whether command bytes are sent directly from
+   frontend-owned command storage, from a service-owned registered source ring,
+   or from a redesigned true-zero-copy command ring whose producer credit is
+   retired by send-CQ ownership.
+2. **Credit owner**: define the exact event that allows each source slot to be
+   reused. For frontend-owned direct zero-copy, frontend `consumedEpoch` cannot
+   mean "service has posted the WR"; it must mean "the RDMA source range is no
+   longer needed by the NIC", or there must be a second source-credit frontier.
+3. **CQ owner**: command WR retirement must flow through the typed shared-CQ
+   dispatcher/owner FIFO rather than hidden polling or ad hoc per-path waits.
+   Stage 4d should not add another CQ-consumer path.
+4. **Remote visibility gate**: if the command is split into body and ready
+   publication WRs, the ready/publish WR remains the remote visibility gate. If
+   whole-message WRITE is relied on, the device/connection capability and memory
+   ordering requirement must be explicit in the connection setup and counters.
+5. **Instrumentation**: the next attempt needs counters for command source
+   reservations, source-credit stalls, posted command WRs, retired command WRs,
+   remote-ready publications, and source-slot reuse distance. Without those,
+   the run-2 stall cannot be distinguished between lost scheduling, source
+   credit leak, CQ retirement leak, and remote backend visibility.
+
+Do not proceed from Stage 4d to Stage 5a in the same implementation series if
+Stage 4d is the active question. Stage 5a is logically independent, but jumping
+to it would leave the command-publication ownership bug unresolved and would
+make future validation harder to attribute.
 
 ## Stage 5a: final partial DATA+EOS publication
 
@@ -707,6 +2275,22 @@ FinalizeCitusTupleSinkGeneration(...);
 
 The current global `PEER_CLOSED` flag must not remain the per-command terminal
 mechanism.
+
+Failed-query wire semantics:
+
+```text
+No data published:
+    publish ERROR+EOS sequence 1.
+
+Some data published:
+    discard unpublished partial batch;
+    append immutable ERROR+EOS sequence N+1.
+```
+
+The failed terminal completion names that error frontier. The frontend drains or
+discards through the required frontier and then applies the command failure.
+Never expose partial rows as a successful result merely because they preceded
+the error.
 
 ### Targeted tests
 
@@ -799,10 +2383,26 @@ set for the next pass. This avoids the clear-after-publish lost-wakeup race.
 
 1. Add separate bitmaps for command readiness, completion readiness, and resource
    pressure.
-2. Add stable session-slot generation validation.
-3. Add periodic fallback full scan.
-4. Add `readyBitmapFallbackDiscoveries`; it should normally remain zero.
-5. Have the Stage 2 CQ dispatcher set typed ready facts directly for send-CQ
+2. Cache-line isolate bitmap words to avoid replacing active-table scans with a
+   new hot shared cache line:
+
+   ```c
+   typedef struct HomerReadyBitmapLine
+   {
+       _Alignas(64) _Atomic uint64_t bits;
+       char padding[56];
+   } HomerReadyBitmapLine;
+   ```
+
+   If session count exceeds 64, use an array of separately aligned words or
+   shard by lane.
+3. Add stable session-slot generation validation.
+4. Add periodic fallback full scan.
+5. Add `readyBitmapSetCalls`, `readyBitmapAlreadySet`,
+   `readyBitmapExchanges`, and `readyBitmapFallbackDiscoveries`.
+   `readyBitmapFallbackDiscoveries` should normally remain zero; the already-set
+   ratio shows whether bitmap atomic traffic is excessive.
+6. Have the Stage 2 CQ dispatcher set typed ready facts directly for send-CQ
    resource relief, recv-CQ doorbells, and owner FIFO backpressure.
 
 ### Targeted tests
@@ -899,6 +2499,18 @@ byte rings.
 7. Partial-post failure follows the same reset-required rules as other multi-WR
    publication.
 
+Wrap cases:
+
+- Local source-ring wrap can use multiple SGEs to gather into one contiguous
+  remote range if the NIC supports the required `max_sge`.
+- Remote destination-ring wrap requires multiple RDMA WRITE WRs because remote
+  addresses are discontinuous.
+- If both source and destination wrap, use multiple WRs, each with one or more
+  SGEs.
+- The final remote-tail WIMM is posted after all data WRs.
+- Query `max_sge` and `max_send_wr` during connection setup. Reject unsupported
+  geometry or fall back to the registered staging path.
+
 ### Acceptance
 
 - `producerToRegisteredSourceCopyBytes` approaches zero for accepted direct-MR
@@ -941,6 +2553,25 @@ Use no-stats builds for performance acceptance. Stats builds are diagnostic
 only. A run after timeout, interruption, manual cleanup, stale process discovery,
 or mismatched binary hash is not an acceptance run.
 
+Acceptance uses median warmed repeats, not individual best/worst runs:
+
+```text
+c4 median TPS:
+    no worse than 3% below previous accepted stage
+
+c1 median TPS:
+    no worse than 5% below previous accepted stage
+
+p99:
+    no worse than 5-10%, depending on measured variance
+
+basebackup median wall time:
+    no worse than 3-5%
+```
+
+Credit an improvement only when it survives at least three warmed repeats and
+exceeds ordinary variance.
+
 ## Decisions that should not be repeated
 
 - Do not reintroduce dual delivery plus deduplication for frontend command
@@ -955,8 +2586,11 @@ or mismatched binary hash is not an acceptance run.
 - Do not force basebackup into SQL-result STARTED/terminal lifecycle just
   because it shares the byte-ring transport substrate.
 - Do not make descriptor split and required-frontier completion two separate
-  completion ABI migrations. Stage 3b/4a is the single deliberate completion
-  protocol migration.
+  completion ABI migrations. Stage 3b plus Stage 4a form the single deliberate
+  completion protocol deployment unit.
+- Do not revive the old descriptor-heavy completion layout as a fallback for
+  descriptor-table exhaustion in measured paths. Fail explicitly and size the
+  first descriptor table for the benchmark shapes.
 
 ## Open questions
 
@@ -964,7 +2598,9 @@ or mismatched binary hash is not an acceptance run.
   foreground-only fast path after the required-frontier design is correct.
 - Whether payload WR-IDs should keep semantic frontier encoding permanently or
   move to owner-array indexes once the lane-owned dispatcher is in place.
-- Whether descriptor publication should be service-owned, backend-owned, or
-  frontend-library-owned when moving toward true zero-copy result production.
+- For Stage 4a, descriptor publication is frontend-side-service-owned. The
+  remaining future question is whether true zero-copy result production should
+  later move descriptor construction or producer-slot ownership closer to the
+  backend/frontend library.
 - Whether direct registration of producer byte rings is enough for basebackup or
   whether Stage 7d QP/CQ isolation is necessary for foreground p99.

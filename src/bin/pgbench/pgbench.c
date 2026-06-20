@@ -662,7 +662,10 @@ typedef struct
 	uint32		homer_pending_result_mode;
 	uint64		homer_pending_command_sequence;
 	uint64		homer_pending_drained_rows;
+	HomerClientResultDrainTarget homer_pending_drain_target;
 	const char *homer_pending_operation_name;
+	bool homer_stable_result_binding_valid;
+	uint64 homer_stable_result_drained_tail;
 	int			id;				/* client No. */
 	ConnectionStateEnum state;	/* state machine's current state. */
 	ConditionalStack cstack;	/* enclosing conditionals state */
@@ -3482,7 +3485,117 @@ clearHomerPendingCommand(CState *st)
 	st->homer_pending_result_mode = CITUS_REMOTE_EXEC_SQL_RESULT_NONE;
 	st->homer_pending_command_sequence = 0;
 	st->homer_pending_drained_rows = 0;
+	memset(&st->homer_pending_drain_target, 0, sizeof(st->homer_pending_drain_target));
 	st->homer_pending_operation_name = NULL;
+}
+
+/*
+ * Stage 4b pre-arm cache management.
+ *
+ * A stable result binding is not a prediction that the next query is small. It
+ * is a proof that pgbench already has the same descriptor/contract mapped and
+ * that the previous result generation reached EOS at a known byte-ring tail.
+ * The next SQL_EXECUTE tuple result can then be bound to commandSequence and
+ * that tail before STARTED arrives. STARTED is still published in Stage 4b and
+ * is used to validate the pre-armed binding before the event is ACKed.
+ */
+static void HomerInvalidateStableResultBinding(CState *st)
+{
+	st->homer_stable_result_binding_valid = false;
+	st->homer_stable_result_drained_tail = 0;
+}
+
+static bool HomerQueueDescriptorSamePhysicalSink(const CitusTupleSinkQueueDescriptor *left,
+												 const CitusTupleSinkQueueDescriptor *right)
+{
+	return left != NULL && right != NULL && left->protocolVersion == right->protocolVersion &&
+		   left->slotCount == right->slotCount && left->slotCapacityBytes == right->slotCapacityBytes &&
+		   left->slotReservedPrefixBytes == right->slotReservedPrefixBytes && left->direction == right->direction &&
+		   left->descriptorFlags == right->descriptorFlags &&
+		   memcmp(left->queueShmName, right->queueShmName, sizeof(left->queueShmName)) == 0;
+}
+
+static bool HomerPrearmedResultBindingMatchesCompletion(CState *st, const CitusRemoteExecCommandCompletion *completion)
+{
+	const HomerClientResultSink *resultSink = &st->homer_result_sink;
+
+	if (completion == NULL || (completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) == 0)
+		return true;
+
+	if (!st->homer_pending_result_sink_bound || !st->homer_result_sink_open || !resultSink->open)
+		return true;
+
+	return HomerQueueDescriptorSamePhysicalSink(&resultSink->queueDescriptor, &completion->resultQueueDescriptor) &&
+		   memcmp(&resultSink->tupleViewContract, &completion->resultTupleViewContract,
+				  sizeof(resultSink->tupleViewContract)) == 0 &&
+		   resultSink->resultGeneration == completion->resultQueueDescriptor.resultGeneration &&
+		   resultSink->startByteTail == completion->resultQueueDescriptor.startByteTail;
+}
+
+static void HomerRememberStableResultBinding(CState *st, const CitusRemoteExecCommandCompletion *completion)
+{
+	const HomerClientResultSink *resultSink = &st->homer_result_sink;
+
+	if (completion == NULL || st->homer_pending_command_kind != CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE ||
+		st->homer_pending_result_mode != CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE ||
+		(completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) == 0 ||
+		!st->homer_pending_result_sink_bound || !st->homer_result_sink_open || !resultSink->open ||
+		!resultSink->eosSeen)
+	{
+		return;
+	}
+
+	/*
+	 * Only remember a descriptor after the real completion descriptor has been
+	 * validated against the currently bound sink. The next command may then
+	 * reuse the same physical sink and start at the drained byte tail.
+	 */
+	st->homer_stable_result_binding_valid = true;
+	st->homer_stable_result_drained_tail = resultSink->consumedHead;
+}
+
+static bool HomerTryPrearmStableResultBinding(CState *st, uint32 commandKind, uint32 resultMode, uint64 commandSequence,
+											  const char *operationName)
+{
+	CitusRemoteExecCommandCompletion prearmCompletion;
+	char errorMessage[HOMER_CLIENT_ERROR_BYTES];
+
+	if (commandKind != CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE || resultMode != CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE ||
+		commandSequence == 0 || !st->homer_stable_result_binding_valid || !st->homer_result_sink_open ||
+		!st->homer_result_sink.open || !st->homer_result_sink.eosSeen ||
+		st->homer_result_sink.consumedHead != st->homer_stable_result_drained_tail)
+	{
+		return false;
+	}
+
+	memset(&prearmCompletion, 0, sizeof(prearmCompletion));
+	prearmCompletion.protocolVersion = CITUS_REMOTE_EXEC_CONTROL_PROTOCOL_VERSION;
+	prearmCompletion.commandKind = commandKind;
+	prearmCompletion.commandState = CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED;
+	prearmCompletion.commandSequence = commandSequence;
+	prearmCompletion.resultFlags = CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY;
+	prearmCompletion.resultQueueDescriptor = st->homer_result_sink.queueDescriptor;
+	prearmCompletion.resultQueueDescriptor.resultGeneration = commandSequence;
+	prearmCompletion.resultQueueDescriptor.startByteTail = st->homer_stable_result_drained_tail;
+	prearmCompletion.resultQueueDescriptor.firstRingRecordOrdinal = 0;
+	prearmCompletion.resultTupleViewContract = st->homer_result_sink.tupleViewContract;
+
+	if (!HomerClientOpenResultSink(&prearmCompletion, &st->homer_result_sink, errorMessage, sizeof(errorMessage)))
+	{
+		/*
+		 * Pre-arm is an optimization predicate. A miss must fall back to the
+		 * normal STARTED descriptor path, not fail a command that is already
+		 * in flight. Invalidate so later commands re-learn from a real event.
+		 */
+		pg_log_debug("client %d could not pre-arm Homer result sink for %s: %s", st->id, operationName, errorMessage);
+		HomerInvalidateStableResultBinding(st);
+		return false;
+	}
+
+	st->homer_result_sink_open = true;
+	pg_log_debug("client %d pre-armed Homer result sink for %s sequence=%llu tail=%llu", st->id, operationName,
+				 (unsigned long long)commandSequence, (unsigned long long)st->homer_stable_result_drained_tail);
+	return true;
 }
 
 typedef enum HomerCompletionApplyResult
@@ -3493,6 +3606,63 @@ typedef enum HomerCompletionApplyResult
 	HOMER_COMPLETION_NOT_APPLIED_RETRY,
 	HOMER_COMPLETION_APPLY_FATAL
 } HomerCompletionApplyResult;
+
+/*
+ * HomerDrainPendingResultSink advances the command-local result sink without
+ * spinning inside the client library. For terminal completions, NOT_READY or
+ * VISIBILITY_PENDING means pgbench must keep the leased completion unacked and
+ * retry from the normal state-machine loop.
+ */
+static HomerCompletionApplyResult HomerDrainPendingResultSink(CState *st, const char *operationName,
+															  bool terminalCompletion)
+{
+	char errorMessage[HOMER_CLIENT_ERROR_BYTES];
+	HomerClientResultDrainStatus drainStatus = HOMER_RESULT_DRAIN_NOT_READY;
+	HomerClientResultDrainTarget drainTarget;
+	HomerClientResultDrainBudget drainBudget;
+
+	memset(&drainBudget, 0, sizeof(drainBudget));
+	if (terminalCompletion)
+		drainTarget = st->homer_pending_drain_target;
+	else
+		memset(&drainTarget, 0, sizeof(drainTarget));
+
+	if (!HomerClientDrainResultSinkUntil(&st->homer_result_sink, &drainTarget, &drainBudget, &drainStatus,
+										 &st->homer_pending_drained_rows, errorMessage, sizeof(errorMessage)))
+	{
+		pg_log_error("client %d failed to drain Homer result sink for %s: %s", st->id, operationName, errorMessage);
+		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		HomerClientCloseResultSink(&st->homer_result_sink, false);
+		st->homer_result_sink_open = false;
+		HomerInvalidateStableResultBinding(st);
+		clearHomerPendingCommand(st);
+		return HOMER_COMPLETION_APPLY_FATAL;
+	}
+
+	if (!terminalCompletion)
+	{
+		return HOMER_COMPLETION_APPLIED_CONTINUE;
+	}
+
+	if (drainStatus == HOMER_RESULT_DRAIN_COMPLETE)
+	{
+		return HOMER_COMPLETION_APPLIED_CONTINUE;
+	}
+	if (drainStatus == HOMER_RESULT_DRAIN_NOT_READY || drainStatus == HOMER_RESULT_DRAIN_PROGRESS ||
+		drainStatus == HOMER_RESULT_DRAIN_VISIBILITY_PENDING)
+	{
+		return HOMER_COMPLETION_NOT_APPLIED_RETRY;
+	}
+
+	pg_log_error("client %d Homer result sink for %s returned unexpected drain status %u", st->id, operationName,
+				 (unsigned int)drainStatus);
+	st->estatus = ESTATUS_OTHER_SQL_ERROR;
+	HomerClientCloseResultSink(&st->homer_result_sink, false);
+	st->homer_result_sink_open = false;
+	HomerInvalidateStableResultBinding(st);
+	clearHomerPendingCommand(st);
+	return HOMER_COMPLETION_APPLY_FATAL;
+}
 
 /*
  * HomerApplyCommandCompletion consumes one command completion observed either
@@ -3515,6 +3685,17 @@ HomerApplyCommandCompletion(CState *st, const CitusRemoteExecCommandCompletion *
 	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED ||
 		completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED)
 	{
+		if ((completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0 &&
+			!HomerPrearmedResultBindingMatchesCompletion(st, completion))
+		{
+			pg_log_error("client %d Homer pre-armed result binding for %s did not match STARTED descriptor", st->id,
+						 operationName);
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+			HomerInvalidateStableResultBinding(st);
+			clearHomerPendingCommand(st);
+			return HOMER_COMPLETION_APPLY_FATAL;
+		}
+
 		if (!st->homer_pending_result_sink_bound &&
 			(completion->resultFlags &
 			 CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
@@ -3545,18 +3726,14 @@ HomerApplyCommandCompletion(CState *st, const CitusRemoteExecCommandCompletion *
 			bool		requireEos =
 				(completion->commandState ==
 				 CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED);
+			HomerCompletionApplyResult drainResult = HomerDrainPendingResultSink(st, operationName, requireEos);
 
-			if (!HomerClientDrainResultSink(resultSink, requireEos,
-											&st->homer_pending_drained_rows,
-											errorMessage,
-											sizeof(errorMessage)))
+			if (drainResult == HOMER_COMPLETION_NOT_APPLIED_RETRY)
 			{
-				pg_log_error("client %d failed to drain Homer result sink for %s: %s",
-							 st->id, operationName, errorMessage);
-				st->estatus = ESTATUS_OTHER_SQL_ERROR;
-				HomerClientCloseResultSink(resultSink, false);
-				st->homer_result_sink_open = false;
-				clearHomerPendingCommand(st);
+				return HOMER_COMPLETION_NOT_APPLIED_RETRY;
+			}
+			if (drainResult == HOMER_COMPLETION_APPLY_FATAL)
+			{
 				return HOMER_COMPLETION_APPLY_FATAL;
 			}
 		}
@@ -3580,6 +3757,7 @@ HomerApplyCommandCompletion(CState *st, const CitusRemoteExecCommandCompletion *
 		pg_log_debug("client %d Homer %s completed: rows=%llu",
 					 st->id, operationName,
 					 (unsigned long long) completion->processedRowCount);
+		HomerRememberStableResultBinding(st, completion);
 		clearHomerPendingCommand(st);
 		*commandComplete = true;
 		return HOMER_COMPLETION_APPLIED_TERMINAL_SUCCESS;
@@ -3597,6 +3775,7 @@ HomerApplyCommandCompletion(CState *st, const CitusRemoteExecCommandCompletion *
 			HomerClientCloseResultSink(resultSink, false);
 			st->homer_result_sink_open = false;
 		}
+		HomerInvalidateStableResultBinding(st);
 		clearHomerPendingCommand(st);
 		return HOMER_COMPLETION_APPLIED_TERMINAL_FAILURE;
 	}
@@ -3621,8 +3800,11 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 {
 	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
 	uint64		commandSequence = 0;
+	uint64 predictedCommandSequence = 0;
+	uint32 commandFlags = 0;
 	CitusRemoteExecCommandCompletion completion;
 	bool		commandComplete = false;
+	bool resultBindingPrearmed = false;
 
 	if (st->homer_command_pending)
 	{
@@ -3634,29 +3816,41 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 		return false;
 	}
 
-	if (!HomerClientStartCommandWithCompletionFlags(&st->homer_session,
-													commandKind,
-													0,
-													NULL,
-													sql,
-													resultMode,
-													&commandSequence,
-													&completion,
-													errorMessage,
+	if (HomerClientPredictNextCommandSequence(&st->homer_session, &predictedCommandSequence, errorMessage,
+											  sizeof(errorMessage)) &&
+		HomerTryPrearmStableResultBinding(st, commandKind, resultMode, predictedCommandSequence, operationName))
+	{
+		commandFlags |= CITUS_REMOTE_EXEC_COMMAND_FLAG_RESULT_BINDING_PREARMED;
+		resultBindingPrearmed = true;
+	}
+
+	if (!HomerClientStartCommandWithCompletionFlags(&st->homer_session, commandKind, commandFlags, NULL, sql,
+													resultMode, &commandSequence, &completion, errorMessage,
 													sizeof(errorMessage)))
 	{
 		pg_log_error("client %d failed to start Homer %s: %s",
 					 st->id, operationName, errorMessage);
 		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		if (resultBindingPrearmed)
+			HomerInvalidateStableResultBinding(st);
+		return false;
+	}
+	if (resultBindingPrearmed && commandSequence != predictedCommandSequence)
+	{
+		pg_log_error("client %d Homer %s command sequence changed after pre-arm: predicted=%llu got=%llu", st->id,
+					 operationName, (unsigned long long)predictedCommandSequence, (unsigned long long)commandSequence);
+		st->estatus = ESTATUS_OTHER_SQL_ERROR;
+		HomerInvalidateStableResultBinding(st);
 		return false;
 	}
 
 	st->homer_command_pending = true;
-	st->homer_pending_result_sink_bound = false;
+	st->homer_pending_result_sink_bound = resultBindingPrearmed;
 	st->homer_pending_command_kind = commandKind;
 	st->homer_pending_result_mode = resultMode;
 	st->homer_pending_command_sequence = commandSequence;
 	st->homer_pending_drained_rows = 0;
+	memset(&st->homer_pending_drain_target, 0, sizeof(st->homer_pending_drain_target));
 	st->homer_pending_operation_name = operationName;
 
 	switch (HomerApplyCommandCompletion(st, &completion, &commandComplete))
@@ -3713,26 +3907,17 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 	{
 		if (st->homer_pending_result_sink_bound)
 		{
+			HomerCompletionApplyResult drainResult = HomerDrainPendingResultSink(
+				st, st->homer_pending_operation_name ? st->homer_pending_operation_name : "unknown", false);
+
 			/*
 			 * Drain producer-visible rows while the command is still running.
 			 * This keeps larger future result streams from filling the sink and
 			 * blocking backend completion behind a frontend that is waiting only
 			 * on the completion mailbox.
 			 */
-			if (!HomerClientDrainResultSink(&st->homer_result_sink, false,
-											&st->homer_pending_drained_rows,
-											errorMessage,
-											sizeof(errorMessage)))
+			if (drainResult == HOMER_COMPLETION_APPLY_FATAL)
 			{
-				pg_log_error("client %d failed to drain running Homer result sink for %s: %s",
-							 st->id,
-							 st->homer_pending_operation_name ?
-							 st->homer_pending_operation_name : "unknown",
-							 errorMessage);
-				st->estatus = ESTATUS_OTHER_SQL_ERROR;
-				HomerClientCloseResultSink(&st->homer_result_sink, false);
-				st->homer_result_sink_open = false;
-				clearHomerPendingCommand(st);
 				return false;
 			}
 		}
@@ -3767,6 +3952,7 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 		return false;
 	}
 
+	st->homer_pending_drain_target = lease->resultDrainTarget;
 	applyResult = HomerApplyCommandCompletion(st, &lease->completion, commandComplete);
 	if (applyResult == HOMER_COMPLETION_NOT_APPLIED_RETRY)
 	{
@@ -8957,6 +9143,7 @@ finishHomerSession(CState *st)
 		 */
 		HomerClientCloseResultSink(&st->homer_result_sink, false);
 		st->homer_result_sink_open = false;
+		HomerInvalidateStableResultBinding(st);
 	}
 
 	if (!HomerClientCloseSession(&st->homer_session,
@@ -9010,6 +9197,7 @@ openHomerSession(TState *thread, CState *st)
 	st->homer_result_sink_open = false;
 	st->homer_transaction_attached = false;
 	clearHomerPendingCommand(st);
+	HomerInvalidateStableResultBinding(st);
 
 	/*
 	 * Regular pgbench creates persistent libpq connections before bench_start.
