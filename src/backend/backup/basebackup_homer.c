@@ -41,8 +41,7 @@ typedef struct bbsink_homer
 	uint32		archive_index;
 	uint64		archive_offset;
 	uint64		total_bytes;
-	char	   *current_payload;
-	char		current_archive_name[CITUS_REMOTE_BASEBACKUP_NAME_BYTES];
+	char *current_payload;
 } bbsink_homer;
 
 static void bbsink_homer_begin_backup(bbsink *sink);
@@ -175,20 +174,23 @@ bbsink_homer_apply_detail(HomerClientBaseBackupStreamOptions *options,
 	pfree(detail_copy);
 }
 
-static void
-bbsink_homer_reserve_record(bbsink_homer *mysink, const char *operation)
+/*
+ * bbsink_homer_reserve_record reserves the next producer byte-ring record with
+ * the semantic header shape that will be submitted later. This matters for
+ * compact basebackup headers: payload bytes are exposed immediately after the
+ * actual header, so reserving with a different object kind would corrupt the
+ * name/payload boundary instead of just wasting a few bytes.
+ */
+static void bbsink_homer_reserve_record(bbsink_homer *mysink, uint32 object_kind, const char *name,
+										const char *operation)
 {
 	void	   *payload = NULL;
 	uint32		payload_capacity = 0;
 	uint64		stream_sequence = 0;
 	char		error[HOMER_CLIENT_ERROR_BYTES];
 
-	if (!HomerClientReserveBaseBackupRecord(&mysink->stream,
-											&payload,
-											&payload_capacity,
-											&stream_sequence,
-											error,
-											sizeof(error)))
+	if (!HomerClientReserveBaseBackupRecordForObject(&mysink->stream, object_kind, name, &payload, &payload_capacity,
+													 &stream_sequence, error, sizeof(error)))
 		bbsink_homer_error(operation, error);
 
 	mysink->current_payload = payload;
@@ -207,7 +209,7 @@ bbsink_homer_submit_reserved_record(bbsink_homer *mysink, uint32 object_kind,
 	char		error[HOMER_CLIENT_ERROR_BYTES];
 
 	if (!mysink->record_reserved)
-		bbsink_homer_reserve_record(mysink, operation);
+		bbsink_homer_reserve_record(mysink, object_kind, name, operation);
 
 	if (payload_len > UINT32_MAX)
 		ereport(ERROR,
@@ -261,15 +263,9 @@ bbsink_homer_begin_backup(bbsink *sink)
 		bbsink_homer_error("open stream", error);
 	mysink->stream_open = true;
 
-	bbsink_homer_reserve_record(mysink, "reserve begin record");
-	bbsink_homer_submit_reserved_record(mysink,
-									  CITUS_REMOTE_BASEBACKUP_OBJECT_BEGIN,
-									  0,
-									  "basebackup",
-									  0,
-									  0,
-									  "submit begin");
-	bbsink_homer_reserve_record(mysink, "reserve first payload record");
+	bbsink_homer_reserve_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_BEGIN, "basebackup", "reserve begin record");
+	bbsink_homer_submit_reserved_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_BEGIN, 0, "basebackup", 0, 0,
+										"submit begin");
 }
 
 static void
@@ -278,9 +274,6 @@ bbsink_homer_begin_archive(bbsink *sink, const char *archive_name)
 	bbsink_homer *mysink = (bbsink_homer *) sink;
 
 	mysink->archive_offset = 0;
-	strlcpy(mysink->current_archive_name,
-			archive_name,
-			sizeof(mysink->current_archive_name));
 	bbsink_homer_submit_reserved_record(mysink,
 									  CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_BEGIN,
 									  mysink->archive_index,
@@ -288,7 +281,8 @@ bbsink_homer_begin_archive(bbsink *sink, const char *archive_name)
 									  0,
 									  0,
 									  "submit archive begin");
-	bbsink_homer_reserve_record(mysink, "reserve archive payload record");
+	bbsink_homer_reserve_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_CHUNK, NULL,
+								"reserve archive payload record");
 	bbsink_begin_archive(sink->bbs_next, archive_name);
 }
 
@@ -301,14 +295,10 @@ bbsink_homer_archive_contents(bbsink *sink, size_t len)
 	mysink->base.bbs_state->bytes_done += len;
 	mysink->archive_offset += len;
 	mysink->total_bytes += len;
-	bbsink_homer_submit_reserved_record(mysink,
-									  CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_CHUNK,
-									  mysink->archive_index,
-									  mysink->current_archive_name,
-									  len,
-									  chunk_offset,
-									  "submit archive chunk");
-	bbsink_homer_reserve_record(mysink, "reserve next archive payload record");
+	bbsink_homer_submit_reserved_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_CHUNK, mysink->archive_index,
+										NULL, len, chunk_offset, "submit archive chunk");
+	bbsink_homer_reserve_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_CHUNK, NULL,
+								"reserve next archive payload record");
 }
 
 static void
@@ -316,16 +306,10 @@ bbsink_homer_end_archive(bbsink *sink)
 {
 	bbsink_homer *mysink = (bbsink_homer *) sink;
 
-	bbsink_homer_submit_reserved_record(mysink,
-									  CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_END,
-									  mysink->archive_index,
-									  mysink->current_archive_name,
-									  0,
-									  mysink->archive_offset,
-									  "submit archive end");
+	bbsink_homer_submit_reserved_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_END, mysink->archive_index, NULL,
+										0, mysink->archive_offset, "submit archive end");
 	mysink->base.bbs_state->tablespace_num++;
 	mysink->archive_index++;
-	bbsink_homer_reserve_record(mysink, "reserve post-archive record");
 	bbsink_end_archive(sink->bbs_next);
 }
 
@@ -342,7 +326,8 @@ bbsink_homer_begin_manifest(bbsink *sink)
 									  0,
 									  0,
 									  "submit manifest begin");
-	bbsink_homer_reserve_record(mysink, "reserve manifest payload record");
+	bbsink_homer_reserve_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_MANIFEST_CHUNK, NULL,
+								"reserve manifest payload record");
 	bbsink_begin_manifest(sink->bbs_next);
 }
 
@@ -354,14 +339,10 @@ bbsink_homer_manifest_contents(bbsink *sink, size_t len)
 
 	mysink->archive_offset += len;
 	mysink->total_bytes += len;
-	bbsink_homer_submit_reserved_record(mysink,
-									  CITUS_REMOTE_BASEBACKUP_OBJECT_MANIFEST_CHUNK,
-									  mysink->archive_index,
-									  "backup_manifest",
-									  len,
-									  chunk_offset,
-									  "submit manifest chunk");
-	bbsink_homer_reserve_record(mysink, "reserve next manifest payload record");
+	bbsink_homer_submit_reserved_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_MANIFEST_CHUNK, mysink->archive_index,
+										NULL, len, chunk_offset, "submit manifest chunk");
+	bbsink_homer_reserve_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_MANIFEST_CHUNK, NULL,
+								"reserve next manifest payload record");
 }
 
 static void
@@ -369,14 +350,8 @@ bbsink_homer_end_manifest(bbsink *sink)
 {
 	bbsink_homer *mysink = (bbsink_homer *) sink;
 
-	bbsink_homer_submit_reserved_record(mysink,
-									  CITUS_REMOTE_BASEBACKUP_OBJECT_MANIFEST_END,
-									  mysink->archive_index,
-									  "backup_manifest",
-									  0,
-									  mysink->archive_offset,
-									  "submit manifest end");
-	bbsink_homer_reserve_record(mysink, "reserve end record");
+	bbsink_homer_submit_reserved_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_MANIFEST_END, mysink->archive_index,
+										NULL, 0, mysink->archive_offset, "submit manifest end");
 	bbsink_end_manifest(sink->bbs_next);
 }
 
@@ -386,13 +361,8 @@ bbsink_homer_end_backup(bbsink *sink, XLogRecPtr endptr, TimeLineID endtli)
 	bbsink_homer *mysink = (bbsink_homer *) sink;
 	char		error[HOMER_CLIENT_ERROR_BYTES];
 
-	bbsink_homer_submit_reserved_record(mysink,
-									  CITUS_REMOTE_BASEBACKUP_OBJECT_END,
-									  mysink->archive_index,
-									  "basebackup",
-									  0,
-									  0,
-									  "submit end");
+	bbsink_homer_submit_reserved_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_END, mysink->archive_index, NULL, 0, 0,
+										"submit end");
 	if (!HomerClientCloseBaseBackupStream(&mysink->stream,
 										  error,
 										  sizeof(error)))

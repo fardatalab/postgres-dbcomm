@@ -3094,6 +3094,112 @@ Chunks should not retransmit object name or total size.
 - Basebackup semantic bytes per GiB drop.
 - Object boundary across ring wrap remains correct.
 
+### Accepted Stage 7a checkpoint - June 20, 2026
+
+Stage 7a is implemented and validated. The implementation intentionally keeps
+the physical producer byte-ring geometry conservative: each reservation still
+requires enough contiguous space for the maximum basebackup semantic header, so
+a record cannot straddle the local producer-ring wrap. Within that physical
+reservation, however, the producer now exposes payload bytes immediately after
+the actual semantic header for the next object kind. This gives compact
+chunk/end records without adding a payload copy or a risky wrap-time relocation.
+
+Implemented code shape:
+
+- The basebackup semantic protocol is now v2 at
+  [`CITUS_REMOTE_BASEBACKUP_PROTOCOL_VERSION`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:67).
+  [`CitusRemoteBaseBackupMessageHeader`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:417)
+  carries authoritative `headerBytes` and `nameBytes`; the fixed semantic
+  prefix is
+  [`CITUS_REMOTE_BASEBACKUP_HEADER_FIXED_BYTES`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:433),
+  while
+  [`CITUS_REMOTE_BASEBACKUP_HEADER_MAX_BYTES`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:434)
+  remains the worst-case physical reservation size.
+- The client reserve API now has an object-aware path,
+  [`HomerClientReserveBaseBackupRecordForObject()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1762),
+  also declared for PostgreSQL callers at
+  [`remote_execution_client.h`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h:324).
+  It records the reserved semantic header length and returns a payload pointer
+  at `[transport header][actual semantic header]`, not after the legacy
+  maximum header.
+- [`HomerClientSubmitBaseBackupRecord()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1896)
+  rejects reserve/submit shape mismatches, publishes
+  `transportHeader->payloadBytes = headerBytes + payloadBytes`, writes
+  `nameBytes` only for named object-boundary records, and clears repeated
+  `totalBytes` for archive/manifest chunks.
+- PostgreSQL's Homer bbsink now reserves by the next exact object kind in
+  [`bbsink_homer_reserve_record()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:184).
+  Archive/manifest chunks and end markers pass `name = NULL` through
+  [`bbsink_homer_archive_contents()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:290),
+  [`bbsink_homer_end_archive()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:305),
+  [`bbsink_homer_manifest_contents()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:335),
+  and
+  [`bbsink_homer_end_manifest()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:349),
+  so chunks no longer copy or retransmit the archive/manifest name.
+- The service validates compact basebackup headers through
+  [`HomerServiceValidateBaseBackupSemanticHeader()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20409)
+  and
+  [`HomerServiceBaseBackupHeaderNameShapeValid()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20353).
+  The fragment path
+  [`HomerServiceAppendOutgoingBaseBackupFragmentWrite()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13121)
+  now forces the first fragment to carry the actual semantic header length, and
+  [`HomerServicePayloadMinimumBytes()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22832)
+  uses the fixed basebackup prefix rather than the old max header.
+- Payload stats now record both compact and legacy-equivalent semantic header
+  bytes in
+  [`HomerServiceRecordBaseBackupShapeStats()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2953).
+
+Validation evidence from `/tmp/homer_stage7a_validate_1781954660`:
+
+```text
+no-stats installed hashes matched on farnet1 and farnet0:
+    citus_tuple_sink_service 4a0718892cdd901c863c6b87ab2bdf8a429a0b4c74c9765f57b941875a9ba405
+    libhomer_client.a       e812b1dfca05e1b63814176def39e53729622c9159d4ca1edb59b75fe62dff4a
+    citus.so                c5bc80d3e261ad07181d3c6975171aa7077fd273507fc0a9c4931b3d30899156
+
+remote RDMA pgbench c1:
+    run 1 warmup: failed=0, TPS=2830.958112, p99=0.240 ms
+    run 2 warmed: failed=0, TPS=4501.610901, p99=0.239 ms
+    run 3 warmed: failed=0, TPS=4075.300136, p99=0.270 ms
+
+remote RDMA pgbench c4:
+    run 1: failed=0, TPS=11647.765740, p95=0.455 ms, p99=0.524 ms
+    run 2: failed=0, TPS=11580.055092, p95=0.453 ms, p99=0.521 ms
+    run 3: failed=0, TPS=11522.834802, p95=0.453 ms, p99=0.526 ms
+
+local Homer blackhole basebackup:
+    4.07s, 3.94s
+
+remote RDMA basebackup:
+    warmup 5.83s; warmed 4.13s, 4.12s
+
+stats-enabled remote RDMA basebackup:
+    semantic_header_bytes=370753
+    legacy_header_bytes=1218080
+    kind_objects[archive_chunk]=6613
+    kind_payload_bytes[archive_chunk]=23314645504
+```
+
+The stats run proves the Stage 7a byte-volume acceptance condition: compact
+basebackup semantic headers used about `30.4%` of the legacy-equivalent header
+bytes for that stream. The no-stats build was restored and synced afterward;
+`strings citus_tuple_sink_service | grep -c 'basebackup shape stats'` returned
+`0` on both hosts.
+
+Validation caveats:
+
+- The validation script initially used a broad `pkill -f` pattern that matched
+  its own shell command text. The validator switched to shorter process checks;
+  no source/runtime code changed because of this.
+- Service logs still showed two known `stale payload progress grant` diagnostics
+  after local blackhole stream reclamation. They did not correlate with any
+  workload failure and are still a payload scheduler cleanup caveat rather than
+  a Stage 7a semantic-header failure.
+- PostgreSQL logs again contained Citus maintenance-daemon warnings about
+  `10.10.1.100:5432` because PostgreSQL was intentionally not running on
+  `farnet0` for this validation shape. No Homer protocol/header/transport errors
+  were found in the service logs.
+
 ## Stage 7b: tune existing remote range publication
 
 Goal: measure and tune the already-existing basebackup range publication path
