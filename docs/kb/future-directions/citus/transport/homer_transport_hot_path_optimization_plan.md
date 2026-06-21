@@ -3676,6 +3676,151 @@ Current suspicion to review before implementation:
   not be cleared or reused until the signaled CQ checkpoint that covers both its
   body WRITE and ready WIMM has retired.
 
+### Stage 7d blocker fix plan - June 21, 2026
+
+The next implementation step is not QP/CQ isolation. First fix the frontend
+client-completion publication contract that the trigger run exposed.
+
+Planned/current fix:
+
+1. Replace the leading `bodyEpoch` proof in the client-completion slot with a
+   trailing post-body seal. The seal must contain at least the completion epoch,
+   command sequence, command kind, command state, and result flags. The seal is
+   filled after the hot completion body and is checked after the frontend copies
+   the hot body.
+2. Bump `CITUS_REMOTE_EXEC_CONTROL_PROTOCOL_VERSION` and the control/client
+   completion shared-memory names so mixed old/new binaries fail fast.
+3. Update the local completion publisher and peer-client RDMA publisher:
+   - fill the hot completion body,
+   - fill the trailing seal last,
+   - issue a compiler/release barrier before posting or publishing,
+   - keep local same-process completion publication as a CPU store to
+     `readyEpochSlots[slot]`,
+   - publish the peer body+seal region with the existing body WRITE,
+   - publish peer completion visibility with WRITE WITH IMM to an inert service
+     scratch word, not to `readyEpochSlots[slot]`,
+   - let the receiver service validate body+seal and then CPU-publish
+     `readyEpochSlots[slot]`/`publishedEpoch`.
+4. Update the frontend stable-read path:
+   - treat `publishedEpoch` as a hint only,
+   - require `readyEpochSlots[slot] == expectedEpoch`,
+   - copy hot body plus trailing seal,
+   - recheck ready,
+   - accept only if the trailing seal matches both the expected epoch and the
+     copied hot completion fields.
+5. Fail fast on a ready/seal mismatch in the client. Once
+   `readyEpochSlots[slot] == expectedEpoch`, the trailing seal must match the
+   copied hot completion body. A mismatch is a publication invariant violation,
+   not a normal retry condition, and should report the hot/seal fields
+   immediately.
+6. Tighten peer-client completion source-slot state enough to prove the source
+   slot cannot be cleared or reused before the signaled CQ checkpoint covering
+   its body WRITE and ready WIMM has retired. This first pass should add
+   explicit filled/body-posted/ready-posted states and defensive logs/counters;
+   broader CQ topology isolation remains Stage 7d proper.
+
+Correctness acceptance before QP/CQ isolation:
+
+- remote RDMA pgbench c1/c4 standalone correctness holds with fail-fast
+  ready/seal checks enabled,
+- the exact concurrent c4 + background basebackup reproduction no longer
+  reports stale/mismatched client completions,
+- no ready/seal mismatch is observed after `readyEpochSlots[slot]` reaches the
+  expected epoch,
+- no source-slot reuse-before-retire diagnostic fires.
+
+Performance acceptance remains separate. The fix must not be judged by the old
+direct-ready c4 peak because that path violated the publication contract on the
+current farnet hardware. The next accepted performance point should compare
+receiver-service CPU publication against the previous valid correctness point
+and then optimize CQE handling, token dispatch, and service-loop scheduling
+without reintroducing direct RDMA writes to frontend-polled ready words.
+
+Implementation/validation note from June 21, 2026:
+
+- The first fail-fast trailing-seal implementation compiled and installed with
+  protocol/control shared-memory version `v25`. It replaced the leading
+  `bodyEpoch` proof with a trailing seal and made
+  [`HomerClientCopyClientCompletionSlotStable()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1108)
+  fail fast when `readyEpochSlots[slot] == expectedEpoch` but the copied body
+  and seal did not agree.
+- The first diagnostic had one bug of its own:
+  [`HomerClientReportCompletionSealMismatch()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1193)
+  re-read the mailbox slot while reporting, so the printed fields did not
+  necessarily match the copied slot that failed validation. That diagnostic was
+  fixed by passing the exact failed slot copy and ready epoch from
+  [`HomerClientCopyClientCompletionSlotStable()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1108)
+  to the reporter.
+- With exact-copy diagnostics, the long remote RDMA pgbench c1 repro failed
+  with:
+  `epoch=50349 slot=5 ready=50349 seal_epoch=50349 hot_sequence=50348
+  seal_sequence=50348 hot_kind=6 seal_kind=7 hot_state=3 seal_state=3
+  hot_flags=0 seal_flags=0`. The important fact is that the frontend observed
+  the new `readyEpochSlots[slot]` value while the completion body/seal image was
+  still stale or mixed.
+- The service log on both hosts reported
+  `RDMA write data-in-order caps=0x0 whole-message=false aligned-128=false`.
+  That invalidated the remaining v25 assumption that a peer RDMA WRITE WITH IMM
+  to the frontend-polled ready word could serve as the final host-client
+  publication gate. On this hardware, directly RDMA-writing
+  `readyEpochSlots[slot]` can make the CPU client observe ready before the
+  previous body WRITE is coherent.
+- The corrected implementation bumped the protocol/control shared-memory names
+  to `v26` and changed the publication owner:
+  [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14200)
+  still writes the remote completion slot body+seal, but its WRITE WITH IMM now
+  targets inert
+  [`peerCompletionDoorbellScratch`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:881)
+  instead of `readyEpochSlots[slot]`.
+- The receiver service now owns frontend-visible publication. The recv-CQ path
+  parses the peer-client-completion immediate and dispatches it to
+  [`TupleSinkServiceHandlePeerClientCompletionDoorbell()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20175),
+  which validates the copied body/seal at
+  [`tuple_sink_service_process.c:20246`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20246)
+  and then CPU-publishes `readyEpochSlots[slot]` and `publishedEpoch`.
+  This restores the invariant that the host client polls only CPU-published
+  ready words unless a future platform/path explicitly proves an equivalent
+  data-in-order guarantee.
+- The recv-CQ implementation was then tightened so the normal pump calls the
+  doorbell handler directly while the CQE is hot instead of pushing every
+  completion doorbell through the pending FIFO. The FIFO remains for call paths
+  that drain connection events without a handler, but it is not the intended
+  hot path.
+
+Current correctness evidence:
+
+```text
+remote RDMA pgbench c1 long repro:
+    100000/100000 transactions, 0 failed
+    no ready/seal mismatch reported
+
+remote RDMA pgbench c1 warmed sequential repeat:
+    20000/20000 transactions, 0 failed
+
+remote RDMA pgbench c4 warmed sequential repeat:
+    40000/40000 transactions, 0 failed
+```
+
+Current performance caveat:
+
+```text
+remote RDMA pgbench c1 warmed sequential repeat:
+    about 3402 TPS
+    p50 about 0.291 ms, p95 about 0.303 ms, p99 about 0.321 ms
+
+remote RDMA pgbench c4 warmed sequential repeat:
+    about 9469 TPS
+    p50 about 0.420 ms, p95 about 0.589 ms, p99 about 0.682 ms
+```
+
+The corrected `v26` receiver-service publication path fixes the real
+publication-ordering bug for the reproduced c1/c4 cases, but it is not yet a
+performance acceptance point. The earlier direct-ready path reached about
+`11.2k TPS` for c4, but it was relying on an invalid RNIC-to-CPU publication
+contract. The remaining optimization problem is therefore to reduce receiver
+service doorbell handling overhead without going back to direct RDMA
+publication of frontend-polled ready words.
+
 ### Acceptance
 
 - Foreground pgbench with background remote RDMA basebackup improves p95/p99
@@ -3722,8 +3867,11 @@ exceeds ordinary variance.
 
 - Do not reintroduce dual delivery plus deduplication for frontend command
   completions. The accepted direction is one explicit peek/apply/ack owner.
-- Do not rely on receiver-service token demux to publish host-client visibility
-  when the host client already polls its mailbox memory.
+- Do not RDMA-publish frontend-polled ready words directly on hardware that does
+  not prove the required RDMA-write data-in-order guarantee. For the current
+  farnet path, peer-client completion WRITE WITH IMM targets an inert service
+  scratch word; the receiver service validates body/seal and CPU-publishes
+  `readyEpochSlots[slot]`/`publishedEpoch` for the host client to poll.
 - Do not treat `publishedEpoch` alone as a completion-body visibility proof.
   Slot-local ready epoch and stable reads remain required.
 - Do not use client-side tolerance for tuple-result sequence mismatches as a
