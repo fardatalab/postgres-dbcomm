@@ -227,7 +227,7 @@ was restored to no-stats binaries afterward.
   is the frontend ready-copy-ready and trailing-seal validator.
 - [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14200)
   is the backend-node peer-client completion publisher.
-- [`TupleSinkServicePostPeerRegisteredClientCompletionBytesWithImmediateRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5936)
+- [`TupleSinkServicePostPeerRegisteredClientCompletionBytesWithImmediateRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6288)
   is the registered-source `RDMA_WRITE_WITH_IMM` posting surface.
 - [`TupleSinkServiceHandlePeerClientCompletionDoorbell()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20139)
   is the receiver-side doorbell handler that validates completion content and
@@ -236,11 +236,17 @@ was restored to no-stats binaries afterward.
   is the current permanent recv dispatcher for steady-state WIMM CQEs.
 - [`TupleSinkServiceDecodePeerDoorbellImmediate()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:606)
   implements the v14 immediate-data kind/token decoder.
-- [`TupleSinkServiceDrainPeerConnectionEvents()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3955)
-  no longer accepts optional semantic handlers. It still combines recv-CQ and
-  CM draining, and residual `pendingClientCompletionDoorbell*` fields remain as
-  dead/cleanup state until the Slice 2B typed-completion cleanup deletes them.
-- [`ibv_query_qp_data_in_order()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2217)
+- [`TupleSinkServicePollBootstrapRecvCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1595)
+  is the bootstrap-only recv-CQ poller for the setup descriptor exchange.
+- [`TupleSinkServiceDrainCanonicalRecvCq()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4304)
+  is the static canonical steady-state recv-CQ drain that decodes WIMM CQEs and
+  never polls RDMA-CM events.
+- [`TupleSinkServiceDrainRecvCqCollectorAction()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4506)
+  revalidates connection index/generation before calling the canonical recv-CQ
+  drain.
+- [`TupleSinkServiceDrainPeerConnectionCmEvents()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4565)
+  is the CM-only peer connection event drain.
+- [`ibv_query_qp_data_in_order()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2609)
   is currently logged for capability diagnostics.
 
 ## Corrected Diagnosis
@@ -2117,8 +2123,8 @@ Remaining caveats from completed Slice 2 stages:
 ```text
 Control typed readiness is correct but not indexed. controlMailboxReady is now
 the right semantic fact, but the service still scans active connections to find
-ready control mailboxes. An indexed ready-connection structure remains follow-up
-work.
+ready control mailboxes. Slice 3D below turns this caveat into explicit indexed
+readiness work.
 
 Some older KB pointers may still describe residual completion FIFO state that
 has already been removed. Keep updating those as touched; they do not block the
@@ -2196,6 +2202,24 @@ the missing readiness before doing more Stage 7 topology/performance work.
 
 ### 3A Backend-Completion-Ready Bitmap
 
+The bitmap lives in `CitusRemoteExecControlRegion`, currently as
+`completionReadySessions`. Backend code must not open-code bitmap layout or
+atomic operations. Add a narrow helper/interface on the backend side, for
+example:
+
+```c
+bool HomerBackendMarkCompletionReady(CitusRemoteExecControlRegion *controlRegion,
+                                     uint32_t serviceSessionIndex,
+                                     uint64_t serviceSessionGeneration);
+```
+
+The helper is the abstraction boundary between today's host shared-memory
+implementation and a future DPU/DMA-visible readiness update. For now it
+performs the cheap validation available in the backend and then atomically ORs
+the session bit into shared memory with release semantics. Later the helper can
+be replaced by a DMA-visible bitmap/doorbell update without changing completion
+publisher call sites.
+
 Add both fields to backend startup identity:
 
 ```c
@@ -2217,7 +2241,7 @@ After local completion publication:
 
 ```text
 release-store backend completion publishedEpoch
-fetch_or completionReadySessions bit
+call HomerBackendMarkCompletionReady(), which fetch_or's completionReadySessions
 ```
 
 Add `HomerServiceAppendBackendCompletionBitmapSources()` to exchange the bitmap
@@ -2227,6 +2251,10 @@ when more records remain or staging was blocked. Keep one fallback broad scan
 every 1024 service passes; warmed c1/c4 should have zero fallback discoveries.
 
 ### 3B Critical Recv-CQ Demand Facts
+
+This is a physical polling-demand fact for the critical client-command
+completion recv CQ, not a replacement for control mailbox readiness and not just
+the existing `terminalCompletionPendingPeerPoll` semantic flag.
 
 Track per session:
 
@@ -2241,7 +2269,8 @@ uint32_t clientCommandsAwaitingTerminal;
 bool criticalRecvPollDemanded;
 ```
 
-On successful remote command publication:
+On successful remote command publication, after the command is actually
+committed to the peer transport rather than merely selected as a candidate:
 
 ```text
 assert session flag is false
@@ -2271,6 +2300,14 @@ It should run before peer-control mailbox work, foreground payload, bulk
 payload, and maintenance. Connections without outstanding client commands keep a
 low-rate periodic recv-CQ fallback for control/lifetime traffic.
 
+Implementation guardrail: before coding this slice, audit and record the exact
+increment and decrement hooks. The increment belongs at the successful remote
+command publication point. The decrement belongs at terminal CPU publication to
+the client completion mailbox, currently near the same success path that clears
+`terminalCompletionPendingPeerPoll`. Failure, teardown, and connection reset
+must clear the per-session flag and decrement exactly once if the flag is set.
+The session flag and connection counter must never disagree.
+
 ### 3C Resource-Pressure Readiness
 
 Use `resourcePressureSessions` for session-owned send resources. Add per
@@ -2296,6 +2333,65 @@ Do not set the bitmap on every CQ retirement.
 The candidate builder exchanges the bitmap and schedules exact blocked
 sessions. Payload streams remain on indexed stream-ready structures because
 they are not all session-owned.
+
+### 3D Control Indexed Readiness
+
+Replace broad active-connection scans for control mailbox discovery with an
+indexed readiness structure. This slice uses the existing `controlMailboxReady`
+fact as the semantic per-connection state, but makes discovery exact.
+
+Do not implement this as a FIFO queue. Control connections already have stable
+table indexes and generations, so the primary structure should be fixed and
+indexed:
+
+```c
+controlReadyBits[direction][trafficClass][word]
+controlReadyRoundRobinCursor[direction][trafficClass]
+```
+
+The ready bitmap is level-triggered and uses arm/disarm semantics:
+
+```text
+control WIMM CQE decoded:
+    set connection->controlMailboxReady
+    set the indexed ready bit for that connection
+
+candidate construction:
+    scan ready bitmap words from the traffic-class round-robin cursor
+    emit {incoming/outgoing, connectionIndex, connectionGeneration, trafficClass}
+    do not clear the ready bit while merely building a candidate
+
+executor:
+    validate connection index and generation
+    consume control mailbox records within budget
+    if stable empty recheck says consumedHead >= arrivedTail:
+        clear controlMailboxReady
+        clear the indexed ready bit
+    else:
+        leave the bit armed
+
+teardown/reset:
+    clear the indexed bit
+    invalidate stale candidates by generation
+```
+
+Repeated control WIMMs coalesce while the ready bit is set. Budget exhaustion
+does not re-enqueue anything; the bit simply remains armed until the mailbox is
+stable-empty. This is intentionally different from payload ready queues, where
+many streams need round-robin stream-level fairness. Control readiness is
+connection-indexed and should avoid both active-connection scans and stale FIFO
+entries.
+
+Acceptance:
+
+```text
+control WIMM sets controlMailboxReady and the indexed ready bit
+candidate construction does not clear readiness
+executor clears the bit only after a stable empty recheck
+budget exhaustion leaves the bit armed
+connection reset/teardown invalidates stale generation candidates
+no active-connection scan is used for control mailbox discovery
+```
 
 ## Slice 4: Critical-First Stage 7d Service Scheduling
 
@@ -2617,7 +2713,7 @@ empty critical polls per transaction
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
 | Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work            |
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
-| Slice 3     | Sufficiently detailed to start after Slice 2                                         |
+| Slice 3     | Sufficiently detailed to start after Slice 2; 3D control indexed readiness added     |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
@@ -2634,8 +2730,8 @@ empty critical polls per transaction
    permanent dispatcher, typed event materialization, no optional handler/FIFO path.
 
 3. Complete Stage 6:
-   backend completion bitmap, resource-pressure bitmap,
-   critical recv-CQ demand facts.
+   backend completion bitmap, critical recv-CQ demand facts,
+   control indexed readiness, resource-pressure bitmap.
 
 4. Critical-first Stage 7d service scheduling:
    no additional QP, no dedicated thread, suppress bulk spin under foreground load.
