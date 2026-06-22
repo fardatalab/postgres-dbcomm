@@ -185,6 +185,28 @@ completed successfully in `5.81 s`. A later four-repeat run without restarting
 services measured `4.32 s`, `4.17 s`, `4.16 s`, and `4.24 s`, so the warmed
 2E-C basebackup band is `4.16-4.24 s`.
 
+Slice 2F is now landed as the final physical recv-CQ ownership cleanup for the
+current dispatcher architecture. `TupleSinkServiceRecvCqPhaseAllowsPoll()` was
+replaced by role-specific ownership validation; bootstrap setup consumes
+bootstrap receive CQEs only through `TupleSinkServicePollBootstrapRecvCompletion()`;
+steady-state WIMM CQEs are drained only by the static
+`TupleSinkServiceDrainCanonicalRecvCq()` path reached through a
+generation-checked `HomerRecvCqCollectorAction`; and the public combined
+`TupleSinkServiceDrainPeerConnectionEventsRdma()` wrapper was deleted. The old
+combined `drainRecvCq/drainCmEvents` implementation shape is gone: recv-CQ
+polling and RDMA-CM polling are physically separate functions. Runtime
+validation used no-stats binaries for performance and a short stats-enabled
+pass for ownership counters. No-stats validation passed remote cold c1
+`2000/2000`, zero failures; warm c1 `5000/5000`, zero failures, `3954 TPS`,
+p99 `0.275 ms`; short c4 `48000/48000`, zero failures, `9761 TPS`, p99
+`0.666 ms`; and remote RDMA basebackup runs `5.44 s`, `4.22 s`, `4.16 s`,
+`4.15 s`, so the warmed post-2F basebackup band is `4.15-4.22 s`. The
+stats-enabled ownership pass completed c1, c4, and basebackup correctness; the
+connection stats showed `noncanonical_recv_cq_polls=0`,
+`bootstrap_unexpected_wimm=0`, `canonical_unexpected_opcode=0`, and
+`stale_recv_cq_collector_actions=0` on active connections. The installed runtime
+was restored to no-stats binaries afterward.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)
@@ -212,7 +234,7 @@ services measured `4.32 s`, `4.17 s`, `4.16 s`, and `4.24 s`, so the warmed
   CPU-publishes frontend visibility.
 - [`HomerPeerRecvDispatcher`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:215)
   is the current permanent recv dispatcher for steady-state WIMM CQEs.
-- [`TupleSinkServiceDecodePeerDoorbellImmediate()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:567)
+- [`TupleSinkServiceDecodePeerDoorbellImmediate()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:606)
   implements the v14 immediate-data kind/token decoder.
 - [`TupleSinkServiceDrainPeerConnectionEvents()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3955)
   no longer accepts optional semantic handlers. It still combines recv-CQ and
@@ -1868,24 +1890,48 @@ Acceptance:
 
 Slice 2F, final recv-CQ ownership cleanup:
 
+Implementation status: landed on June 22, 2026.
+
 Current code pointers:
 
-- [`TupleSinkServiceRecvCqPhaseAllowsPoll()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:825)
-  is still too permissive because it accepts both `BOOTSTRAP` and `CANONICAL`
-  without knowing which caller is polling.
-- Outgoing bootstrap currently polls the recv CQ directly through
-  `TupleSinkServicePollCompletionOnce(connectionState->recvCompletionQueue,
-  IBV_WC_RECV, ...)` at
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3593`.
-- Incoming bootstrap currently has the same direct recv-CQ poll at
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3717`.
-- [`TupleSinkServiceFinishPeerConnectionSetup()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3408)
-  is the intended handoff point into canonical ownership.
-- [`TupleSinkServiceDrainPeerConnectionEventsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4075)
-  is still a public combined recv-CQ/CM drain wrapper and must be deleted.
-- The scheduled peer pump currently owns the two steady-state recv-CQ call sites:
-  outgoing at `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7635`
-  and incoming at `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7753`.
+- [`TupleSinkServiceValidateRecvCqPollOwner()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:870)
+  is the role-specific owner check. It accepts only
+  `HOMER_RECV_CQ_POLL_BOOTSTRAP_SETUP` in bootstrap wait phases and only
+  `HOMER_RECV_CQ_POLL_CANONICAL_COLLECTOR` after the ready dispatcher handoff.
+- [`TupleSinkServicePollBootstrapRecvCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1582)
+  is the only bootstrap recv-CQ poller. The outgoing and incoming bootstrap
+  setup paths call it at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3801`
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3925`.
+- [`TupleSinkServicePollBootstrapSendCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1523)
+  remains the send-CQ-only bootstrap helper. It is deliberately separate from
+  recv-CQ ownership.
+- [`TupleSinkServiceFinishPeerConnectionSetup()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3579)
+  is the only handoff into canonical ownership. It checks bootstrap owner state,
+  completed send/receive bootstrap CQEs, a valid peer descriptor, and permanent
+  dispatcher installation; then posts steady-state notification receives, sets
+  `setupPhase = READY`, sets owner phase to `CANONICAL`, and finally publishes
+  `bootstrapComplete = true`.
+- [`TupleSinkServiceDrainCanonicalRecvCq()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4290)
+  is the sole steady-state recv-CQ drain. It is static and is reached through
+  [`TupleSinkServiceDrainRecvCqCollectorAction()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4476),
+  which revalidates connection index, generation, and traffic class before
+  polling.
+- [`TupleSinkServiceDrainPeerConnectionCmEvents()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4536)
+  is now physically CM-only and remains callable by write-preparation and
+  peer-control helper paths until their later ownership cleanup.
+- [`TupleSinkServicePumpPeerRequestsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7639)
+  is the only steady-state caller that builds recv-CQ collector actions. The
+  outgoing and incoming scheduled action call sites are at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7886`
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:8011`.
+- `TupleSinkServiceDrainPeerConnectionEventsRdma()`,
+  `TupleSinkServiceDrainPeerConnectionEvents()`,
+  `TupleSinkServiceDrainPeerConnectionRecvCq()`,
+  `TupleSinkServiceRecvCqPhaseAllowsPoll()`, and
+  `TupleSinkServicePollCompletionOnce()` have zero references after 2F.
 
 2F contract:
 
@@ -1907,7 +1953,7 @@ the permanent dispatcher become active. After the handoff, bootstrap polling
 must never run again; WIMMs that arrive around the handoff remain queued in the
 hardware CQ until the first canonical collector pass.
 
-Implementation steps:
+Implemented steps:
 
 ```text
 1. Replace TupleSinkServiceRecvCqPhaseAllowsPoll() with role-specific validation.
@@ -2069,18 +2115,14 @@ bootstrapUnexpectedWimm remains zero
 Remaining caveats from completed Slice 2 stages:
 
 ```text
-Single recv-CQ ownership is not fully enforced yet. Owner phases exist, but 2F
-still needs to make the canonical collector the only post-bootstrap recv-CQ poll
-entry point, not merely require the connection to be in CANONICAL.
-
 Control typed readiness is correct but not indexed. controlMailboxReady is now
 the right semantic fact, but the service still scans active connections to find
 ready control mailboxes. An indexed ready-connection structure remains follow-up
 work.
 
-Some older KB pointers may still describe combined recv-CQ/CM draining or
-residual completion FIFO state that has already been removed. Keep updating those
-as touched; they do not block 2E.
+Some older KB pointers may still describe residual completion FIFO state that
+has already been removed. Keep updating those as touched; they do not block the
+next slice.
 ```
 
 Use the kind-specific direct binding tables defined in Slice 2A for stale-token
@@ -2573,8 +2615,8 @@ empty critical polls per transaction
 | Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
 | Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
-| Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work              |
-| Slice 2F    | Implementation-ready with role-specific recv-CQ ownership contract and wrapper deletion |
+| Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work            |
+| Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |

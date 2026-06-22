@@ -38,7 +38,7 @@ payload namespace.
 
 [`HomerPeerRecvDispatcher`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:215)
 is installed when
-[`TupleSinkServiceCreatePeerTransportState()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5093)
+[`TupleSinkServiceCreatePeerTransportState()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5419)
 creates the peer transport. The dispatcher currently has one service callback,
 `onClientCompletion`, because peer-client completion publication must access the
 service session table to validate the v27 body/seal and CPU-publish frontend
@@ -47,9 +47,10 @@ ready state.
 Command, payload, and control event materialization remains inside the transport
 for this checkpoint because their existing pending structures are
 transport-owned. The recv-CQ collector decodes every WIMM CQE through
-[`TupleSinkServiceDecodePeerDoorbellImmediate()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:567)
+[`TupleSinkServiceDecodePeerDoorbellImmediate()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:606)
 and then dispatches by kind inside
-[`TupleSinkServiceDrainPeerConnectionEvents()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3955).
+[`TupleSinkServiceDrainCanonicalRecvCq()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4290),
+which is the static scheduled steady-state recv-CQ owner after Slice 2F.
 
 The service-level peer pump no longer supplies per-grant optional completion
 handlers. Its permanent completion bridge is
@@ -94,18 +95,15 @@ completion handler. There is no intermediate completion-token FIFO producer left
 to preserve.
 
 This checkpoint intentionally does not complete every planned Slice 2 item from
-the future-direction plan. The next slices should still implement:
+the future-direction plan. Later Slice 2 work has since completed the recv-CQ
+dispatcher cleanup, command/control/payload FIFO deletion or replacement, and
+strict recv-CQ ownership. Remaining related work is narrower:
 
 - direct kind-specific binding tables for command, completion, and payload
-  tokens;
-- split recv-CQ and CM drain APIs;
-- explicit bootstrap/canonical/teardown recv-CQ owner phases;
-- typed completion ready state, then deletion of residual
-  `pendingClientCompletionDoorbell*` fields and cleanup helpers;
-- typed command, control, and payload ready state, followed by deletion of their
-  legacy pending arrays/counters;
-- final assertion/debug counter that rejects any noncanonical steady-state
-  recv-CQ poll.
+  tokens where they are not already direct-indexed;
+- direct command ready bits to replace the remaining session mailbox scan;
+- an indexed ready-connection structure for control mailbox readiness;
+- detailed payload-ready counters, if future diagnostics need them.
 
 Do not reintroduce optional semantic handlers or a generic CQE/token FIFO as a
 replacement for those typed states.
@@ -116,23 +114,53 @@ control mailbox protocol version is
 `2`, because the publication semantics changed even though the shared mailbox
 layout still retains the old `publishedTail` word. The sender-side publication
 point,
-[`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4452),
+[`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4705),
 now posts one full-message `RDMA_WRITE_WITH_IMM` directly to the remote mailbox
 slot. It no longer posts a separate body WRITE followed by an 8-byte
 `publishedTail` WIMM.
 
 On the receiver,
-[`TupleSinkServiceQueuePeerControlDoorbellRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:614)
+[`TupleSinkServiceQueuePeerControlDoorbellRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:697)
 turns each decoded control CQE into `controlDoorbellArrivedTail` and the
 level-triggered `controlMailboxReady` bit. It fails the connection if the CQE
 frontier would overrun the local control mailbox ring. The mailbox precheck and
 consumer,
-[`TupleSinkServiceLocalMailboxMayHaveMessage()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4366)
+[`TupleSinkServiceLocalMailboxMayHaveMessage()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4619)
 and
-[`TupleSinkServiceTryConsumeLocalMailbox()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4390),
+[`TupleSinkServiceTryConsumeLocalMailbox()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4643),
 only drain while `consumedHead < controlDoorbellArrivedTail`. They no longer
 observe remote `publishedTail` as a semantic readiness source and no longer have
 stale-late-doorbell reconciliation.
+
+Slice 2F now makes recv-CQ ownership strict. The owner check is
+[`TupleSinkServiceValidateRecvCqPollOwner()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:870).
+Bootstrap setup may poll only through
+[`TupleSinkServicePollBootstrapRecvCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1582),
+which accepts only the ordinary bootstrap `IBV_WC_RECV` with bootstrap
+`wr_id == 0` and rejects `IBV_WC_RECV_RDMA_WITH_IMM`. Send bootstrap polling is
+separate in
+[`TupleSinkServicePollBootstrapSendCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1523)
+and does not participate in recv-CQ ownership.
+
+The handoff point is
+[`TupleSinkServiceFinishPeerConnectionSetup()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3579):
+it verifies bootstrap owner state, completed bootstrap send/receive CQEs, a
+valid peer descriptor, and permanent dispatcher installation; posts
+steady-state notification receives; then sets `setupPhase = READY`, owner phase
+`CANONICAL`, and finally `bootstrapComplete = true`. After that point, the only
+steady-state recv-CQ drain is
+[`TupleSinkServiceDrainCanonicalRecvCq()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4290),
+reached through the generation-checked
+[`TupleSinkServiceDrainRecvCqCollectorAction()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4476)
+from the scheduled peer pump. RDMA-CM polling is physically separate in
+[`TupleSinkServiceDrainPeerConnectionCmEvents()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4536).
+
+The public combined drain wrapper `TupleSinkServiceDrainPeerConnectionEventsRdma()`
+and the old combined implementation `TupleSinkServiceDrainPeerConnectionEvents()`
+are deleted. A zero-reference audit also found no
+`TupleSinkServiceDrainPeerConnectionRecvCq()`,
+`TupleSinkServiceRecvCqPhaseAllowsPoll()`, or
+`TupleSinkServicePollCompletionOnce()` references.
 
 ## Validation Evidence
 
@@ -214,6 +242,43 @@ remote c1 -t 100000: 100000/100000 transactions, 0 failures, 3951 TPS, p99 0.281
 remote c4 warmup:    40000/40000 transactions, 0 failures, 9798 TPS, p99 0.622 ms
 remote c4 measured1: 40000/40000 transactions, 0 failures, 9602 TPS, p99 0.631 ms
 remote c4 measured2: 40000/40000 transactions, 0 failures, 9489 TPS, p99 0.685 ms
+```
+
+Slice 2F recv-CQ ownership validation:
+
+```text
+No-stats build/install/sync:
+    sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+    sudo -n -u dbcomm make install-headers install-service-bin install
+    rsync installed prefix to farnet0
+
+Remote c1 cold:
+    2000/2000 transactions, 0 failures
+
+Remote c1 warm:
+    5000/5000 transactions, 0 failures, 3954 TPS, p99 0.275 ms
+
+Remote c4:
+    48000/48000 transactions, 0 failures, 9761 TPS, p99 0.666 ms
+
+Remote RDMA basebackup:
+    run1 5.44 s
+    run2 4.22 s
+    run3 4.16 s
+    run4 4.15 s
+    warmed band 4.15-4.22 s
+
+Stats-enabled ownership pass:
+    c1 1000/1000, 0 failures
+    c4 4000/4000, 0 failures
+    remote RDMA basebackup completed
+    noncanonical_recv_cq_polls=0
+    bootstrap_unexpected_wimm=0
+    canonical_unexpected_opcode=0
+    stale_recv_cq_collector_actions=0
+
+Post-validation:
+    runtime restored to no-stats binaries and synced to farnet0
 ```
 
 Slice 2D0a recv-CQ owner-phase scaffolding validation:
