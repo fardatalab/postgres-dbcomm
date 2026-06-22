@@ -67,6 +67,13 @@ c4 band to roughly `9.2k-9.7k TPS`.
 Do not add new optional handlers or expand the generic FIFO/stash path while
 implementing later slices.
 
+Slice 2B is also complete for peer-client completion FIFO cleanup. It removed
+the residual `pendingClientCompletionDoorbell*` fields, the completion FIFO
+consume helper, and the unused optional handler typedefs. A zero-reference check
+for those symbols returned empty, and remote c1/c4 validation stayed in the
+Slice 1/2A band. This narrows the next Slice 2 work to command, control, and
+payload typed readiness plus the larger split collector/owner-phase changes.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)
@@ -1172,9 +1179,11 @@ old semantic storage still temporarily present
 Slice 2B, client-completion migration:
 
 ```text
-use session->clientCompletionReceiver.pendingDoorbellCount
-use session->clientCompletionReceiver.pendingPublication
-use pendingCompletionPublicationSessions
+validated as a cleanup-only stage after the v14 permanent dispatcher:
+    peer-client completion WIMM CQEs are handled immediately
+    matching CQEs CPU-publish readyEpochSlots
+    stale CQEs are discarded by the session-generation check
+    no intermediate completion-token FIFO producer remains
 ```
 
 Delete immediately after targeted validation:
@@ -1185,6 +1194,8 @@ pendingClientCompletionDoorbellHead
 pendingClientCompletionDoorbellCount
 TupleSinkServicePopPeerClientCompletionDoorbell
 TupleSinkServiceDrainQueuedPeerClientCompletionDoorbells
+TupleSinkServiceConsumePeerClientCompletionDoorbellRdma
+unused optional doorbell-handler typedefs
 ```
 
 This is the first family removed because the v27 completion protocol already

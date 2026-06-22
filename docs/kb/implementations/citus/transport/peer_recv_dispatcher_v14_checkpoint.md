@@ -79,7 +79,23 @@ After that correction, c4 recovered to the Slice 1 performance band.
 
 ## Remaining Slice 2 Work
 
-This checkpoint intentionally does not complete every planned Slice 2A item from
+Slice 2B followed this checkpoint and removed the now-dead peer-client
+completion FIFO state:
+
+- `pendingClientCompletionDoorbellHead`;
+- `pendingClientCompletionDoorbellCount`;
+- `pendingClientCompletionDoorbellTokens`;
+- `TupleSinkServiceConsumePeerClientCompletionDoorbellRdma()`;
+- the unused optional command/completion doorbell handler typedefs.
+
+This was a cleanup stage, not a new retry-state implementation. After v14, the
+canonical recv-CQ dispatcher handles peer-client completion WIMM CQEs
+immediately. A matching CQE validates and CPU-publishes the frontend-ready epoch;
+a stale CQE is discarded by the session-generation check in the receiver-side
+completion handler. There is no intermediate completion-token FIFO producer left
+to preserve.
+
+This checkpoint intentionally does not complete every planned Slice 2 item from
 the future-direction plan. The next slices should still implement:
 
 - direct kind-specific binding tables for command, completion, and payload
@@ -126,3 +142,20 @@ measured2: 40000/40000 transactions, 0 failures, 9188 TPS, p99 0.658 ms
 Service logs on both hosts showed normal RDMA setup and session lifecycle
 messages, with no immediate decode errors, completion seal mismatch, descriptor
 mismatch, or failed-transaction symptoms.
+
+Slice 2B cleanup validation:
+
+```text
+Build/install: passed with CPPFLAGS='-D_GNU_SOURCE'
+Zero-reference check: no remaining pendingClientCompletionDoorbell,
+    TupleSinkServiceConsumePeerClientCompletionDoorbellRdma,
+    PeerCommandDoorbellHandler, PeerClientCompletionDoorbellHandler, or
+    clientCompletionDoorbellHandler references
+
+remote c1 -t 1000:   1000/1000 transactions, 0 failures, 500 TPS cold including setup
+remote c1 -t 100000: 100000/100000 transactions, 0 failures, 3924 TPS, p99 0.281 ms
+
+remote c4 warmup:    40000/40000 transactions, 0 failures, 9785 TPS, p99 0.614 ms
+remote c4 measured1: 40000/40000 transactions, 0 failures, 9704 TPS, p99 0.631 ms
+remote c4 measured2: 40000/40000 transactions, 0 failures, 9497 TPS, p99 0.679 ms
+```
