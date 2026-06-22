@@ -150,6 +150,24 @@ zero failures; warm c1 `5000/5000`, zero failures, `3816 TPS`, p99 `0.295 ms`;
 remote RDMA basebackup completed successfully in `5.96 s`; short c4
 `12000/12000`, zero failures, `9458 TPS`, p99 `0.664 ms`.
 
+Slice 2E-B is now landed as the direct service materialization checkpoint.
+Payload recv-CQ CQEs call the narrow permanent `onPayloadReady` dispatcher;
+the service decodes the payload token, validates stream index, token
+generation, peer binding, connection generation, and traffic class, then
+coalesces readiness into fixed per-traffic-class array-backed queues. Scheduler
+candidate construction appends exact queued payload-stream candidates without
+claiming them; selected payload executors claim and recheck the stream before
+draining. The dense aggregate payload scan is not appended in the same pass as
+exact queued payload-doorbell candidates, so receive-doorbell discovery no
+longer depends on the broad active-stream scan. The legacy pending-array fields
+and helper APIs still exist but no longer drive recv-CQ payload materialization
+or scheduler readiness. Validation used no-stats binaries, rebuilt and
+installed as `dbcomm`, synced to `farnet0`, then restarted both Homer services:
+remote cold c1 `2000/2000`, zero failures with one cold outlier; warm c1
+`5000/5000`, zero failures, `3839 TPS`, p99 `0.287 ms`; short c4
+`12000/12000`, zero failures, `9505 TPS`, p99 `0.636 ms`; remote RDMA
+basebackup completed successfully in `5.97 s`.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)
@@ -2353,7 +2371,7 @@ empty critical polls per transaction
 | Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
 | Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
-| Slice 2E    | 2E-A landed; 2E-B/2E-C remain as staged payload ready-queue and legacy-delete work     |
+| Slice 2E    | 2E-A and 2E-B landed; 2E-C remains as legacy pending-array/API deletion and counter work |
 | Slice 2F    | Follow-up ownership cleanup; enforce canonical recv-CQ poll owner and delete leftovers |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
