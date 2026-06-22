@@ -168,6 +168,18 @@ remote cold c1 `2000/2000`, zero failures with one cold outlier; warm c1
 `12000/12000`, zero failures, `9505 TPS`, p99 `0.636 ms`; remote RDMA
 basebackup completed successfully in `5.97 s`.
 
+Slice 2E-C is now landed as the legacy pending-array deletion checkpoint. The
+connection-local `pendingDataDoorbell*` fields and
+`TupleSinkServiceConsumePeerDataDoorbellRdma()` /
+`TupleSinkServicePeerDataDoorbellPendingRdma()` APIs are deleted, and the
+post-delete zero-reference check for those names returned no matches.
+`receivePayloadDoorbellPending` remains intentionally as executor-local
+already-claimed drain state, not as a transport FIFO shadow. Validation stayed
+correct and performance-neutral: remote cold c1 `2000/2000`, zero failures with
+the same one-time cold outlier shape; warm c1 `5000/5000`, zero failures,
+`3878 TPS`, p99 `0.282 ms`; short c4 `12000/12000`, zero failures, `9726 TPS`,
+p99 `0.651 ms`; remote RDMA basebackup completed successfully in `5.81 s`.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)
@@ -2371,7 +2383,7 @@ empty critical polls per transaction
 | Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
 | Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
-| Slice 2E    | 2E-A and 2E-B landed; 2E-C remains as legacy pending-array/API deletion and counter work |
+| Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work              |
 | Slice 2F    | Follow-up ownership cleanup; enforce canonical recv-CQ poll owner and delete leftovers |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |

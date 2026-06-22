@@ -7,9 +7,8 @@
   generation-bearing payload tokens, peer-open token exchange, sender use of the
   peer token in payload `WRITE_WITH_IMM` immediates, and direct recv-CQ
   materialization into service-owned fixed payload ready queues.
-- **What this doc does NOT cover**: final deletion of the legacy
-  `pendingDataDoorbell*` fields/APIs or the planned detailed payload-ready
-  diagnostic counters. Those remain Slice 2E-C work.
+- **What this doc does NOT cover**: the planned detailed payload-ready
+  diagnostic counters. Those remain follow-up work after Slice 2E-C.
 - **Primary code**: `/data/dbcomm/citus-dbcomm`
 - **Design source**:
   [`homer_completion_publication_v27_recovery_plan.md`](../../../future-directions/citus/transport/homer_completion_publication_v27_recovery_plan.md)
@@ -123,15 +122,24 @@ discovery does not pay the broad active-stream scan.
 
 ## Legacy State
 
-The legacy transport fields
-[`pendingDataDoorbellCount`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:498)
-and
-[`pendingDataDoorbellSinkIds`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:505)
-still exist after Slice 2E-B, along with
-[`TupleSinkServiceConsumePeerDataDoorbellRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6837)
-and `TupleSinkServicePeerDataDoorbellPendingRdma()`. They are no longer driven
-by the recv-CQ payload path or scheduler readiness path. Slice 2E-C should
-delete these fields/APIs and add zero-reference checks.
+Slice 2E-C deletes the legacy transport pending-array state and helper APIs.
+The zero-reference check after implementation was:
+
+```sh
+rg -n "pendingDataDoorbell|TupleSinkServiceConsumePeerDataDoorbellRdma|TupleSinkServicePeerDataDoorbellPendingRdma" \
+  /data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.[ch] \
+  /data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c
+```
+
+It returned no matches.
+
+[`receivePayloadDoorbellPending`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1248)
+intentionally remains. It is no longer a transport pending-array shadow. It is
+executor-local drain state set after
+[`HomerServiceClaimPayloadReadyForStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18759)
+claims a coalesced ready-queue entry, and it keeps the receiver draining an
+already-doorbelled ring across budget/backpressure boundaries without requiring
+another CQE.
 
 ## Validation
 
@@ -160,12 +168,21 @@ Evidence from June 22, 2026:
 - Slice 2E-B remote c4 smoke: `12000/12000`, zero failures, `9505 TPS`, p99
   `0.636 ms`.
 - Slice 2E-B remote RDMA basebackup: completed successfully in `5.97 s`.
+- Slice 2E-C zero-reference check for legacy pending-array symbols returned no
+  matches.
+- Slice 2E-C build/install: `sudo -n -u dbcomm make -B -j8 service-bin
+  client-bin CPPFLAGS='-D_GNU_SOURCE'` plus `make install-headers
+  install-service-bin install` completed successfully.
+- Slice 2E-C remote c1 cold smoke: `2000/2000`, zero failures. This had the
+  same one-time cold outlier shape as 2E-B and reported `875 TPS`, so it is
+  diagnostic only.
+- Slice 2E-C remote c1 warmed smoke: `5000/5000`, zero failures, `3878 TPS`,
+  p99 `0.282 ms`.
+- Slice 2E-C remote c4 smoke: `12000/12000`, zero failures, `9726 TPS`, p99
+  `0.651 ms`.
+- Slice 2E-C remote RDMA basebackup: completed successfully in `5.81 s`.
 
 ## Remaining Work
 
-- Slice 2E-C: delete `pendingDataDoorbellSinkIds`,
-  `pendingDataDoorbellCount`,
-  `TupleSinkServiceConsumePeerDataDoorbellRdma()`, and
-  `TupleSinkServicePeerDataDoorbellPendingRdma()`.
 - Add the planned counters for payload token decode, binding lookup, enqueue,
   stale-token errors, queue compaction, and fallback discovery.
