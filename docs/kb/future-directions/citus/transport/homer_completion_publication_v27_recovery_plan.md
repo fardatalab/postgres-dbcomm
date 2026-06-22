@@ -1431,10 +1431,30 @@ payload token scans
 payload pending/consume helpers
 ```
 
+Decision after Slice 2D1:
+
+```text
+Use a dedicated generation-bearing payload doorbell token, an O(1)
+service-stream lookup, and a service-owned intrusive ready list.
+
+Do not retain serviceSinkId as the immediate token, and do not build a direct
+map keyed by serviceSinkId.
+
+serviceSinkId is a semantic identifier, not a safe transport binding:
+    it has no generation encoded in the immediate
+    it is wider than the 30-bit token namespace
+    it does not directly identify a fixed stream-table slot
+    reusing or resolving it still requires separate lookup and lifetime machinery
+
+The payload token is an opaque receiver-issued capability that identifies one
+local payload stream table slot and one allocation generation.
+```
+
 Pre-implementation finding after Slice 2D1:
 
 ```text
-2E is not yet a mechanical cleanup.
+2E is no longer blocked, but it must be implemented through the staged token and
+ready-list plan below rather than as a mechanical cleanup.
 
 Current code:
     TupleSinkServiceQueuePeerPayloadDoorbellRdma() is the recv-CQ materializer.
@@ -1455,31 +1475,308 @@ Implication:
 ```
 
 Do not replace `pendingDataDoorbellSinkIds[]` with another transport-local FIFO
-or scan. Before coding 2E, settle the payload-doorbell ownership contract:
+or scan. The payload-doorbell ownership contract is now:
 
 ```text
-Preferred shape:
-    make payload doorbells a fixed permanent dispatcher callback, like
+Accepted shape:
+    make payload doorbells one fixed permanent dispatcher callback, like
     peer-client completion, not an optional per-grant handler
-    encode a payload binding token with stream index plus generation, or prove
-    that the existing serviceStreamId lookup is bounded/direct enough
-    validate connection generation, stream active state, peer binding state,
-    stream generation/token generation, and traffic class at CQE time
-    append HomerServicePayloadStreamEntry to the intrusive ready list exactly
+    encode a payload binding token with stream index plus generation
+    validate connection generation, stream active state, stream generation,
+    token generation, peer binding state, and traffic class at CQE time
+    append HomerServicePayloadStreamEntry to an intrusive ready list exactly
     once while recvReadyEnqueued is false
     have the payload executor unlink/requeue in O(1) after draining work
 
-Rejected shortcut:
+Rejected shortcuts:
+    keep serviceSinkId as the immediate token
+    build a direct map keyed by serviceSinkId
     keep the current transport-owned sink-id array and merely add a service-side
     scan over it. That preserves the old ownership leak and does not satisfy the
     Slice 2E deletion gate.
 ```
 
-This needs a small design decision before implementation: whether the payload
-token ABI changes now to an index/generation binding or whether the current
-service-stream id remains the token and is resolved through a precomputed direct
-array. The answer affects the immediate-data ABI and stale-token behavior, so do
-not improvise it inside the 2E patch.
+2E.0 - Define payload token ABI v15:
+
+```text
+Keep the v14 top-level immediate layout:
+    bits 31:30 = kind
+    bits 29:0  = kind-local token
+
+Payload kind-local token:
+    bits 29:12 = token generation, 18 bits
+    bits 11:0  = payload stream index + 1, 12 bits
+
+#define HOMER_PAYLOAD_TOKEN_INDEX_BITS       12U
+#define HOMER_PAYLOAD_TOKEN_INDEX_MASK       UINT32_C(0x00000fff)
+#define HOMER_PAYLOAD_TOKEN_GENERATION_SHIFT 12U
+#define HOMER_PAYLOAD_TOKEN_GENERATION_MASK  UINT32_C(0x0003ffff)
+
+token = (tokenGeneration << 12) | (streamIndex + 1U)
+
+Rules:
+    encoded index zero is invalid
+    generation zero is invalid
+    static assert that CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS <= 4095
+    do not silently wrap the 18-bit generation
+    force peer connection reset before token generation would wrap
+    bump CITUS_REMOTE_EXEC_PEER_PROTOCOL_VERSION from 14 to 15
+
+Helpers:
+    HomerEncodePayloadDoorbellToken(streamIndex, tokenGeneration, tokenOut)
+    HomerDecodePayloadDoorbellToken(token, streamIndexOut, tokenGenerationOut)
+```
+
+2E.1 - Exchange receiver-issued tokens during stream open:
+
+```text
+Keep service sink ids for semantic identity and diagnostics.
+
+Add peer stream-open fields:
+    uint32_t localPayloadDoorbellToken;  // request
+    uint32_t peerPayloadDoorbellToken;   // response
+
+Receiver allocates its token only after:
+    stream table entry is active
+    stream generation is fixed
+    peer connection and traffic class are bound
+
+Peer stores the returned token in its outgoing stream state and uses it for every
+payload WIMM targeting that local stream.
+
+Direction semantics:
+    local receive stream: WIMM means new payload/frontier is available
+    local send stream:    WIMM means remote consumed-head/credit state changed
+
+No additional immediate kind is needed.
+```
+
+2E.2 - Keep token generations outside resettable stream entries:
+
+```text
+Do not store the only generation counter inside HomerServicePayloadStreamEntry,
+because stream reclamation can memset that entry.
+
+Add service-lifetime storage:
+    uint32_t PayloadDoorbellTokenGenerations[CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS];
+
+On stream allocation:
+    generation = ++PayloadDoorbellTokenGenerations[streamIndex]
+    generation &= HOMER_PAYLOAD_TOKEN_GENERATION_MASK
+    if generation == 0, require peer connection reset before reuse
+    store resulting token and generation in the live stream entry
+```
+
+2E.3 - Add one permanent payload dispatcher callback:
+
+```text
+Extend HomerPeerRecvDispatcher with exactly one additional service callback:
+
+bool (*onPayloadReady)(
+    TupleSinkServicePeerConnectionHandle *connection,
+    uint64_t connectionGeneration,
+    uint32_t payloadToken,
+    void *context,
+    char *error,
+    size_t errorBytes);
+
+Do not restore generic callbacks for command and control. The rejected
+all-callback version dropped c4 to roughly 7.7k-8.8k TPS; this narrow callback
+does one direct O(1) lookup and leaves command/control transport-local.
+
+Callback allowed work:
+    decode stream index and token generation
+    validate index
+    load stream entry directly
+    validate active state, token generation, stream generation, connection
+    handle, connection generation, peer binding, and traffic class
+    enqueue the stream if it is not already ready
+
+Callback forbidden work:
+    scan the stream table
+    inspect or drain payload records
+    run the payload executor
+    allocate memory
+    format logs on success
+
+A stale token is a transport lifetime violation. Mark the stream/connection
+failed rather than silently dropping it.
+```
+
+2E.4 - Add service-owned ready lists:
+
+```c
+typedef struct HomerPayloadReadyList
+{
+    uint32_t head;
+    uint32_t tail;
+    uint32_t count;
+} HomerPayloadReadyList;
+
+HomerPayloadReadyList PayloadReadyLists[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+```
+
+Use `UINT32_MAX` as the invalid index. Add to each payload stream entry:
+
+```c
+bool recvReadyEnqueued;
+uint32_t recvReadyPrevious;
+uint32_t recvReadyNext;
+uint64_t recvReadyStreamGeneration;
+uint32_t payloadDoorbellTokenGeneration;
+uint32_t localPayloadDoorbellToken;
+uint32_t peerPayloadDoorbellToken;
+```
+
+List helpers:
+
+```text
+HomerServiceEnqueuePayloadReady(service, streamIndex)
+HomerServiceRemovePayloadReady(service, streamIndex)
+HomerServiceClaimPayloadReady(service, streamIndex, streamGeneration)
+```
+
+Invariants:
+
+```text
+a stream appears in at most one list
+its list corresponds to its bound traffic class
+repeated WIMMs coalesce while recvReadyEnqueued is true
+stream reclamation removes it from the list before the entry is cleared
+list entries always carry/validate the current stream generation
+```
+
+2E.5 - Integrate the list with the scheduler safely:
+
+```text
+Do not unlink streams while merely constructing candidates. A candidate may be
+built but not selected.
+
+Candidate construction traverses the ready list and emits:
+
+typedef struct HomerPayloadReadyCandidate
+{
+    uint32_t streamIndex;
+    uint64_t streamGeneration;
+    HomerTransportTrafficClass trafficClass;
+} HomerPayloadReadyCandidate;
+
+At executor entry:
+    validate index and generation
+    claim and unlink the stream
+    drain within granted record/byte/WR budget
+    recheck the underlying ring/frontier
+    re-enqueue at tail if unread payload remains, budget was exhausted with more
+    ready work, or a temporary dependency prevented draining
+    leave it off-list only after a stable empty recheck
+
+Only receive-side payload readiness discovery moves from the broad stream scan
+to this list. Producer-side outgoing payload discovery can keep existing indexed
+facts until its own scheduler work is completed.
+```
+
+2E.6 - Define stream close and token invalidation:
+
+```text
+Do not release the payload binding merely because a close request was received.
+
+Release only after existing stream state proves:
+    peer can no longer post new payload WIMMs
+    final payload/EOS frontier has been observed
+    local receive ring is drained through that frontier
+    stream is not on a payload ready list
+    no payload executor action references its generation
+    peer close/lifetime protocol permits reclamation
+
+Then:
+    remove it from any ready list
+    mark token binding inactive
+    clear connection binding
+    preserve the external token-generation counter for the next allocation
+    reclaim the stream entry
+
+A payload WIMM received after binding invalidation on the same connection
+generation is a protocol error and should reset the affected connection.
+```
+
+2E.7 - Delete legacy payload pending state:
+
+```text
+After direct-token and ready-list validation, delete:
+    pendingDataDoorbellSinkIds
+    pendingDataDoorbellCount
+    TupleSinkServiceQueuePeerPayloadDoorbellRdma
+    TupleSinkServiceConsumePeerDataDoorbellRdma
+    TupleSinkServicePeerDataDoorbellPendingRdma
+
+Also delete receivePayloadDoorbellPending after zero-reference check proves the
+intrusive ready state fully replaces it.
+```
+
+Recommended commit staging:
+
+```text
+2E-A Token protocol:
+    peer protocol v15
+    token encode/decode helpers
+    stream token generation and lifecycle
+    peer open request/response token exchange
+    sender uses new payload token
+    existing pending array remains temporarily as materialization target
+
+2E-B Direct service materialization:
+    add permanent onPayloadReady callback
+    add direct stream lookup and validation
+    add intrusive ready lists
+    switch receive-side scheduler readiness to the lists
+    keep legacy array only behind diagnostic comparison macro for one stats run;
+    it must not drive execution
+
+2E-C Delete legacy state:
+    remove pending sink-id array and APIs
+    remove legacy stream pending flag
+    add zero-reference checks
+    run full acceptance
+```
+
+Required tests and counters:
+
+```text
+Tests:
+    encode/decode boundary stream indexes and generations
+    reject zero token, zero generation, and out-of-range index
+    reject stale token generation
+    reject wrong connection generation
+    reject wrong traffic class
+    reject closed/reused stream entry
+    two or more WIMMs for one stream produce one ready-list node
+    multiple unread ring records drain after coalesced WIMMs
+    multiple streams in one traffic class make round-robin progress
+    concurrent foreground and bulk lists retain class priority
+    stream close while enqueued removes the node safely
+    ring wrap and EOS remain correct
+    remote pgbench c1/c4
+    local and remote basebackup
+    concurrent c4 plus remote basebackup
+
+Counters:
+    payloadDoorbellsDecoded
+    payloadDoorbellBindingLookups
+    payloadDoorbellBindingFailures
+    payloadReadyEnqueues
+    payloadReadyAlreadyEnqueued
+    payloadReadyClaims
+    payloadReadyRequeues
+    payloadReadyListHighWater
+    payloadStaleTokenErrors
+    payloadReadyFallbackDiscoveries
+
+Acceptance:
+    payloadReadyFallbackDiscoveries = 0
+    payloadStaleTokenErrors = 0
+    no legacy pending-array references
+    no payload stream scan used for receive-doorbell discovery
+```
 
 Slice 2F, final ownership cleanup:
 
@@ -1495,6 +1792,23 @@ require that counter to remain zero in c1, c4, and basebackup validation
 Bootstrap/setup code may retain setup-specific polling until the permanent
 dispatcher is installed. After `bootstrapComplete`, a debug assertion rejects
 any noncanonical recv-CQ poll.
+
+Remaining caveats from completed Slice 2 stages:
+
+```text
+Single recv-CQ ownership is not fully enforced yet. Owner phases exist, but 2F
+still needs to make the canonical collector the only post-bootstrap recv-CQ poll
+entry point, not merely require the connection to be in CANONICAL.
+
+Control typed readiness is correct but not indexed. controlMailboxReady is now
+the right semantic fact, but the service still scans active connections to find
+ready control mailboxes. An indexed ready-connection structure remains follow-up
+work.
+
+Some older KB pointers may still describe combined recv-CQ/CM draining or
+residual completion FIFO state that has already been removed. Keep updating those
+as touched; they do not block 2E.
+```
 
 Use the kind-specific direct binding tables defined in Slice 2A for stale-token
 protection. The dispatcher resolves:
@@ -1986,7 +2300,8 @@ empty critical polls per transaction
 | Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
 | Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
-| Slice 2E/F  | Blocked on payload-doorbell ownership contract; do not improvise token/binding design |
+| Slice 2E    | Implementation-ready as staged 2E-A/2E-B/2E-C payload token and ready-list work       |
+| Slice 2F    | Follow-up ownership cleanup; enforce canonical recv-CQ poll owner and delete leftovers |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
