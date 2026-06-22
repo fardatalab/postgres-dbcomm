@@ -3681,6 +3681,14 @@ Current suspicion to review before implementation:
 The next implementation step is not QP/CQ isolation. First fix the frontend
 client-completion publication contract that the trigger run exposed.
 
+Follow-on audit note: this section records the v26 diagnosis and temporary
+correctness bridge. The current canonical recovery plan is
+[`homer_completion_publication_v27_recovery_plan.md`](homer_completion_publication_v27_recovery_plan.md).
+That plan corrects two points here: `ibv_query_qp_data_in_order()` returning
+zero does not by itself prove cross-WQE body/ready reordering, and the target
+peer-client completion publication shape should be one full-slot
+`RDMA_WRITE_WITH_IMM`, not body WRITE plus scratch WIMM.
+
 Planned/current fix:
 
 1. Replace the leading `bodyEpoch` proof in the client-completion slot with a
@@ -3760,11 +3768,12 @@ Implementation/validation note from June 21, 2026:
   still stale or mixed.
 - The service log on both hosts reported
   `RDMA write data-in-order caps=0x0 whole-message=false aligned-128=false`.
-  That invalidated the remaining v25 assumption that a peer RDMA WRITE WITH IMM
-  to the frontend-polled ready word could serve as the final host-client
-  publication gate. On this hardware, directly RDMA-writing
-  `readyEpochSlots[slot]` can make the CPU client observe ready before the
-  previous body WRITE is coherent.
+  This capability query does not directly prove that separate body/ready WQEs
+  are unordered; its documented scope is intra-WQE data-in-order visibility for
+  CPU readers. The actionable conclusion came from the lack of a documented
+  cross-WQE CPU-publication contract plus the captured observation where the
+  frontend saw the new `readyEpochSlots[slot]` value while the completion
+  body/seal image was stale or mixed.
 - The corrected implementation bumped the protocol/control shared-memory names
   to `v26` and changed the publication owner:
   [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14200)
@@ -3813,13 +3822,11 @@ remote RDMA pgbench c4 warmed sequential repeat:
     p50 about 0.420 ms, p95 about 0.589 ms, p99 about 0.682 ms
 ```
 
-The corrected `v26` receiver-service publication path fixes the real
-publication-ordering bug for the reproduced c1/c4 cases, but it is not yet a
-performance acceptance point. The earlier direct-ready path reached about
-`11.2k TPS` for c4, but it was relying on an invalid RNIC-to-CPU publication
-contract. The remaining optimization problem is therefore to reduce receiver
-service doorbell handling overhead without going back to direct RDMA
-publication of frontend-polled ready words.
+The `v26` receiver-service publication path fixed the reproduced correctness
+bug, but it is not the target performance or protocol shape. The audit-selected
+next step is v27: one full completion-slot `RDMA_WRITE_WITH_IMM`, receiver
+validation, descriptor CPU gate, and CPU publication of frontend ready. See
+[`homer_completion_publication_v27_recovery_plan.md`](homer_completion_publication_v27_recovery_plan.md).
 
 ### Acceptance
 
@@ -3868,10 +3875,10 @@ exceeds ordinary variance.
 - Do not reintroduce dual delivery plus deduplication for frontend command
   completions. The accepted direction is one explicit peek/apply/ack owner.
 - Do not RDMA-publish frontend-polled ready words directly on hardware that does
-  not prove the required RDMA-write data-in-order guarantee. For the current
-  farnet path, peer-client completion WRITE WITH IMM targets an inert service
-  scratch word; the receiver service validates body/seal and CPU-publishes
-  `readyEpochSlots[slot]`/`publishedEpoch` for the host client to poll.
+  not prove the required publication contract. The v26 scratch-WIMM path was a
+  correctness bridge; the v27 target is one full-slot `RDMA_WRITE_WITH_IMM`,
+  receiver validation of body/seal and descriptors, then receiver CPU
+  publication of `readyEpochSlots[slot]` for the host client to poll.
 - Do not treat `publishedEpoch` alone as a completion-body visibility proof.
   Slot-local ready epoch and stable reads remain required.
 - Do not use client-side tolerance for tuple-result sequence mismatches as a
