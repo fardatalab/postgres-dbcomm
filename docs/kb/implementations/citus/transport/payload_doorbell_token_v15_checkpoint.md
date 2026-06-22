@@ -155,7 +155,8 @@ Evidence from June 22, 2026:
 - Slice 2E-A remote c1 cold smoke: `2000/2000`, zero failures.
 - Slice 2E-A remote c1 warmed smoke: `5000/5000`, zero failures, `3816 TPS`, p99
   `0.295 ms`.
-- Slice 2E-A remote RDMA basebackup: completed successfully in `5.96 s`.
+- Slice 2E-A remote RDMA basebackup: first post-restart correctness check
+  completed successfully in `5.96 s`; this was not a warmed performance sample.
 - Slice 2E-A remote c4 smoke: `12000/12000`, zero failures, `9458 TPS`, p99
   `0.664 ms`.
 - Slice 2E-B build/install: `sudo -n -u dbcomm make -B -j8 service-bin
@@ -167,7 +168,8 @@ Evidence from June 22, 2026:
   p99 `0.287 ms`.
 - Slice 2E-B remote c4 smoke: `12000/12000`, zero failures, `9505 TPS`, p99
   `0.636 ms`.
-- Slice 2E-B remote RDMA basebackup: completed successfully in `5.97 s`.
+- Slice 2E-B remote RDMA basebackup: first post-restart correctness check
+  completed successfully in `5.97 s`; this was not a warmed performance sample.
 - Slice 2E-C zero-reference check for legacy pending-array symbols returned no
   matches.
 - Slice 2E-C build/install: `sudo -n -u dbcomm make -B -j8 service-bin
@@ -180,7 +182,11 @@ Evidence from June 22, 2026:
   p99 `0.282 ms`.
 - Slice 2E-C remote c4 smoke: `12000/12000`, zero failures, `9726 TPS`, p99
   `0.651 ms`.
-- Slice 2E-C remote RDMA basebackup: completed successfully in `5.81 s`.
+- Slice 2E-C remote RDMA basebackup: first post-restart correctness check
+  completed successfully in `5.81 s`; this was not a warmed performance sample.
+- Slice 2E-C warmed remote RDMA basebackup repeat, run without restarting
+  services after the validation sequence: run1 `4.32 s`, run2 `4.17 s`, run3
+  `4.16 s`, run4 `4.24 s`. Treat runs 2-4 as the warmed band: `4.16-4.24 s`.
 
 ## Remaining Work
 

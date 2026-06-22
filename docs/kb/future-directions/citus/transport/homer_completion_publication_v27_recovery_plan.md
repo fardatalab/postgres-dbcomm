@@ -147,8 +147,9 @@ and fixed ready queues to Slice 2E-B. Validation used no-stats binaries, rebuilt
 and installed as `dbcomm`, synced to `farnet0`, then restarted both Homer
 services. Remote farnet0-to-farnet1 validation passed: cold c1 `2000/2000`,
 zero failures; warm c1 `5000/5000`, zero failures, `3816 TPS`, p99 `0.295 ms`;
-remote RDMA basebackup completed successfully in `5.96 s`; short c4
-`12000/12000`, zero failures, `9458 TPS`, p99 `0.664 ms`.
+remote RDMA basebackup first post-restart correctness check completed
+successfully in `5.96 s`; short c4 `12000/12000`, zero failures, `9458 TPS`,
+p99 `0.664 ms`.
 
 Slice 2E-B is now landed as the direct service materialization checkpoint.
 Payload recv-CQ CQEs call the narrow permanent `onPayloadReady` dispatcher;
@@ -166,7 +167,8 @@ installed as `dbcomm`, synced to `farnet0`, then restarted both Homer services:
 remote cold c1 `2000/2000`, zero failures with one cold outlier; warm c1
 `5000/5000`, zero failures, `3839 TPS`, p99 `0.287 ms`; short c4
 `12000/12000`, zero failures, `9505 TPS`, p99 `0.636 ms`; remote RDMA
-basebackup completed successfully in `5.97 s`.
+basebackup first post-restart correctness check completed successfully in
+`5.97 s`.
 
 Slice 2E-C is now landed as the legacy pending-array deletion checkpoint. The
 connection-local `pendingDataDoorbell*` fields and
@@ -178,7 +180,10 @@ already-claimed drain state, not as a transport FIFO shadow. Validation stayed
 correct and performance-neutral: remote cold c1 `2000/2000`, zero failures with
 the same one-time cold outlier shape; warm c1 `5000/5000`, zero failures,
 `3878 TPS`, p99 `0.282 ms`; short c4 `12000/12000`, zero failures, `9726 TPS`,
-p99 `0.651 ms`; remote RDMA basebackup completed successfully in `5.81 s`.
+p99 `0.651 ms`; remote RDMA basebackup first post-restart correctness check
+completed successfully in `5.81 s`. A later four-repeat run without restarting
+services measured `4.32 s`, `4.17 s`, `4.16 s`, and `4.24 s`, so the warmed
+2E-C basebackup band is `4.16-4.24 s`.
 
 ## Current Code Pointers
 
