@@ -506,6 +506,123 @@ work; it means converting the CQE into durable typed state.
 
 ### 2A Permanent Recv Dispatcher
 
+Freeze the immediate-data ABI before changing the collector. The current
+implementation uses the high two bits as kind and lower 30 bits as value, but
+raw zero is special-cased for control and overlaps the payload namespace. Replace
+that with a complete four-kind namespace:
+
+```c
+#define HOMER_PEER_DOORBELL_KIND_SHIFT 30U
+#define HOMER_PEER_DOORBELL_KIND_MASK  UINT32_C(0xC0000000)
+#define HOMER_PEER_DOORBELL_TOKEN_MASK UINT32_C(0x3FFFFFFF)
+
+typedef enum HomerPeerDoorbellKind
+{
+    HOMER_PEER_DOORBELL_PAYLOAD = 0,
+    HOMER_PEER_DOORBELL_CLIENT_COMPLETION = 1,
+    HOMER_PEER_DOORBELL_CLIENT_COMMAND = 2,
+    HOMER_PEER_DOORBELL_CONTROL = 3
+} HomerPeerDoorbellKind;
+```
+
+Immediate values:
+
+```text
+00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx = payload
+01xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx = client completion
+10xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx = client command
+11xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx = control
+```
+
+Control uses token zero:
+
+```text
+kind = CONTROL
+token = 0
+```
+
+Every other kind requires a nonzero token. This preserves the current payload,
+completion, and command high-bit encodings while replacing the raw-zero control
+special case with an explicit kind. Bump
+`CITUS_REMOTE_EXEC_PEER_PROTOCOL_VERSION` from `13` to `14` for this wire
+change.
+
+Use the lower 30 bits as a direct token:
+
+```text
+bits 29:12 = binding generation, 18 bits
+bits 11:0  = binding index + 1, 12 bits
+```
+
+```c
+#define HOMER_PEER_DOORBELL_BINDING_INDEX_BITS 12U
+#define HOMER_PEER_DOORBELL_BINDING_INDEX_MASK UINT32_C(0x00000FFF)
+#define HOMER_PEER_DOORBELL_BINDING_GENERATION_SHIFT 12U
+#define HOMER_PEER_DOORBELL_BINDING_GENERATION_MASK UINT32_C(0x0003FFFF)
+```
+
+Encoding:
+
+```c
+token =
+    (bindingGeneration << HOMER_PEER_DOORBELL_BINDING_GENERATION_SHIFT) |
+    (bindingIndex + 1U);
+```
+
+Decoding:
+
+```c
+encodedIndex = token & HOMER_PEER_DOORBELL_BINDING_INDEX_MASK;
+bindingIndex = encodedIndex - 1U;
+bindingGeneration =
+    token >> HOMER_PEER_DOORBELL_BINDING_GENERATION_SHIFT;
+```
+
+Rules:
+
+- index encoding zero is invalid;
+- generation zero is invalid;
+- command-session, completion-session, and payload-stream tables must
+  statically fit within 4095 entries;
+- a binding-generation counter must not wrap within one connection generation;
+  reset the peer connection before an 18-bit binding generation would wrap to
+  zero.
+
+Use separate kind-specific direct tables:
+
+```c
+HomerPeerDoorbellBinding commandBindings[COMMAND_BINDING_CAPACITY];
+HomerPeerDoorbellBinding completionBindings[COMPLETION_BINDING_CAPACITY];
+HomerPeerDoorbellBinding payloadBindings[PAYLOAD_BINDING_CAPACITY];
+```
+
+Each entry stores:
+
+```c
+typedef struct HomerPeerDoorbellBinding
+{
+    bool active;
+    uint32_t tokenGeneration;
+
+    uint32_t objectIndex;
+    uint64_t objectGeneration;
+    uint64_t connectionGeneration;
+} HomerPeerDoorbellBinding;
+```
+
+The hot lookup is:
+
+```text
+kind -> kind-specific table -> direct binding index -> generation validation
+     -> exact session or stream
+```
+
+No service-session or stream-table scan is allowed on the CQE hot path.
+
+The immediate-data ABI must be documented in code comments next to the encode
+and decode helpers during implementation. After implementation, mirror the final
+ABI into a KB implementation note, not only this future-direction plan.
+
 Introduce one permanent dispatcher in
 `remote_execution_peer_transport_rdma.h`:
 
@@ -547,15 +664,40 @@ typedef struct HomerPeerRecvDispatcher
 } HomerPeerRecvDispatcher;
 ```
 
-Store it in `TupleSinkServicePeerTransportState` or as a pointer from each
-connection to the transport-global dispatcher:
+Use the transport-owned dispatcher form:
 
 ```c
-const HomerPeerRecvDispatcher *recvDispatcher;
+struct TupleSinkServicePeerTransportState
+{
+    ...
+    HomerPeerRecvDispatcher recvDispatcher;
+    bool recvDispatcherInstalled;
+};
 ```
 
-Install it once during service/peer-transport initialization. An active
-steady-state connection without a dispatcher is a fatal internal error.
+Every connection already points back to its transport state, so the collector
+accesses:
+
+```c
+&connectionState->transportState->recvDispatcher
+```
+
+Change creation to:
+
+```c
+TupleSinkServicePeerTransportState *
+TupleSinkServiceCreatePeerTransportState(
+    const char *listenHost,
+    uint32_t listenPort,
+    const HomerPeerRecvDispatcher *dispatcher,
+    char *error,
+    size_t errorBytes);
+```
+
+The constructor copies the dispatcher by value and requires all four handlers to
+be non-null. This guarantees that the dispatcher exists before any outgoing
+connection is started or incoming connection is accepted. An active steady-state
+connection with `recvDispatcherInstalled == false` is a fatal internal error.
 
 Replace the current optional-handler drain API with a physical collector API:
 
@@ -596,6 +738,92 @@ bool TupleSinkServiceDrainPeerConnectionCmEvents(...);
 That prevents a caller interested only in connection lifetime from accidentally
 polling the mixed recv CQ.
 
+Define recv-CQ ownership explicitly:
+
+```c
+typedef enum HomerRecvCqOwnerPhase
+{
+    HOMER_RECV_CQ_OWNER_BOOTSTRAP = 0,
+    HOMER_RECV_CQ_OWNER_CANONICAL,
+    HOMER_RECV_CQ_OWNER_TEARDOWN
+} HomerRecvCqOwnerPhase;
+```
+
+Every new connection starts as:
+
+```text
+recvCqOwnerPhase = BOOTSTRAP
+bootstrapComplete = false
+```
+
+`TupleSinkServiceApplyPeerBootstrapMessage()` validates and stores the peer
+descriptor only. It must not set `bootstrapComplete`.
+
+`TupleSinkServiceFinishPeerConnectionSetup()` is the only function that
+transitions a connection into steady-state recv-CQ ownership:
+
+```text
+1. Assert RDMA CM connection is established.
+2. Assert bootstrap send and receive have completed.
+3. Assert peer bootstrap descriptor has been validated and applied.
+4. Assert the permanent recv dispatcher is installed.
+5. Initialize connection-local doorbell binding tables.
+6. Post every steady-state notification receive WQE.
+7. Set setupPhase = READY.
+8. Set recvCqOwnerPhase = CANONICAL.
+9. Set bootstrapComplete = true as the final transition.
+10. Register the connection in steady-state collector facts.
+```
+
+A WIMM may arrive after receive WQEs are posted but before step 9. It may sit in
+the hardware CQ, but no setup poller may consume it. The canonical collector
+will consume it after the final transition.
+
+All recv-CQ polling goes through one internal wrapper:
+
+```c
+int TupleSinkServicePollRecvCq(
+    TupleSinkServicePeerConnectionState *connection,
+    HomerRecvCqOwnerPhase expectedOwner,
+    int maxCqes,
+    struct ibv_wc *cqes,
+    char *error,
+    size_t errorBytes);
+```
+
+Assertions:
+
+```text
+setup poller:
+    expectedOwner == BOOTSTRAP
+    bootstrapComplete == false
+
+canonical collector:
+    expectedOwner == CANONICAL
+    bootstrapComplete == true
+    setupPhase == READY
+
+teardown poller:
+    expectedOwner == TEARDOWN
+```
+
+Before QP teardown:
+
+```text
+recvCqOwnerPhase = TEARDOWN
+```
+
+Keep `bootstrapComplete` during the migration, but assert:
+
+```c
+bootstrapComplete ==
+    (setupPhase == READY &&
+     recvCqOwnerPhase == HOMER_RECV_CQ_OWNER_CANONICAL);
+```
+
+Eventually `bootstrapComplete` can be removed and derived from setup and owner
+phases.
+
 Inside the collector, dispatch by immediate kind:
 
 ```c
@@ -632,10 +860,33 @@ semantic object. The dispatcher materializes only compact typed readiness.
 | --- | --- | --- | --- |
 | Client completion | Completion slot and descriptor table | Per-session pending doorbell count, next expected epoch, visibility-pending state | No |
 | Client command | Command mailbox/ring | Session command-ready bit | No |
-| Payload | Payload ring and published frontier/in-band headers | Stream-ready bit or coalesced frontier | No |
+| Payload | Payload ring and published frontier/in-band headers | Intrusive per-traffic-class ready-list membership | No |
 | Control mailbox | Control mailbox sequence/slots | Connection mailbox-ready bit | No |
 | Send completion | Source-owner FIFO/table | Immediate owner retirement and resource-pressure ready bit | No |
 | Disconnect/lifetime | Connection state | Connection lifetime-ready state | No |
+
+Exact ready-state storage:
+
+| Event | Ready state |
+| --- | --- |
+| Client completion | Per-session pending count plus pending-publication bitmap |
+| Client command | Service-local 64-bit session bitmap |
+| Payload | Intrusive per-traffic-class ready list |
+| Control mailbox | Per-connection boolean plus ready connection bitmap |
+| Connection lifetime | Per-connection lifetime boolean plus ready connection bitmap |
+| Send-resource relief | Per-session blocked-reason mask plus resource-pressure bitmap |
+
+For fixed incoming/outgoing connection tables of at most 64 entries each, use:
+
+```c
+uint64_t incomingControlReadyConnections;
+uint64_t outgoingControlReadyConnections;
+uint64_t incomingLifetimeReadyConnections;
+uint64_t outgoingLifetimeReadyConnections;
+```
+
+This avoids scanning all connections after the collector materializes a control
+or lifetime fact.
 
 Client completion is edge-counted:
 
@@ -667,7 +918,7 @@ Client command readiness is level-triggered:
 
 ```text
 durable data: remote command mailbox and epochs/ready words
-materialized state: remoteCommandReadySessions bitmap
+materialized state: remoteCommandDoorbellReadySessions bitmap
 dispatcher action: set bit for exact session
 executor: drain commands within budget, recheck mailbox, re-set bit when unread commands remain
 ```
@@ -675,24 +926,41 @@ executor: drain commands within budget, recheck mailbox, re-set bit when unread 
 Multiple command doorbells safely coalesce because the command mailbox retains
 all unread commands.
 
-Payload readiness is level-triggered:
+Payload readiness is level-triggered and uses an intrusive ready queue, not an
+open choice between queue and bitmap. Each payload stream entry gets:
 
 ```c
 bool recvReadyEnqueued;
-uint64_t observedDoorbellCount; /* diagnostic only */
+uint32_t recvReadyPrevious;
+uint32_t recvReadyNext;
+uint64_t recvReadyGeneration;
 ```
 
-Use an intrusive ready queue or indexed ready bitmap for payload streams:
+The service owns one doubly linked ready list per traffic class:
+
+```c
+uint32_t payloadRecvReadyHead[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+uint32_t payloadRecvReadyTail[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+```
+
+Use an invalid index sentinel for empty links.
 
 ```text
-doorbell:
-    enqueue stream only when not already enqueued
+payload dispatcher:
+    decode the direct payload binding
+    validate stream index, stream generation, and connection generation
+    append the stream only when recvReadyEnqueued == false
 
-executor:
+payload executor:
+    remove one ready stream
+    validate stored generation
     drain within byte/record budget
     recheck ring
-    remain/re-enqueue when data remains
+    append stream to the tail again when unread payload remains
 ```
+
+On stream close or reclamation, remove an enqueued stream in O(1) using the
+doubly linked pointers.
 
 Control mailbox readiness is level-triggered:
 
@@ -700,8 +968,12 @@ Control mailbox readiness is level-triggered:
 bool controlMailboxReady;
 ```
 
-The control executor drains within message budget, rechecks the mailbox, and
-leaves the connection ready when more messages remain.
+The control dispatcher materializes `controlMailboxReady = true` and sets the
+ready connection bitmap. The control executor drains within message budget,
+rechecks mailbox published/consumed frontiers, leaves `controlMailboxReady` true
+when unread messages remain, and clears it only after a stable empty recheck.
+Multiple control WIMMs safely coalesce because the mailbox retains unread
+messages.
 
 Connection lifetime CQEs apply the transport fact immediately:
 
@@ -780,6 +1052,36 @@ mandatory materialization step for already-visible completions. The semantic
 phase handles only visibility-pending completion publication,
 descriptor-pending publication, retry, and escalation.
 
+Do not introduce the two-phase service pass in the same patch that first adds
+the canonical dispatcher. Use this migration order:
+
+```text
+2A:
+    canonical dispatcher under current scheduler structure
+
+2B-2E:
+    typed ready state by event family
+
+2F:
+    remove old token storage
+
+2G:
+    split each service pass into collector phase and semantic phase
+```
+
+This keeps regressions attributable. The final collector phase contains only
+physical resources:
+
+```text
+connection identity
+recv/send/CM CQ identity
+poll-batch budget
+CQE budget
+```
+
+It never contains an event-kind filter. The final semantic phase consumes only
+typed ready state produced by collectors and other producers.
+
 Collector priority:
 
 ```text
@@ -804,44 +1106,146 @@ Semantic priority:
 
 ### 2D Remove Optional Handlers And Generic Token FIFOs
 
-After the collector and typed ready state pass validation:
+Do not keep all old token arrays until the end, and do not delete them all in
+one large patch. Stage deletion by event family.
 
-1. Remove optional handlers from `TupleSinkServicePeerPumpGrant`.
-2. Remove all steady-state recv-CQ polling outside the collector.
-3. Remove completion, command, and payload pending token arrays.
-4. Remove queue-drain compatibility helpers.
-5. Add debug counters asserting exactly one steady-state poll owner per CQ.
-6. Treat any unknown or unbound token as a protocol error.
-7. Preserve bootstrap-only polling behind an explicit
-   `connection->bootstrapComplete == false` assertion.
+Slice 2A, canonical collector skeleton:
+
+```text
+implement permanent transport-owned dispatcher
+implement canonical physical recv-CQ collector
+split recv-CQ and CM drain APIs
+add explicit bootstrap/canonical/teardown ownership
+add direct immediate kind decoder
+add direct token-binding validation
+remove optional handler parameters immediately
+```
+
+For event families not migrated yet, the permanent dispatcher may temporarily
+write into their existing pending structures. This preserves behavior while
+ensuring that only the canonical collector polls the CQ. End state:
+
+```text
+one recv-CQ poll owner
+one permanent dispatcher
+old semantic storage still temporarily present
+```
+
+Slice 2B, client-completion migration:
+
+```text
+use session->clientCompletionReceiver.pendingDoorbellCount
+use session->clientCompletionReceiver.pendingPublication
+use pendingCompletionPublicationSessions
+```
+
+Delete immediately after targeted validation:
+
+```text
+pendingClientCompletionDoorbellTokens
+pendingClientCompletionDoorbellHead
+pendingClientCompletionDoorbellCount
+TupleSinkServicePopPeerClientCompletionDoorbell
+TupleSinkServiceDrainQueuedPeerClientCompletionDoorbells
+```
+
+This is the first family removed because the v27 completion protocol already
+supplies its replacement.
+
+Slice 2C, client-command migration:
+
+```text
+dispatcher:
+    decode direct command token
+    validate session index, session generation, and connection generation
+    set remoteCommandDoorbellReadySessions bit
+    do not execute command in collector
+
+executor:
+    exchange or consume ready bits
+    drain exact command mailbox within budget
+    recheck command mailbox
+    re-set bit when unread command records remain
+```
+
+Use a separate service-local bitmap from the shared frontend command-ready
+bitmap:
+
+```c
+uint64_t remoteCommandDoorbellReadySessions;
+```
+
+After command-doorbell tests pass, delete:
+
+```text
+pendingCommandDoorbellSessionIds
+pendingCommandDoorbellCount
+command token pop/consume helpers
+command-specific recv-CQ poll helper
+```
+
+Slice 2D, control-mailbox migration:
+
+```text
+immediate kind = CONTROL
+token = 0
+connection->controlMailboxReady = true
+set control ready connection bitmap
+```
+
+Delete after control tests pass:
+
+```text
+pendingControlDoorbellCount
+control-doorbell count-specific paths
+special immediateData == 0 decoder branch
+```
+
+Slice 2E, payload migration:
+
+```text
+use intrusive per-traffic-class payload ready lists
+append stream only when recvReadyEnqueued == false
+remove/requeue streams through O(1) doubly linked pointers
+```
+
+After payload tests pass, delete:
+
+```text
+pendingDataDoorbellSinkIds
+pendingDataDoorbellCount
+payload token scans
+payload pending/consume helpers
+```
+
+Slice 2F, final ownership cleanup:
+
+```text
+remove all token-FIFO compatibility adapters
+remove optional handlers from TupleSinkServicePeerPumpGrant
+remove every steady-state recv-CQ polling helper other than the canonical collector
+require zero source references to old pending arrays
+add debug counter for every attempted noncanonical recv-CQ poll
+require that counter to remain zero in c1, c4, and basebackup validation
+```
 
 Bootstrap/setup code may retain setup-specific polling until the permanent
 dispatcher is installed. After `bootstrapComplete`, a debug assertion rejects
 any noncanonical recv-CQ poll.
 
-Use a direct connection-local binding table for stale-token protection:
-
-```c
-typedef struct HomerClientCompletionTokenBinding
-{
-    bool active;
-    uint32_t token;
-    uint32_t sessionIndex;
-    uint64_t sessionGeneration;
-    uint64_t connectionGeneration;
-} HomerClientCompletionTokenBinding;
-```
-
-The dispatcher resolves:
+Use the kind-specific direct binding tables defined in Slice 2A for stale-token
+protection. The dispatcher resolves:
 
 ```text
-token -> session index -> session generation -> bound connection generation
+kind -> kind-specific binding table -> binding index -> token generation
+     -> object index -> object generation -> bound connection generation
 ```
 
-A stale token, closed session, or wrong connection generation is fatal. No
-linear session-table scan may occur on the CQE hot path.
+A stale token generation, closed object, wrong object generation, or wrong
+connection generation is fatal. No linear session-table or stream-table scan may
+occur on the CQE hot path.
 
-Deterministic tests before deleting the FIFO:
+Deterministic tests before deleting the family FIFOs:
 
 1. One CQ batch containing control, command, completion, and payload events.
 2. Semantic plan grants only control work, but collector receives a completion;
@@ -860,6 +1264,37 @@ Deterministic tests before deleting the FIFO:
 10. CQ batch receive buffers are reposted once as a batch.
 11. Ten consecutive c4 runs plus five c4-with-basebackup runs pass.
 12. Zero references to deleted pending-token FIFOs remain in the source tree.
+
+Exact Slice 2 acceptance gates:
+
+```text
+Immediate ABI:
+    every kind encodes/decodes correctly
+    token zero rejected for command/completion/payload
+    nonzero token rejected for control
+    stale binding generation rejected
+    binding-index overflow rejected
+    connection reset forced before token generation wrap
+
+Bootstrap:
+    ApplyPeerBootstrapMessage never sets bootstrapComplete
+    FinishPeerConnectionSetup is the only true transition
+    setup poll after CANONICAL transition asserts
+    canonical poll before transition asserts
+    notification CQE arriving just before final transition is later consumed exactly once
+
+Family migration:
+    after 2B, zero completion FIFO references
+    after 2C, zero command pending-array references
+    after 2D, zero control doorbell-count references
+    after 2E, zero payload pending-array references
+    after 2F, zero optional recv-handler parameters
+
+Ownership:
+    exactly one steady-state poll owner per recv CQ
+    zero noncanonical poll attempts
+    every polled CQE increments exactly one decoded-kind counter
+```
 
 ## Slice 3: Complete Stage 6 Before More Stage 7 Work
 
@@ -1263,6 +1698,11 @@ empty critical polls per transaction
   validation, cleanup, and fallback broad-scan metrics must all move together.
 - Direct command reservation abort should start as a tight invariant for the
   pgbench-Homer direct path, not as a complex general rollback mechanism.
+- The immediate-data ABI is a wire contract. During implementation, document it
+  next to the encode/decode helpers and the protocol-version bump in code
+  comments. After validation, create or update a factual implementation KB note
+  under `docs/kb/implementations/...` that records the landed ABI, helper names,
+  version number, and validation evidence.
 - Slices 6 and 7 are not implementation-ready from this note alone. Before a
   developer starts either one, expand the target slice with: files/functions
   changed, new fields/API, state transitions, failure behavior, ABI bump,
@@ -1274,10 +1714,10 @@ empty critical polls per transaction
 
 | Slice       | Status                                                                               |
 | ----------- | ------------------------------------------------------------------------------------ |
-| Slice 1     | Implementation-ready with cursor lifecycle, descriptor WR chain, and pending count   |
-| Slice 2     | Implementation-ready as canonical collector, typed ready state, and FIFO removal     |
-| Slice 3     | Direction correct; implement exact startup mapping and blocked-reason transitions    |
-| Slice 4     | Direction correct; tune two-phase pass, bounded fairness, and intra-CQ order         |
+| Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
+| Slice 2     | Implementation-ready end to end with frozen ABI and staged family migration          |
+| Slice 3     | Sufficiently detailed to start after Slice 2                                         |
+| Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
 | Slice 6     | Backlog summary; needs a stage-template expansion before implementation              |
