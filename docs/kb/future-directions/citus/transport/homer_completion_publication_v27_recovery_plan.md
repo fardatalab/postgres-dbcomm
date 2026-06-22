@@ -135,6 +135,21 @@ failures. This is correctness-equivalent and performance-neutral relative to the
 2D0 band; the expected c4 throughput recovery still depends on later hot-path
 cleanup rather than on this ownership slice alone.
 
+Slice 2E-A is now landed as the payload token-protocol checkpoint. Peer protocol
+version is bumped to `15`; payload WIMM immediates now use a receiver-issued
+generation-bearing token instead of `serviceSinkId`; the token is exchanged in
+peer open request/response; and per-stream token generations live in a
+service-lifetime array outside resettable stream entries. The old
+`pendingDataDoorbellSinkIds[]` array still exists only as a temporary bridge,
+but it now stores payload tokens and is still scheduled/pumped through the old
+broad stream scan. This intentionally defers direct O(1) service materialization
+and fixed ready queues to Slice 2E-B. Validation used no-stats binaries, rebuilt
+and installed as `dbcomm`, synced to `farnet0`, then restarted both Homer
+services. Remote farnet0-to-farnet1 validation passed: cold c1 `2000/2000`,
+zero failures; warm c1 `5000/5000`, zero failures, `3816 TPS`, p99 `0.295 ms`;
+remote RDMA basebackup completed successfully in `5.96 s`; short c4
+`12000/12000`, zero failures, `9458 TPS`, p99 `0.664 ms`.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)
@@ -2338,7 +2353,7 @@ empty critical polls per transaction
 | Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
 | Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
-| Slice 2E    | Implementation-ready as staged 2E-A/2E-B/2E-C payload token and ready-queue work      |
+| Slice 2E    | 2E-A landed; 2E-B/2E-C remain as staged payload ready-queue and legacy-delete work     |
 | Slice 2F    | Follow-up ownership cleanup; enforce canonical recv-CQ poll owner and delete leftovers |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
