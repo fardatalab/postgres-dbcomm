@@ -112,6 +112,21 @@ the future-direction plan. The next slices should still implement:
 Do not reintroduce optional semantic handlers or a generic CQE/token FIFO as a
 replacement for those typed states.
 
+Control mailbox readiness remains deliberately unfinished in this checkpoint.
+The current code still has two receiver-side publication signals: decoded
+control WIMM CQEs increment
+[`pendingControlDoorbellCount`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:482),
+while
+[`TupleSinkServiceTryConsumeLocalMailbox()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4251)
+can also consume when remote `publishedTail` is visible ahead of
+`consumedHead`. That visible-tail path is a liveness workaround for delayed
+recv-CQ polling, not the accepted design. The planned Slice 2D fix is to first
+finish recv-CQ owner phases and exact CQ demand, then replace control readiness
+with one full-message control `WRITE_WITH_IMM`, a CQE-derived
+`controlDoorbellArrivedTail`, and a level-triggered control-ready bit. The
+tail-visible path should become temporary diagnostic evidence only, not a
+semantic consumption path.
+
 ## Validation Evidence
 
 Build/install used no-stats binaries:
@@ -192,4 +207,31 @@ remote c1 -t 100000: 100000/100000 transactions, 0 failures, 3951 TPS, p99 0.281
 remote c4 warmup:    40000/40000 transactions, 0 failures, 9798 TPS, p99 0.622 ms
 remote c4 measured1: 40000/40000 transactions, 0 failures, 9602 TPS, p99 0.631 ms
 remote c4 measured2: 40000/40000 transactions, 0 failures, 9489 TPS, p99 0.685 ms
+```
+
+Slice 2D0a recv-CQ owner-phase scaffolding validation:
+
+```text
+Code change:
+    add explicit recv-CQ owner phases UNUSED, BOOTSTRAP, CANONICAL, TEARDOWN
+    set BOOTSTRAP after incoming/outgoing connection resources are initialized
+    set CANONICAL in TupleSinkServiceFinishPeerConnectionSetup()
+    set TEARDOWN before connection resource release/reset
+    guard existing TupleSinkServiceDrainPeerConnectionEvents() recv-CQ polling
+    expose noncanonicalRecvCqPollAttempts in stats builds
+
+Important non-changes:
+    TupleSinkServiceApplyPeerBootstrapMessage() still sets bootstrapComplete
+    TupleSinkServicePrepareConnectionForWrite() still performs hidden recv-CQ/CM progress
+    control publication is still message WRITE plus tail WRITE_WITH_IMM
+    pendingControlDoorbellCount and visible-tail fallback still exist
+
+Build/install: passed with CPPFLAGS='-D_GNU_SOURCE'
+
+remote c1 -t 1000:   1000/1000 transactions, 0 failures, 499 TPS cold including setup
+remote c1 -t 100000: 100000/100000 transactions, 0 failures, 3958 TPS, p99 0.278 ms
+
+remote c4 warmup:    40000/40000 transactions, 0 failures, 9693 TPS, p99 0.640 ms
+remote c4 measured1: 40000/40000 transactions, 0 failures, 9586 TPS, p99 0.641 ms
+remote c4 measured2: 40000/40000 transactions, 0 failures, 9348 TPS, p99 0.663 ms
 ```

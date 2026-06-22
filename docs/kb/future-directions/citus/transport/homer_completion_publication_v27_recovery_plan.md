@@ -80,6 +80,30 @@ array. This is safe because the previous command token array had no live
 service-side pop consumer; scheduler readiness already comes from the durable
 per-session command mailbox fact. Direct command ready bits remain future work.
 
+Post-2C control-path review tightened the Slice 2D target. The current control
+mailbox path has two publication signals: a decoded control WIMM increments
+`pendingControlDoorbellCount`, while the mailbox consumer may also consume by
+observing remote `publishedTail > consumedHead`. That visible-tail fallback is a
+liveness workaround for delayed recv-CQ polling, not an accepted publication
+protocol. It relies on the same class of separate-WQE visibility assumption that
+v27 removed from peer-client completion publication. Slice 2D must therefore
+move control to a one full-message `WRITE_WITH_IMM` publication and a
+CQE-derived arrival frontier; tail observation may be retained only as temporary
+diagnostic evidence that exact recv-CQ demand is insufficient, and must not
+consume records or set semantic readiness.
+
+Slice 2D0a is now landed as owner-phase scaffolding. It adds explicit
+`UNUSED`/`BOOTSTRAP`/`CANONICAL`/`TEARDOWN` recv-CQ owner state, records
+transitions around resource initialization, setup completion, and reset, and
+guards the existing recv-CQ drain against polling with no owner or during
+teardown. This checkpoint intentionally preserves current polling behavior:
+`TupleSinkServiceApplyPeerBootstrapMessage()` still sets `bootstrapComplete`,
+`TupleSinkServicePrepareConnectionForWrite()` still performs hidden recv-CQ/CM
+progress, and control publication is still the old message WRITE plus tail
+WIMM shape. Remote RDMA validation stayed correct and performance-neutral:
+c1 `100000/100000`, zero failures, `3958 TPS`; c4 warmup `9693 TPS`, measured
+`9586 TPS` and `9348 TPS`, all zero failures.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)
@@ -1013,18 +1037,33 @@ payload executor:
 On stream close or reclamation, remove an enqueued stream in O(1) using the
 doubly linked pointers.
 
-Control mailbox readiness is level-triggered:
+Control mailbox readiness is level-triggered and CQE-authorized:
 
 ```c
+uint64_t controlDoorbellArrivedTail;
 bool controlMailboxReady;
 ```
 
-The control dispatcher materializes `controlMailboxReady = true` and sets the
-ready connection bitmap. The control executor drains within message budget,
-rechecks mailbox published/consumed frontiers, leaves `controlMailboxReady` true
-when unread messages remain, and clears it only after a stable empty recheck.
-Multiple control WIMMs safely coalesce because the mailbox retains unread
-messages.
+The accepted control publisher uses one full-message `WRITE_WITH_IMM` for the
+control slot itself, not a message WRITE followed by a separate tail WIMM. The
+control dispatcher increments `controlDoorbellArrivedTail`, checks that the
+arrival frontier has not overrun the fixed mailbox slot window, materializes
+`controlMailboxReady = true`, and sets the ready connection bitmap. The control
+executor drains only while `consumedHead < controlDoorbellArrivedTail`; it
+copies the corresponding mailbox slot, validates `ringSequence`, dispatches the
+request or response, and release-stores `consumedHead`. It leaves
+`controlMailboxReady` true when the arrival frontier still exceeds
+`consumedHead`, and clears it when the CQE-authorized frontier is drained.
+Multiple control WIMMs safely coalesce because `controlDoorbellArrivedTail`
+records how far the executor is allowed to consume.
+
+Do not treat a visible remote `publishedTail` as an alternate publication gate.
+During migration, a temporary stats-only check may count
+`remotePublishedTail > controlDoorbellArrivedTail` and demand an exact recv-CQ
+poll, but it must not set `controlMailboxReady`, consume a mailbox record,
+advance `consumedHead`, or classify the later CQE as harmless stale work. A
+persistent tail-ahead condition after exact CQ drain is a collector ownership
+bug or transport failure, not normal fallback behavior.
 
 Connection lifetime CQEs apply the transport fact immediately:
 
@@ -1239,21 +1278,93 @@ command token pop/consume helpers
 command-specific recv-CQ poll helper
 ```
 
-Slice 2D, control-mailbox migration:
+Slice 2D0, recv-CQ ownership prerequisite for control:
 
 ```text
-immediate kind = CONTROL
-token = 0
-connection->controlMailboxReady = true
-set control ready connection bitmap
+finish before replacing control mailbox readiness:
+    add BOOTSTRAP, CANONICAL, and TEARDOWN recv-CQ owner phases
+    make FinishPeerConnectionSetup() the only transition into CANONICAL
+    make ApplyPeerBootstrapMessage() only validate/store the peer descriptor
+    split recv-CQ draining from CM-event draining
+    remove steady-state recv-CQ polling from write preparation and op polling
+    have those helpers set exact recv-CQ demand facts and return pending
+    add noncanonicalRecvCqPollAttempts
+    require zero noncanonical recv-CQ polls in normal runs
 ```
+
+The current code does not yet satisfy this prerequisite:
+`TupleSinkServiceApplyPeerBootstrapMessage()` still sets `bootstrapComplete`,
+`TupleSinkServiceFinishPeerConnectionSetup()` also sets it, and
+`TupleSinkServicePrepareConnectionForWrite()` still drains recv-CQ/CM events
+before writes. These are the concrete ownership issues to fix before removing
+the control visible-tail workaround.
+
+Slice 2D1, control-mailbox one-WIMM publication:
+
+```text
+protocol bump for peer control mailbox if layout or publish semantics change
+sender:
+    choose slot using outgoingControlPublishedTail and peerControlConsumedHeadMirror
+    fill full TupleSinkServicePeerControlMessage including ringSequence
+    post one full-message RDMA_WRITE_WITH_IMM to the remote slot
+    do not RDMA-write remote publishedTail as the publication gate
+receiver:
+    decoded CONTROL CQE increments connection->controlDoorbellArrivedTail
+    overrun if arrivedTail - consumedHead > slotCount
+    set connection->controlMailboxReady = true
+    set incoming/outgoing control-ready bitmap bit
+executor:
+    drain only while consumedHead < controlDoorbellArrivedTail
+    acquire before copying the slot
+    require slot.ringSequence == consumedHead + 1
+    dispatch request or response
+    release-store local consumedHead
+    keep ready bit set while unread CQE-authorized messages remain
+    clear ready bit after the arrival frontier is drained
+```
+
+Do not retain visible-tail consumption as fallback. A temporary stats-only check
+may count `remotePublishedTail > controlDoorbellArrivedTail` and mark exact
+recv-CQ demand, but it must not consume a record or advance `consumedHead`.
+After exact CQ drain, a persistent tail-ahead condition is a transport or
+collector-ownership failure.
+
+`CONTROL` immediate token zero remains acceptable because control is
+connection-scoped and the physical CQ identifies the connection. That depends on
+the recv-CQ owner-phase invariant:
+
+```text
+one connection generation owns one QP and its CQs
+canonical polling stops before teardown
+QP/CQs are drained or destroyed during TEARDOWN
+no software control-ready state survives teardown
+the connection table slot is reused only after teardown completes
+```
+
+If this invariant cannot be asserted cleanly during implementation, change
+control to use a generation-bearing token instead of token zero.
 
 Delete after control tests pass:
 
 ```text
 pendingControlDoorbellCount
 control-doorbell count-specific paths
+tail-based control mailbox consumption
+stale-late-control-doorbell handling
+remote publishedTail as a receiver-side publication gate
 special immediateData == 0 decoder branch
+```
+
+Control acceptance gates:
+
+```text
+one full-message control WIMM is the only publication gate
+remote publishedTail is not required for receiver readiness
+controlDoorbellArrivedTail never exceeds consumedHead + slotCount
+multiple control CQEs coalesce through arrivedTail and one ready bit
+late/stale CQE after teardown is rejected by owner phase or destroyed CQ
+noncanonicalRecvCqPollAttempts remains zero in steady-state c1/c4 runs
+temporary tail-ahead diagnostic counter is zero after exact CQ demand is active
 ```
 
 Slice 2E, payload migration:
@@ -1748,6 +1859,12 @@ empty critical polls per transaction
   replacement for optional handlers/FIFOs is durable RDMA mailbox/ring data,
   typed ready state, and per-session completion counts where edges cannot
   coalesce.
+- The current control visible-tail fallback is not part of the accepted
+  publication protocol. It exists because recv-CQ ownership is not yet clean
+  enough for demanded control-response polling. Replace it with
+  `controlDoorbellArrivedTail`, a level-triggered ready bit, exact recv-CQ demand,
+  and one full-message control `WRITE_WITH_IMM`; do not consume control records
+  solely because remote `publishedTail` is visible.
 - Backend-completion bitmap work maps the control region into socketless
   backends. That is straightforward but not tiny: startup data, protocol
   validation, cleanup, and fallback broad-scan metrics must all move together.
@@ -1770,7 +1887,9 @@ empty critical polls per transaction
 | Slice       | Status                                                                               |
 | ----------- | ------------------------------------------------------------------------------------ |
 | Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
-| Slice 2     | Implementation-ready end to end with frozen ABI and staged family migration          |
+| Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
+| Slice 2D    | Implementation-ready after CQ owner-phase prerequisite; do 2D0 before control WIMM    |
+| Slice 2E/F  | Direction is clear; expand per-family files/tests before implementation               |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
