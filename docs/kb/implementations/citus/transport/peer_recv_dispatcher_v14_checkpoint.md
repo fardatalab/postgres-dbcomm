@@ -254,3 +254,29 @@ remote c4 warmup:    40000/40000 transactions, 0 failures, 9760 TPS, p99 0.624 m
 remote c4 measured1: 40000/40000 transactions, 0 failures, 9565 TPS, p99 0.637 ms
 remote c4 measured2: 40000/40000 transactions, 0 failures, 9401 TPS, p99 0.682 ms
 ```
+
+Slice 2D0c hidden recv-CQ ownership cleanup validation:
+
+```text
+Code change:
+    add TupleSinkServiceDrainPeerConnectionRecvCq()
+    add TupleSinkServiceDrainPeerConnectionCmEvents()
+    keep the scheduled peer pump as the recv-CQ polling owner
+    make TupleSinkServicePrepareConnectionForWrite() CM-only
+    make TupleSinkServiceTryPublishPeerControlAsyncOp() CM-only for connection events
+    make TupleSinkServicePollPeerRequestRdma() CM-only for connection events
+
+Important non-changes:
+    peer-op helpers still drain send CQ and response mailbox
+    control publication is still message WRITE plus tail WRITE_WITH_IMM
+    pendingControlDoorbellCount and visible-tail fallback still exist
+
+Build/install: passed with CPPFLAGS='-D_GNU_SOURCE'
+
+remote c1 -t 1000:   1000/1000 transactions, 0 failures, 498 TPS cold including setup
+remote c1 -t 100000: 100000/100000 transactions, 0 failures, 3910 TPS, p99 0.281 ms
+
+remote c4 warmup:    40000/40000 transactions, 0 failures, 9720 TPS, p99 0.629 ms
+remote c4 measured1: 40000/40000 transactions, 0 failures, 9669 TPS, p99 0.654 ms
+remote c4 measured2: 40000/40000 transactions, 0 failures, 9375 TPS, p99 0.702 ms
+```

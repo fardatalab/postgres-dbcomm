@@ -112,6 +112,17 @@ RDMA validation stayed correct and performance-neutral: c1 `100000/100000`,
 zero failures, `3948 TPS`; c4 warmup `9760 TPS`, measured `9565 TPS` and
 `9401 TPS`, all zero failures.
 
+Slice 2D0c is landed as the first hidden recv-CQ ownership cleanup.
+`TupleSinkServiceDrainPeerConnectionRecvCq()` and
+`TupleSinkServiceDrainPeerConnectionCmEvents()` split physical recv-CQ polling
+from RDMA-CM event polling. `TupleSinkServicePrepareConnectionForWrite()`,
+`TupleSinkServiceTryPublishPeerControlAsyncOp()`, and
+`TupleSinkServicePollPeerRequestRdma()` now use the CM-only helper instead of
+silently draining recv CQEs. The scheduled peer pump remains the recv-CQ owner.
+Remote RDMA validation stayed correct: c1 `100000/100000`, zero failures,
+`3910 TPS`; c4 warmup `9720 TPS`, measured `9669 TPS` and `9375 TPS`, all zero
+failures.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)
