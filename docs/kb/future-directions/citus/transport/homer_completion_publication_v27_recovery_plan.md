@@ -2202,8 +2202,11 @@ the missing readiness before doing more Stage 7 topology/performance work.
 
 ### 3A Backend-Completion-Ready Bitmap
 
-Status: partially landed; June 22 validation exposed a remaining
-completion-readiness ownership bug before fallback discovery can be removed.
+Status: landed and validated through the persistent-pending repair. June 22
+validation showed that the command and completion bitmap path was missing
+durable service-owned readiness; the repaired Citus tree now transfers producer
+signals into service-local pending bits and removes production fallback/re-arm
+recovery.
 
 The bitmap lives in `CitusRemoteExecControlRegion`, currently as
 `completionReadySessions`. Backend code must not open-code bitmap layout or
@@ -2248,12 +2251,12 @@ release-store backend completion publishedEpoch
 call HomerBackendMarkCompletionReady(), which fetch_or's completionReadySessions
 ```
 
-Add `HomerServiceAppendBackendCompletionBitmapSources()` to exchange the bitmap
-and then validate session index, session generation, mailbox protocol, and
-actual unread completion state before appending exact candidates. Re-set a bit
-when more records remain or staging was blocked. Keep one fallback broad scan
-every `HOMER_SERVICE_COMMAND_READY_BITMAP_FALLBACK_INTERVAL` service passes
-(currently 4096); warmed c1/c4 should have zero fallback discoveries.
+Add `HomerServiceAppendBackendCompletionBitmapSources()` to enumerate durable
+service-local pending state, validate session index, session generation, mailbox
+protocol, and append exact candidates. It must not exchange producer bitmaps,
+clear local pending bits, re-set shared producer bits, or perform fallback
+recovery. The executor finalizer is the only place that may discharge
+service-local pending state.
 
 Implemented shape:
 
@@ -2277,28 +2280,45 @@ Implemented shape:
   `src/backend/distributed/utils/homer/tuple_sink_service_process.c`; normal
   ready-set construction no longer scans every session for backend completion
   readiness when the progress registry is active.
-- `TupleSinkServiceConsumeCompletionMailbox()` re-marks the session bit when one
-  consumed backend completion leaves more unread records, preserving the
-  level-triggered bitmap invariant across multi-record completion bursts.
-- The fallback broad scan is being converted from recovery behavior into a
-  fail-fast invariant check. Implementation found three real or apparent
-  hidden-readiness classes:
-  - A frontend can set a command-ready bit after the service exchanges the
-    bitmap but before the fallback scan checks that session. The command
-    fallback materializer now claims such raced-in bits with
-    `fetch_and(~sessionBit)` and treats only a missing bit as fatal.
-  - The exchange path can observe a command/completion bitmap bit before the
-    corresponding mailbox tail is visible. The exchanged bit is now re-armed for
-    still-live source owners instead of being dropped.
-  - `TupleSinkServiceConsumeCompletionMailbox()` can publish a previously
-    staged peer-client completion and return before consuming the backend
-    completion mailbox. That path now re-arms the completion bit if the mailbox
-    remains ahead of `lastConsumedPublishedEpoch`.
-- A fourth completion hidden-readiness path remains unresolved. A conservative
-  re-arm pass was added after execution planning for command/completion sources
-  that were materialized into the ready set but not selected in the execution
-  plan. Remote c4 still hit fail-fast completion fallback, so the remaining bug
-  is not explained solely by unselected candidate destruction.
+- The validated direction is now stricter: all service-consumed command and
+  completion mailboxes must be discovered through the shared producer bitmap
+  and then retained through service-local pending state until semantic execution
+  discharges them. Direct frontend-consumed completion mailboxes remain outside
+  this path because the service does not consume them.
+- The current re-arm/fallback patch series should be treated as diagnostic
+  scaffolding, not target architecture. In particular, service code should stop
+  re-setting `commandReadySessions` or `completionReadySessions`; those shared
+  bitmaps are producer-owned notifications, not service-owned pending work.
+- Persistent pending implementation:
+  - `HomerServiceSessionPendingState` in
+    `src/backend/distributed/utils/homer/tuple_sink_service_process.c` owns
+    service-local `commandPendingSessions` and `completionPendingSessions`.
+  - `HomerServiceCollectSessionReadySignals()` is the only service-side
+    consumer of the shared producer bitmaps; it exchanges producer bits to zero
+    and ORs them into local pending state before ready-set construction.
+  - `HomerServiceAppendRemoteClientSqlCommandBitmapSources()` and
+    `HomerServiceAppendBackendCompletionBitmapSources()` enumerate local pending
+    bits non-destructively and append generation-bearing exact source refs.
+  - `HomerServiceFinalizeCommandPendingBit()` and
+    `HomerServiceFinalizeCompletionPendingBit()` clear local pending only after
+    selected semantic execution proves the machine has no remaining work.
+  - `HomerServiceCommandMachineHasWork()` uses the monotonic
+    `publishedEpoch > clientSqlRemoteCommandAcceptedEpoch` predicate.
+    `HomerServiceCompletionMachineHasWork()` includes backend completion-ring
+    unread work plus staged/deferred peer-client completion publication.
+  - `TupleSinkServiceResetSession()` calls
+    `HomerServiceClearSessionPendingState()` before clearing the table slot so
+    stale local/shared bits cannot target a reused session index.
+  - `HOMER_SERVICE_READY_BITMAP_AUDIT` is a disabled-by-default invariant check.
+    When enabled it scans active sessions and fails if durable machine work has
+    neither local pending nor shared producer signal before/after the predicate
+    check; it never repairs progress.
+  - Production references to `HomerServiceRearmUnplannedBitmapSources()`,
+    `HomerProgressExecutionPlanContainsSource()`,
+    `HomerServiceMarkCommandReadyByIndex()`,
+    `HomerServiceMarkCompletionReadyByIndex()`,
+    `CommandReadyBitmapFallbackCountdown`, and
+    `CompletionReadyBitmapFallbackCountdown` were deleted.
 
 Validation evidence:
 
@@ -2340,58 +2360,263 @@ Validation evidence:
     `completion-ready bitmap fallback discovered hidden work session_index=0 session=11 command_sequence=2535`,
     `session_index=2 session=7 command_sequence=3642`, and after the unplanned
     ready-set re-arm attempt `session_index=3 session=4 command_sequence=9135`.
-    This is now the blocking issue for completing Slice 3A and for deleting or
-    permanently failing all fallback discoveries.
+    This became the blocking issue that led to the persistent-pending repair
+    below.
+- Persistent-pending validation:
+  - No-stats build/install/sync:
+    `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`,
+    `sudo -n -u dbcomm make install-headers install-service-bin install`, and
+    installed-prefix `rsync` to `farnet0`.
+  - Source audit found no production references to the deleted re-arm/fallback
+    symbols listed above.
+  - Runtime cleanup note: `pkill -x citus_tuple_sink_service` does not match the
+    service because Linux truncates `comm` to `citus_tuple_sin`; use exact
+    command-path PID matching with `sudo kill` for validation cleanup. A stale
+    `farnet0` service initially contaminated one run and logged
+    `rdma_bind_addr failed ... Address already in use`.
+  - After restarting both services with the new binary, remote RDMA c1 warmup
+    completed `1000/1000` with 0 failures; warmed c1 completed `20000/20000`
+    with 0 failures, `3927.452105 TPS`, p95 `0.268 ms`, p99 `0.282 ms`.
+  - Remote RDMA c4 warmup completed `10000/10000` with 0 failures,
+    `9321.766885 TPS`; warmed c4 completed `40000/40000` with 0 failures,
+    `9301.285135 TPS`, p95 `0.618 ms`, p99 `0.710 ms`.
+  - Remote RDMA basebackup completed a cold run in `6.28s` and a warmed run in
+    `4.25s`.
+  - Concurrent remote RDMA c4 plus remote RDMA basebackup completed with
+    pgbench `10000/10000`, 0 failures, `7799.387280 TPS`; basebackup completed
+    in `4.23s`.
 
-Current blocker:
+Resolved blocker and corrected diagnosis:
 
-The remaining completion fallback means some backend completion mailbox becomes
-ready without an active completion-ready bit by the time the periodic broad scan
-checks it. The attempted fixes covered:
+The earlier c4 failures were not best modeled as four independent races. They exposed one
+ownership error: `atomic_exchange(bitmap, 0)` removes the producer signal during
+discovery, but the service currently transfers that signal only into a transient
+ready set and execution plan. If the plan does not select the source, a guard
+rejects execution, the action makes only staged peer-completion progress, the
+budget ends, or the source blocks on another dependency, the temporary ready-set
+state disappears. Every branch then needs to remember to recreate readiness, and
+that is inherently fragile.
 
-1. raced-in producer bit after fallback scan begins;
-2. exchanged bit observed before mailbox tail visibility;
-3. staged peer-client completion publication returning before mailbox consume;
-4. ready-set materialization without execution-plan selection.
+The current "bit visible before mailbox tail" explanation should not be treated
+as a normal-path assumption. Frontend command producers and socketless backend
+completion producers release-publish mailbox state before setting the shared
+ready bit, and the service's acquire exchange is intended to observe the
+preceding mailbox publication. A bit with no ready mailbox record can still be a
+redundant signal for already-drained work, a stale lifecycle signal, or a real
+producer/publication bug. It should not be papered over by blindly re-arming the
+shared producer bitmap from service code.
 
-Since c4 still reproduces after those fixes, the next diagnosis should instrument
-the exact ownership transition for a completion source: backend publication
-`RemoteExecBackendMarkCompletionReady()`, service bitmap exchange, ready-set
-append, action-plan selection, `TupleSinkServiceConsumeCompletionMailbox()`, and
-any return path that leaves `publishedEpoch > lastConsumedPublishedEpoch`
-without `completionReadySessions` set. Do not remove the fallback scan until this
-path is proven and the fatal fallback check stays silent in warmed remote c4.
-
-Detailed follow-up findings for review:
-
-| Finding | Symptom/evidence | Current interpretation | Code state |
-| --- | --- | --- | --- |
-| Command readiness predicate was too broad | Fail-fast printed `command-ready bitmap fallback discovered hidden work session_index=2 session=3 command_sequence=0`. | `publishedEpoch != acceptedEpoch` can classify a non-forward or stale epoch as work. The command source should only be ready when the frontend-published epoch is strictly ahead of the service-accepted epoch. | Unvalidated Citus tree changes `HomerServiceRemoteClientSqlCommandSourceReady()` to `publishedEpoch > acceptedEpoch` in `src/backend/distributed/utils/homer/tuple_sink_service_process.c`. |
-| Fallback scan can race producer bit publication | A source can become ready between bitmap exchange and fallback scan. Treating that as fallback discovery falsely reports hidden work. | The fallback scan must first attempt to claim the bit with `fetch_and(~sessionBit)`. If the bit was present, the source was explicitly published and should be materialized normally. If not, it is a real invariant violation. | Unvalidated Citus tree applies raced-bit claiming for command and completion fallback scans. |
-| Bitmap exchange can observe the bit before the mailbox tail is visible | A destructive `atomic_exchange(..., 0)` can clear the source bit, then the source predicate reads the mailbox as not ready. Later fallback sees the mailbox ready. | The bitmap signal and mailbox tail are separate memory locations. If the source owner is still live but the predicate is not yet true, preserve the producer signal by re-arming the bit instead of dropping it. | Unvalidated Citus tree re-arms command and completion bits in the exchange loops when the owner is still active but the mailbox predicate is false. |
-| Staged peer-client completion retry can mask backend completion readiness | `TupleSinkServiceConsumeCompletionMailbox()` can return after publishing a previously staged peer-client completion without consuming the backend completion mailbox record that made the completion source ready. | Peer-client completion retry and backend completion mailbox consumption are separate pieces of work sharing the completion action path. If staged retry makes progress first, the backend completion source must remain armed. | Unvalidated Citus tree re-arms the completion bit after staged publish if `HomerServiceCompletionRingSourceReady()` remains true. |
-| Unselected ready-set materialization hypothesis did not explain the c4 failure | After adding an unplanned-source re-arm pass, remote c4 still failed with `completion-ready bitmap fallback discovered hidden work session_index=3 session=4 command_sequence=9135`. | Candidate/ready-set materialization being destructive is a real design hazard, but it is not sufficient to explain the current remaining completion fallback. Do not treat this as the root cause without more evidence. | Unvalidated Citus tree includes `HomerServiceRearmUnplannedBitmapSources()`, but validation says this is not enough and may need redesign/removal depending on the next diagnosis. |
-
-The next useful diagnostic is not another broad fix. Add targeted counters or
-temporary debug logs around one completion source's lifecycle:
+Replacement design:
 
 ```text
-backend publishes completion and calls RemoteExecBackendMarkCompletionReady()
-service exchanges completionReadySessions
-service appends HomerCompletionRingProgressSourceRef()
-policy selects or skips the completion source
-TupleSinkServiceConsumeCompletionMailbox() enters
-TupleSinkServiceConsumeCompletionMailbox() returns after staged publish, no-work, overrun, or consume
-service re-arms or does not re-arm completionReadySessions
-fallback scan observes publishedEpoch > lastConsumedPublishedEpoch
+durable mailbox/ring
+    contains command/completion records
+
+shared producer bitmap
+    coalesced producer-to-service notification only
+
+service-local pending bitmap
+    durable scheduler-owned readiness until semantic work is discharged
 ```
 
-For each event, log session table index, `serviceSessionId`,
-`publishedEpoch`, `lastConsumedPublishedEpoch`, the old/new bitmap word, and
-whether the source was selected in the execution plan. The expected invariant is:
-after any service pass that leaves `publishedEpoch > lastConsumedPublishedEpoch`
-for a service-owned completion mailbox, `completionReadySessions` must contain
-that session bit unless the same pass is about to consume it.
+Add persistent service-local pending state:
+
+```c
+typedef struct HomerServiceSessionPendingState
+{
+    uint64_t commandPendingSessions;
+    uint64_t completionPendingSessions;
+} HomerServiceSessionPendingState;
+```
+
+These fields are service-owned and non-atomic because the service loop is
+single-threaded. At the beginning of each service pass, before ready-set
+construction, collect shared producer signals:
+
+```c
+static void
+HomerServiceCollectSessionReadySignals(CitusRemoteExecControlRegion *controlRegion)
+{
+    uint64_t commandBits =
+        TupleSinkServiceAtomicExchangeU64(&controlRegion->commandReadySessions.bits, 0);
+    uint64_t completionBits =
+        TupleSinkServiceAtomicExchangeU64(&controlRegion->completionReadySessions.bits, 0);
+
+    SessionPendingState.commandPendingSessions |= commandBits;
+    SessionPendingState.completionPendingSessions |= completionBits;
+}
+```
+
+Rewrite `HomerServiceAppendRemoteClientSqlCommandBitmapSources()` and
+`HomerServiceAppendBackendCompletionBitmapSources()` to enumerate local pending
+words non-destructively. They should validate the fixed session index,
+`serviceSessionId`/generation, mailbox ownership, and append a generation-bearing
+source reference. They must not require the mailbox predicate to be true before
+appending, because coalesced producer signals can be redundant by the time
+execution runs. If the slot is inactive or reused, clear the stale local bit and
+increment `pendingStaleBitsCleared`.
+
+The planner must never clear or re-arm readiness. Instead, command and
+completion executors should return a centralized result:
+
+```c
+typedef enum HomerSessionSourceResult
+{
+    HOMER_SESSION_SOURCE_DRAINED = 0,
+    HOMER_SESSION_SOURCE_MORE_READY,
+    HOMER_SESSION_SOURCE_BLOCKED,
+    HOMER_SESSION_SOURCE_STALE,
+    HOMER_SESSION_SOURCE_FAILED
+} HomerSessionSourceResult;
+```
+
+Only the executor finalizer may clear a local pending bit:
+
+```text
+DRAINED or STALE:
+    clear the local pending bit
+
+MORE_READY or BLOCKED:
+    leave the local pending bit set
+
+FAILED:
+    leave cleanup to session teardown
+```
+
+Define authoritative machine-work predicates for finalization and audit:
+
+```c
+static bool HomerServiceCommandMachineHasWork(const TupleSinkServiceSessionState *session);
+static bool HomerServiceCompletionMachineHasWork(const TupleSinkServiceSessionState *session);
+```
+
+The command predicate includes `publishedEpoch > clientSqlRemoteCommandAcceptedEpoch`
+plus staged/retry work owned by the same command action. The completion predicate
+includes `publishedEpoch > lastConsumedPublishedEpoch`, staged peer-client
+completion publication, and any descriptor, payload-frontier, or source-credit
+retry state progressed by the same completion action. Keep monotonic `>` checks;
+do not use `!=`.
+
+Session teardown must clear both local pending and shared producer bits only
+after frontend/backend producers can no longer publish and before the table slot
+can be reused:
+
+```text
+stop/close producer
+wait for producer ownership to end
+clear shared and local readiness
+reset mailbox/session state
+increment session generation
+permit slot reuse
+```
+
+The repair should delete the current bandaid code after the pending layer is
+active:
+
+```text
+HomerProgressExecutionPlanContainsSource()
+HomerServiceRearmUnplannedBitmapSources()
+HomerServiceMarkCommandReadyByIndex()
+HomerServiceMarkCompletionReadyByIndex()
+fallback raced-bit fetch_and recovery
+exchange-path "predicate false, re-arm bit" branches
+staged-completion shared-bit re-arm
+remaining-record shared-bit re-arm
+production command/completion fallback discovery
+CommandReadyBitmapFallbackCountdown
+CompletionReadyBitmapFallbackCountdown
+```
+
+During one validation stage, keep only a compile-time audit:
+
+```c
+#if HOMER_SERVICE_READY_BITMAP_AUDIT
+```
+
+The audit may scan active sessions, but it must never append candidates, claim or
+re-set shared bits, advance mailboxes, or recover progress. Its assertion is:
+
+```text
+if machine has durable work
+and neither local pending nor shared producer bit is set before/after the check:
+    report ready-bitmap invariant violation
+```
+
+Use two signal snapshots around the durable-state check to avoid flagging a
+producer racing the audit.
+
+Recommended repair sequence:
+
+1. `3A-R1`: add `HomerServiceSessionPendingState`, exchange shared command and
+   completion bits into local pending, build candidates from local pending, and
+   keep old fallback only as diagnostics.
+2. `3A-R2`: add `HomerSessionSourceResult`, centralize command/completion
+   pending-bit finalization, add authoritative machine predicates, remove every
+   shared-bit re-arm from service code, and remove
+   `HomerServiceRearmUnplannedBitmapSources()`.
+3. `3A-R3`: delete normal fallback recovery, replace it with the temporary
+   compile-time invariant audit, and rename fallback counters to audit
+   violations for diagnostic output.
+4. `3A-R4`: clear local/shared readiness during ordered session teardown, add
+   stale-generation checks, run the full acceptance matrix, and disable the
+   audit for accepted performance binaries.
+
+Implementation note: `3A-R1` and `3A-R2` landed as one validated code stage.
+Local pending without executor discharge is not a runnable service state because
+pending bits would never clear. `3A-R3` and the session-teardown portion of
+`3A-R4` landed in the same stage; additional deterministic fault-injection hooks
+remain future validation tooling rather than production behavior. The landed
+code did not thread a new `HomerSessionSourceResult` enum through every legacy
+early-return branch; instead, selected command/completion executors run the
+existing bounded helpers and then call centralized finalizers that consult
+`HomerServiceCommandMachineHasWork()` and
+`HomerServiceCompletionMachineHasWork()`. That preserves the ownership invariant
+with a smaller hot-path edit.
+
+Deterministic validation scenarios:
+
+```text
+producer publishes before bitmap exchange
+producer publishes immediately after bitmap exchange
+two records are published while one local pending bit is set
+ready candidate is not selected because of plan budget
+candidate is selected but a guard rejects execution
+completion action publishes a staged peer completion and returns
+completion action consumes one of multiple mailbox records
+command/completion action blocks on source or payload credit
+producer publishes while executor is draining
+session closes and table slot is reused
+c4 runs with deliberately one-source execution budget
+c4 plus concurrent basebackup
+```
+
+Acceptance:
+
+```text
+no production fallback-discovery code
+no service-side re-setting of producer-owned command/completion bitmaps
+no ready mailbox without shared-or-local signal in audit builds
+no lost command/completion progress
+no stale session candidate execution
+10 warmed c4 runs pass
+5 c4-plus-basebackup runs pass
+```
+
+Useful counters:
+
+```text
+commandSignalsCollected
+completionSignalsCollected
+commandPendingHighWater
+completionPendingHighWater
+pendingCandidatesBuilt
+pendingCandidatesSelected
+pendingActionsDrained
+pendingActionsRetainedMore
+pendingActionsRetainedBlocked
+pendingStaleBitsCleared
+readyBitmapAuditViolations
+```
 
 ### 3B Critical Recv-CQ Demand Facts
 
@@ -2856,8 +3081,8 @@ empty critical polls per transaction
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
 | Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work            |
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
-| Slice 3A    | Partially landed; fail-fast fallback found unresolved c4 completion readiness bug     |
-| Slice 3B/3C | Blocked until Slice 3A completion fallback stays silent in warmed remote c4           |
+| Slice 3A    | Landed; persistent service-local pending readiness replaces production re-arm/fallback recovery |
+| Slice 3B/3C | Unblocked after Slice 3A; proceed with critical recv-CQ demand and resource-pressure readiness |
 | Slice 3D    | Planned; control indexed readiness added                                            |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
