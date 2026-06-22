@@ -5,12 +5,10 @@
 - **What this doc explains**: the landed Slice 2A checkpoint for the peer
   recv-CQ dispatcher: peer protocol v14 immediate-data ABI, one permanent
   transport-owned recv dispatcher, direct dispatch of all steady-state WIMM
-  CQEs, and removal of the optional peer-client-completion handler path from the
-  service pump.
-- **What this doc does NOT cover**: direct binding tables, split recv-CQ versus
-  CM drain APIs, bootstrap/canonical/teardown recv-CQ owner phases, or typed
-  ready-state replacement for command/control/payload. Those remain later Slice
-  2 work.
+  CQEs, removal of the optional peer-client-completion handler path from the
+  service pump, and the Slice 2D recv-CQ ownership/control-mailbox checkpoints.
+- **What this doc does NOT cover**: direct binding tables or typed ready-state
+  replacement for command and payload. Those remain later Slice 2 work.
 - **Primary code**: `/data/dbcomm/citus-dbcomm`
 - **Design source**:
   [`homer_completion_publication_v27_recovery_plan.md`](../../../future-directions/citus/transport/homer_completion_publication_v27_recovery_plan.md)
@@ -112,20 +110,29 @@ the future-direction plan. The next slices should still implement:
 Do not reintroduce optional semantic handlers or a generic CQE/token FIFO as a
 replacement for those typed states.
 
-Control mailbox readiness remains deliberately unfinished in this checkpoint.
-The current code still has two receiver-side publication signals: decoded
-control WIMM CQEs increment
-[`pendingControlDoorbellCount`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:482),
-while
-[`TupleSinkServiceTryConsumeLocalMailbox()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4251)
-can also consume when remote `publishedTail` is visible ahead of
-`consumedHead`. That visible-tail path is a liveness workaround for delayed
-recv-CQ polling, not the accepted design. The planned Slice 2D fix is to first
-finish recv-CQ owner phases and exact CQ demand, then replace control readiness
-with one full-message control `WRITE_WITH_IMM`, a CQE-derived
-`controlDoorbellArrivedTail`, and a level-triggered control-ready bit. The
-tail-visible path should become temporary diagnostic evidence only, not a
-semantic consumption path.
+Control mailbox readiness is now transport-CQE owned after Slice 2D1. The peer
+control mailbox protocol version is
+[`CITUS_REMOTE_EXEC_PEER_CONTROL_MAILBOX_PROTOCOL_VERSION`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:59)
+`2`, because the publication semantics changed even though the shared mailbox
+layout still retains the old `publishedTail` word. The sender-side publication
+point,
+[`TupleSinkServicePublishControlMessage()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4452),
+now posts one full-message `RDMA_WRITE_WITH_IMM` directly to the remote mailbox
+slot. It no longer posts a separate body WRITE followed by an 8-byte
+`publishedTail` WIMM.
+
+On the receiver,
+[`TupleSinkServiceQueuePeerControlDoorbellRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:614)
+turns each decoded control CQE into `controlDoorbellArrivedTail` and the
+level-triggered `controlMailboxReady` bit. It fails the connection if the CQE
+frontier would overrun the local control mailbox ring. The mailbox precheck and
+consumer,
+[`TupleSinkServiceLocalMailboxMayHaveMessage()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4366)
+and
+[`TupleSinkServiceTryConsumeLocalMailbox()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4390),
+only drain while `consumedHead < controlDoorbellArrivedTail`. They no longer
+observe remote `publishedTail` as a semantic readiness source and no longer have
+stale-late-doorbell reconciliation.
 
 ## Validation Evidence
 
@@ -280,3 +287,37 @@ remote c4 warmup:    40000/40000 transactions, 0 failures, 9720 TPS, p99 0.629 m
 remote c4 measured1: 40000/40000 transactions, 0 failures, 9669 TPS, p99 0.654 ms
 remote c4 measured2: 40000/40000 transactions, 0 failures, 9375 TPS, p99 0.702 ms
 ```
+
+Slice 2D1 one-WIMM control-mailbox publication validation:
+
+```text
+Code change:
+    bump CITUS_REMOTE_EXEC_PEER_CONTROL_MAILBOX_PROTOCOL_VERSION to 2
+    replace pendingControlDoorbellCount with controlDoorbellArrivedTail and controlMailboxReady
+    make each decoded CONTROL CQE advance the CQE-derived arrival frontier
+    fail fast if arrivedTail - consumedHead exceeds the local mailbox slot count
+    make TupleSinkServicePublishControlMessage() post one full-message RDMA_WRITE_WITH_IMM
+    stop writing remote publishedTail as the control publication gate
+    make TupleSinkServiceTryConsumeLocalMailbox() drain only CQE-authorized slots
+    delete visible-tail fallback and stale-late-doorbell handling
+
+Important non-changes:
+    publishedTail remains in the shared mailbox layout for now but is not receiver readiness
+    CONTROL immediate token zero remains connection-scoped
+    peer-op helpers still drain send CQ and response mailbox
+    command and payload typed ready-state migrations remain later Slice 2 work
+
+Build/install: passed with CPPFLAGS='-D_GNU_SOURCE'
+
+remote c1 -t 1000:   1000/1000 transactions, 0 failures, 498 TPS cold including setup
+remote c1 -t 100000: 100000/100000 transactions, 0 failures, 3929 TPS, p99 0.280 ms
+
+remote c4 warmup:    40000/40000 transactions, 0 failures, 9654 TPS, p99 0.618 ms
+remote c4 measured1: 40000/40000 transactions, 0 failures, 9254 TPS, p99 0.657 ms
+remote c4 measured2: 40000/40000 transactions, 0 failures, 9345 TPS, p99 0.654 ms
+```
+
+Service logs on both hosts after Slice 2D1 showed normal RDMA setup and session
+lifecycle messages, with no peer control mailbox protocol mismatch, control
+ring sequence mismatch, overrun, immediate decode error, or failed pgbench
+transaction.

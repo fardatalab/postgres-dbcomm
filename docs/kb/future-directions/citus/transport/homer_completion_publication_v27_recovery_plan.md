@@ -80,8 +80,8 @@ array. This is safe because the previous command token array had no live
 service-side pop consumer; scheduler readiness already comes from the durable
 per-session command mailbox fact. Direct command ready bits remain future work.
 
-Post-2C control-path review tightened the Slice 2D target. The current control
-mailbox path has two publication signals: a decoded control WIMM increments
+Post-2C control-path review tightened the Slice 2D target. Before Slice 2D, the
+control mailbox path had two publication signals: a decoded control WIMM increments
 `pendingControlDoorbellCount`, while the mailbox consumer may also consume by
 observing remote `publishedTail > consumedHead`. That visible-tail fallback is a
 liveness workaround for delayed recv-CQ polling, not an accepted publication
@@ -122,6 +122,18 @@ silently draining recv CQEs. The scheduled peer pump remains the recv-CQ owner.
 Remote RDMA validation stayed correct: c1 `100000/100000`, zero failures,
 `3910 TPS`; c4 warmup `9720 TPS`, measured `9669 TPS` and `9375 TPS`, all zero
 failures.
+
+Slice 2D1 is now landed. The peer control mailbox protocol version is bumped to
+`2`; decoded control CQEs now advance `controlDoorbellArrivedTail` and set
+`controlMailboxReady`; `TupleSinkServicePublishControlMessage()` posts one
+full-message `RDMA_WRITE_WITH_IMM` to the remote mailbox slot; and the receiver
+no longer treats remote `publishedTail` as a publication gate. The visible-tail
+fallback and stale-late-doorbell handling are gone from the semantic path.
+Remote RDMA validation stayed correct: c1 `100000/100000`, zero failures,
+`3929 TPS`; c4 warmup `9654 TPS`, measured `9254 TPS` and `9345 TPS`, all zero
+failures. This is correctness-equivalent and performance-neutral relative to the
+2D0 band; the expected c4 throughput recovery still depends on later hot-path
+cleanup rather than on this ownership slice alone.
 
 ## Current Code Pointers
 
@@ -1311,12 +1323,11 @@ finish before replacing control mailbox readiness:
     require zero noncanonical recv-CQ polls in normal runs
 ```
 
-The current code does not yet satisfy this prerequisite:
-`TupleSinkServiceApplyPeerBootstrapMessage()` still sets `bootstrapComplete`,
-`TupleSinkServiceFinishPeerConnectionSetup()` also sets it, and
-`TupleSinkServicePrepareConnectionForWrite()` still drains recv-CQ/CM events
-before writes. These are the concrete ownership issues to fix before removing
-the control visible-tail workaround.
+This prerequisite is now partially satisfied by Slice 2D0a through 2D0c:
+bootstrap ownership is centralized in `TupleSinkServiceFinishPeerConnectionSetup()`,
+and write preparation/op polling no longer drain the physical recv CQ. Remaining
+peer-op ownership cleanup is separate: the op helpers still drain send CQ and
+response mailbox until the later peer-control helper cleanup slice.
 
 Slice 2D1, control-mailbox one-WIMM publication:
 
@@ -1348,6 +1359,11 @@ recv-CQ demand, but it must not consume a record or advance `consumedHead`.
 After exact CQ drain, a persistent tail-ahead condition is a transport or
 collector-ownership failure.
 
+Implementation status: landed with protocol version `2`. The current code keeps
+the `publishedTail` field physically present in `TupleSinkServicePeerControlMailbox`
+to avoid mailbox layout churn during this slice, but receiver-side control
+readiness is now solely `controlDoorbellArrivedTail`/`controlMailboxReady`.
+
 `CONTROL` immediate token zero remains acceptable because control is
 connection-scoped and the physical CQ identifies the connection. That depends on
 the recv-CQ owner-phase invariant:
@@ -1366,11 +1382,11 @@ control to use a generation-bearing token instead of token zero.
 Delete after control tests pass:
 
 ```text
-pendingControlDoorbellCount
-control-doorbell count-specific paths
-tail-based control mailbox consumption
-stale-late-control-doorbell handling
-remote publishedTail as a receiver-side publication gate
+pendingControlDoorbellCount - deleted in Slice 2D1
+control-doorbell count-specific paths - replaced by controlDoorbellArrivedTail in Slice 2D1
+tail-based control mailbox consumption - deleted in Slice 2D1
+stale-late-control-doorbell handling - deleted in Slice 2D1
+remote publishedTail as a receiver-side publication gate - removed semantically in Slice 2D1
 special immediateData == 0 decoder branch
 ```
 
@@ -1384,6 +1400,18 @@ multiple control CQEs coalesce through arrivedTail and one ready bit
 late/stale CQE after teardown is rejected by owner phase or destroyed CQ
 noncanonicalRecvCqPollAttempts remains zero in steady-state c1/c4 runs
 temporary tail-ahead diagnostic counter is zero after exact CQ demand is active
+```
+
+Validated status for Slice 2D1:
+
+```text
+one full-message control WIMM is the only publication gate - yes
+remote publishedTail is not required for receiver readiness - yes
+controlDoorbellArrivedTail overrun is fail-fast - yes
+multiple CQEs coalesce through arrivedTail and one ready bit - implemented
+late/stale CQE after teardown - still relies on owner phase/destroyed CQ invariant
+noncanonicalRecvCqPollAttempts - stats-gated counter exists; no-stats validation used for performance
+tail-ahead diagnostic counter - not added because visible-tail fallback was removed rather than retained diagnostically
 ```
 
 Slice 2E, payload migration:
@@ -1907,7 +1935,7 @@ empty critical polls per transaction
 | ----------- | ------------------------------------------------------------------------------------ |
 | Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
 | Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
-| Slice 2D    | Implementation-ready after CQ owner-phase prerequisite; do 2D0 before control WIMM    |
+| Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
 | Slice 2E/F  | Direction is clear; expand per-family files/tests before implementation               |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
