@@ -104,6 +104,14 @@ WIMM shape. Remote RDMA validation stayed correct and performance-neutral:
 c1 `100000/100000`, zero failures, `3958 TPS`; c4 warmup `9693 TPS`, measured
 `9586 TPS` and `9348 TPS`, all zero failures.
 
+Slice 2D0b is also landed. `TupleSinkServiceApplyPeerBootstrapMessage()` now
+only validates and stores the peer mailbox descriptor; it no longer sets
+`bootstrapComplete`. `TupleSinkServiceFinishPeerConnectionSetup()` is now the
+only transition into `bootstrapComplete`/canonical recv-CQ ownership. Remote
+RDMA validation stayed correct and performance-neutral: c1 `100000/100000`,
+zero failures, `3948 TPS`; c4 warmup `9760 TPS`, measured `9565 TPS` and
+`9401 TPS`, all zero failures.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)

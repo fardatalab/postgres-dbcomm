@@ -235,3 +235,22 @@ remote c4 warmup:    40000/40000 transactions, 0 failures, 9693 TPS, p99 0.640 m
 remote c4 measured1: 40000/40000 transactions, 0 failures, 9586 TPS, p99 0.641 ms
 remote c4 measured2: 40000/40000 transactions, 0 failures, 9348 TPS, p99 0.663 ms
 ```
+
+Slice 2D0b bootstrap ownership cleanup validation:
+
+```text
+Code change:
+    TupleSinkServiceApplyPeerBootstrapMessage() only validates and stores the peer mailbox descriptor
+    TupleSinkServiceApplyPeerBootstrapMessage() no longer sets bootstrapComplete
+    TupleSinkServiceFinishPeerConnectionSetup() is the sole bootstrapComplete/CANONICAL transition
+    passive-side setup no longer needs to undo an early bootstrapComplete=true
+
+Build/install: passed with CPPFLAGS='-D_GNU_SOURCE'
+
+remote c1 -t 1000:   1000/1000 transactions, 0 failures, 499 TPS cold including setup
+remote c1 -t 100000: 100000/100000 transactions, 0 failures, 3948 TPS, p99 0.278 ms
+
+remote c4 warmup:    40000/40000 transactions, 0 failures, 9760 TPS, p99 0.624 ms
+remote c4 measured1: 40000/40000 transactions, 0 failures, 9565 TPS, p99 0.637 ms
+remote c4 measured2: 40000/40000 transactions, 0 failures, 9401 TPS, p99 0.682 ms
+```
