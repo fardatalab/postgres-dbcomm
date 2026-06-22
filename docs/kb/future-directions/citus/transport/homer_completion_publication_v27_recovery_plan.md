@@ -966,7 +966,7 @@ semantic object. The dispatcher materializes only compact typed readiness.
 | --- | --- | --- | --- |
 | Client completion | Completion slot and descriptor table | Per-session pending doorbell count, next expected epoch, visibility-pending state | No |
 | Client command | Command mailbox/ring | Session command-ready bit | No |
-| Payload | Payload ring and published frontier/in-band headers | Intrusive per-traffic-class ready-list membership | No |
+| Payload | Payload ring and published frontier/in-band headers | Fixed per-traffic-class ready-queue membership | No |
 | Control mailbox | Control mailbox sequence/slots | Connection mailbox-ready bit | No |
 | Send completion | Source-owner FIFO/table | Immediate owner retirement and resource-pressure ready bit | No |
 | Disconnect/lifetime | Connection state | Connection lifetime-ready state | No |
@@ -977,7 +977,7 @@ Exact ready-state storage:
 | --- | --- |
 | Client completion | Per-session pending count plus pending-publication bitmap |
 | Client command | Service-local 64-bit session bitmap |
-| Payload | Intrusive per-traffic-class ready list |
+| Payload | Fixed per-traffic-class array-backed ready queue |
 | Control mailbox | Per-connection boolean plus ready connection bitmap |
 | Connection lifetime | Per-connection lifetime boolean plus ready connection bitmap |
 | Send-resource relief | Per-session blocked-reason mask plus resource-pressure bitmap |
@@ -1032,41 +1032,61 @@ executor: drain commands within budget, recheck mailbox, re-set bit when unread 
 Multiple command doorbells safely coalesce because the command mailbox retains
 all unread commands.
 
-Payload readiness is level-triggered and uses an intrusive ready queue, not an
-open choice between queue and bitmap. Each payload stream entry gets:
+Payload readiness is level-triggered and uses a fixed array-backed ready queue,
+not an open choice between queue and bitmap. Each payload stream entry gets only
+membership/generation state, not linked-list pointers:
 
 ```c
 bool recvReadyEnqueued;
-uint32_t recvReadyPrevious;
-uint32_t recvReadyNext;
 uint64_t recvReadyGeneration;
 ```
 
-The service owns one doubly linked ready list per traffic class:
+The service owns one small ring queue per traffic class:
 
 ```c
-uint32_t payloadRecvReadyHead[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
-uint32_t payloadRecvReadyTail[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+typedef struct HomerPayloadReadyQueueEntry
+{
+    uint32_t streamIndex;
+    uint64_t streamGeneration;
+} HomerPayloadReadyQueueEntry;
+
+typedef struct HomerPayloadReadyQueue
+{
+    uint32_t head;
+    uint32_t tail;
+    uint32_t count;
+    HomerPayloadReadyQueueEntry entries[HOMER_PAYLOAD_READY_QUEUE_CAPACITY];
+} HomerPayloadReadyQueue;
+
+HomerPayloadReadyQueue payloadReadyQueues[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
 ```
 
-Use an invalid index sentinel for empty links.
+Use fixed capacity sized above the active stream table, for example
+`2 * CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS` or
+`4 * CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS`. The current capacity is only
+64 streams, so the queue can stay small and cache-local.
 
 ```text
 payload dispatcher:
     decode the direct payload binding
     validate stream index, stream generation, and connection generation
-    append the stream only when recvReadyEnqueued == false
+    enqueue {streamIndex, streamGeneration} only when recvReadyEnqueued == false
 
 payload executor:
-    remove one ready stream
-    validate stored generation
+    pop or peek one ready queue entry
+    validate index, stored generation, active state, binding, and membership bit
+    discard stale entries at the head without executing payload work
     drain within byte/record budget
     recheck ring
-    append stream to the tail again when unread payload remains
+    enqueue a fresh tail entry when unread payload remains
 ```
 
-On stream close or reclamation, remove an enqueued stream in O(1) using the
-doubly linked pointers.
+On stream close or reclamation, clear `recvReadyEnqueued` and invalidate the
+binding/generation; do not scan the queue. Any old queue entries are lazily
+discarded when they reach the head. If a queue reaches a pressure high-water mark
+or fills, compact it in place by keeping only entries that still validate. If it
+still overflows after compaction, treat that as a correctness/resource bug rather
+than silently falling back to a stream scan.
 
 Control mailbox readiness is level-triggered and CQE-authorized:
 
@@ -1417,9 +1437,9 @@ tail-ahead diagnostic counter - not added because visible-tail fallback was remo
 Slice 2E, payload migration:
 
 ```text
-use intrusive per-traffic-class payload ready lists
-append stream only when recvReadyEnqueued == false
-remove/requeue streams through O(1) doubly linked pointers
+use fixed per-traffic-class payload ready queues
+enqueue stream only when recvReadyEnqueued == false
+claim/requeue streams through O(1) ring-queue operations
 ```
 
 After payload tests pass, delete:
@@ -1435,7 +1455,7 @@ Decision after Slice 2D1:
 
 ```text
 Use a dedicated generation-bearing payload doorbell token, an O(1)
-service-stream lookup, and a service-owned intrusive ready list.
+service-stream lookup, and service-owned fixed array-backed ready queues.
 
 Do not retain serviceSinkId as the immediate token, and do not build a direct
 map keyed by serviceSinkId.
@@ -1447,14 +1467,15 @@ serviceSinkId is a semantic identifier, not a safe transport binding:
     reusing or resolving it still requires separate lookup and lifetime machinery
 
 The payload token is an opaque receiver-issued capability that identifies one
-local payload stream table slot and one allocation generation.
+local payload stream table slot and one allocation generation. The ready queue is
+not a linked list; it is a small non-concurrent ring per traffic class.
 ```
 
 Pre-implementation finding after Slice 2D1:
 
 ```text
 2E is no longer blocked, but it must be implemented through the staged token and
-ready-list plan below rather than as a mechanical cleanup.
+ready-queue plan below rather than as a mechanical cleanup.
 
 Current code:
     TupleSinkServiceQueuePeerPayloadDoorbellRdma() is the recv-CQ materializer.
@@ -1467,11 +1488,11 @@ Current code:
     stream-local receivePayloadDoorbellPending bit.
 
 Implication:
-    The planned intrusive ready list is service-owned, because the list nodes
-    must live in HomerServicePayloadStreamEntry/HomerPayloadStreamState and must
-    be ordered by traffic class. The physical recv-CQ owner currently has no
+    The planned ready queue is service-owned, because the queue entries identify
+    HomerServicePayloadStreamEntry/HomerPayloadStreamState objects and must be
+    ordered by traffic class. The physical recv-CQ owner currently has no
     service-stream pointer, binding table, or generation-bearing payload token
-    that would let it append a stream directly.
+    that would let it enqueue a stream directly.
 ```
 
 Do not replace `pendingDataDoorbellSinkIds[]` with another transport-local FIFO
@@ -1484,9 +1505,9 @@ Accepted shape:
     encode a payload binding token with stream index plus generation
     validate connection generation, stream active state, stream generation,
     token generation, peer binding state, and traffic class at CQE time
-    append HomerServicePayloadStreamEntry to an intrusive ready list exactly
+    enqueue HomerServicePayloadStreamEntry into a fixed ready queue exactly
     once while recvReadyEnqueued is false
-    have the payload executor unlink/requeue in O(1) after draining work
+    have the payload executor claim/requeue in O(1) after draining work
 
 Rejected shortcuts:
     keep serviceSinkId as the immediate token
@@ -1603,56 +1624,67 @@ A stale token is a transport lifetime violation. Mark the stream/connection
 failed rather than silently dropping it.
 ```
 
-2E.4 - Add service-owned ready lists:
+2E.4 - Add service-owned array-backed ready queues:
 
 ```c
-typedef struct HomerPayloadReadyList
+typedef struct HomerPayloadReadyQueueEntry
+{
+    uint32_t streamIndex;
+    uint64_t streamGeneration;
+} HomerPayloadReadyQueueEntry;
+
+typedef struct HomerPayloadReadyQueue
 {
     uint32_t head;
     uint32_t tail;
     uint32_t count;
-} HomerPayloadReadyList;
+    HomerPayloadReadyQueueEntry entries[HOMER_PAYLOAD_READY_QUEUE_CAPACITY];
+} HomerPayloadReadyQueue;
 
-HomerPayloadReadyList PayloadReadyLists[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+HomerPayloadReadyQueue PayloadReadyQueues[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
 ```
 
-Use `UINT32_MAX` as the invalid index. Add to each payload stream entry:
+Use fixed queue capacity sized above the stream table, initially
+`2 * CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS` or
+`4 * CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS`. The current table capacity is
+64, so a small fixed queue is enough. Add to each payload stream entry:
 
 ```c
 bool recvReadyEnqueued;
-uint32_t recvReadyPrevious;
-uint32_t recvReadyNext;
 uint64_t recvReadyStreamGeneration;
 uint32_t payloadDoorbellTokenGeneration;
 uint32_t localPayloadDoorbellToken;
 uint32_t peerPayloadDoorbellToken;
 ```
 
-List helpers:
+Queue helpers:
 
 ```text
 HomerServiceEnqueuePayloadReady(service, streamIndex)
-HomerServiceRemovePayloadReady(service, streamIndex)
 HomerServiceClaimPayloadReady(service, streamIndex, streamGeneration)
+HomerServiceCompactPayloadReadyQueue(service, trafficClass)
 ```
 
 Invariants:
 
 ```text
-a stream appears in at most one list
-its list corresponds to its bound traffic class
+a stream has at most one live ready-queue membership
+its queue corresponds to its bound traffic class
 repeated WIMMs coalesce while recvReadyEnqueued is true
-stream reclamation removes it from the list before the entry is cleared
-list entries always carry/validate the current stream generation
+stream reclamation clears recvReadyEnqueued before the entry is cleared
+old queue entries are lazily discarded when they reach the queue head
+queue entries always carry/validate the current stream generation
+queue pressure compaction keeps only entries that still validate
+overflow after compaction is a correctness/resource bug, not a fallback trigger
 ```
 
-2E.5 - Integrate the list with the scheduler safely:
+2E.5 - Integrate the queue with the scheduler safely:
 
 ```text
-Do not unlink streams while merely constructing candidates. A candidate may be
+Do not claim streams while merely constructing candidates. A candidate may be
 built but not selected.
 
-Candidate construction traverses the ready list and emits:
+Candidate construction peeks/traverses the ready queue and emits:
 
 typedef struct HomerPayloadReadyCandidate
 {
@@ -1663,15 +1695,16 @@ typedef struct HomerPayloadReadyCandidate
 
 At executor entry:
     validate index and generation
-    claim and unlink the stream
+    claim the stream by popping a valid queue entry
+    discard stale head entries without executing payload work
     drain within granted record/byte/WR budget
     recheck the underlying ring/frontier
     re-enqueue at tail if unread payload remains, budget was exhausted with more
     ready work, or a temporary dependency prevented draining
-    leave it off-list only after a stable empty recheck
+    leave it off-queue only after a stable empty recheck
 
 Only receive-side payload readiness discovery moves from the broad stream scan
-to this list. Producer-side outgoing payload discovery can keep existing indexed
+to this queue. Producer-side outgoing payload discovery can keep existing indexed
 facts until its own scheduler work is completed.
 ```
 
@@ -1684,16 +1717,19 @@ Release only after existing stream state proves:
     peer can no longer post new payload WIMMs
     final payload/EOS frontier has been observed
     local receive ring is drained through that frontier
-    stream is not on a payload ready list
+    stream has no live payload ready-queue membership
     no payload executor action references its generation
     peer close/lifetime protocol permits reclamation
 
 Then:
-    remove it from any ready list
+    clear recvReadyEnqueued
     mark token binding inactive
     clear connection binding
     preserve the external token-generation counter for the next allocation
     reclaim the stream entry
+
+Do not scan/remove stale queue entries at close time. They are discarded at the
+queue head or removed by pressure compaction.
 
 A payload WIMM received after binding invalidation on the same connection
 generation is a protocol error and should reset the affected connection.
@@ -1702,7 +1738,7 @@ generation is a protocol error and should reset the affected connection.
 2E.7 - Delete legacy payload pending state:
 
 ```text
-After direct-token and ready-list validation, delete:
+After direct-token and ready-queue validation, delete:
     pendingDataDoorbellSinkIds
     pendingDataDoorbellCount
     TupleSinkServiceQueuePeerPayloadDoorbellRdma
@@ -1710,7 +1746,7 @@ After direct-token and ready-list validation, delete:
     TupleSinkServicePeerDataDoorbellPendingRdma
 
 Also delete receivePayloadDoorbellPending after zero-reference check proves the
-intrusive ready state fully replaces it.
+ready-queue state fully replaces it.
 ```
 
 Recommended commit staging:
@@ -1727,8 +1763,8 @@ Recommended commit staging:
 2E-B Direct service materialization:
     add permanent onPayloadReady callback
     add direct stream lookup and validation
-    add intrusive ready lists
-    switch receive-side scheduler readiness to the lists
+    add fixed array-backed ready queues
+    switch receive-side scheduler readiness to the queues
     keep legacy array only behind diagnostic comparison macro for one stats run;
     it must not drive execution
 
@@ -1749,7 +1785,7 @@ Tests:
     reject wrong connection generation
     reject wrong traffic class
     reject closed/reused stream entry
-    two or more WIMMs for one stream produce one ready-list node
+    two or more WIMMs for one stream produce one ready-queue entry
     multiple unread ring records drain after coalesced WIMMs
     multiple streams in one traffic class make round-robin progress
     concurrent foreground and bulk lists retain class priority
@@ -1767,7 +1803,9 @@ Counters:
     payloadReadyAlreadyEnqueued
     payloadReadyClaims
     payloadReadyRequeues
-    payloadReadyListHighWater
+    payloadReadyQueueHighWater
+    payloadReadyQueueCompactions
+    payloadReadyQueueStaleDrops
     payloadStaleTokenErrors
     payloadReadyFallbackDiscoveries
 
@@ -2300,7 +2338,7 @@ empty critical polls per transaction
 | Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
 | Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
-| Slice 2E    | Implementation-ready as staged 2E-A/2E-B/2E-C payload token and ready-list work       |
+| Slice 2E    | Implementation-ready as staged 2E-A/2E-B/2E-C payload token and ready-queue work      |
 | Slice 2F    | Follow-up ownership cleanup; enforce canonical recv-CQ poll owner and delete leftovers |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
