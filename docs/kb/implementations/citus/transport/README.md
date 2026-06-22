@@ -16,6 +16,7 @@ remote execution session semantics.
 
 <!-- kb-docs:start -->
 - [byte_ring_payload_stream_checkpoint.md](byte_ring_payload_stream_checkpoint.md) - Current checkpoint for the service-to-service byte-ring RDMA substrate used by Homer basebackup streams.
+- [peer_client_completion_v27_checkpoint.md](peer_client_completion_v27_checkpoint.md) - Landed checkpoint for peer-client completion mailbox v27, full-slot WRITE_WITH_IMM publication, and receiver-service CPU publication.
 <!-- kb-docs:end -->
 
 ## Related

@@ -19,31 +19,62 @@ This plan supersedes the Stage 7d blocker section of
 for peer-client completion publication. That larger plan remains the broad
 transport optimization roadmap.
 
+## Implementation Progress
+
+As of June 22, 2026, Slice 1 has landed in `/data/dbcomm/citus-dbcomm` and is
+recorded in
+[`peer_client_completion_v27_checkpoint.md`](../../../implementations/citus/transport/peer_client_completion_v27_checkpoint.md).
+The landed checkpoint includes:
+
+- frontend completion mailbox protocol version `27`;
+- control/client-completion/peer-completion shared-memory names bumped to `v27`
+  for stale-region isolation;
+- removal of frontend-client aggregate `publishedEpoch` and
+  `peerCompletionDoorbellScratch`;
+- one full-slot `RDMA_WRITE_WITH_IMM` for peer-client completion publication on
+  descriptor-cache hits;
+- descriptor-body WRITE plus full-slot completion WIMM on descriptor-cache
+  misses;
+- receiver-service validation and CPU publication of descriptor `readyVersion`
+  and completion `readyEpochSlots`;
+- descriptor trailing `sealVersion`;
+- receiver acquire fence after WIMM CQE observation;
+- send-CQ owner-table cleanup if the final WIMM post is rejected before a CQE
+  can ever arrive.
+
+Validation for this checkpoint used no-stats binaries and the farnet0-to-farnet1
+remote RDMA pgbench path. The current accepted evidence is remote c1 and c4
+correctness, plus warmed c4 performance in the `9.4k-9.8k TPS` band with zero
+failed transactions. The deterministic injection matrix in Slice 1.8 was not
+implemented in this commit and remains a follow-up hardening task.
+
+The next implementation stage should be Slice 2: canonical recv-CQ dispatcher
+and typed event materialization. Do not add new optional handlers or expand the
+generic FIFO/stash path while implementing later slices.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)
   is the trailing content proof currently appended to a client completion slot.
-- [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:867)
-  still contains frontend-client `publishedEpoch`, `consumedEpoch`,
-  `peerCompletionDoorbellScratch`, slot-local `readyEpochSlots`, completion
-  slots, and the result descriptor table.
+- [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:879)
+  now contains `consumedEpoch`, slot-local `readyEpochSlots`, completion slots,
+  and the result descriptor table; frontend-client aggregate `publishedEpoch`
+  and `peerCompletionDoorbellScratch` are gone in v27.
 - [`HomerResultDescriptorSlot`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:604)
-  currently has a leading `bodyVersion` but no trailing seal.
-- [`CitusRemoteExecPublishResultDescriptor()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:767)
+  now has both a leading `bodyVersion` and trailing `sealVersion`.
+- [`CitusRemoteExecPublishResultDescriptor()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:774)
   and
-  [`CitusRemoteExecReadResultDescriptorStable()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:790)
+  [`CitusRemoteExecReadResultDescriptorStable()`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:798)
   implement current descriptor publication/read validation.
-- [`HomerClientOpenSqlSession()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:680)
-  initializes the remote client completion cursor from
-  `completionMailbox->publishedEpoch`; v27 should initialize from
-  `consumedEpoch` instead.
+- [`HomerClientOpenCompletionMailbox()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:588)
+  initializes the remote client completion cursor from `consumedEpoch`.
 - [`HomerClientCopyClientCompletionSlotStable()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:1108)
   is the frontend ready-copy-ready and trailing-seal validator.
 - [`TupleSinkServicePublishPeerClientCommandCompletion()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14200)
   is the backend-node peer-client completion publisher.
 - [`TupleSinkServicePostPeerRegisteredClientCompletionBytesWithImmediateRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:5936)
   is the registered-source `RDMA_WRITE_WITH_IMM` posting surface.
-- [`TupleSinkServiceHandlePeerClientCompletionDoorbell()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20175)
+- [`TupleSinkServiceHandlePeerClientCompletionDoorbell()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20139)
   is the receiver-side doorbell handler that validates completion content and
   CPU-publishes frontend visibility.
 - [`TupleSinkServiceDrainPeerConnectionEvents()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3906)
