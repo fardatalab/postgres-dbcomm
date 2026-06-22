@@ -2202,7 +2202,8 @@ the missing readiness before doing more Stage 7 topology/performance work.
 
 ### 3A Backend-Completion-Ready Bitmap
 
-Status: landed and validated on June 22, 2026.
+Status: partially landed; June 22 validation exposed a remaining
+completion-readiness ownership bug before fallback discovery can be removed.
 
 The bitmap lives in `CitusRemoteExecControlRegion`, currently as
 `completionReadySessions`. Backend code must not open-code bitmap layout or
@@ -2279,12 +2280,25 @@ Implemented shape:
 - `TupleSinkServiceConsumeCompletionMailbox()` re-marks the session bit when one
   consumed backend completion leaves more unread records, preserving the
   level-triggered bitmap invariant across multi-record completion bursts.
-- The fallback broad scan remains a safety net. Implementation found that a
-  backend can set a completion bit after the service exchanges the bitmap but
-  before the fallback scan checks that session. The fallback materializer now
-  claims that raced-in bit with `fetch_and(~sessionBit)` and does not count it
-  as `completionReadyBitmapFallbackDiscoveries`; otherwise the counter falsely
-  reported hidden fallback progress even though the bitmap fired.
+- The fallback broad scan is being converted from recovery behavior into a
+  fail-fast invariant check. Implementation found three real or apparent
+  hidden-readiness classes:
+  - A frontend can set a command-ready bit after the service exchanges the
+    bitmap but before the fallback scan checks that session. The command
+    fallback materializer now claims such raced-in bits with
+    `fetch_and(~sessionBit)` and treats only a missing bit as fatal.
+  - The exchange path can observe a command/completion bitmap bit before the
+    corresponding mailbox tail is visible. The exchanged bit is now re-armed for
+    still-live source owners instead of being dropped.
+  - `TupleSinkServiceConsumeCompletionMailbox()` can publish a previously
+    staged peer-client completion and return before consuming the backend
+    completion mailbox. That path now re-arms the completion bit if the mailbox
+    remains ahead of `lastConsumedPublishedEpoch`.
+- A fourth completion hidden-readiness path remains unresolved. A conservative
+  re-arm pass was added after execution planning for command/completion sources
+  that were materialized into the ready set but not selected in the execution
+  plan. Remote c4 still hit fail-fast completion fallback, so the remaining bug
+  is not explained solely by unselected candidate destruction.
 
 Validation evidence:
 
@@ -2296,7 +2310,7 @@ Validation evidence:
   and `meson install -C build --no-rebuild`.
 - Installed artifact check: `pgbench`, `citus_tuple_sink_service`, and
   `libhomer_client.a` all contained v12 mailbox names and no v11 mailbox names.
-- Remote RDMA pgbench after restoring no-stats binaries:
+- Earlier remote RDMA pgbench after restoring no-stats binaries:
   cold c1 `5000/5000` with 0 failures, warmed c1 `10000/10000` with 0 failures,
   `3965.690433 TPS`, p95 `0.264 ms`, p99 `0.279 ms`; warmed c4 `40000/40000`
   with 0 failures, `9917.272591 TPS`, p95 `0.534 ms`, p99 `0.614 ms`.
@@ -2311,6 +2325,73 @@ Validation evidence:
   completion-ring progress. Client-host `command_fallback_discoveries=12` is an
   existing command-ready bitmap follow-up and is not part of this completion
   bitmap slice.
+- Follow-up fail-fast validation:
+  - Command fallback first fired with `command_sequence=0`; the original
+    command readiness predicate used `publishedEpoch != acceptedEpoch`, which
+    could classify stale or non-forward epochs as work. It now uses
+    `publishedEpoch > acceptedEpoch`.
+  - After raced-in bit claiming and exchange/read re-arm, remote c4 `20000/20000`
+    completed with 0 failures under the stats build; no fallback fatal appeared
+    in service logs.
+  - No-stats c1 remained correct (`20000/20000`, 0 failures, about
+    `3939 TPS`, p99 `0.276 ms`).
+  - No-stats c4 still failed the new completion fallback invariant. Observed
+    fatal examples on `farnet1`:
+    `completion-ready bitmap fallback discovered hidden work session_index=0 session=11 command_sequence=2535`,
+    `session_index=2 session=7 command_sequence=3642`, and after the unplanned
+    ready-set re-arm attempt `session_index=3 session=4 command_sequence=9135`.
+    This is now the blocking issue for completing Slice 3A and for deleting or
+    permanently failing all fallback discoveries.
+
+Current blocker:
+
+The remaining completion fallback means some backend completion mailbox becomes
+ready without an active completion-ready bit by the time the periodic broad scan
+checks it. The attempted fixes covered:
+
+1. raced-in producer bit after fallback scan begins;
+2. exchanged bit observed before mailbox tail visibility;
+3. staged peer-client completion publication returning before mailbox consume;
+4. ready-set materialization without execution-plan selection.
+
+Since c4 still reproduces after those fixes, the next diagnosis should instrument
+the exact ownership transition for a completion source: backend publication
+`RemoteExecBackendMarkCompletionReady()`, service bitmap exchange, ready-set
+append, action-plan selection, `TupleSinkServiceConsumeCompletionMailbox()`, and
+any return path that leaves `publishedEpoch > lastConsumedPublishedEpoch`
+without `completionReadySessions` set. Do not remove the fallback scan until this
+path is proven and the fatal fallback check stays silent in warmed remote c4.
+
+Detailed follow-up findings for review:
+
+| Finding | Symptom/evidence | Current interpretation | Code state |
+| --- | --- | --- | --- |
+| Command readiness predicate was too broad | Fail-fast printed `command-ready bitmap fallback discovered hidden work session_index=2 session=3 command_sequence=0`. | `publishedEpoch != acceptedEpoch` can classify a non-forward or stale epoch as work. The command source should only be ready when the frontend-published epoch is strictly ahead of the service-accepted epoch. | Unvalidated Citus tree changes `HomerServiceRemoteClientSqlCommandSourceReady()` to `publishedEpoch > acceptedEpoch` in `src/backend/distributed/utils/homer/tuple_sink_service_process.c`. |
+| Fallback scan can race producer bit publication | A source can become ready between bitmap exchange and fallback scan. Treating that as fallback discovery falsely reports hidden work. | The fallback scan must first attempt to claim the bit with `fetch_and(~sessionBit)`. If the bit was present, the source was explicitly published and should be materialized normally. If not, it is a real invariant violation. | Unvalidated Citus tree applies raced-bit claiming for command and completion fallback scans. |
+| Bitmap exchange can observe the bit before the mailbox tail is visible | A destructive `atomic_exchange(..., 0)` can clear the source bit, then the source predicate reads the mailbox as not ready. Later fallback sees the mailbox ready. | The bitmap signal and mailbox tail are separate memory locations. If the source owner is still live but the predicate is not yet true, preserve the producer signal by re-arming the bit instead of dropping it. | Unvalidated Citus tree re-arms command and completion bits in the exchange loops when the owner is still active but the mailbox predicate is false. |
+| Staged peer-client completion retry can mask backend completion readiness | `TupleSinkServiceConsumeCompletionMailbox()` can return after publishing a previously staged peer-client completion without consuming the backend completion mailbox record that made the completion source ready. | Peer-client completion retry and backend completion mailbox consumption are separate pieces of work sharing the completion action path. If staged retry makes progress first, the backend completion source must remain armed. | Unvalidated Citus tree re-arms the completion bit after staged publish if `HomerServiceCompletionRingSourceReady()` remains true. |
+| Unselected ready-set materialization hypothesis did not explain the c4 failure | After adding an unplanned-source re-arm pass, remote c4 still failed with `completion-ready bitmap fallback discovered hidden work session_index=3 session=4 command_sequence=9135`. | Candidate/ready-set materialization being destructive is a real design hazard, but it is not sufficient to explain the current remaining completion fallback. Do not treat this as the root cause without more evidence. | Unvalidated Citus tree includes `HomerServiceRearmUnplannedBitmapSources()`, but validation says this is not enough and may need redesign/removal depending on the next diagnosis. |
+
+The next useful diagnostic is not another broad fix. Add targeted counters or
+temporary debug logs around one completion source's lifecycle:
+
+```text
+backend publishes completion and calls RemoteExecBackendMarkCompletionReady()
+service exchanges completionReadySessions
+service appends HomerCompletionRingProgressSourceRef()
+policy selects or skips the completion source
+TupleSinkServiceConsumeCompletionMailbox() enters
+TupleSinkServiceConsumeCompletionMailbox() returns after staged publish, no-work, overrun, or consume
+service re-arms or does not re-arm completionReadySessions
+fallback scan observes publishedEpoch > lastConsumedPublishedEpoch
+```
+
+For each event, log session table index, `serviceSessionId`,
+`publishedEpoch`, `lastConsumedPublishedEpoch`, the old/new bitmap word, and
+whether the source was selected in the execution plan. The expected invariant is:
+after any service pass that leaves `publishedEpoch > lastConsumedPublishedEpoch`
+for a service-owned completion mailbox, `completionReadySessions` must contain
+that session bit unless the same pass is about to consume it.
 
 ### 3B Critical Recv-CQ Demand Facts
 
@@ -2775,8 +2856,8 @@ empty critical polls per transaction
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
 | Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work            |
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
-| Slice 3A    | Landed; backend completion bitmap validated with zero completion fallback discoveries |
-| Slice 3B/3C | Sufficiently detailed to start after Slice 3A                                       |
+| Slice 3A    | Partially landed; fail-fast fallback found unresolved c4 completion readiness bug     |
+| Slice 3B/3C | Blocked until Slice 3A completion fallback stays silent in warmed remote c4           |
 | Slice 3D    | Planned; control indexed readiness added                                            |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
