@@ -1387,7 +1387,7 @@ control-doorbell count-specific paths - replaced by controlDoorbellArrivedTail i
 tail-based control mailbox consumption - deleted in Slice 2D1
 stale-late-control-doorbell handling - deleted in Slice 2D1
 remote publishedTail as a receiver-side publication gate - removed semantically in Slice 2D1
-special immediateData == 0 decoder branch
+special immediateData == 0 decoder branch - already absent after v14 explicit CONTROL kind
 ```
 
 Control acceptance gates:
@@ -1430,6 +1430,56 @@ pendingDataDoorbellCount
 payload token scans
 payload pending/consume helpers
 ```
+
+Pre-implementation finding after Slice 2D1:
+
+```text
+2E is not yet a mechanical cleanup.
+
+Current code:
+    TupleSinkServiceQueuePeerPayloadDoorbellRdma() is the recv-CQ materializer.
+    It validates the payload token as a local service sink id and stores that id
+    in connection->pendingDataDoorbellSinkIds[].
+    TupleSinkServicePeerDataDoorbellPendingRdma() and
+    TupleSinkServiceConsumePeerDataDoorbellRdma() linearly scan/remove that
+    transport-owned array.
+    Service-side readiness then combines that transport fact with the
+    stream-local receivePayloadDoorbellPending bit.
+
+Implication:
+    The planned intrusive ready list is service-owned, because the list nodes
+    must live in HomerServicePayloadStreamEntry/HomerPayloadStreamState and must
+    be ordered by traffic class. The physical recv-CQ owner currently has no
+    service-stream pointer, binding table, or generation-bearing payload token
+    that would let it append a stream directly.
+```
+
+Do not replace `pendingDataDoorbellSinkIds[]` with another transport-local FIFO
+or scan. Before coding 2E, settle the payload-doorbell ownership contract:
+
+```text
+Preferred shape:
+    make payload doorbells a fixed permanent dispatcher callback, like
+    peer-client completion, not an optional per-grant handler
+    encode a payload binding token with stream index plus generation, or prove
+    that the existing serviceStreamId lookup is bounded/direct enough
+    validate connection generation, stream active state, peer binding state,
+    stream generation/token generation, and traffic class at CQE time
+    append HomerServicePayloadStreamEntry to the intrusive ready list exactly
+    once while recvReadyEnqueued is false
+    have the payload executor unlink/requeue in O(1) after draining work
+
+Rejected shortcut:
+    keep the current transport-owned sink-id array and merely add a service-side
+    scan over it. That preserves the old ownership leak and does not satisfy the
+    Slice 2E deletion gate.
+```
+
+This needs a small design decision before implementation: whether the payload
+token ABI changes now to an index/generation binding or whether the current
+service-stream id remains the token and is resolved through a precomputed direct
+array. The answer affects the immediate-data ABI and stale-token behavior, so do
+not improvise it inside the 2E patch.
 
 Slice 2F, final ownership cleanup:
 
@@ -1936,7 +1986,7 @@ empty critical polls per transaction
 | Slice 1     | Implementation-ready; start here before Stage 6 or Stage 7 work                      |
 | Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
-| Slice 2E/F  | Direction is clear; expand per-family files/tests before implementation               |
+| Slice 2E/F  | Blocked on payload-doorbell ownership contract; do not improvise token/binding design |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
