@@ -1866,20 +1866,205 @@ Acceptance:
     no payload stream scan used for receive-doorbell discovery
 ```
 
-Slice 2F, final ownership cleanup:
+Slice 2F, final recv-CQ ownership cleanup:
+
+Current code pointers:
+
+- [`TupleSinkServiceRecvCqPhaseAllowsPoll()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:825)
+  is still too permissive because it accepts both `BOOTSTRAP` and `CANONICAL`
+  without knowing which caller is polling.
+- Outgoing bootstrap currently polls the recv CQ directly through
+  `TupleSinkServicePollCompletionOnce(connectionState->recvCompletionQueue,
+  IBV_WC_RECV, ...)` at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3593`.
+- Incoming bootstrap currently has the same direct recv-CQ poll at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3717`.
+- [`TupleSinkServiceFinishPeerConnectionSetup()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3408)
+  is the intended handoff point into canonical ownership.
+- [`TupleSinkServiceDrainPeerConnectionEventsRdma()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4075)
+  is still a public combined recv-CQ/CM drain wrapper and must be deleted.
+- The scheduled peer pump currently owns the two steady-state recv-CQ call sites:
+  outgoing at `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7635`
+  and incoming at `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:7753`.
+
+2F contract:
 
 ```text
-remove all token-FIFO compatibility adapters
-remove optional handlers from TupleSinkServicePeerPumpGrant
-remove every steady-state recv-CQ polling helper other than the canonical collector
-require zero source references to old pending arrays
-add debug counter for every attempted noncanonical recv-CQ poll
-require that counter to remain zero in c1, c4, and basebackup validation
+BOOTSTRAP:
+    only the connection setup state machine may poll the recv CQ
+    only while bootstrapComplete == false
+
+CANONICAL:
+    only the scheduled canonical peer recv-CQ collector may poll the recv CQ
+
+TEARDOWN / UNUSED:
+    no recv-CQ polling is permitted
 ```
 
-Bootstrap/setup code may retain setup-specific polling until the permanent
-dispatcher is installed. After `bootstrapComplete`, a debug assertion rejects
-any noncanonical recv-CQ poll.
+Direct bootstrap polling is legitimate because setup is waiting for the
+bootstrap `IBV_WC_RECV` exchange before steady-state WIMM receive buffers and
+the permanent dispatcher become active. After the handoff, bootstrap polling
+must never run again; WIMMs that arrive around the handoff remain queued in the
+hardware CQ until the first canonical collector pass.
+
+Implementation steps:
+
+```text
+1. Replace TupleSinkServiceRecvCqPhaseAllowsPoll() with role-specific validation.
+
+   typedef enum HomerRecvCqPollRole
+   {
+       HOMER_RECV_CQ_POLL_BOOTSTRAP_SETUP = 1,
+       HOMER_RECV_CQ_POLL_CANONICAL_COLLECTOR = 2
+   } HomerRecvCqPollRole;
+
+   static bool TupleSinkServiceValidateRecvCqPollOwner(
+       TupleSinkServicePeerConnectionState *connection,
+       HomerRecvCqPollRole role,
+       char *errorMessage,
+       size_t errorMessageBytes);
+
+2. Bootstrap setup role is valid only when:
+       connection active
+       recvCqOwnerPhase == BOOTSTRAP
+       bootstrapComplete == false
+       setupPhase == OUTGOING_BOOTSTRAP_WAIT or INCOMING_BOOTSTRAP_WAIT
+
+3. Canonical collector role is valid only when:
+       connection active
+       recvCqOwnerPhase == CANONICAL
+       bootstrapComplete == true
+       setupPhase == READY
+       permanent recv dispatcher installed
+
+4. TEARDOWN and UNUSED always reject. Every rejection increments
+   noncanonicalRecvCqPollAttempts. Debug builds should assert after recording a
+   useful diagnostic; normal builds should return failure so the caller can reset
+   the affected connection.
+
+5. Add TupleSinkServicePollBootstrapRecvCompletion(). The setup state machine
+   must call this wrapper instead of polling connection->recvCompletionQueue
+   directly. It validates HOMER_RECV_CQ_POLL_BOOTSTRAP_SETUP, polls only the
+   connection recv CQ, accepts only successful IBV_WC_RECV for the bootstrap
+   receive WR ID, and rejects IBV_WC_RECV_RDMA_WITH_IMM as an invalid bootstrap
+   event.
+
+6. Reorder TupleSinkServiceFinishPeerConnectionSetup() into the precise handoff:
+       assert recvCqOwnerPhase == BOOTSTRAP
+       assert bootstrapComplete == false
+       assert bootstrap send and receive completed
+       assert peer descriptor is valid
+       assert permanent dispatcher is installed
+       initialize connection-local token/ready state
+       post all steady-state notification receive WQEs
+       set setupPhase = READY
+       set recvCqOwnerPhase = CANONICAL
+       set bootstrapComplete = true as final readiness publication
+       register/mark canonical collector facts
+
+   No function that polls recv CQ may run between posting steady-state receives
+   and setting bootstrapComplete true.
+
+7. Delete TupleSinkServiceDrainPeerConnectionEventsRdma() from the header and
+   implementation. Do not preserve it as a public canonical wrapper because a
+   public helper cannot prove that its caller is the scheduled collector.
+
+8. Physically split recv-CQ and CM implementations. Remove the combined
+   drainRecvCq/drainCmEvents implementation shape. Keep a CM-only helper for
+   connection lifetime/write-preparation paths. Rename the steady-state recv-CQ
+   helper to static TupleSinkServiceDrainCanonicalRecvCq().
+
+9. Restrict TupleSinkServiceDrainCanonicalRecvCq() to the two scheduled
+   TupleSinkServicePumpPeerRequestsRdma() call sites. No control-op poller,
+   payload helper, write-preparation helper, or public API may call it.
+
+10. Add generation-safe collector actions now:
+
+    typedef struct HomerRecvCqCollectorAction
+    {
+        bool incoming;
+        uint32_t connectionIndex;
+        uint64_t connectionGeneration;
+        HomerTransportTrafficClass trafficClass;
+        uint16_t maxPollBatches;
+        uint16_t maxCqes;
+    } HomerRecvCqCollectorAction;
+
+    Execution skips stale inactive or generation-mismatched actions without
+    polling. A generation match with non-CANONICAL ownership is an ownership bug
+    and must fail/assert. This prevents an old action from polling a reused
+    connection-table slot.
+
+11. Enforce teardown ordering:
+       remove collector demand/ready facts
+       remove control and payload ready memberships
+       invalidate command/completion/payload token bindings
+       set recvCqOwnerPhase = TEARDOWN
+       set bootstrapComplete = false
+       destroy/reset QP and CQs
+       release MRs and remaining connection resources
+       clear table entry to UNUSED
+
+    Do not add a teardown recv-CQ poll role. QP reset/destruction owns flushed
+    receive WQEs; semantic events are not dispatched during teardown.
+```
+
+Low-level audit after implementation:
+
+```text
+Search for:
+    ibv_poll_cq
+    TupleSinkServicePollCompletionOnce
+    recvCompletionQueue
+    TupleSinkServiceDrainPeerConnectionEventsRdma
+
+Raw peer recv-CQ polling may exist only in:
+    TupleSinkServicePollBootstrapRecvCompletion()
+    TupleSinkServiceDrainCanonicalRecvCq()
+
+TupleSinkServiceDrainCanonicalRecvCq should have:
+    one static function definition
+    two scheduled peer-pump call sites
+```
+
+Instrumentation:
+
+```text
+bootstrapRecvCqPolls
+canonicalRecvCqPolls
+bootstrapRecvCompletions
+canonicalRecvCompletions
+bootstrapUnexpectedWimm
+canonicalUnexpectedOpcode
+noncanonicalRecvCqPollAttempts
+staleRecvCqCollectorActions
+recvCqOwnerTransitions
+recvCqPollsByOwnerPhase[4]
+```
+
+Required steady-state results:
+
+```text
+noncanonicalRecvCqPollAttempts = 0
+bootstrapUnexpectedWimm = 0
+```
+
+2F acceptance:
+
+```text
+bootstrap setup receives are consumed only by TupleSinkServicePollBootstrapRecvCompletion()
+canonical collector is rejected before setup completion
+bootstrap poller is rejected after canonical transition
+all polling is rejected in TEARDOWN and UNUSED
+TupleSinkServiceFinishPeerConnectionSetup() is the only canonical transition
+WIMM arriving immediately around the handoff is consumed exactly once
+stale collector action after reset performs no CQ poll
+connection-table slot reuse cannot be targeted by an old collector action
+TupleSinkServiceDrainPeerConnectionEventsRdma has zero references
+raw recv-CQ polls exist only in the two owner functions
+noncanonicalRecvCqPollAttempts remains zero in c1, c4, and basebackup validation
+bootstrapUnexpectedWimm remains zero
+```
 
 Remaining caveats from completed Slice 2 stages:
 
@@ -2389,7 +2574,7 @@ empty critical polls per transaction
 | Slice 2A-2C | Landed through command FIFO cleanup; direct command ready bits remain future work     |
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
 | Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work              |
-| Slice 2F    | Follow-up ownership cleanup; enforce canonical recv-CQ poll owner and delete leftovers |
+| Slice 2F    | Implementation-ready with role-specific recv-CQ ownership contract and wrapper deletion |
 | Slice 3     | Sufficiently detailed to start after Slice 2                                         |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
