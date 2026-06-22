@@ -159,3 +159,37 @@ remote c4 warmup:    40000/40000 transactions, 0 failures, 9785 TPS, p99 0.614 m
 remote c4 measured1: 40000/40000 transactions, 0 failures, 9704 TPS, p99 0.631 ms
 remote c4 measured2: 40000/40000 transactions, 0 failures, 9497 TPS, p99 0.679 ms
 ```
+
+The next cleanup removed the equally dead command-doorbell token FIFO:
+
+- `pendingCommandDoorbellCount`;
+- `pendingCommandDoorbellSessionIds`;
+- `TupleSinkServiceConsumePeerCommandDoorbellRdma()`;
+- `TupleSinkServicePopPeerCommandDoorbellRdma()`.
+
+Before this cleanup, the recv-CQ dispatcher pushed command tokens into the
+transport connection, but no service-side command executor popped that queue.
+Current command readiness is built from the durable per-session command mailbox
+fact (`publishedEpoch` versus accepted/retired epoch) in the scheduler. The
+dispatcher now validates the command WIMM token and leaves readiness to that
+existing mailbox-based path. This keeps behavior unchanged while removing the
+generic token FIFO. The future direct-ready-bit slice should still replace the
+session scan with exact typed readiness; this cleanup does not claim to have
+implemented that optimization.
+
+Command FIFO cleanup validation:
+
+```text
+Build/install: passed with CPPFLAGS='-D_GNU_SOURCE'
+Zero-reference check: no remaining pendingCommandDoorbell,
+    TupleSinkServiceConsumePeerCommandDoorbellRdma,
+    TupleSinkServicePopPeerCommandDoorbellRdma, or
+    TupleSinkServiceQueuePeerCommandDoorbellRdma references
+
+remote c1 -t 1000:   1000/1000 transactions, 0 failures, 502 TPS cold including setup
+remote c1 -t 100000: 100000/100000 transactions, 0 failures, 3951 TPS, p99 0.281 ms
+
+remote c4 warmup:    40000/40000 transactions, 0 failures, 9798 TPS, p99 0.622 ms
+remote c4 measured1: 40000/40000 transactions, 0 failures, 9602 TPS, p99 0.631 ms
+remote c4 measured2: 40000/40000 transactions, 0 failures, 9489 TPS, p99 0.685 ms
+```

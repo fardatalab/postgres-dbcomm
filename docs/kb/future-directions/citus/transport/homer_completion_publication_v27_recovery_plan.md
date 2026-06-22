@@ -74,6 +74,12 @@ for those symbols returned empty, and remote c1/c4 validation stayed in the
 Slice 1/2A band. This narrows the next Slice 2 work to command, control, and
 payload typed readiness plus the larger split collector/owner-phase changes.
 
+The command-doorbell token FIFO cleanup is also complete. The dispatcher now
+validates command WIMM tokens without materializing them into a transport token
+array. This is safe because the previous command token array had no live
+service-side pop consumer; scheduler readiness already comes from the durable
+per-session command mailbox fact. Direct command ready bits remain future work.
+
 ## Current Code Pointers
 
 - [`CitusRemoteExecClientCompletionSeal`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:560)
@@ -1204,17 +1210,17 @@ supplies its replacement.
 Slice 2C, client-command migration:
 
 ```text
-dispatcher:
-    decode direct command token
+validated cleanup now:
+    dispatcher decodes and validates command WIMM token
+    no transport token FIFO remains
+    readiness still comes from command mailbox published/accepted epoch facts
+
+future optimization still needed:
+    decode direct command binding
     validate session index, session generation, and connection generation
     set remoteCommandDoorbellReadySessions bit
-    do not execute command in collector
-
-executor:
-    exchange or consume ready bits
-    drain exact command mailbox within budget
-    recheck command mailbox
-    re-set bit when unread command records remain
+    executor drains exact command mailbox within budget
+    executor rechecks command mailbox and re-sets bit when unread records remain
 ```
 
 Use a separate service-local bitmap from the shared frontend command-ready
