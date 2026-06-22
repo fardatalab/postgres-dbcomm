@@ -2202,6 +2202,8 @@ the missing readiness before doing more Stage 7 topology/performance work.
 
 ### 3A Backend-Completion-Ready Bitmap
 
+Status: landed and validated on June 22, 2026.
+
 The bitmap lives in `CitusRemoteExecControlRegion`, currently as
 `completionReadySessions`. Backend code must not open-code bitmap layout or
 atomic operations. Add a narrow helper/interface on the backend side, for
@@ -2224,6 +2226,7 @@ Add both fields to backend startup identity:
 
 ```c
 uint32_t serviceSessionIndex;
+uint32_t completionReadyBitmapEnabled;
 uint64_t serviceSessionGeneration;
 ```
 
@@ -2248,7 +2251,66 @@ Add `HomerServiceAppendBackendCompletionBitmapSources()` to exchange the bitmap
 and then validate session index, session generation, mailbox protocol, and
 actual unread completion state before appending exact candidates. Re-set a bit
 when more records remain or staging was blocked. Keep one fallback broad scan
-every 1024 service passes; warmed c1/c4 should have zero fallback discoveries.
+every `HOMER_SERVICE_COMMAND_READY_BITMAP_FALLBACK_INTERVAL` service passes
+(currently 4096); warmed c1/c4 should have zero fallback discoveries.
+
+Implemented shape:
+
+- `CITUS_REMOTE_EXEC_BACKEND_PROTOCOL_VERSION` is now v12, and backend spawn,
+  command-mailbox, and completion-mailbox shared-memory names use v12 prefixes
+  in `src/include/distributed/homer/remote_execution_backend_protocol.h`.
+- `CitusRemoteExecBackendStartupData` and
+  `CitusRemoteExecBackendSpawnRequest` carry `serviceSessionIndex`,
+  `completionReadyBitmapEnabled`, and `serviceSessionGeneration`.
+  `completionReadyBitmapEnabled` is set only for completion mailboxes consumed
+  by the service. Direct local `CLIENT_SQL_SESSION` frontend-polled completions
+  intentionally leave it clear to avoid a pointless backend atomic and service
+  wakeup.
+- Backend publication calls
+  `RemoteExecBackendMarkCompletionReady()` in
+  `src/backend/distributed/utils/homer/remote_execution_backend_bridge.c`
+  immediately after the release-store to the backend completion mailbox
+  `publishedEpoch`.
+- The service materializes completion-ring sources in
+  `HomerServiceAppendBackendCompletionBitmapSources()` in
+  `src/backend/distributed/utils/homer/tuple_sink_service_process.c`; normal
+  ready-set construction no longer scans every session for backend completion
+  readiness when the progress registry is active.
+- `TupleSinkServiceConsumeCompletionMailbox()` re-marks the session bit when one
+  consumed backend completion leaves more unread records, preserving the
+  level-triggered bitmap invariant across multi-record completion bursts.
+- The fallback broad scan remains a safety net. Implementation found that a
+  backend can set a completion bit after the service exchanges the bitmap but
+  before the fallback scan checks that session. The fallback materializer now
+  claims that raced-in bit with `fetch_and(~sessionBit)` and does not count it
+  as `completionReadyBitmapFallbackDiscoveries`; otherwise the counter falsely
+  reported hidden fallback progress even though the bitmap fired.
+
+Validation evidence:
+
+- Build/install:
+  `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`,
+  `sudo -n -u dbcomm make -j8 CPPFLAGS='-D_GNU_SOURCE'`,
+  `sudo -n -u dbcomm make install-headers install-service-bin install`,
+  Postgres `ninja -C build src/backend/postgres src/bin/pgbench/pgbench src/bin/pg_basebackup/pg_basebackup`,
+  and `meson install -C build --no-rebuild`.
+- Installed artifact check: `pgbench`, `citus_tuple_sink_service`, and
+  `libhomer_client.a` all contained v12 mailbox names and no v11 mailbox names.
+- Remote RDMA pgbench after restoring no-stats binaries:
+  cold c1 `5000/5000` with 0 failures, warmed c1 `10000/10000` with 0 failures,
+  `3965.690433 TPS`, p95 `0.264 ms`, p99 `0.279 ms`; warmed c4 `40000/40000`
+  with 0 failures, `9917.272591 TPS`, p95 `0.534 ms`, p99 `0.614 ms`.
+- Remote RDMA basebackup after restoring no-stats binaries: cold run completed
+  in `5.95s`; warmed repeat completed in `4.25s`.
+- Stats diagnostic with `HOMER_SERVICE_PROGRESS_STATS=1`: backend-host
+  service-exit counters reported `completion_fallback_discoveries=0` while
+  completion-ring work was present (`ready=61010`, `planned=64012`,
+  `grant_progress=64012`). `completion_set_calls=0` in that diagnostic because
+  the socketless backend bridge object was not compiled with the stats macro;
+  the bitmap functionality was validated by zero fallback discoveries and
+  completion-ring progress. Client-host `command_fallback_discoveries=12` is an
+  existing command-ready bitmap follow-up and is not part of this completion
+  bitmap slice.
 
 ### 3B Critical Recv-CQ Demand Facts
 
@@ -2713,7 +2775,9 @@ empty critical polls per transaction
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
 | Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work            |
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
-| Slice 3     | Sufficiently detailed to start after Slice 2; 3D control indexed readiness added     |
+| Slice 3A    | Landed; backend completion bitmap validated with zero completion fallback discoveries |
+| Slice 3B/3C | Sufficiently detailed to start after Slice 3A                                       |
+| Slice 3D    | Planned; control indexed readiness added                                            |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
