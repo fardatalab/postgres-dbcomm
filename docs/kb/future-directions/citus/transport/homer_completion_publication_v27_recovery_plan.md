@@ -48,9 +48,24 @@ correctness, plus warmed c4 performance in the `9.4k-9.8k TPS` band with zero
 failed transactions. The deterministic injection matrix in Slice 1.8 was not
 implemented in this commit and remains a follow-up hardening task.
 
-The next implementation stage should be Slice 2: canonical recv-CQ dispatcher
-and typed event materialization. Do not add new optional handlers or expand the
-generic FIFO/stash path while implementing later slices.
+Slice 2A has also landed as the first implementable recv-CQ dispatcher
+checkpoint and is recorded in
+[`peer_recv_dispatcher_v14_checkpoint.md`](../../../implementations/citus/transport/peer_recv_dispatcher_v14_checkpoint.md).
+That checkpoint freezes the peer immediate ABI at protocol v14, installs a
+permanent transport-owned dispatcher, removes the per-grant optional completion
+handler path, and routes all steady-state WIMM CQEs through one decoder/switch.
+
+Important scope correction: the validated 2A checkpoint does **not** yet include
+direct binding tables, split recv-CQ/CM APIs, explicit recv-CQ owner phases, or
+typed ready-state replacement for command/control/payload. Those remain the
+next Slice 2 sub-stages. The callback-heavy first 2A attempt was correct but
+regressed remote c4 to roughly `7.7k-8.8k TPS`; the landed form keeps
+command/payload/control materialization transport-local and only leaves
+peer-client completion publication as a service callback, recovering the remote
+c4 band to roughly `9.2k-9.7k TPS`.
+
+Do not add new optional handlers or expand the generic FIFO/stash path while
+implementing later slices.
 
 ## Current Code Pointers
 
@@ -77,10 +92,14 @@ generic FIFO/stash path while implementing later slices.
 - [`TupleSinkServiceHandlePeerClientCompletionDoorbell()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20139)
   is the receiver-side doorbell handler that validates completion content and
   CPU-publishes frontend visibility.
-- [`TupleSinkServiceDrainPeerConnectionEvents()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3906)
-  still accepts optional semantic handlers and still has a fallback
-  `pendingClientCompletionDoorbellTokens` FIFO rooted at
-  [`remote_execution_peer_transport_rdma.c:473`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:473).
+- [`HomerPeerRecvDispatcher`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:215)
+  is the current permanent recv dispatcher for steady-state WIMM CQEs.
+- [`TupleSinkServiceDecodePeerDoorbellImmediate()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:567)
+  implements the v14 immediate-data kind/token decoder.
+- [`TupleSinkServiceDrainPeerConnectionEvents()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3955)
+  no longer accepts optional semantic handlers. It still combines recv-CQ and
+  CM draining, and residual `pendingClientCompletionDoorbell*` fields remain as
+  dead/cleanup state until the Slice 2B typed-completion cleanup deletes them.
 - [`ibv_query_qp_data_in_order()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2217)
   is currently logged for capability diagnostics.
 
@@ -668,32 +687,19 @@ typedef struct HomerPeerRecvDispatcher
         char *error,
         size_t errorBytes);
 
-    bool (*onClientCommand)(
-        TupleSinkServicePeerConnectionHandle *connection,
-        uint64_t connectionGeneration,
-        uint32_t token,
-        void *context,
-        char *error,
-        size_t errorBytes);
-
-    bool (*onPayload)(
-        TupleSinkServicePeerConnectionHandle *connection,
-        uint64_t connectionGeneration,
-        uint32_t sinkToken,
-        void *context,
-        char *error,
-        size_t errorBytes);
-
-    bool (*onControl)(
-        TupleSinkServicePeerConnectionHandle *connection,
-        uint64_t connectionGeneration,
-        void *context,
-        char *error,
-        size_t errorBytes);
-
     void *context;
 } HomerPeerRecvDispatcher;
 ```
+
+This is intentionally not a four-callback semantic hook table. The physical
+recv-CQ collector owns kind decoding. Command, payload, and control readiness
+are transport-owned today, so Slice 2A materializes them directly in the
+transport while they still use legacy pending state. Peer-client completion
+publication is the only service callback in the checkpoint because it must
+validate v27 completion content and CPU-publish frontend-ready state through the
+service session table. When later slices add direct binding tables and typed
+ready state, keep that ownership split: do not reintroduce optional handlers for
+every kind.
 
 Use the transport-owned dispatcher form:
 
@@ -725,10 +731,11 @@ TupleSinkServiceCreatePeerTransportState(
     size_t errorBytes);
 ```
 
-The constructor copies the dispatcher by value and requires all four handlers to
-be non-null. This guarantees that the dispatcher exists before any outgoing
-connection is started or incoming connection is accepted. An active steady-state
-connection with `recvDispatcherInstalled == false` is a fatal internal error.
+The constructor copies the dispatcher by value and currently requires the
+service-owned client-completion callback to be non-null. This guarantees that the
+dispatcher exists before any outgoing connection is started or incoming
+connection is accepted. An active steady-state connection with
+`recvDispatcherInstalled == false` is a fatal internal error.
 
 Replace the current optional-handler drain API with a physical collector API:
 
@@ -861,16 +868,16 @@ Inside the collector, dispatch by immediate kind:
 switch (doorbellKind)
 {
     case CONTROL:
-        dispatcher->onControl(...);
+        materialize transport-owned control readiness;
         break;
     case CLIENT_COMMAND:
-        dispatcher->onClientCommand(...);
+        materialize transport-owned command readiness;
         break;
     case CLIENT_COMPLETION:
         dispatcher->onClientCompletion(...);
         break;
     case PAYLOAD:
-        dispatcher->onPayload(...);
+        materialize transport-owned payload readiness;
         break;
     default:
         protocol error;
