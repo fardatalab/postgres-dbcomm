@@ -2624,18 +2624,38 @@ This is a physical polling-demand fact for the critical client-command
 completion recv CQ, not a replacement for control mailbox readiness and not just
 the existing `terminalCompletionPendingPeerPoll` semantic flag.
 
+Implementation decision: keep the semantic "one remote client command is waiting
+for terminal visibility" latch in the client-SQL session, but keep the physical
+recv-CQ demand counter in the RDMA peer connection. The service scheduler should
+consume a transport fact for "critical connections with client-completion demand"
+instead of scanning sessions or connections itself.
+
 Track per session:
 
 ```c
 bool remoteCommandAwaitingTerminal;
+TupleSinkServicePeerConnectionHandle *remoteCommandAwaitingTerminalConnectionHandle;
+uint64_t remoteCommandAwaitingTerminalConnectionGeneration;
+uint64_t remoteCommandAwaitingTerminalCommandSequence;
 ```
 
 Track per critical connection:
 
 ```c
 uint32_t clientCommandsAwaitingTerminal;
-bool criticalRecvPollDemanded;
 ```
+
+Track per peer transport:
+
+```c
+uint32_t criticalClientCompletionDemandConnectionCount;
+```
+
+`criticalClientCompletionDemandConnectionCount` increments only on a connection
+transition from zero to one awaiting client command and decrements on the
+transition back to zero. The per-connection command counter may be greater than
+one if a future client permits deeper command pipelining, but the current
+pgbench path should normally keep it at one.
 
 On successful remote command publication, after the command is actually
 committed to the peer transport rather than merely selected as a candidate:
@@ -2654,9 +2674,16 @@ session flag = false
 connection count--
 ```
 
-`STARTED` does not decrement demand. Session failure/teardown clears the flag
-and decrements the connection count exactly once. While demand is nonzero, poll
-the exact critical recv CQ every service pass with no empty-poll backoff.
+`STARTED` does not decrement demand. For the remote pgbench path, the decrement
+belongs on the receiver-side peer-client completion WIMM handler after the
+completion slot has been validated and CPU-published to the frontend-polled
+ready word. The backend-node sender posting the completion WIMM is not sufficient
+because it has not made the completion visible to the host client process.
+Session failure/teardown clears the flag and decrements the connection count
+exactly once when the original connection generation is still live; connection
+reset clears any remaining connection-owned demand as transport teardown state.
+While demand is nonzero, poll the exact critical recv CQ every service pass with
+no empty-poll backoff.
 
 The scheduler action is:
 
@@ -2664,9 +2691,14 @@ The scheduler action is:
 DRAIN_CRITICAL_CLIENT_COMPLETION_RECV_CQ
 ```
 
-It should run before peer-control mailbox work, foreground payload, bulk
-payload, and maintenance. Connections without outstanding client commands keep a
-low-rate periodic recv-CQ fallback for control/lifetime traffic.
+The implementation may encode this as a filtered `PEER_RECV_CQ` collector grant
+rather than adding a new top-level action enum immediately. The grant must carry
+a "critical client-completion demand only" filter into the peer pump so the
+recv-CQ branch polls only critical-control connections whose
+`clientCommandsAwaitingTerminal > 0`. It should run before remote command
+forwarding, peer-control mailbox work, foreground payload, bulk payload, and
+maintenance. Connections without outstanding client commands keep a low-rate
+periodic recv-CQ fallback for control/lifetime traffic.
 
 Implementation guardrail: before coding this slice, audit and record the exact
 increment and decrement hooks. The increment belongs at the successful remote
@@ -2675,6 +2707,155 @@ the client completion mailbox, currently near the same success path that clears
 `terminalCompletionPendingPeerPoll`. Failure, teardown, and connection reset
 must clear the per-session flag and decrement exactly once if the flag is set.
 The session flag and connection counter must never disagree.
+
+Current hook audit:
+
+- increment after the successful post path in
+  `TupleSinkServicePumpRemoteClientSqlCommands()` once
+  `clientSqlRemoteCommandAcceptedEpoch` advances;
+- strict terminal decrement in
+  `TupleSinkServiceHandlePeerClientCompletionDoorbell()` after
+  `readyEpochSlots[slotIndex]` is CPU-published and the WIMM body reports
+  `COMPLETED` or `FAILED`;
+- local-path decrement in `TupleSinkServicePublishClientCommandCompletion()` is
+  a no-op unless the session was a remote sender with an outstanding demand;
+- best-effort cleanup in `TupleSinkServiceResetSession()`;
+- transport reset cleanup in `TupleSinkServiceResetPeerConnection()` before the
+  connection slot is cleared.
+
+Validation status on 2026-06-22: implementation builds, but Slice 3B is not yet
+accepted. A no-stats remote c1 run did not complete in the expected warm c1 band.
+One diagnostic run with
+`HOMER_SERVICE_CLIENT_SQL_STATS=1`, `HOMER_SERVICE_PEER_TRANSPORT_STATS=1`, and
+`HOMER_SERVICE_PROGRESS_STATS=1` used remote `pgbench --homer -c 1 -j 1 -t 1000`
+under a 12 second timeout and was killed after timing out.
+
+Code state at the failed validation:
+
+```text
+citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h
+    TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_CRITICAL_CLIENT_COMPLETION_DEMAND
+    TupleSinkServicePeerSchedulerFacts.criticalClientCompletionDemandConnectionCount
+
+citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c
+    TupleSinkServicePeerConnectionHandle.clientCommandsAwaitingTerminal
+    TupleSinkServicePeerTransportState.criticalClientCompletionDemandConnectionCount
+    TupleSinkServicePeerConnectionMarkClientCommandAwaitingTerminalRdma()
+    TupleSinkServicePeerConnectionClearClientCommandAwaitingTerminalRdma()
+    TupleSinkServicePumpPeerRequestsRdma() recv-CQ branch filter
+
+citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c
+    TupleSinkServiceSessionState.remoteCommandAwaitingTerminal*
+    HomerServiceMarkRemoteCommandAwaitingTerminal()
+    HomerServiceClearRemoteCommandAwaitingTerminal()
+    mark after TupleSinkServicePumpRemoteClientSqlCommands() accepts the peer write
+    clear after TupleSinkServiceHandlePeerClientCompletionDoorbell() CPU-publishes
+    filtered PEER_RECV_CQ collector before REMOTE_CLIENT_SQL_SENDER actions
+```
+
+Observed diagnostic counters:
+
+```text
+farnet0 opener:
+    remote_command_forwarded=5
+    command-ring grants=5
+    peer-recv-cq grants=100028004
+    peer-recv-cq grant_progress=5
+    cq-drain grants=12, grant_progress=1
+    terminal demand remained for session=1 sequence=5 at teardown
+
+farnet1 backend side:
+    peer_receiver_completions_consumed=4
+    peer_completion_published=4
+    peer_completion_publish_posted=4
+    peer_completion_publish_retired=0
+    completion-ring grants=4
+```
+
+Important symptom details:
+
+```text
+remote pgbench did not finish 1000 transactions within 12 seconds
+timeout killed the client; service teardown then cleared one remaining demand
+farnet0 log reported:
+    clearing 1 client-completion recv-CQ demand entries during peer connection reset
+    could not clear remote client SQL terminal demand session=1 sequence=5
+        reason=session-reset detail=cannot clear terminal command demand on stale peer connection
+farnet1 log showed backend-side peer completions were consumed and WIMMs were posted
+both services stayed alive until explicit teardown; no fail-fast assertion fired
+no production fallback discovery was reintroduced
+```
+
+This means the opener did make command-forwarding progress and the backend side
+did publish several peer-client completions, but the full pgbench transaction did
+not complete. The current suspicion is an interaction between the new always-hot
+critical recv-CQ demand path and the remaining peer-client completion publication
+resource-retirement / command visibility path:
+
+- exact recv-CQ demand is being planned and executed aggressively while the
+  session waits for terminal visibility;
+- terminal demand clears for earlier commands, then remains on the last observed
+  sequence;
+- peer-client completion publish source entries are posted on the backend side,
+  but no peer-client completion publish CQ retirement was observed in the short
+  diagnostic run;
+- the fifth command was forwarded by the opener but its backend completion was
+  not observed before timeout.
+
+What the diagnostic appears to rule out:
+
+- the opener never sending commands: `remote_command_forwarded=5`;
+- the backend-side completion machine being entirely dead:
+  `peer_receiver_completions_consumed=4`;
+- the peer-client completion WIMM publication path being entirely dead:
+  `peer_completion_published=4`;
+- the demanded recv-CQ collector never being scheduled:
+  `peer-recv-cq grants=100028004`.
+
+What remains ambiguous:
+
+- whether sequence 5 was not made visible in the backend-side command mailbox;
+- whether sequence 5 was executed but its peer-client completion publication was
+  blocked before posting;
+- whether peer-client completion WIMMs for earlier sequences were handled by the
+  opener but the stats are insufficient to prove each callback and demand-clear;
+- whether the always-hot recv-CQ demand path causes the machine-baseline policy
+  to spend too many grants on empty observation and starve the resource-relief or
+  command-machine step needed for sequence 5.
+
+Do not treat Slice 3B as complete until a follow-up diagnostic distinguishes:
+
+1. whether the fifth command body/ready publication is not becoming visible to
+   the backend-side command machine;
+2. whether backend execution is producing the fifth completion but publication
+   is blocked behind peer-client completion source credit / send-CQ retirement;
+3. whether the always-hot demanded recv-CQ action is starving another required
+   scheduler action under machine-baseline budgets.
+
+The next diagnostic should use a short no-stats remote c1 run plus narrow
+one-shot counters for peer-client completion WIMM callback success, terminal
+demand clear count, command-machine consume count on the backend side, and
+peer-client completion source-ring reserved count/high-water. Avoid adding
+production fallback recovery; this is an ownership/scheduling bug to root-cause,
+not a reason to reintroduce fallback discovery.
+
+Suggested next instrumentation points:
+
+- increment a receiver-side counter at the top and success exit of
+  `TupleSinkServiceHandlePeerClientCompletionDoorbell()` with token, session
+  index, command sequence, and terminal/non-terminal state in debug builds;
+- count `HomerServiceClearRemoteCommandAwaitingTerminal()` success/failure by
+  reason and command sequence;
+- count backend-side command mailbox records consumed by the peer receiver path,
+  including the last command sequence accepted by the backend-side command
+  machine;
+- expose `clientSqlPeerCompletionPublishSourceRing.reservedCount`,
+  `PeerClientCompletionPublishCompletionActiveCount`, and
+  `PeerClientCompletionPublishSignaledCompletionActiveCount` in the exit stats;
+- add a bounded diagnostic that reports the first pass where
+  `criticalClientCompletionDemandConnectionCount > 0` and the plan contains no
+  command-send-CQ/resource-relief grant while peer-client completion publish
+  resources are active.
 
 ### 3C Resource-Pressure Readiness
 
