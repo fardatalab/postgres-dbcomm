@@ -2664,6 +2664,51 @@ This spreads sessions `0..3` across separate cache lines instead of making all
 four producers serialize on one atomic word. Do this only after the smaller
 load-before-exchange change is measured.
 
+3A optimization checkpoint on 2026-06-22:
+
+- Implemented the smaller load-before-exchange optimization in the service
+  collector. `HomerServiceCollectReadyWord()` first performs an acquire load of
+  the producer-owned ready word and only performs the locked acquire-release
+  exchange when the word is nonzero. A producer racing after a zero load leaves
+  its bit set for the next service pass, so this preserves the producer-to-
+  service ownership transfer contract.
+- `commandReadyBitmapExchanges` and `completionReadyBitmapExchanges` now count
+  actual nonzero ownership transfers in stats builds, not every empty service
+  pass.
+- Did not implement sharded ready-bitmaps in this checkpoint. The warmed c4
+  numbers stayed within about 3 percent of the immediately prior 3B-R6
+  checkpoint, so the larger ABI/data-structure change is not justified yet.
+
+Validated on 2026-06-22 with no-stats binaries after build/install/sync and
+fresh service restart:
+
+```text
+remote c1 smoke, -t 1000:
+    1000/1000, 0 failures
+    p95 0.245 ms, p99 0.268 ms
+
+remote c1 warmed, -t 20000:
+    20000/20000, 0 failures
+    4316.070132 TPS
+    p95 0.242 ms, p99 0.253 ms
+
+remote c4 warmed repeat 1, -t 10000 per client:
+    40000/40000, 0 failures
+    10635.424045 TPS
+    p95 0.507 ms, p99 0.587 ms
+
+remote c4 warmed repeat 2, -t 10000 per client:
+    40000/40000, 0 failures
+    10595.490400 TPS
+    p95 0.507 ms, p99 0.581 ms
+```
+
+Post-run service-log scan on both hosts found no terminal-demand clear errors,
+critical recv-demand stale/reset diagnostics, fallback discoveries, reset
+messages, source-ring-full errors, sequence mismatches, ready-bitmap errors, or
+lane send-CQ drain failures. Only the intended PostgreSQL service on `farnet1`
+and one Homer service on each host remained running.
+
 ### 3B Critical Recv-CQ Demand Facts
 
 This is a physical polling-demand fact for the critical client-command
@@ -3721,7 +3766,7 @@ empty critical polls per transaction
 | Slice 2D    | Landed through 2D1 one-WIMM control publication; peer-op helper cleanup remains later |
 | Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work            |
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
-| Slice 3A    | Landed; persistent service-local pending readiness replaces production re-arm/fallback recovery |
+| Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Pull forward exact send-CQ demand for 3B, then implement owned/runnable resource-pressure readiness |
 | Slice 3D    | Planned; control indexed readiness added                                            |
