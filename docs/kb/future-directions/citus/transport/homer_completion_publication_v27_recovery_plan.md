@@ -3657,6 +3657,38 @@ many streams need round-robin stream-level fairness. Control readiness is
 connection-indexed and should avoid both active-connection scans and stale FIFO
 entries.
 
+3D-1 implementation and validation checkpoint on 2026-06-22:
+
+- `remote_execution_peer_transport_rdma.c` now has a transport-owned
+  `HomerControlReadyIndex` with incoming/outgoing bitmap words per traffic class,
+  per-class cursors, direction alternation state, and a total ready-bit count.
+- `TupleSinkServiceQueuePeerControlDoorbellRdma()` still advances
+  `controlDoorbellArrivedTail` from the control WIMM CQE, but now arms
+  `TupleSinkServiceArmControlMailboxReady()` instead of only setting the
+  per-connection `controlMailboxReady` flag.
+- The existing broad control-mailbox consumers remain in place for this slice,
+  but their stable-empty paths call
+  `TupleSinkServiceDisarmControlMailboxReady()` so the old per-connection mirror
+  and the new indexed bit stay in lockstep.
+- `TupleSinkServiceResetPeerConnection()` clears the indexed control-ready bit
+  before unregistering facts, switching the recv-CQ owner to teardown, and
+  zeroing/reusing the connection slot.
+- This slice deliberately does not yet build exact control-mailbox candidates.
+  3D-2 remains responsible for enumerating `HomerControlMailboxAction` values
+  from the indexed bitmap and validating connection generation before execution.
+- Validation used no-stats binaries, installed under `dbcomm`, synced to
+  `farnet0`, and restarted Homer services on both hosts. Remote RDMA pgbench from
+  `farnet0` to `farnet1` passed:
+  - c1 smoke: `1000/1000`, 0 failures, about `455.6 TPS` excluding initial
+    connection, with the expected cold setup outlier.
+  - warmed c1: `20000/20000`, 0 failures, about `4285.8 TPS`, p95 `0.244 ms`,
+    p99 `0.255 ms`.
+  - warmed c4: `40000/40000`, 0 failures, about `10689.7 TPS`, p95 `0.517 ms`,
+    p99 `0.593 ms`.
+- Service-log scans on both hosts found no stale/reset/fallback/control-mailbox
+  error patterns, and the post-run process preflight showed only the intended
+  PostgreSQL service on `farnet1` plus one Homer service on each host.
+
 #### 3D-2 Exact Candidate Enumeration
 
 Add:
@@ -4196,7 +4228,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | 3D-0 landed and validated; 3D-1 transport-owned indexed control readiness is next     |
+| Slice 3D    | 3D-0 and 3D-1 landed and validated; 3D-2 exact candidate enumeration is next          |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
