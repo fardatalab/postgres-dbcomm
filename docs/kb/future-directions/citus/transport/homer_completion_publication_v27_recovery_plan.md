@@ -3689,6 +3689,54 @@ entries.
   error patterns, and the post-run process preflight showed only the intended
   PostgreSQL service on `farnet1` plus one Homer service on each host.
 
+Required cleanup before the exact-only control-mailbox path is considered
+complete:
+
+- `TupleSinkServiceArmControlMailboxReady()` currently represents the right
+  ownership boundary, but in the exact-only end state it must not have a
+  flag-only fallback. If an active canonical connection cannot be mapped to an
+  indexed control-ready bit, that is a connection-fatal invariant violation:
+  returning with only `controlMailboxReady = true` would create undiscoverable
+  semantic readiness once broad mailbox scans are gone.
+- Change the helper from `void` to `bool`, surface a useful diagnostic, and make
+  active/canonical indexing failure reset the affected connection. Reset/teardown
+  paths may still clear idempotently.
+- Add or retain low-cost counters for `staleControlReadyBits`,
+  `staleControlMailboxActions`, and `controlReadyCountUnderflow`. A stale action
+  after candidate construction skips by generation; a stale ready bit during
+  candidate construction is a lifecycle cleanup bug that should be counted and
+  cleared.
+
+3D-1 exact-only cleanup checkpoint on 2026-06-23:
+
+- `TupleSinkServiceArmControlMailboxReady()` now returns `bool` and fails with a
+  detailed diagnostic instead of setting only the per-connection
+  `controlMailboxReady` flag when an active/canonical connection cannot be
+  represented in `HomerControlReadyIndex`.
+- Control WIMM materialization through
+  `TupleSinkServiceQueuePeerControlDoorbellRdma()` and post-commit rearming in
+  `TupleSinkServiceCommitLocalControlMessage()` propagate that failure rather
+  than creating undiscoverable semantic work.
+- Reset/disarm remains idempotent because teardown paths still need to clear
+  best-effort state safely.
+- Stats builds now expose `staleControlReadyBits`,
+  `staleControlMailboxActions`, and `controlReadyCountUnderflow` through
+  `peer_control_ready_stats`.
+- Validation used no-stats binaries, installed as `dbcomm`, synced to `farnet0`,
+  and restarted Homer services on both hosts. An accidental parallel c1/c4 run
+  was discarded as contaminated. After truncating `pgbench_history` and refreshing
+  pgbench table stats, sequential remote RDMA validation passed:
+  - c1 smoke: `1000/1000`, 0 failures, p95 `0.248 ms`, p99 `0.265 ms`.
+  - warmed c1: `20000/20000`, 0 failures, about `4231.4 TPS`, p95 `0.248 ms`,
+    p99 `0.261 ms`.
+  - warmed c4: `40000/40000`, 0 failures, about `10485.7 TPS`, p95 `0.531 ms`,
+    p99 `0.610 ms`.
+- Targeted service-log scans on both hosts found no
+  `control mailbox ready cannot be indexed`, stale, fallback, reset, protocol,
+  noncanonical, failure, or binding-mismatch diagnostics. Post-run process
+  preflight showed only the intended PostgreSQL service on `farnet1` and one
+  Homer service on each host.
+
 #### 3D-2 Exact Candidate Enumeration
 
 Add:
@@ -4036,9 +4084,9 @@ Add one exact action kind:
 HOMER_PROGRESS_ACTION_DRAIN_PEER_CONTROL_MAILBOX
 ```
 
-3D-6 implementation attempt and validation blocker on 2026-06-22:
+3D-6 committed implementation and validation blocker on 2026-06-22/23:
 
-- Uncommitted implementation removed the broad peer-pump request/response
+- Citus commit `5d2dd5c36` removed the broad peer-pump request/response
   mailbox phases from `TupleSinkServicePeerPumpPhaseMask`, deleted the old
   `TupleSinkServicePumpIncomingPeerMailbox()` and
   `TupleSinkServiceProgressPeerControlResponses()` consumers, stopped
@@ -4065,14 +4113,181 @@ tuple-sink service: RDMA peer-control pump failed: payload doorbell binding mism
 - Surrounding log context shows the errors occur after
   `marked send byte-ring terminal`, `reclaiming sink`, and
   `reclaiming idle non-reusable compatibility session` for the basebackup send
-  streams. The likely issue is not the removed broad control-mailbox scan
-  itself, but a payload close/lifetime ordering problem: the local stream entry
-  can be cleared before all remote payload WIMMs targeting its receiver-issued
-  payload token have either arrived and been drained or been made impossible by
-  the close protocol.
-- Do not mark 3D-6 complete until this late-payload-doorbell behavior is
-  explained and either fixed or explicitly classified as a pre-existing
-  basebackup close/lifetime bug with its own accepted validation boundary.
+  streams. Decoding the tokens gives generation 4 / stream index 0 and
+  generation 5 / stream index 0, so the payload-token decoder is working: two
+  successive stream generations were reclaimed before a WIMM for that generation
+  reached the local recv-CQ dispatcher.
+- This should be treated as a pre-existing payload close/lifetime bug exposed by
+  exact control-mailbox progress, not as a reason to restore broad mailbox
+  scans. 3D-5 removed hidden peer-op transport progress and 3D-6 removed broad
+  semantic mailbox consumers; together they allow a close response to be applied
+  without the incidental delay that previously let more payload/credit WIMMs
+  drain first.
+- The late WIMM is probably a reverse consumed-head/credit WIMM for a local send
+  stream, not late payload data. That distinction matters for the fix but does
+  not make the mismatch harmless: the RDMA write targeting the mirrored head has
+  already happened before the immediate token is decoded. If the stream slot or
+  mirror storage has been reused, a stale peer write could corrupt a new stream
+  generation.
+- Do not mark 3D-6 complete by downgrading this mismatch to a warning, adding a
+  grace period, or restoring broad scans. The required fix is an explicit
+  payload close/quiescence protocol that prevents normal token invalidation
+  until the peer can no longer post WIMMs for that token and all final payload or
+  credit/head updates have been applied.
+
+Current code pointers for this blocker:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21504`
+  dispatches payload WIMMs in `TupleSinkServiceDispatchPeerPayloadDoorbell()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20256`
+  clears stream peer binding in `HomerServiceClearPayloadStreamPeerBinding()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20673`
+  runs the current best-effort sender-side close in
+  `TupleSinkServicePeerCloseSinkBestEffort()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21137`
+  handles peer close requests in `TupleSinkServiceHandlePeerCloseSinkRequest()`.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_peer_control_protocol.h:207`
+  defines the current close request/response messages, which do not carry the
+  stream generation or final payload/head frontier.
+
+Required 3D-6 unblock plan:
+
+Patch A - diagnose WIMM role and block unsafe reclaim:
+
+- Add a small retired-binding diagnostic outside the resettable stream entry so
+  a late mismatch can report token, token generation, stream generation,
+  connection generation, local direction, final published tail, final consumed
+  head, and close phase.
+- Split payload WIMM handling by local stream direction. A local receive stream
+  still materializes payload/frontier readiness into the payload ready queue. A
+  local send stream treats the WIMM as peer consumed-head/credit publication and
+  applies the mirrored head immediately in the recv-CQ dispatcher.
+- Add `HomerServicePayloadStreamMayReclaim()` and make normal reclaim fail or
+  assert until quiescence predicates hold. Keep the binding, token, MR, and head
+  mirror active while normal close is in progress. Forced cleanup is allowed only
+  after the owning QP/CQ has been reset or destroyed.
+
+Patch B - immediate head/credit application:
+
+- In `TupleSinkServiceDispatchPeerPayloadDoorbell()`, validate token generation,
+  connection generation, peer binding, and traffic class as today. After
+  validation, branch on local direction.
+- For local send streams, acquire-load the peer-updated consumed-head mirror,
+  validate monotonicity and posted-tail bounds, update the local
+  `peerConsumedHead`/credit facts, rearm any source-credit-blocked work, and
+  update close/drain state. Do not enqueue a generic payload-ready action for a
+  send-side credit WIMM.
+- For local receive streams, keep the current queue/coalescing behavior and let
+  the payload executor decode/drain records.
+
+Patch C - peer protocol v16 close frontier:
+
+- Bump `CITUS_REMOTE_EXEC_PEER_PROTOCOL_VERSION` to 16.
+- Extend `CitusRemoteExecPeerCloseSinkRequest` with close flags,
+  `payloadStreamGeneration`, and `finalPublishedTail`.
+- Extend `CitusRemoteExecPeerCloseSinkResponse` with close flags,
+  `payloadStreamGeneration`, and `finalConsumedHead`.
+- Define `HOMER_PAYLOAD_CLOSE_FLAG_NORMAL_DRAIN`,
+  `HOMER_PAYLOAD_CLOSE_FLAG_ABORT_RESET`, and
+  `HOMER_PAYLOAD_CLOSE_FLAG_QUIESCED`.
+- On normal close, the sender stops accepting producer records, publishes
+  immutable EOS, records the final published tail, posts the final payload WIMM,
+  keeps token/binding/MR/mirror state alive, sends close with generation plus
+  final tail, and treats `peerBindingStillActive = 1` as "not quiesced; retry
+  later."
+- The sender may accept `peerBindingStillActive = 0` only when the response
+  generation matches, `finalConsumedHead >= finalPublishedTail`, the locally
+  mirrored peer head is at least the final tail, local payload WRs through the
+  final tail have retired, and no ready-queue/executor reference remains.
+
+Patch D - receiver close and final head WIMM:
+
+- On a normal close request, the receiver records the peer close request and
+  validates generation/final tail. It returns `peerBindingStillActive = 1` while
+  EOS is not observed, the ring is not drained through the requested final tail,
+  or a receive payload action is queued/active.
+- Once drained, post one final consumed-head WIMM using the peer's opener-local
+  payload token, wait for its local send completion on the cold close path, stop
+  issuing ordinary head/credit WIMMs for that stream, and then return
+  `peerBindingStillActive = 0` with the `QUIESCED` flag and
+  `finalConsumedHead = finalPublishedTail`.
+- Assert that the final head WIMM and close response use the same stream-bound
+  traffic-class connection/QP: same connection handle, connection generation,
+  and traffic class. The final head WIMM must be posted before the control
+  response so the requester processes the final head update before semantically
+  consuming the inactive close response.
+
+Patch E - close/reclaim state machine:
+
+- Add a non-resettable close section to each live payload stream with phase,
+  stream generation, token generation, final published tail, final consumed
+  head, final payload posted/send-retired flags, final head WIMM
+  posted/retired/applied flags, peer final-head observation, and close-response
+  confirmation.
+- Normal `HOMER_PROGRESS_ACTION_PAYLOAD_CLOSE_RECLAIM` is the sole owner that
+  clears token/binding/stream state. Control request handlers may update close
+  state and return the current status, but must not directly `memset` or reclaim
+  a normal stream.
+- Abort/error close is separate: reset or destroy the stream's payload
+  connection/QP first, then invalidate token and memory. QP teardown is the
+  proof that no future old-generation WIMM/RDMA write can arrive.
+
+Patch F - re-enable and finish 3D-6 validation:
+
+- Keep exact control mailbox as the sole semantic control-mailbox consumer.
+- After the payload close fix passes, delete residual broad-mailbox
+  compatibility fields such as `maxMailboxMessages` in broad peer-pump grants,
+  old request/response collector/action enum values, and unused request
+  handler/context arguments on the physical peer pump.
+- Run close/reuse stress before declaring 3D-6 complete.
+
+Required acceptance before 3D-6 is complete:
+
+```text
+close request before EOS drain:
+    response active=1
+    stream remains bound
+
+final head WIMM delayed:
+    sender does not reclaim
+
+exact control action before payload action:
+    no reclaim
+
+final head WIMM arrives:
+    send-side head is applied in recv-CQ dispatcher
+    close retry returns inactive
+
+immediate stream-table slot reuse:
+    no old-generation RDMA/WIMM reaches new stream
+
+20 sequential remote basebackups over persistent connection:
+    zero stale-token events
+
+connection abort with active stream:
+    QP reset precedes token invalidation
+
+concurrent c4 plus basebackup:
+    zero stream binding mismatches
+```
+
+Add counters:
+
+```text
+payloadCloseRequests
+payloadCloseStillActiveResponses
+payloadCloseQuiescedResponses
+payloadFinalHeadWimmsPosted
+payloadFinalHeadWimmsApplied
+payloadReclaimBlockedByFinalHead
+payloadReclaimBlockedBySendCq
+payloadReclaimBlockedByReadyQueue
+latePayloadWimmAfterReclaim
+lateCreditWimmAfterReclaim
+forcedPayloadConnectionResets
+```
+
+Acceptance requires both late-WIMM counters to remain zero.
 
 #### 3D Validation
 
@@ -4416,7 +4631,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | 3D-0 through 3D-5 landed; 3D-6 implementation attempt hit late payload-doorbell validation blocker |
+| Slice 3D    | 3D-0 through 3D-6 code landed; 3D-6 validation blocked by payload close/quiescence lifetime bug |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
