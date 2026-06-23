@@ -3810,6 +3810,42 @@ commit consumedHead only after successful semantic application
 No message is acknowledged before response correlation succeeds or the request
 handler accepts/stages the request response.
 
+3D-3 implementation and validation checkpoint on 2026-06-22:
+
+- `TupleSinkServiceTryConsumeLocalMailbox()` has been removed.
+- `TupleSinkServicePeekLocalControlMessage()` now stable-copies the next
+  WIMM-published control mailbox record and returns the mailbox ring sequence
+  without advancing `localMailbox.consumedHead`.
+- `TupleSinkServiceCommitLocalControlMessage()` advances `consumedHead` only
+  after semantic success. It also applies the peer `senderConsumedHead` mirror
+  and arms/disarms `controlMailboxReady` plus the indexed ready bit.
+- The outgoing response path now commits only after
+  `TupleSinkServiceCompletePeerControlOp()` succeeds.
+- The incoming mailbox path now commits only after either
+  `TupleSinkServiceCompletePeerControlOp()` succeeds for a response at the FIFO
+  head, or `TupleSinkServiceProcessIncomingMailboxRequest()` accepts/stages the
+  response for a request.
+- Implementation note: the first 3D-3 attempt reloaded
+  `localMailbox.consumedHead` inside the commit helper as a defensive check. That
+  kept correctness but dropped warmed remote c1 into roughly the `3.8k TPS` band.
+  The accepted version treats the service loop as the sole local mailbox
+  consumer and avoids the second shared-memory acquire load; it still checks the
+  copied ring sequence and WIMM-derived arrived tail before committing.
+- Validation used no-stats binaries, installed under `dbcomm`, synced to
+  `farnet0`, and restarted Homer services on both hosts. After discarding the
+  first post-restart cold setup run, remote RDMA pgbench from `farnet0` to
+  `farnet1` passed:
+  - warmed c1: `20000/20000`, 0 failures, about `4278.8 TPS`, p95 `0.243 ms`,
+    p99 `0.262 ms`.
+  - warmed c4 repeat 1: `40000/40000`, 0 failures, about `10594.6 TPS`,
+    p95 `0.487 ms`, p99 `0.564 ms`.
+  - warmed c4 repeat 2: `40000/40000`, 0 failures, about `10623.9 TPS`,
+    p95 `0.506 ms`, p99 `0.569 ms`.
+- Service-log scans on both hosts found no stale/reset/fallback/control-mailbox
+  or commit-sequence error patterns, and post-run process preflight showed only
+  the intended PostgreSQL service on `farnet1` plus one Homer service on each
+  host.
+
 #### 3D-4 Exact Control-Mailbox Executor
 
 Add one transport API and make it the sole steady-state consumer of local
@@ -4262,7 +4298,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | 3D-0 through 3D-2 landed and validated; 3D-3 peek/apply/commit API is next            |
+| Slice 3D    | 3D-0 through 3D-3 landed and validated; 3D-4 exact control-mailbox executor is next   |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
