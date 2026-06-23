@@ -3259,6 +3259,23 @@ the later scheduler should still replace payload stream scans and formalize the
 owned-versus-runnable state for every blocked dependency, not only peer-client
 completion source credit.
 
+Pre-3D cleanup decisions:
+
+- Do not copy 3B's exact-action payload style into 3D. The current 3B action is
+  copied into `HomerProgressMachineCandidateSet.criticalRecvDemands[]`, but the
+  compiled action still reaches it through `sourceRef.owner`. That is acceptable
+  only for same-pass execution. Before adding control-mailbox exact actions,
+  extend the compiled action grant with a durable typed payload union and
+  migrate critical-recv actions to that storage.
+- Add direction fairness to critical recv-CQ demand. The current iterator checks
+  outgoing demand before incoming demand. Add a
+  `nextCriticalRecvDirectionIncoming` flag and alternate the first direction
+  examined after every successful critical-recv action selection.
+- After the exact critical-recv action path is validated with typed payload
+  storage, remove the rejected broad-filter compatibility path
+  `TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_CRITICAL_CLIENT_COMPLETION_DEMAND` so it
+  cannot be accidentally re-enabled.
+
 The next diagnostic should use a short no-stats remote c1 run plus narrow
 one-shot counters for peer-client completion WIMM callback success, terminal
 demand clear count, command-machine consume count on the backend side, and
@@ -3409,6 +3426,21 @@ they are not all session-owned.
 - This is intentionally not the full 3C generalization. Payload send-CQ and
   payload/frontier dependencies still use their existing stream-indexed facts,
   and command-side blocked ownership remains a follow-up.
+- Follow-up rearm invariant: every blocked reason that clears completion
+  runnable must have an exact rearm transition. Source-credit rearm is now
+  explicit at peer-client completion source-slot retirement. The remaining
+  follow-ups are payload/EOS frontier visibility and result send-CQ frontier
+  retirement. They must set completion runnable when the dependency becomes
+  satisfiable rather than relying on periodic semantic scans.
+- Follow-up runnable-order invariant: if a staged peer-client completion exists,
+  the completion machine's runnable test must evaluate the staged publication
+  first. Unread backend completion records must not make the machine runnable
+  while the staged publication that the executor will service first is blocked.
+- Later hot-path cleanup: add `signaledOwnerCount` to each command/completion
+  lane FIFO and update it on signaled owner insertion and CQ retirement. Today
+  the scheduler predicates scan FIFO entries looking for a signaled owner. That
+  is correct at current FIFO sizes, but the O(1) count is the cleaner owner fact
+  before broader send-CQ scheduling work.
 
 Validated on 2026-06-22 with no-stats binaries after build/install/sync and
 fresh service restart:
@@ -3444,20 +3476,111 @@ lane send-CQ drain failures.
 
 ### 3D Control Indexed Readiness
 
-Replace broad active-connection scans for control mailbox discovery with an
-indexed readiness structure. This slice uses the existing `controlMailboxReady`
-fact as the semantic per-connection state, but makes discovery exact.
+Replace broad active-connection scans for control mailbox discovery and semantic
+control mailbox consumption with exact, connection-indexed actions. This slice
+uses the existing `controlMailboxReady` fact as the per-connection semantic
+state, but makes discovery and execution exact.
 
-Do not implement this as a FIFO queue. Control connections already have stable
-table indexes and generations, so the primary structure should be fixed and
-indexed:
+3D models the physical fact:
 
-```c
-controlReadyBits[direction][trafficClass][word]
-controlReadyRoundRobinCursor[direction][trafficClass]
+```text
+CONTROL_MAILBOX_READY(connection)
 ```
 
-The ready bitmap is level-triggered and uses arm/disarm semantics:
+Do not split this into `REQUEST_READY(connection)` and
+`RESPONSE_READY(connection)`. The current local control mailbox is one ordered
+FIFO. Outgoing connection mailboxes normally carry responses and reject
+requests, but incoming connection mailboxes may carry either requests or
+responses. A response at the FIFO head must be consumed before a later request
+can be reached. Therefore the exact executor must peek/copy one mailbox record
+and branch on `messageKind`.
+
+#### 3D-0 Durable Typed Action Payloads
+
+Before adding control-mailbox actions, remove the remaining exact-action
+dependency on stack-local payloads carried through `sourceRef.owner`.
+
+Add a tagged payload union to the compiled action grant:
+
+```c
+typedef union HomerProgressActionPayload
+{
+    HomerCriticalRecvDemandAction criticalRecv;
+    HomerControlMailboxAction controlMailbox;
+} HomerProgressActionPayload;
+
+typedef struct HomerProgressCompiledActionGrant
+{
+    HomerProgressActionKind actionKind;
+    HomerActionClass primaryClass;
+    uint16_t planFlags;
+    uint32_t reasonFlags;
+    HomerGrantVector grantVector;
+    HomerProgressGrant sourceGrant;
+    HomerProgressMachineRef machine;
+    HomerProgressActionPayload payload;
+} HomerProgressCompiledActionGrant;
+```
+
+Add the control-mailbox payload:
+
+```c
+typedef struct HomerControlMailboxAction
+{
+    bool incoming;
+    uint32_t connectionIndex;
+    uint64_t connectionGeneration;
+    HomerTransportTrafficClass trafficClass;
+} HomerControlMailboxAction;
+```
+
+Migrate `HOMER_PROGRESS_ACTION_DRAIN_CRITICAL_CLIENT_COMPLETION_RECV_CQ` to
+read `actionGrant->payload.criticalRecv`. Do not add another exact action that
+depends on a pointer to a candidate-array or stack object.
+
+Acceptance:
+
+```text
+execution plans may be copied or delayed without retaining stack pointers
+critical recv-CQ exact action no longer dereferences sourceRef.owner
+```
+
+#### 3D-1 Transport-Owned Indexed Readiness
+
+Do not implement control readiness as a FIFO queue. Control connections already
+have stable table indexes and generations, so the primary structure should be a
+fixed indexed bitmap:
+
+```c
+typedef struct HomerControlReadyIndex
+{
+    uint64_t incomingBits[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+    uint64_t outgoingBits[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+
+    uint32_t incomingCursor[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+    uint32_t outgoingCursor[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+
+    bool nextDirectionIncoming[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+
+    uint32_t readyCount;
+} HomerControlReadyIndex;
+```
+
+Store it in `TupleSinkServicePeerTransportState`.
+
+Add helpers:
+
+```c
+TupleSinkServiceArmControlMailboxReady(connection);
+TupleSinkServiceDisarmControlMailboxReady(connection);
+TupleSinkServiceClearControlMailboxReadyOnReset(connection);
+```
+
+Arm in `TupleSinkServiceQueuePeerControlDoorbellRdma()` after advancing
+`controlDoorbellArrivedTail`. Reset/teardown must clear the indexed bit before
+the table slot can be reused.
+
+The ready bitmap is level-triggered:
 
 ```text
 control WIMM CQE decoded:
@@ -3490,6 +3613,205 @@ many streams need round-robin stream-level fairness. Control readiness is
 connection-indexed and should avoid both active-connection scans and stale FIFO
 entries.
 
+#### 3D-2 Exact Candidate Enumeration
+
+Add:
+
+```c
+bool TupleSinkServiceAppendReadyControlMailboxActionsRdma(
+    TupleSinkServicePeerTransportState *transport,
+    HomerControlMailboxAction *actions,
+    uint16_t actionCapacity,
+    uint16_t *actionCount,
+    char *errorMessage,
+    size_t errorMessageBytes);
+```
+
+Emit up to `HOMER_CONTROL_READY_CANDIDATE_BUDGET` exact connection candidates
+per service pass, limited by remaining candidate-set capacity. Initial value:
+
+```c
+#define HOMER_CONTROL_READY_CANDIDATE_BUDGET 8U
+```
+
+Ordering:
+
+```text
+critical-control traffic class
+foreground traffic class
+bulk traffic class
+maintenance traffic class
+```
+
+Within each class, alternate incoming/outgoing starting direction using
+`nextDirectionIncoming[class]`, then use that direction's round-robin cursor.
+Candidate construction is non-destructive; it must not clear ready bits.
+
+Candidate validation:
+
+```text
+connection active
+generation nonzero
+canonical/ready connection
+traffic class matches the ready-index bucket
+controlMailboxReady == true
+consumedHead < controlDoorbellArrivedTail
+```
+
+If a ready bit points at inactive/non-ready state during candidate construction,
+reset should already have cleared it. Treat this as a lifecycle invariant
+defect: clear the stale bit, increment `staleControlReadyBits`, assert in
+diagnostic builds, and continue in production.
+
+If a candidate becomes stale after construction because the connection resets
+before execution, increment `staleControlMailboxActions` and skip without
+touching the mailbox or clearing the bit; the table slot may already belong to a
+new generation with real work.
+
+#### 3D-3 Peek / Apply / Commit Mailbox API
+
+Refactor mailbox consumption before installing the exact executor. The current
+`TupleSinkServiceTryConsumeLocalMailbox()` advances `consumedHead` before the
+caller validates and semantically applies the message. Replace the execution
+path with:
+
+```c
+bool TupleSinkServicePeekLocalControlMessage(
+    connection,
+    TupleSinkServicePeerControlMessage *message,
+    uint64_t *messageSequence,
+    bool *ready,
+    ...);
+
+void TupleSinkServiceCommitLocalControlMessage(
+    connection,
+    uint64_t messageSequence);
+```
+
+Flow:
+
+```text
+peek and stable-copy the next control record
+validate protocol and ring sequence
+dispatch request or complete response
+commit consumedHead only after successful semantic application
+```
+
+No message is acknowledged before response correlation succeeds or the request
+handler accepts/stages the request response.
+
+#### 3D-4 Exact Control-Mailbox Executor
+
+Add one transport API and make it the sole steady-state consumer of local
+control mailbox records:
+
+```c
+bool TupleSinkServiceDrainPeerControlMailboxRdma(
+    TupleSinkServicePeerTransportState *transport,
+    const HomerControlMailboxAction *action,
+    TupleSinkServicePeerRequestHandler requestHandler,
+    void *requestContext,
+    uint16_t maxMessages,
+    HomerControlMailboxDrainResult *result,
+    char *errorMessage,
+    size_t errorMessageBytes);
+```
+
+The transport owns:
+
+```text
+exact connection lookup
+connection/generation validation
+mailbox sequence validation
+response correlation
+consumed-head advancement
+ready-bit arm/disarm
+```
+
+The service handler owns semantic processing of request messages.
+
+Drain result:
+
+```c
+typedef struct HomerControlMailboxDrainResult
+{
+    uint16_t messagesConsumed;
+    uint16_t requestsDispatched;
+    uint16_t responsesCompleted;
+    bool moreReady;
+    bool staleAction;
+} HomerControlMailboxDrainResult;
+```
+
+Direction rules:
+
+```text
+outgoing connection:
+    RESPONSE valid
+    REQUEST protocol error
+
+incoming connection:
+    REQUEST valid
+    RESPONSE valid
+```
+
+Execution policy should initially grant at most:
+
+```c
+#define HOMER_CONTROL_MAILBOX_ACTIONS_PER_PASS 2U
+#define HOMER_CONTROL_MAILBOX_MESSAGES_PER_ACTION 16U
+```
+
+After each action budget:
+
+```text
+consumedHead < controlDoorbellArrivedTail:
+    retain controlMailboxReady and indexed bit
+
+stable empty:
+    clear controlMailboxReady and indexed bit
+```
+
+#### 3D-5 Remove Hidden Response Progress
+
+After exact mailbox scheduling lands, change
+`TupleSinkServicePollPeerRequestRdma()` to be non-observational with respect to
+peer transport:
+
+```text
+publish request if not yet published
+inspect op state
+return PENDING / COMPLETED / FAILED
+```
+
+It must not consume response mailboxes, drain recv CQs, drain send CQs, poll CM,
+or make unrelated peer transport progress. CM, send-CQ, recv-CQ, and control
+mailbox progress belong to their typed collectors/executors.
+
+#### 3D-6 Delete Broad Semantic Mailbox Scans
+
+After outgoing and incoming exact mailbox paths pass validation:
+
+```text
+remove RESPONSE_MAILBOX processing from the outgoing broad pump
+remove REQUEST_MAILBOX processing from the incoming broad pump
+remove their phase masks from machine-baseline planning
+migrate compatibility policies to exact indexed mailbox actions
+retain no semantic fallback scan
+```
+
+The broad peer pump may remain for setup, listener/CM, periodic recv-CQ liveness,
+and remaining send-CQ work until their exact migrations are complete. It must no
+longer be the steady-state consumer of control mailbox records.
+
+Add one exact action kind:
+
+```text
+HOMER_PROGRESS_ACTION_DRAIN_PEER_CONTROL_MAILBOX
+```
+
+#### 3D Validation
+
 Acceptance:
 
 ```text
@@ -3498,7 +3820,13 @@ candidate construction does not clear readiness
 executor clears the bit only after a stable empty recheck
 budget exhaustion leaves the bit armed
 connection reset/teardown invalidates stale generation candidates
-no active-connection scan is used for control mailbox discovery
+outgoing REQUEST is rejected as protocol error
+incoming REQUEST and incoming RESPONSE both progress through the exact executor
+async peer-control poll does not consume mailboxes or CQs
+broad outgoing RESPONSE_MAILBOX and incoming REQUEST_MAILBOX branches are gone
+machine-baseline grants at most two control-mailbox actions per pass initially
+zero active-connection scan is used for control mailbox discovery
+zero semantic fallback mailbox scans remain
 ```
 
 ## Slice 4: Critical-First Stage 7d Service Scheduling
@@ -3824,7 +4152,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | Planned; control indexed readiness added                                            |
+| Slice 3D    | Planned with concrete 3D-0..3D-6 sub-slices; exact control mailbox owner/action path |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
