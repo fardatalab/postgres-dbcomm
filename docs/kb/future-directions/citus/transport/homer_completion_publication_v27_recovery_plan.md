@@ -3154,6 +3154,66 @@ R6 must add exact send-CQ demand for signaled peer-client completion
 publication WIMMs, and R7 must distinguish owned-but-blocked completion work
 from runnable completion work.
 
+3B-R5/R6 implementation and validation:
+
+- R5 fairness is represented in the machine-baseline plan order: the command
+  send-CQ collector is appended before local-control and before critical
+  recv-CQ demanded actions, so resource-relief work cannot sit behind an
+  always-eligible critical recv-CQ poll. The critical recv-CQ action remains
+  bounded to one CQ batch and eight CQEs.
+- R6 is implemented at the current service-owned lane-FIFO layer rather than as
+  a new transport-side bitmap. This is the cleanest exact owner available today:
+  `ClientSqlCommandWriteLaneFifos[]` and
+  `PeerClientCompletionPublishLaneFifos[]` are already keyed by the
+  `TupleSinkServicePeerConnectionHandle` whose QP owns the send CQ. The CQ drain
+  executor now walks only lane FIFOs that contain a signaled owner and calls the
+  typed send-CQ dispatcher on those exact lanes. It no longer scans active
+  sessions to rediscover command/completion send-CQ connection handles.
+- Peer-client completion publication signaled checkpoints now make command
+  send-CQ relief immediately scheduler-ready. This avoids waiting for
+  source-ring pressure or the old polling interval before retiring full-slot
+  WIMM source slots.
+- Payload send-CQ ownership is still stream-indexed, so payload CQ work remains
+  discovered through the payload stream table until its own scheduler slice
+  replaces that scan.
+- R7 for peer-client completion source credit is already represented by the
+  current completion-machine facts: a staged peer-client completion blocked on
+  `HOMER_PROGRESS_REASON_COMPLETION_PUBLISH_SOURCE_CREDIT` is not runnable and
+  waits on `HOMER_PROGRESS_WAIT_COMMAND_SEND_CQ`. The broader owned-versus-
+  runnable split for all resource dependencies remains part of the later 3C
+  cleanup.
+
+Validated on 2026-06-22 with no-stats binaries after build/install/sync and
+fresh service restart:
+
+```text
+remote c1 smoke, -t 1000:
+    1000/1000, 0 failures
+    p95 0.246 ms, p99 0.284 ms
+
+remote c1 warmed, -t 20000:
+    20000/20000, 0 failures
+    4377.247854 TPS
+    p95 0.237 ms, p99 0.247 ms
+
+remote c4 warmed, -t 10000 per client:
+    40000/40000, 0 failures
+    10792.376265 TPS
+    p95 0.516 ms, p99 0.595 ms
+```
+
+Post-run service-log scan on both hosts found no terminal-demand clear errors,
+critical recv-demand stale/reset diagnostics, fallback discoveries, reset
+messages, source-ring-full errors, sequence mismatches, or lane send-CQ drain
+failures. Only the intended PostgreSQL service on `farnet1` and one Homer
+service on each host remained running.
+
+R5/R6 acceptance: complete for the current service-owned send-CQ owner model.
+The remaining 3B/3C boundary is not a correctness blocker for pgbench c1/c4, but
+the later scheduler should still replace payload stream scans and formalize the
+owned-versus-runnable state for every blocked dependency, not only peer-client
+completion source credit.
+
 The next diagnostic should use a short no-stats remote c1 run plus narrow
 one-shot counters for peer-client completion WIMM callback success, terminal
 demand clear count, command-machine consume count on the backend side, and
@@ -3662,7 +3722,7 @@ empty critical polls per transaction
 | Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work            |
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
 | Slice 3A    | Landed; persistent service-local pending readiness replaces production re-arm/fallback recovery |
-| Slice 3B    | R0 and exact recv-CQ R1-R4 landed and validated; R5-R7 fairness/send-CQ/resource-blocking remain next |
+| Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Pull forward exact send-CQ demand for 3B, then implement owned/runnable resource-pressure readiness |
 | Slice 3D    | Planned; control indexed readiness added                                            |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
