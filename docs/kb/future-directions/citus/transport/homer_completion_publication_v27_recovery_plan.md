@@ -4036,6 +4036,44 @@ Add one exact action kind:
 HOMER_PROGRESS_ACTION_DRAIN_PEER_CONTROL_MAILBOX
 ```
 
+3D-6 implementation attempt and validation blocker on 2026-06-22:
+
+- Uncommitted implementation removed the broad peer-pump request/response
+  mailbox phases from `TupleSinkServicePeerPumpPhaseMask`, deleted the old
+  `TupleSinkServicePumpIncomingPeerMailbox()` and
+  `TupleSinkServiceProgressPeerControlResponses()` consumers, stopped
+  machine-baseline from translating request/response mailbox collectors into
+  peer-pump grants, and left exact
+  `HOMER_PROGRESS_ACTION_DRAIN_PEER_CONTROL_MAILBOX` as the only semantic
+  control-mailbox consumer.
+- Remote RDMA pgbench still passed:
+  - c1 smoke: `1000/1000`, 0 failures, about `453.8 TPS` excluding initial
+    connection, with the expected cold setup outlier.
+  - warmed c1: `20000/20000`, 0 failures, about `4265.8 TPS`, p95 `0.244 ms`,
+    p99 `0.255 ms`.
+  - warmed c4: `40000/40000`, 0 failures, about `10810.7 TPS`, p95 `0.506 ms`,
+    p99 `0.574 ms`.
+- Remote RDMA basebackup also completed client-visible work, with a first run
+  `6.05 s` and a warmed repeat `4.19 s`, but the `farnet1` service log then
+  reported late payload doorbells after local stream reclamation:
+
+```text
+tuple-sink service: RDMA peer-control pump failed: payload doorbell binding mismatch token=16385 index=0 active=0 token_generation=4 stream_token_generation=0 peer_binding=0 connection_generation=3 stream_connection_generation=0 traffic_class=3 stream_traffic_class=0
+tuple-sink service: RDMA peer-control pump failed: payload doorbell binding mismatch token=20481 index=0 active=0 token_generation=5 stream_token_generation=0 peer_binding=0 connection_generation=3 stream_connection_generation=0 traffic_class=3 stream_traffic_class=0
+```
+
+- Surrounding log context shows the errors occur after
+  `marked send byte-ring terminal`, `reclaiming sink`, and
+  `reclaiming idle non-reusable compatibility session` for the basebackup send
+  streams. The likely issue is not the removed broad control-mailbox scan
+  itself, but a payload close/lifetime ordering problem: the local stream entry
+  can be cleared before all remote payload WIMMs targeting its receiver-issued
+  payload token have either arrived and been drained or been made impossible by
+  the close protocol.
+- Do not mark 3D-6 complete until this late-payload-doorbell behavior is
+  explained and either fixed or explicitly classified as a pre-existing
+  basebackup close/lifetime bug with its own accepted validation boundary.
+
 #### 3D Validation
 
 Acceptance:
@@ -4378,7 +4416,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | 3D-0 through 3D-5 landed and validated; 3D-6 broad semantic mailbox deletion is next  |
+| Slice 3D    | 3D-0 through 3D-5 landed; 3D-6 implementation attempt hit late payload-doorbell validation blocker |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
