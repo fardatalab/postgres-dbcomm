@@ -3046,6 +3046,47 @@ The current "could not clear terminal command demand on stale peer connection"
 message should become expected stale-ticket cleanup after connection-led
 teardown, not a hard demand-clear error.
 
+3B-R0 implementation and validation:
+
+- Citus commit-in-progress removed machine-baseline consumption of
+  `criticalClientCompletionDemandConnectionCount` in
+  `HomerServiceBuildProgressCollectorCandidates()` and removed the early
+  filtered recv-CQ collector grant in
+  `HomerServiceBuildMachineBaselineProgressActionPlan()`. The transport-side
+  demand counters, session mark/clear hooks, and the unused peer-pump filter
+  remain as diagnostics/scaffolding until the exact-action replacement lands.
+- Build/install/sync used no-stats binaries:
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`,
+  `sudo -n -u dbcomm make install-headers install-service-bin install`, and
+  installed-prefix `rsync` to `farnet0`.
+- Remote RDMA smoke after service restart completed `1000/1000` c1 with zero
+  failures, proving the rejected hot-spin action was the proximate cause of the
+  prior 12-second c1 timeout.
+- Sequential warmed checks completed:
+
+```text
+remote c1, -t 20000:
+    20000/20000, 0 failures
+    3308.045531 TPS
+    p95 0.313 ms, p99 0.332 ms
+
+remote c4, -t 10000 per client:
+    40000/40000, 0 failures
+    8847.670541 TPS
+    p95 0.654 ms, p99 0.771 ms
+```
+
+- An earlier c1 and c4 pair was accidentally launched concurrently and is
+  discarded as performance evidence; it is only additional correctness signal.
+- `farnet1` and `farnet0` service logs showed no terminal-demand clear errors,
+  client-completion recv-CQ demand reset errors, fallback discoveries, or reset
+  messages in the post-R0 run window.
+
+R0 acceptance: complete for correctness recovery. Performance is not final: c1
+and c4 are below the earlier 3A validated band, and the remaining 3B work must
+replace the disabled aggregate path with exact generation-safe recv-CQ actions,
+bounded empty-poll pacing, and pulled-forward exact send-CQ demand.
+
 The next diagnostic should use a short no-stats remote c1 run plus narrow
 one-shot counters for peer-client completion WIMM callback success, terminal
 demand clear count, command-machine consume count on the backend side, and
