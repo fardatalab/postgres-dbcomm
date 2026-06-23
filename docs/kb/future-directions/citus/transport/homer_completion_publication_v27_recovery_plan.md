@@ -2618,44 +2618,152 @@ pendingStaleBitsCleared
 readyBitmapAuditViolations
 ```
 
+Post-3A optimization note:
+
+The landed persistent-pending repair preserves correctness, but it still
+conflates "the service owns unfinished work" with "the work is runnable right
+now" until 3C splits owned/runnable state. That means a completion action may
+remain selectable while blocked on completion-publication source credit,
+send-CQ retirement, payload/EOS visibility, remote mailbox credit, or deferred
+peer-client publication. Retaining blocked work as perpetually runnable is safe
+but can burn scheduler cycles; 3C must add the owned/runnable split and
+dependency re-arm described below.
+
+There is also a small c4 regression after 3A: c4 fell from about `9.9k TPS` to
+about `9.3k TPS`, while c1 stayed near `3.9k TPS`. That pattern is consistent
+with shared-cacheline contention on the command and completion ready bitmap
+words. After the 3B correctness recovery is validated, optimize collection by
+loading before exchanging:
+
+```c
+static uint64_t
+HomerServiceCollectReadyWord(uint64_t *word)
+{
+    uint64_t observed = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+
+    if (observed == 0)
+        return 0;
+
+    return __atomic_exchange_n(word, 0, __ATOMIC_ACQ_REL);
+}
+```
+
+This avoids a locked exchange when no producer bit is set. It is race-safe:
+producer-before-exchange is collected by the exchange, while producer-after-zero
+load remains set for the next pass. Also skip the command or completion
+ready-word load entirely when the service has no active producer sessions of
+that type. If warmed c4 remains more than about 3 percent below the 2F baseline
+after this change, split each bitmap into eight cacheline-isolated shards:
+
+```text
+shard = sessionIndex & 7
+bit = sessionIndex >> 3
+```
+
+This spreads sessions `0..3` across separate cache lines instead of making all
+four producers serialize on one atomic word. Do this only after the smaller
+load-before-exchange change is measured.
+
 ### 3B Critical Recv-CQ Demand Facts
 
 This is a physical polling-demand fact for the critical client-command
 completion recv CQ, not a replacement for control mailbox readiness and not just
 the existing `terminalCompletionPendingPeerPoll` semantic flag.
 
-Implementation decision: keep the semantic "one remote client command is waiting
-for terminal visibility" latch in the client-SQL session, but keep the physical
-recv-CQ demand counter in the RDMA peer connection. The service scheduler should
-consume a transport fact for "critical connections with client-completion demand"
-instead of scanning sessions or connections itself.
+Current status: the first implementation attempt is rejected as a scheduling
+shape, even though several of its diagnostic fields remain useful. It maintained
+only an aggregate `criticalClientCompletionDemandConnectionCount` and routed a
+"demand only" filter through `TupleSinkServicePumpPeerRequestsRdma()`. That pump
+still builds active incoming/outgoing connection arrays by scanning connection
+tables and then filters only the recv-CQ branch. The result is not an exact
+collector action; it is:
+
+```text
+aggregate source permanently ready
+    -> broad peer pump
+    -> active connection-table scans
+    -> poll selected critical CQ
+```
+
+The validation failure made the scheduling bug visible. The demanded recv-CQ
+source was granted `100,028,004` times in about 12 seconds while producing only
+five useful CQ events. Empty CQ polling is observation, not semantic progress.
+The demand fact should make a critical CQ eligible and timely; it must not let an
+empty collector monopolize the service plan.
+
+The same diagnostic run showed a likely starvation consequence on the backend
+side:
+
+```text
+peer_receiver_completions_consumed = 4
+peer_completion_publish_posted = 4
+peer_completion_publish_retired = 0
+```
+
+This points at send-CQ/resource-retirement starvation: peer-client completion
+publication posted signaled WIMMs but did not retire them, so publication source
+or owner slots can fill and block the next terminal completion. Therefore 3B is
+not independently complete until the minimal exact send-CQ demand part of 3C is
+pulled forward.
+
+Temporary recovery rule: disable the current scheduler insertion of filtered
+`PEER_RECV_CQ | CRITICAL_CLIENT_COMPLETION_DEMAND` while developing the
+replacement. Keep the session demand fields, connection counters, and mark/clear
+diagnostics. First verify that the 3A-only c1/c4 path completes again so new
+failures are not hidden by hot empty polling.
+
+The target implementation still keeps the semantic "one remote client command is
+waiting for terminal visibility" latch in the client-SQL session, but the
+physical readiness fact must identify exact peer connections and generations.
+The service scheduler should consume exact transport facts for critical
+connections with client-completion demand instead of scanning sessions or
+connections itself.
 
 Track per session:
 
 ```c
-bool remoteCommandAwaitingTerminal;
-TupleSinkServicePeerConnectionHandle *remoteCommandAwaitingTerminalConnectionHandle;
-uint64_t remoteCommandAwaitingTerminalConnectionGeneration;
-uint64_t remoteCommandAwaitingTerminalCommandSequence;
+typedef struct HomerRemoteTerminalDemandTicket
+{
+    bool active;
+    bool incoming;
+    uint32_t connectionIndex;
+    uint64_t connectionGeneration;
+    uint64_t commandSequence;
+} HomerRemoteTerminalDemandTicket;
 ```
+
+The ticket replaces the raw connection-handle-only latch. It is generated only
+after command body publication succeeds, final command ready publication
+succeeds, and `clientSqlRemoteCommandAcceptedEpoch` advances. If demand marking
+fails after the command was published, the command cannot be rolled back; mark
+the affected session/connection failed and enter teardown.
 
 Track per critical connection:
 
 ```c
 uint32_t clientCommandsAwaitingTerminal;
+uint16_t criticalRecvEmptyPollStreak;
+uint64_t criticalRecvNextEligiblePass;
 ```
 
-Track per peer transport:
+Track exact demand sets per peer transport:
 
 ```c
-uint32_t criticalClientCompletionDemandConnectionCount;
+typedef struct HomerCriticalRecvDemandSet
+{
+    uint64_t incomingBits;
+    uint64_t outgoingBits;
+    uint32_t demandedConnectionCount;
+    uint32_t incomingRoundRobinCursor;
+    uint32_t outgoingRoundRobinCursor;
+} HomerCriticalRecvDemandSet;
 ```
 
-`criticalClientCompletionDemandConnectionCount` increments only on a connection
-transition from zero to one awaiting client command and decrements on the
-transition back to zero. The per-connection command counter may be greater than
-one if a future client permits deeper command pipelining, but the current
-pgbench path should normally keep it at one.
+The aggregate count may remain as a summary, but it must no longer be the only
+routing fact. On `clientCommandsAwaitingTerminal` transition `0 -> 1`, set the
+exact incoming/outgoing bit and increment `demandedConnectionCount`. On
+transition `1 -> 0`, clear the exact bit and decrement the count. Connection
+reset clears its exact bit before clearing the connection slot.
 
 On successful remote command publication, after the command is actually
 committed to the peer transport rather than merely selected as a candidate:
@@ -2682,23 +2790,78 @@ because it has not made the completion visible to the host client process.
 Session failure/teardown clears the flag and decrements the connection count
 exactly once when the original connection generation is still live; connection
 reset clears any remaining connection-owned demand as transport teardown state.
-While demand is nonzero, poll the exact critical recv CQ every service pass with
-no empty-poll backoff.
 
-The scheduler action is:
+The scheduler action should become exact:
 
 ```text
 DRAIN_CRITICAL_CLIENT_COMPLETION_RECV_CQ
 ```
 
-The implementation may encode this as a filtered `PEER_RECV_CQ` collector grant
-rather than adding a new top-level action enum immediately. The grant must carry
-a "critical client-completion demand only" filter into the peer pump so the
-recv-CQ branch polls only critical-control connections whose
-`clientCommandsAwaitingTerminal > 0`. It should run before remote command
-forwarding, peer-control mailbox work, foreground payload, bulk payload, and
-maintenance. Connections without outstanding client commands keep a low-rate
-periodic recv-CQ fallback for control/lifetime traffic.
+Expose a narrow transport API rather than routing demanded polling through the
+broad peer pump:
+
+```c
+bool TupleSinkServiceDrainCriticalCompletionRecvCqRdma(
+    TupleSinkServicePeerTransportState *transport,
+    bool incoming,
+    uint32_t connectionIndex,
+    uint64_t connectionGeneration,
+    uint16_t maxPollBatches,
+    uint16_t maxCqes,
+    HomerRecvCqDrainResult *result,
+    char *errorMessage,
+    size_t errorMessageBytes);
+```
+
+The function resolves the exact fixed connection slot, validates active state
+and generation, validates critical-control traffic class, validates
+`clientCommandsAwaitingTerminal > 0`, and invokes the canonical recv-CQ
+collector directly. It must not scan connection tables, poll listeners or CM
+events, poll send CQs, or process mailboxes. Initial budget:
+`maxPollBatches = 1`, `maxCqes = 8`. The source identity carries direction,
+connection index, and connection generation so a plan cannot add duplicate
+grants for the same demanded CQ in one pass.
+
+Add bounded empty-poll pacing per demanded connection:
+
+```text
+new command demand:
+    empty streak = 0
+    eligible immediately
+
+CQE observed:
+    empty streak = 0
+    eligible next pass
+
+empty poll 1-4:
+    eligible next pass
+
+empty poll 5-8:
+    skip 1 pass
+
+empty poll 9-16:
+    skip 2 passes
+
+later empty polls:
+    skip at most 8 passes
+```
+
+A service pass is much shorter than command/network latency, so this remains
+latency-sensitive while preventing another 100-million-grant spin. Empty polls
+increment an empty-poll counter, do not count as useful semantic progress, and
+must not reset unrelated collector backoff or suppress send-CQ/resource-relief
+work.
+
+Fairness requirement for each service pass:
+
+```text
+at most one critical recv-CQ grant per demanded connection
+at least one send-CQ/resource-retirement grant when such work is pending
+at least one semantic-machine grant when runnable work exists
+```
+
+Critical recv-CQ may be high priority, but it may not consume the whole
+collector or action budget.
 
 Implementation guardrail: before coding this slice, audit and record the exact
 increment and decrement hooks. The increment belongs at the successful remote
@@ -2788,17 +2951,17 @@ no production fallback discovery was reintroduced
 
 This means the opener did make command-forwarding progress and the backend side
 did publish several peer-client completions, but the full pgbench transaction did
-not complete. The current suspicion is an interaction between the new always-hot
-critical recv-CQ demand path and the remaining peer-client completion publication
-resource-retirement / command visibility path:
+not complete. The primary diagnosis is now a scheduler/ownership deviation:
 
-- exact recv-CQ demand is being planned and executed aggressively while the
-  session waits for terminal visibility;
+- demanded recv-CQ work is still an aggregate source that calls a broad peer pump
+  and scans connection tables;
+- the source remains highest-priority and runnable while the CQ is empty;
+- empty polling does not make semantic progress but was granted roughly twenty
+  million times per useful CQE;
+- resource-relief/send-CQ retirement work was likely starved, shown by posted
+  peer-client completions with zero retirement;
 - terminal demand clears for earlier commands, then remains on the last observed
   sequence;
-- peer-client completion publish source entries are posted on the backend side,
-  but no peer-client completion publish CQ retirement was observed in the short
-  diagnostic run;
 - the fifth command was forwarded by the opener but its backend completion was
   not observed before timeout.
 
@@ -2832,6 +2995,57 @@ Do not treat Slice 3B as complete until a follow-up diagnostic distinguishes:
 3. whether the always-hot demanded recv-CQ action is starving another required
    scheduler action under machine-baseline budgets.
 
+Required recovery sequence:
+
+1. `3B-R0`: disable current hot-spin scheduler insertion of filtered
+   `PEER_RECV_CQ | CRITICAL_CLIENT_COMPLETION_DEMAND`; keep mark/clear
+   diagnostics and verify 3A-only c1/c4 still completes.
+2. `3B-R1`: replace aggregate-only demand with exact incoming/outgoing demand
+   bitmaps and round-robin cursors in peer transport.
+3. `3B-R2`: replace the raw session latch with
+   `HomerRemoteTerminalDemandTicket` carrying direction, connection index,
+   connection generation, and command sequence.
+4. `3B-R3`: add the exact recv-CQ drain API and schedule exact
+   generation-safe collector actions with small CQ budgets.
+5. `3B-R4`: add bounded empty-poll pacing so a critical CQ stays timely without
+   becoming a permanent hot-spin source.
+6. `3B-R5`: enforce collector fairness: critical recv-CQ grants do not suppress
+   send-CQ/resource-retirement or runnable semantic-machine grants.
+7. `3B-R6`: pull forward exact send-CQ demand for signaled peer-client
+   completion publication WIMMs, described in 3C below.
+8. `3B-R7`: record resource-blocking reasons when completion publication cannot
+   reserve source/owner credit; blocked owned work is not runnable until the
+   relevant send-CQ/resource dependency is satisfied.
+
+Demand-clear lifecycle:
+
+```text
+normal terminal completion:
+    TupleSinkServiceHandlePeerClientCompletionDoorbell() validates slot/seal
+    CPU-publishes readyEpochSlots[slot]
+    terminal state requires a matching active demand ticket
+    matching direction/index/generation/sequence decrements connection demand
+    clear session ticket
+
+STARTED:
+    never clears the ticket
+
+connection reset:
+    clear exact critical recv-demand bit
+    clear clientCommandsAwaitingTerminal
+    clear demanded-connection count for that connection
+    record generation as dead
+
+session cleanup after connection-led teardown:
+    if ticket's connection is still live and matching, decrement transport demand
+    if ticket's connection is stale/reset, transport already cleared physical demand
+    clear session ticket locally and increment staleDemandAbandoned
+```
+
+The current "could not clear terminal command demand on stale peer connection"
+message should become expected stale-ticket cleanup after connection-led
+teardown, not a hard demand-clear error.
+
 The next diagnostic should use a short no-stats remote c1 run plus narrow
 one-shot counters for peer-client completion WIMM callback success, terminal
 demand clear count, command-machine consume count on the backend side, and
@@ -2858,6 +3072,83 @@ Suggested next instrumentation points:
   resources are active.
 
 ### 3C Resource-Pressure Readiness
+
+Slice 3C is now split into a minimal physical send-CQ demand subset required by
+3B, followed by the broader owned-versus-runnable resource-pressure work.
+
+3C-minimal for 3B: add exact send-CQ demand for peer-client completion
+publication.
+
+Add per peer transport:
+
+```c
+uint64_t incomingSendCqDemandBits;
+uint64_t outgoingSendCqDemandBits;
+```
+
+Add per connection:
+
+```c
+uint32_t signaledSendOwnersOutstanding;
+```
+
+When any signaled WR is successfully posted, transition `0 -> 1` outstanding
+sets the exact send-CQ demand bit. When typed send-CQ retirement removes owners
+and the remaining count becomes zero, clear the bit. For peer-client completion
+publication, the final full-slot WIMM is signaled, so posting it must arm
+send-CQ demand immediately. Add an exact send-CQ collector action carrying
+direction, connection index, connection generation, and one poll-batch budget.
+Schedule it alongside or before critical recv-CQ polling whenever signaled
+owners are outstanding. Do not wait until source allocation fails before
+beginning send-CQ polling.
+
+Acceptance for the pulled-forward subset:
+
+```text
+peer_completion_publish_posted > 0 with peer_completion_publish_retired == 0
+cannot persist indefinitely while the connection remains healthy
+send-CQ collector does not scan unrelated connections
+send-CQ collector uses connection generation to reject stale actions
+critical recv-CQ hot polling cannot suppress exact send-CQ grants
+```
+
+Broader 3C: separate owned work from runnable work for session-owned send
+resources. Extend `HomerServiceSessionPendingState` from a single pending word
+per kind into owned and runnable words:
+
+```c
+typedef struct HomerServiceSessionPendingState
+{
+    uint64_t commandOwnedSessions;
+    uint64_t commandRunnableSessions;
+    uint64_t completionOwnedSessions;
+    uint64_t completionRunnableSessions;
+} HomerServiceSessionPendingState;
+```
+
+Transitions:
+
+```text
+producer signal:
+    set owned
+    set runnable
+
+executor DRAINED:
+    clear owned
+    clear runnable
+
+executor MORE_READY:
+    keep owned
+    keep runnable
+
+executor BLOCKED(reason):
+    keep owned
+    clear runnable
+    register exact blocked reason
+
+dependency becomes satisfiable:
+    set runnable
+```
 
 Use `resourcePressureSessions` for session-owned send resources. Add per
 session:
@@ -3263,7 +3554,8 @@ empty critical polls per transaction
 | Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work            |
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
 | Slice 3A    | Landed; persistent service-local pending readiness replaces production re-arm/fallback recovery |
-| Slice 3B/3C | Unblocked after Slice 3A; proceed with critical recv-CQ demand and resource-pressure readiness |
+| Slice 3B    | First attempt rejected; next step is 3B-R0 through 3B-R7 exact critical recv-CQ demand plus bounded pacing |
+| Slice 3C    | Pull forward exact send-CQ demand for 3B, then implement owned/runnable resource-pressure readiness |
 | Slice 3D    | Planned; control indexed readiness added                                            |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
