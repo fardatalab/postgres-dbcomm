@@ -3744,6 +3744,40 @@ before execution, increment `staleControlMailboxActions` and skip without
 touching the mailbox or clearing the bit; the table slot may already belong to a
 new generation with real work.
 
+3D-2 implementation and validation checkpoint on 2026-06-22:
+
+- `TupleSinkServiceAppendReadyControlMailboxActionsRdma()` now enumerates exact
+  `HomerControlMailboxAction` candidates from `HomerControlReadyIndex`.
+- Enumeration is bounded by the caller's `actionCapacity`; the service currently
+  passes `HOMER_CONTROL_READY_CANDIDATE_BUDGET == 8`.
+- The transport emits at most one action per direction per traffic class per
+  call, in `HomerTransportServiceLoopPriority` order, so the first candidate-only
+  shape covers critical/foreground/bulk/maintenance and incoming/outgoing
+  fairness without a queue.
+- Candidate construction validates active/canonical connection state,
+  generation, traffic class, `controlMailboxReady`, and
+  `consumedHead < controlDoorbellArrivedTail`. Impossible stale indexed bits are
+  cleared in the transport; valid candidate emission is non-destructive.
+- `HomerProgressMachineCandidateSet` now carries bounded
+  `controlMailboxActions[]` separately from collector facts and critical recv-CQ
+  demand. The machine-baseline candidate bridge populates this array from the
+  transport API.
+- This slice intentionally does not plan or execute the exact control-mailbox
+  action yet. Keeping 3D-2 candidate-only avoids installing a second mailbox
+  consumer before 3D-3's peek/apply/commit ownership refactor.
+- Validation used no-stats binaries, installed under `dbcomm`, synced to
+  `farnet0`, and restarted Homer services on both hosts. Remote RDMA pgbench from
+  `farnet0` to `farnet1` passed:
+  - c1 smoke: `1000/1000`, 0 failures, about `456.0 TPS` excluding initial
+    connection, with the expected cold setup outlier.
+  - warmed c1: `20000/20000`, 0 failures, about `4270.8 TPS`, p95 `0.243 ms`,
+    p99 `0.253 ms`.
+  - warmed c4: `40000/40000`, 0 failures, about `10799.4 TPS`, p95 `0.495 ms`,
+    p99 `0.567 ms`.
+- Service-log scans on both hosts found no stale/reset/fallback/control-mailbox
+  error patterns, and post-run process preflight showed only the intended
+  PostgreSQL service on `farnet1` plus one Homer service on each host.
+
 #### 3D-3 Peek / Apply / Commit Mailbox API
 
 Refactor mailbox consumption before installing the exact executor. The current
@@ -4228,7 +4262,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | 3D-0 and 3D-1 landed and validated; 3D-2 exact candidate enumeration is next          |
+| Slice 3D    | 3D-0 through 3D-2 landed and validated; 3D-3 peek/apply/commit API is next            |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
