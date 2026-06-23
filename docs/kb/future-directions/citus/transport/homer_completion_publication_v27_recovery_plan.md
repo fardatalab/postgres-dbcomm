@@ -3979,6 +3979,41 @@ It must not consume response mailboxes, drain recv CQs, drain send CQs, poll CM,
 or make unrelated peer transport progress. CM, send-CQ, recv-CQ, and control
 mailbox progress belong to their typed collectors/executors.
 
+3D-5 implementation and validation checkpoint on 2026-06-22:
+
+- `TupleSinkServicePollPeerRequestRdma()` no longer drains peer CM events, send
+  CQEs, or response mailbox records before inspecting the explicit async op
+  state.
+- `TupleSinkServiceTryPublishPeerControlAsyncOp()` no longer drains peer CM
+  events, send CQEs, or response mailbox records before reserving and publishing
+  a request. The old `TupleSinkServiceRecordPeerOpHiddenProgress()` hook was
+  deleted because the op helper no longer records hidden CQ/mailbox progress.
+- The peer-op poller now relies on typed progress:
+  recv-CQ collectors decode control WIMMs, exact control-mailbox actions consume
+  responses, and exact send-CQ demand retires signaled WR owners. A response
+  that has not been consumed by those owners leaves the async op pending instead
+  of being consumed behind the poller's back.
+- Scope note: request publication may still call the existing outgoing
+  connection setup helper when an async op was started before the lane became
+  ready. This is the pre-existing setup lifecycle path, not response-mailbox
+  progress. A later setup-owner cleanup should make that boundary stricter, but
+  3D-5's validated change is removal of hidden response/CQ consumption from
+  peer-op helpers.
+- Validation used no-stats binaries, installed under `dbcomm`, synced to
+  `farnet0`, and restarted Homer services on both hosts. Remote RDMA pgbench from
+  `farnet0` to `farnet1` passed:
+  - c1 smoke: `1000/1000`, 0 failures, about `455.2 TPS` excluding initial
+    connection, with the expected cold setup outlier.
+  - warmed c1: `20000/20000`, 0 failures, about `4292.3 TPS`, p95 `0.242 ms`,
+    p99 `0.254 ms`.
+  - warmed c4: `40000/40000`, 0 failures, about `10685.9 TPS`, p95 `0.517 ms`,
+    p99 `0.583 ms`.
+- Targeted service-log scans on both hosts found no exact-control mailbox
+  errors, protocol errors, stale/reset diagnostics, fallback discoveries,
+  noncanonical polling diagnostics, or old `async-start-progress` reset paths.
+  The post-run process preflight showed only the intended PostgreSQL service on
+  `farnet1` plus one Homer service on each host.
+
 #### 3D-6 Delete Broad Semantic Mailbox Scans
 
 After outgoing and incoming exact mailbox paths pass validation:
@@ -4343,7 +4378,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | 3D-0 through 3D-4 landed and validated; 3D-5 hidden response-progress cleanup is next |
+| Slice 3D    | 3D-0 through 3D-5 landed and validated; 3D-6 broad semantic mailbox deletion is next  |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
