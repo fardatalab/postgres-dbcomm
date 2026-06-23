@@ -3545,6 +3545,50 @@ execution plans may be copied or delayed without retaining stack pointers
 critical recv-CQ exact action no longer dereferences sourceRef.owner
 ```
 
+3D-0 implementation and validation checkpoint on 2026-06-22:
+
+- `HomerProgressCompiledActionGrant` now carries
+  `HomerProgressActionPayload`, with durable storage for
+  `HomerCriticalRecvDemandAction` and the planned
+  `HomerControlMailboxAction`.
+- `HOMER_PROGRESS_ACTION_DRAIN_CRITICAL_CLIENT_COMPLETION_RECV_CQ` now reads
+  the exact critical recv-CQ identity from the compiled grant payload instead
+  of dereferencing `sourceRef.owner`. A zero connection-generation payload is
+  treated as an invalid grant and reported before any CQ is polled.
+- `HomerCriticalRecvDemandSet` now carries `nextDirectionIncoming`, and
+  `TupleSinkServiceNextCriticalCompletionRecvDemandRdma()` alternates the first
+  direction examined after each successful exact critical recv-CQ action
+  selection. This removes the previous outgoing-before-incoming bias while
+  preserving per-direction round-robin cursors.
+- The rejected broad `CRITICAL_CLIENT_COMPLETION_DEMAND` phase/filter remains a
+  follow-up deletion after the next exact-control action stage is validated.
+
+Validated with no-stats binaries after build/install/sync and fresh Homer
+service restart:
+
+```text
+remote c1 smoke, -t 1000:
+    1000/1000, 0 failures
+    p95 0.249 ms, p99 0.279 ms
+
+remote c1 warmed, -t 20000:
+    20000/20000, 0 failures
+    4316.352371 TPS
+    p95 0.242 ms, p99 0.256 ms
+
+remote c4 warmed, -t 10000 per client:
+    40000/40000, 0 failures
+    10731.695015 TPS
+    p95 0.524 ms, p99 0.609 ms
+```
+
+Post-run service-log scans on both hosts found no terminal-demand clear errors,
+critical recv-demand stale/reset diagnostics, fallback discoveries, reset
+messages, source-ring-full errors, ready-bitmap errors, lane send-CQ drain
+failures, or missing generation-bearing payload diagnostics. Only the intended
+PostgreSQL service on `farnet1` and one Homer service on each host remained
+running after validation.
+
 #### 3D-1 Transport-Owned Indexed Readiness
 
 Do not implement control readiness as a FIFO queue. Control connections already
@@ -4152,7 +4196,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | Planned with concrete 3D-0..3D-6 sub-slices; exact control mailbox owner/action path |
+| Slice 3D    | 3D-0 landed and validated; 3D-1 transport-owned indexed control readiness is next     |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
