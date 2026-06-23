@@ -4412,6 +4412,61 @@ typedef enum HomerPeerControlOpOwnerKind
   close continuation runnable. This is typed semantic materialization, not the
   rejected optional recv-CQ handler/FIFO design.
 
+Close-3 implementation checkpoint on 2026-06-23:
+
+- Citus commit `2ded30270` starts the exact sender-side normal-close handshake
+  in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+- The sender now builds a v16 `CLOSE_SINK` request from the frozen close-state
+  identity and posts it with
+  `TupleSinkServiceStartPeerRequestOnConnectionRdma()` on the stream-bound
+  connection and captured connection generation. The request carries the exact
+  peer/local payload doorbell token pair and immutable final published frontier.
+- `HomerServiceValidatePayloadCloseResponse()` validates the response status,
+  peer stream ids, echoed token pair, echoed final tail, `QUIESCED` semantics,
+  and `finalConsumedHead >= finalPublishedTail` before setting `peerQuiesced`.
+  A response with `peerBindingStillActive=1` is treated as a cold retry, not as
+  reclaim permission.
+- Close/reclaim readiness now distinguishes owned from runnable close work:
+  `HomerServicePayloadCloseActionReady()` returns runnable only when the exact
+  close op is terminal or a bounded retry is due. In-flight response waits set
+  `HOMER_PROGRESS_REASON_CLOSE_OR_RECLAIM_BLOCKED`, and
+  `HomerServicePopulatePayloadMachineFacts()` advertises the peer recv-CQ,
+  peer send-CQ, remote-credit, and maintenance collectors as possible unblockers
+  without granting the close executor on every service pass.
+- Scoped implementation choice: this checkpoint deliberately does not add the
+  future global peer-control async-op owner callback. The stream-owned close
+  action owns its preallocated async op and polls only terminal state. This keeps
+  Close-3 local and avoids introducing a half-built generic callback surface;
+  a typed owner callback remains available if later Close-4/Close-5 dependency
+  wiring needs exact rearm without payload-stream scans.
+- Receiver-side quiescence is still the existing Close-2 path: an active close
+  request records deferred receiver close, the payload close/reclaim action posts
+  and retires the final head ACK, clears the binding, and a later exact close
+  retry receives a quiesced/already-gone response. Close-4 still needs to make
+  receiver response semantics fully token/final-tail aware before this becomes
+  the final protocol.
+- Validation:
+  - `git clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    left the staged diff formatted;
+  - no-stats `sudo -n -u dbcomm make -j8 service-bin client-bin
+    CPPFLAGS='-D_GNU_SOURCE'` completed successfully;
+  - installed and synced `/data/dbcomm/pg-citus` to `farnet0`;
+  - remote RDMA pgbench c1 cold smoke completed `20000/20000` at
+    `3043.973237 TPS` with the expected cold max-latency outlier;
+  - warmed remote RDMA pgbench c1 completed `20000/20000` at `4417.024538 TPS`
+    with p95 `0.237 ms`, p99 `0.253 ms`, max `5.583 ms`;
+  - remote RDMA pgbench c4 completed `40000/40000` at `11071.484423 TPS` with
+    p95 `0.499 ms`, p99 `0.575 ms`, max `15.247 ms`;
+  - remote RDMA basebackup completed at `6.29`, `4.24`, and `4.24` seconds,
+    where run 1 was the post-restart warmup;
+  - service-log scans on both hosts found zero occurrences of the binding
+    mismatch, late-WIMM, stale-token, protocol, reset, fallback, close response
+    validation failure, close async poll failure, exact CLOSE_SINK publish
+    failure, or close fail-fast signatures. The `farnet0` log showed the
+    expected `peer-close deferred final head ACK` then `peer-close-drained`
+    sequence for pgbench and basebackup receive streams.
+
 Close-4 - receiver quiescence:
 
 - On an incoming normal close request, resolve by semantic IDs and validate:
@@ -5006,7 +5061,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Completion owned/runnable rearm correctness validated; remaining signaled-owner FIFO counts are performance cleanup |
-| Slice 3D    | 3D-0 through 3D-6 exact-control cleanup and Close-1/Close-2 landed and validated; full v16 close sender/receiver handshake remains in Close-3 through Close-6 |
+| Slice 3D    | 3D-0 through 3D-6 exact-control cleanup and Close-1 through Close-3 landed and validated; receiver quiescence and final reclaim/abort remain in Close-4 through Close-6 |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
