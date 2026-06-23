@@ -3087,6 +3087,73 @@ and c4 are below the earlier 3A validated band, and the remaining 3B work must
 replace the disabled aggregate path with exact generation-safe recv-CQ actions,
 bounded empty-poll pacing, and pulled-forward exact send-CQ demand.
 
+3B-R1 through 3B-R4 implementation and validation:
+
+- The peer transport now keeps exact critical recv-CQ demand bitmaps in
+  `HomerCriticalRecvDemandSet`, with separate incoming/outgoing words,
+  round-robin cursors, a demanded-connection summary, and a scheduler-pass
+  counter. The aggregate
+  `criticalClientCompletionDemandConnectionCount` remains only as a cheap
+  summary used to decide whether querying exact demand is worthwhile.
+- Each critical-control connection now carries
+  `criticalRecvEmptyPollStreak` and `criticalRecvNextEligiblePass`. New terminal
+  demand arms the connection immediately; successful CQE observation resets the
+  streak; empty polls apply the planned bounded skip policy.
+- The session semantic latch is now `HomerRemoteTerminalDemandTicket`, carrying
+  direction, connection index, full connection generation, and command sequence.
+  The ticket is captured after the command publication path succeeds and before
+  the connection-owned physical demand is armed.
+- The scheduler no longer routes demanded critical recv-CQ work through
+  `TupleSinkServicePumpPeerRequestsRdma()`. It asks the transport for one exact
+  `HomerCriticalRecvDemandAction`, then executes
+  `HOMER_PROGRESS_ACTION_DRAIN_CRITICAL_CLIENT_COMPLETION_RECV_CQ` with a small
+  budget (`maxPollBatches = 1`, `maxCqes = 8`).
+- The exact drain path resolves the fixed incoming/outgoing connection slot,
+  validates the captured generation and critical-control demand, and calls the
+  canonical recv-CQ collector directly. It does not scan connection tables, poll
+  CM/listener events, drain send CQs, or process mailboxes.
+- Transitional implementation caveat: the current machine-baseline scheduler
+  still builds and executes a plan within one `TupleSinkServicePumpOnce()` pass.
+  The exact action therefore stores a direct `sourceRef.owner` pointer to the
+  stack-local `HomerCriticalRecvDemandAction` candidate, because
+  `HomerProgressSourceId` cannot hold the full 64-bit connection generation.
+  This is acceptable only for immediate same-pass execution. The future
+  two-phase scheduler must copy the exact action payload into durable plan
+  storage rather than carrying this pointer.
+
+Validated on 2026-06-22 with no-stats binaries after build/install/sync and
+fresh service restart on `farnet1` and `farnet0`:
+
+```text
+remote c1 smoke, -t 1000:
+    1000/1000, 0 failures
+    p95 0.247 ms, p99 0.271 ms
+
+remote c1 warmed, -t 20000:
+    20000/20000, 0 failures
+    4378.353682 TPS
+    p95 0.238 ms, p99 0.248 ms
+
+remote c4 warmed, -t 10000 per client:
+    40000/40000, 0 failures
+    10821.377740 TPS
+    p95 0.516 ms, p99 0.592 ms
+```
+
+Post-run service-log scan on both hosts found no terminal-demand clear errors,
+critical recv-demand stale/reset diagnostics, fallback discoveries, reset
+messages, double-mark reports, or sequence mismatches. Only the intended
+PostgreSQL service on `farnet1` and one Homer service on each host remained
+running after the validation commands.
+
+R1-R4 acceptance: complete. The exact-demand path fixes the 100-million-grant
+hot-spin shape from the rejected first attempt and restores remote c4 near the
+pre-regression target band. Remaining 3B work is still required before moving to
+3A optimization work: R5 must preserve explicit collector fairness in the plan,
+R6 must add exact send-CQ demand for signaled peer-client completion
+publication WIMMs, and R7 must distinguish owned-but-blocked completion work
+from runnable completion work.
+
 The next diagnostic should use a short no-stats remote c1 run plus narrow
 one-shot counters for peer-client completion WIMM callback success, terminal
 demand clear count, command-machine consume count on the backend side, and
@@ -3595,7 +3662,7 @@ empty critical polls per transaction
 | Slice 2E    | Landed through 2E-C; detailed payload-ready counters remain follow-up work            |
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
 | Slice 3A    | Landed; persistent service-local pending readiness replaces production re-arm/fallback recovery |
-| Slice 3B    | First attempt rejected; next step is 3B-R0 through 3B-R7 exact critical recv-CQ demand plus bounded pacing |
+| Slice 3B    | R0 and exact recv-CQ R1-R4 landed and validated; R5-R7 fairness/send-CQ/resource-blocking remain next |
 | Slice 3C    | Pull forward exact send-CQ demand for 3B, then implement owned/runnable resource-pressure readiness |
 | Slice 3D    | Planned; control indexed readiness added                                            |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
