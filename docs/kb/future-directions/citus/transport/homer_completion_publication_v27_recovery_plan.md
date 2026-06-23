@@ -4241,6 +4241,66 @@ Patch F - re-enable and finish 3D-6 validation:
   handler/context arguments on the physical peer pump.
 - Run close/reuse stress before declaring 3D-6 complete.
 
+3D-6 local close/credit repair checkpoint on 2026-06-23:
+
+- Implemented the local lifetime part of Patch A/B/D in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  The full peer-control protocol-v16 close handshake is still pending; this
+  checkpoint deliberately does not claim 3D-6 complete until validation confirms
+  the local guard is sufficient and the remaining wire-level close work is
+  either implemented or explicitly deferred.
+- Added sender-side close-frontier fields to `HomerPayloadStreamState`:
+  `payloadCloseFinalTail` and `payloadCloseFinalHeadObserved`. These are reset
+  on bind and clear, and protect normal sender-side binding invalidation.
+- Added `HomerServicePayloadSenderFinalTail()` and changed
+  `TupleSinkServicePeerCloseSinkBestEffort()` so a local send stream does not
+  call `HomerServiceClearPayloadStreamPeerBinding()` merely because EOS payload
+  WRs have locally completed. It now keeps `localPeerClosePending` set until the
+  sender has observed `senderVisibleRemoteConsumedHead >= payloadCloseFinalTail`.
+  This directly targets the observed late reverse consumed-head/credit WIMMs.
+- Split `TupleSinkServiceDispatchPeerPayloadDoorbell()` by stream direction:
+  local receive streams still enqueue exact payload readiness, while local send
+  streams call `HomerServiceApplyPayloadSenderCreditDoorbell()` to acquire-load
+  the peer-written sender-head mirror immediately, validate monotonicity and
+  posted-tail bounds, update `senderVisibleRemoteConsumedHead`, and mark the
+  close final-head condition when applicable. A send-side credit WIMM is no
+  longer converted into a generic payload-ready queue entry.
+- Added `HomerServicePostFinalReceiverHeadAckIfNeeded()` on the receive-side
+  deferred close path. The normal credit path is thresholded for payload
+  throughput, but close now forces the final consumed-head WIMM before the
+  existing `HomerServiceDrainReceiverHeadAckCompletions()` wait and before
+  `HomerServiceClearPayloadStreamPeerBinding()`.
+- Changed `TupleSinkServiceHandlePeerCloseSinkRequest()` so even an already
+  drained receive stream does not clear/reclaim directly. It marks
+  `receivedPeerClosePending` and returns `peerBindingStillActive = 1`; the
+  payload close/reclaim action remains the owner of final ACK publication,
+  send-CQ retirement, and normal binding clear.
+- Caveat: this checkpoint still lacks the planned v16 close request/response
+  fields (`payloadStreamGeneration`, `finalPublishedTail`, `finalConsumedHead`,
+  close flags) and a sender-owned `CLOSE_SINK` retry/confirmation continuation.
+  If validation still shows late-token mismatches, the next step is not another
+  grace period or scan fallback; it is Patch C/E of this plan.
+- Validation for this checkpoint:
+  - No-stats Citus/Homer build and install completed as `dbcomm`, then the
+    installed prefix was synced to `farnet0` and both Homer services were
+    restarted.
+  - Remote RDMA basebackup ran three times. Run 1 was the cold/warmup run at
+    `6.04 s`; warmed repeats were `4.14 s` and `4.16 s`.
+  - Targeted service-log scans on both hosts found no
+    `payload doorbell binding mismatch`, stale-token, protocol, reset,
+    fallback, or generic error signatures after the basebackup and pgbench
+    validation runs.
+  - Remote RDMA pgbench after truncating `pgbench_history` and vacuum/analyzing
+    the pgbench tables:
+    - c4: `40000/40000`, 0 failures, `10631.605051 TPS`, p95 `0.502 ms`,
+      p99 `0.567 ms`.
+    - c1 first run had a 2-second max-latency outlier and only
+      `3028.157168 TPS`, so it was treated as diagnostic. Immediate rerun:
+      `20000/20000`, 0 failures, `4292.642304 TPS`, p95 `0.243 ms`,
+      p99 `0.254 ms`.
+  - Post-run process preflight showed only the intended PostgreSQL service on
+    `farnet1` and one Homer service on each host.
+
 Required acceptance before 3D-6 is complete:
 
 ```text
@@ -4631,7 +4691,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | 3D-0 through 3D-6 code landed; 3D-6 validation blocked by payload close/quiescence lifetime bug |
+| Slice 3D    | 3D-0 through 3D-6 code landed; local close/credit repair validated for the 3D-6 payload lifetime blocker, full v16 close handshake remains follow-up |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
