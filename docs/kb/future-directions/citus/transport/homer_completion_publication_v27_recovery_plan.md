@@ -4339,6 +4339,47 @@ typedef enum HomerPayloadClosePhase
   reclaimable. The only bypass is forced cleanup after the owning QP/CQ has been
   reset or destroyed.
 
+Close-2 implementation checkpoint on 2026-06-23:
+
+- Citus commit `913b9159d` installs the persistent close state in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  `HomerPayloadStreamState.closeState` now snapshots the token pair, local stream
+  generation, connection generation, final published/consumed frontiers, final
+  payload/head WIMM flags, close-op storage, and blocked-reason mask.
+- `HomerServiceBindPeerToPayloadStream()` resets the close state at bind time.
+  `HomerServiceEnsurePayloadCloseStarted()` snapshots the close identity once
+  and fails fast if a later close phase observes a different stream generation,
+  connection generation, or token pair. `HomerServiceFreezePayloadCloseFinalTail()`
+  records the immutable final tail and fails fast if the close path later tries
+  to move it.
+- `HomerServiceClearPayloadStreamPeerBinding()` now refuses normal active binding
+  clear unless the close state is `RECLAIMABLE` or `ABORTING`. This is a
+  deliberate fail-fast boundary for the old local close paths while Close-3 and
+  Close-4 replace them with the real v16 peer-control handshake.
+- The existing local final-credit guard is wired into the close state:
+  `TupleSinkServicePeerCloseSinkBestEffort()` and the in-band byte-ring peer
+  close path start/freeze close state, sender-side credit WIMMs mark final head
+  observation, and `HomerServiceProgressPayloadCloseAndReclaim()` marks receiver
+  streams reclaimable only after the final head ACK work is complete.
+- This checkpoint is still not the complete close protocol. It intentionally
+  keeps the binding alive until the local guard proves reclaimability, but it
+  does not yet post exact `CLOSE_SINK` operations, validate echoed tokens/final
+  frontiers, or drive sender retry from a stream-owned async continuation. Those
+  remain Close-3 and Close-4.
+- Validation:
+  - no-stats `sudo -n -u dbcomm make -j8 service-bin client-bin
+    CPPFLAGS='-D_GNU_SOURCE'` completed successfully;
+  - installed and synced `/data/dbcomm/pg-citus` to `farnet0`;
+  - warmed remote RDMA pgbench c1 completed `20000/20000` at `4364.701351 TPS`
+    with p95 `0.239 ms`, p99 `0.250 ms`, max `6.169 ms`;
+  - remote RDMA pgbench c4 completed `40000/40000` at `10661.779307 TPS` with
+    p95 `0.519 ms`, p99 `0.597 ms`, max `16.189 ms`;
+  - three warmed remote RDMA basebackup runs completed in `4.29`, `4.26`, and
+    `4.18` seconds;
+  - service-log scans on both hosts found zero occurrences of the binding
+    mismatch, late-WIMM, stale-token, protocol, reset, fallback, or close
+    fail-fast signatures.
+
 Close-3 - sender continuation:
 
 - Replace `TupleSinkServicePeerCloseSinkBestEffort()` with explicit sender
@@ -4965,7 +5006,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Completion owned/runnable rearm correctness validated; remaining signaled-owner FIFO counts are performance cleanup |
-| Slice 3D    | 3D-0 through 3D-6 exact-control cleanup landed and validated; local close/credit repair prevents the observed late credit WIMM, full v16 close handshake remains follow-up |
+| Slice 3D    | 3D-0 through 3D-6 exact-control cleanup and Close-1/Close-2 landed and validated; full v16 close sender/receiver handshake remains in Close-3 through Close-6 |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
