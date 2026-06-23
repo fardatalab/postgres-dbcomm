@@ -3918,6 +3918,51 @@ stable empty:
     clear controlMailboxReady and indexed bit
 ```
 
+3D-4 implementation and validation checkpoint on 2026-06-22:
+
+- `HomerControlMailboxDrainResult` is now part of the peer transport API
+  alongside `HomerControlMailboxAction`.
+- `TupleSinkServiceDrainPeerControlMailboxRdma()` is the exact control-mailbox
+  executor. It resolves the action's direction/index/generation to one fixed
+  connection slot, rejects non-canonical or wrong-traffic-class ownership,
+  treats inactive or generation-mismatched actions as stale, and then drains at
+  most `maxMessages` records through the 3D-3 peek/apply/commit API.
+- The exact executor preserves the ordered FIFO semantics: responses complete
+  the matching peer-control op before commit; requests on incoming connections
+  are dispatched through `TupleSinkServiceDispatchPeerRequest()` before commit;
+  requests on outgoing connections are protocol errors.
+- `HOMER_PROGRESS_ACTION_DRAIN_PEER_CONTROL_MAILBOX` is now scheduled by the
+  machine-baseline policy from the 3D-2 exact candidates. The initial grant is
+  bounded to at most two control-mailbox actions per pass and sixteen mailbox
+  messages per action.
+- This checkpoint intentionally leaves the old broad semantic mailbox consumers
+  compiled and reachable. 3D-5/3D-6 still need to remove hidden response
+  progress from `TupleSinkServicePollPeerRequestRdma()` and delete the broad
+  response/request mailbox scans after this exact path is proven in isolation.
+- Code pointers for the checkpoint:
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:236`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6424`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8870`,
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:30507`.
+- Validation used no-stats binaries, installed under `dbcomm`, synced to
+  `farnet0`, and restarted Homer services on both hosts. Remote RDMA pgbench from
+  `farnet0` to `farnet1` passed:
+  - c1 smoke: `1000/1000`, 0 failures, about `452.3 TPS` excluding initial
+    connection, with the expected cold setup outlier.
+  - warmed c1: `20000/20000`, 0 failures, about `4240.4 TPS`, p95 `0.246 ms`,
+    p99 `0.258 ms`.
+  - warmed c4 repeat 1: `40000/40000`, 0 failures, about `10415.7 TPS`,
+    p95 `0.498 ms`, p99 `0.582 ms`.
+  - warmed c4 repeat 2: `40000/40000`, 0 failures, about `10453.7 TPS`,
+    p95 `0.492 ms`, p99 `0.574 ms`.
+- The c4 numbers are slightly below the best 3D-2/3D-3 repeats but still in the
+  current warmed correctness/performance band. Targeted service-log scans on
+  both hosts found no exact-control mailbox errors, protocol errors, stale/reset
+  diagnostics, fallback discoveries, or noncanonical polling diagnostics. The
+  post-run process preflight showed only the intended PostgreSQL service on
+  `farnet1` plus one Homer service on each host.
+
 #### 3D-5 Remove Hidden Response Progress
 
 After exact mailbox scheduling lands, change
@@ -4298,7 +4343,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | 3D-0 through 3D-3 landed and validated; 3D-4 exact control-mailbox executor is next   |
+| Slice 3D    | 3D-0 through 3D-4 landed and validated; 3D-5 hidden response-progress cleanup is next |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
