@@ -3474,6 +3474,54 @@ clear errors, critical recv-demand stale/reset diagnostics, fallback
 discoveries, reset messages, source-ring-full errors, ready-bitmap errors, or
 lane send-CQ drain failures.
 
+3C staged-completion rearm checkpoint on 2026-06-23:
+
+- Implemented the remaining completion owned/runnable follow-ups in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  `HomerServiceCompletionMachineRunnable()` now mirrors executor ordering: if a
+  staged peer-client completion exists, its known blockers are checked before
+  unread backend completion records are allowed to make the completion machine
+  runnable. This prevents later backend-ring work from hiding a first staged
+  publication that cannot yet make progress.
+- Added `HomerServiceRefreshPeerClientCompletionDependencyReadiness()`. It
+  inspects only the exact staged completion and its named result stream, clears
+  `HOMER_PROGRESS_REASON_DEPENDENT_COMPLETION_WAIT_PAYLOAD_EOS` once
+  `HomerServicePayloadStreamResultEosPosted()` is true, and clears
+  `HOMER_PROGRESS_REASON_DEPENDENT_COMPLETION_WAIT_RESULT_SEND_CQ` once
+  `HomerServiceTupleResultStreamHasPendingSendCompletions()` is false. When no
+  known blocker remains, it rearms that exact completion session.
+- Added `HomerServiceRefreshDeferredPeerClientCompletionReadiness()`, which
+  walks only the service-owned deferred-completion list. This is not a broad
+  fallback scan: every visited session already owns a staged payload-dependent
+  completion. Typed send-CQ drains call this after retiring payload CQEs, and
+  `TupleSinkServicePublishPendingPeerClientCommandCompletions()` refreshes the
+  current deferred session before retrying publication.
+- `HomerServiceFinalizeCompletionPendingBit()` now refreshes dependency
+  readiness before deciding whether the owned completion bit is runnable. The
+  existing source-credit rearm in
+  `TupleSinkServiceRetirePeerClientCompletionPublishCompletionEntry()` remains
+  the exact transition for source-slot pressure.
+- Validation used no-stats binaries, installed as `dbcomm`, synced to
+  `farnet0`, then restarted PostgreSQL on `farnet1` and both Homer services:
+  - Remote RDMA pgbench c1 first run: `20000/20000`, 0 failures,
+    `3022.093924 TPS`, p95 `0.239 ms`, p99 `0.250 ms`, with a one-time
+    2-second max-latency outlier.
+  - Remote RDMA pgbench c1 rerun: `20000/20000`, 0 failures,
+    `4310.735023 TPS`, p95 `0.242 ms`, p99 `0.255 ms`.
+  - Remote RDMA pgbench c4: `40000/40000`, 0 failures,
+    `10744.577749 TPS`, p95 `0.527 ms`, p99 `0.616 ms`.
+  - Remote RDMA basebackup: cold/warmup `5.44 s`, warmed repeats `4.17 s` and
+    `4.15 s`.
+  - Targeted service-log scans on both hosts found no `ERROR`, `FATAL`, payload
+    doorbell binding mismatch, late-WIMM, stale-token, protocol, reset,
+    fallback, generic failure, or deferred-list corruption signatures.
+- Remaining 3C cleanup is now performance-oriented rather than required for the
+  current correctness boundary: add `signaledOwnerCount` to the command and
+  peer-client completion lane FIFOs so send-CQ readiness becomes O(1) instead of
+  scanning fixed FIFO entries. Command-side owned/runnable source-credit
+  blocking is still conservative and can be refined when command publication
+  actually reports a blocked source-credit state.
+
 ### 3D Control Indexed Readiness
 
 Replace broad active-connection scans for control mailbox discovery and semantic
@@ -4732,7 +4780,7 @@ empty critical polls per transaction
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
-| Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
+| Slice 3C    | Completion owned/runnable rearm correctness validated; remaining signaled-owner FIFO counts are performance cleanup |
 | Slice 3D    | 3D-0 through 3D-6 exact-control cleanup landed and validated; local close/credit repair prevents the observed late credit WIMM, full v16 close handshake remains follow-up |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
