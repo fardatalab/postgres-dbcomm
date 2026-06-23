@@ -4301,6 +4301,48 @@ Patch F - re-enable and finish 3D-6 validation:
   - Post-run process preflight showed only the intended PostgreSQL service on
     `farnet1` and one Homer service on each host.
 
+3D-6 residual broad-mailbox cleanup checkpoint on 2026-06-23:
+
+- Implemented Patch F's mechanical cleanup in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.[ch]`.
+  The cleanup deletes the obsolete broad request/response mailbox source,
+  collector, action, wait-mask, registry, feedback, and stats-name vocabulary.
+  `HOMER_PROGRESS_ACTION_DRAIN_PEER_CONTROL_MAILBOX` remains the only semantic
+  control-mailbox executor.
+- `TupleSinkServicePeerPumpGrant` no longer carries `maxMailboxMessages`, and
+  `TupleSinkServicePumpPeerRequestsRdma()` no longer accepts a request handler or
+  handler context. The broad pump is now explicitly transport-only: setup,
+  listener/CM, canonical recv-CQ liveness, send-CQ retirement, and close/lifetime
+  progress. Exact mailbox actions still pass
+  `TupleSinkServiceDispatchPeerRequest()` directly to
+  `TupleSinkServiceDrainPeerControlMailboxRdma()`.
+- The local-control wait mask for peer responses now names only the remaining
+  physical prerequisites (`HOMER_PROGRESS_WAIT_PEER_RECV_CQ` and
+  `HOMER_PROGRESS_WAIT_PEER_SEND_CQ`). Control-mailbox readiness is a typed
+  indexed fact, not a broad peer-pump wait source.
+- Zero-reference audit for the removed names returned no matches in the touched
+  Homer transport/service files:
+  `PEER_REQUEST_MAILBOX`, `PEER_RESPONSE_MAILBOX`,
+  `COLLECT_PEER_REQUEST_MAILBOX`, `COLLECT_PEER_RESPONSE_MAILBOX`,
+  `WAIT_PEER_REQUEST_MAILBOX`, `WAIT_PEER_RESPONSE_MAILBOX`,
+  `peerRequestMailbox`, `peerResponseMailbox`, and `maxMailboxMessages`.
+- Validation for this checkpoint:
+  - No-stats `service-bin client-bin` build passed before and after
+    `git clang-format`; install completed as `dbcomm`; the installed prefix was
+    synced to `farnet0`; PostgreSQL on `farnet1` and both Homer services were
+    restarted.
+  - Remote RDMA pgbench c1 smoke: `20000/20000`, 0 failures, `3043.965825 TPS`,
+    p95 `0.238 ms`, p99 `0.251 ms`, with a large one-time max-latency outlier.
+  - Remote RDMA pgbench c4: `40000/40000`, 0 failures, `10791.086455 TPS`,
+    p95 `0.524 ms`, p99 `0.616 ms`.
+  - Remote RDMA basebackup runs: cold/warmup `5.95 s`, warmed repeats `4.24 s`
+    and `4.17 s`.
+  - Targeted service-log scans on both hosts found no `ERROR`, `FATAL`,
+    payload doorbell binding mismatch, late-WIMM, stale-token, protocol, reset,
+    fallback, or generic failure signatures after validation.
+
 Required acceptance before 3D-6 is complete:
 
 ```text
@@ -4691,7 +4733,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
-| Slice 3D    | 3D-0 through 3D-6 code landed; local close/credit repair validated for the 3D-6 payload lifetime blocker, full v16 close handshake remains follow-up |
+| Slice 3D    | 3D-0 through 3D-6 exact-control cleanup landed and validated; local close/credit repair prevents the observed late credit WIMM, full v16 close handshake remains follow-up |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
