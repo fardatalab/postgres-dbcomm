@@ -3286,34 +3286,36 @@ Suggested next instrumentation points:
 
 ### 3C Resource-Pressure Readiness
 
-Slice 3C is now split into a minimal physical send-CQ demand subset required by
-3B, followed by the broader owned-versus-runnable resource-pressure work.
+Slice 3C was originally split into a minimal physical send-CQ demand subset
+required by 3B, followed by broader owned-versus-runnable resource-pressure
+work. The pulled-forward subset has now landed as part of 3B-R5/R6 using the
+service-owned lane FIFOs rather than new transport-side bitmaps.
 
-3C-minimal for 3B: add exact send-CQ demand for peer-client completion
-publication.
+Accepted 3C-minimal / 3B-R6 shape:
 
-Add per peer transport:
+```text
+ClientSqlCommandWriteLaneFifos[]
+PeerClientCompletionPublishLaneFifos[]
+    are the exact service-owned send-CQ owner sets for command writes and
+    peer-client completion WIMM publications.
 
-```c
-uint64_t incomingSendCqDemandBits;
-uint64_t outgoingSendCqDemandBits;
+HomerServiceExecuteCqDrainProgressPlan()
+    walks only active lane FIFOs that contain signaled owners
+    drains each exact connection/QP through the typed send-CQ dispatcher
+    keeps payload send-CQ discovery on the payload stream table for now
+
+HomerMachineBaselinePolicyCommandSendCqDue()
+HomerServiceCommandSendCqReadyForScheduler()
+TupleSinkServiceRemoteClientSqlCommandSendCqShouldDrain()
+    treat peer-client completion signaled checkpoints as immediate
+    resource-relief demand
 ```
 
-Add per connection:
-
-```c
-uint32_t signaledSendOwnersOutstanding;
-```
-
-When any signaled WR is successfully posted, transition `0 -> 1` outstanding
-sets the exact send-CQ demand bit. When typed send-CQ retirement removes owners
-and the remaining count becomes zero, clear the bit. For peer-client completion
-publication, the final full-slot WIMM is signaled, so posting it must arm
-send-CQ demand immediately. Add an exact send-CQ collector action carrying
-direction, connection index, connection generation, and one poll-batch budget.
-Schedule it alongside or before critical recv-CQ polling whenever signaled
-owners are outstanding. Do not wait until source allocation fails before
-beginning send-CQ polling.
+Do not add parallel transport-side send-CQ demand bitmaps for the same
+command/completion owner classes unless ownership moves from the service lane
+FIFOs into the peer transport layer. The current exact owner identity is the
+`TupleSinkServicePeerConnectionHandle` stored in the service FIFO, and the typed
+send-CQ drain validates the live connection before polling.
 
 Acceptance for the pulled-forward subset:
 
@@ -3386,6 +3388,59 @@ Do not set the bitmap on every CQ retirement.
 The candidate builder exchanges the bitmap and schedules exact blocked
 sessions. Payload streams remain on indexed stream-ready structures because
 they are not all session-owned.
+
+3C owned/runnable checkpoint on 2026-06-22:
+
+- `HomerServiceSessionPendingState` now distinguishes owned and runnable bits:
+  command owned/runnable, and completion owned/runnable. Producer-owned shared
+  bitmap collection sets both owned and runnable. Executor finalization clears
+  owned+runnable when the machine is drained.
+- Command work remains effectively owned=runnable in this checkpoint. That keeps
+  the command source behavior conservative while the command-side source-credit
+  blocking model is refined later.
+- Completion work now uses `HomerServiceCompletionMachineRunnable()` to avoid
+  repeatedly selecting staged peer-client completion publication when it is
+  known blocked on completion source credit, payload EOS visibility, or result
+  send-CQ visibility. The service keeps the owned bit so the work is not lost.
+- Peer-client completion source-credit blockage is rearmed exactly when
+  `TupleSinkServiceRetirePeerClientCompletionPublishCompletionEntry()` observes a
+  send CQE and releases a peer-client completion source slot. If the retry still
+  cannot reserve source credit, the completion finalizer clears runnable again.
+- This is intentionally not the full 3C generalization. Payload send-CQ and
+  payload/frontier dependencies still use their existing stream-indexed facts,
+  and command-side blocked ownership remains a follow-up.
+
+Validated on 2026-06-22 with no-stats binaries after build/install/sync and
+fresh service restart:
+
+```text
+remote c1 smoke, -t 1000:
+    1000/1000, 0 failures
+    p95 0.237 ms, p99 0.259 ms
+
+remote c1 warmed, -t 20000:
+    20000/20000, 0 failures
+    4342.431088 TPS
+    p95 0.240 ms, p99 0.254 ms
+
+remote c4 warmed repeat 1, -t 10000 per client:
+    40000/40000, 0 failures
+    10416.891823 TPS
+    p95 0.526 ms, p99 0.635 ms
+
+remote c4 warmed repeat 2, -t 10000 per client:
+    40000/40000, 0 failures
+    10580.524270 TPS
+    p95 0.521 ms, p99 0.598 ms
+```
+
+The first c4 repeat was lower than the prior bitmap checkpoint, but the second
+repeat returned to that same band. Treat this checkpoint as correctness-accepted
+and performance-neutral within current run variance, not as a throughput
+improvement. Post-run service-log scan on both hosts found no terminal-demand
+clear errors, critical recv-demand stale/reset diagnostics, fallback
+discoveries, reset messages, source-ring-full errors, ready-bitmap errors, or
+lane send-CQ drain failures.
 
 ### 3D Control Indexed Readiness
 
@@ -3768,7 +3823,7 @@ empty critical polls per transaction
 | Slice 2F    | Landed; strict bootstrap/canonical recv-CQ ownership and wrapper deletion validated    |
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
-| Slice 3C    | Pull forward exact send-CQ demand for 3B, then implement owned/runnable resource-pressure readiness |
+| Slice 3C    | First owned/runnable completion-source-credit slice validated; broader command/payload resource readiness remains |
 | Slice 3D    | Planned; control indexed readiness added                                            |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
