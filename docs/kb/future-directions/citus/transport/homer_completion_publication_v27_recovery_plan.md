@@ -5794,6 +5794,45 @@ Close-6E1 implementation checkpoint:
   callbacks, response-post paths, and payload/control protocol checks must use
   the typed request path.
 
+Close-6E2 implementation checkpoint:
+
+- Status as of June 24, 2026: the second Close-6E migration slice is
+  implemented in the Citus/Homer tree at commit `89dd81125`.
+- Migrated async peer-control request publication failure in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c`
+  from inline `TupleSinkServiceResetPeerConnection()` to
+  `TupleSinkServiceRequestPeerConnectionResetRdma(...,
+  HOMER_PEER_RESET_PARTIAL_POST)`. The transport still releases the reserved
+  op slot immediately because the request was not durably published, but QP/CQ
+  teardown is now scheduler-owned.
+- Migrated payload doorbell binding mismatch in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  to request `HOMER_PEER_RESET_PAYLOAD_PROTOCOL`. This preserves the exact
+  protocol poison reason before the recv-CQ collector observes the callback
+  failure.
+- Migrated invalid CLOSE_SINK response validation on the sender-side payload
+  close continuation to request `HOMER_PEER_RESET_CLOSE_PROTOCOL` through the
+  stream's captured peer connection handle/generation.
+- Remaining direct string-based reset calls after this slice are setup/startup
+  compatibility paths: incoming accept failure, outgoing async connect start or
+  bootstrap progress failure, and setup progress failure inside the broad peer
+  pump. They are not CQ decoder or send-owner callback resets; keep them direct
+  until their setup lifecycle is reviewed.
+- Validation: formatted with `git clang-format HEAD -- ...`; no-stats
+  Citus/Homer `service-bin client-bin` build completed with
+  `CPPFLAGS='-D_GNU_SOURCE'`; installed as `dbcomm`, synced to `farnet0`, and
+  restarted both Homer services. Remote RDMA basebackup completed twice after
+  restart: run 1 cold `6.38s`, run 2 warmed `4.14s`.
+- Post-validation service-log scan on both hosts found no reset request,
+  reset-begin/reset-complete, owner-reconciliation, abort, late-WIMM, stale,
+  protocol, mismatch, tombstone, error, failed, or send-CQ drain-failure
+  diagnostics in the validation run.
+- Remaining Close-6E work is now mostly audit/fault-injection: confirm no new
+  CQ decoder, send-owner callback, response-post path, or payload/control
+  protocol path calls inline reset; then add deterministic reset-request tests
+  for stale generation, double request, and reset action execution after slot
+  reuse.
+
 Close-6 later-slice dependencies:
 
 - Close-6D can land before exact reset scheduling, but do not add new call sites
