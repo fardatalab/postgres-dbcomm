@@ -5675,6 +5675,36 @@ Close-6D3 implementation checkpoint:
   stream-owned close async ops using `HomerPeerConnectionAbortReport`, and clear
   per-stream response-post semantic flags.
 
+Close-6D4 implementation checkpoint:
+
+- Status as of June 24, 2026: Close-6D4 is implemented in the Citus/Homer tree
+  at commit `982ab6783`.
+- Renamed `HomerPeerResponsePostTicket.streamGeneration` to
+  `serviceStreamIdSnapshot` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h`
+  and updated the close response-post handler in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+- Added `HomerServiceAbortReceiverHeadAckOwners()`. Reset-complete now
+  transitions outstanding ordinary/final receiver-head ACK owners
+  `POSTED -> ABORTED`, decrements `receiverHeadAckOutstandingCount`, and leaves
+  `receiverHeadAckCompletedHead` and `finalHeadWimmRetired` unchanged because
+  those are successful send-CQE facts.
+- Added `HomerServiceAbortPayloadCloseControlOp()`. If a stream-owned close op
+  was published, reset-complete requires the exact connection handle,
+  generation, op index, and op generation to match the
+  `HomerPeerConnectionAbortReport` before clearing the service handle. If the
+  close op was active but not yet published, it has no transport slot and is
+  cleared locally.
+- Reset-complete clears `quiescedResponsePrepared` and
+  `quiescedResponsePosted` for aborting streams. A quiesced response that was
+  prepared or even posted before reset no longer authorizes normal reclaim once
+  the stream enters `ABORTING`.
+- Validation: no-stats Citus/Homer `service-bin client-bin` build completed
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+- Next stage is Close-6D5: mark owner reconciliation complete, add final
+  assertions/counters, keep binding intact for Close-6F, and run real
+  cross-machine validation.
+
 Close-6 later-slice dependencies:
 
 - Close-6D can land before exact reset scheduling, but do not add new call sites
