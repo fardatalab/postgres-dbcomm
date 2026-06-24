@@ -5647,6 +5647,34 @@ Close-6D2 implementation checkpoint:
   release local source reservations, and preserve successful-completion
   frontiers as diagnostics.
 
+Close-6D3 implementation checkpoint:
+
+- Status as of June 24, 2026: Close-6D3 is implemented in the Citus/Homer tree
+  at commit `c26432f1c`.
+- Added `HomerPayloadAbortSummary` and
+  `HomerServiceAbortTrackedPayloadSendOwners()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+- `HomerServicePeerConnectionResetComplete()` now consumes the
+  `affectedStreamBits` cookie from reset-begin and, for each captured stream,
+  revalidates the live stream against the copied connection identity before
+  touching payload send-owner state. A mismatch is logged as an invariant
+  failure rather than treated as a stale bit.
+- Outstanding byte-ring payload send owners transition `POSTED -> ABORTED`.
+  Their WR counts are subtracted from `payloadCompletionOutstandingWrs`, their
+  entries are removed from the completion FIFO, and the backend/source
+  byte-ring `consumedHead` is advanced to release local source storage for the
+  failed stream.
+- The abort path deliberately does not call
+  `HomerServiceApplyTrackedPayloadCompletionFrontier()` and does not update
+  `payloadSourceByteCompletedHead`, `payloadSenderCompletedHead`,
+  `finalPayloadSendRetired`, or semantic completed frontiers. Those fields
+  remain successful-completion diagnostics.
+- Validation: no-stats Citus/Homer `service-bin client-bin` build completed
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+- Next stage is Close-6D4: abort receiver-head ACK owners, validate and clear
+  stream-owned close async ops using `HomerPeerConnectionAbortReport`, and clear
+  per-stream response-post semantic flags.
+
 Close-6 later-slice dependencies:
 
 - Close-6D can land before exact reset scheduling, but do not add new call sites
