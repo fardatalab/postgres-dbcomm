@@ -5306,6 +5306,39 @@ Close-6B implementation checkpoint:
   scan, return `affectedStreamBits`, mark matching streams `ABORTING`, and
   remove ready/runnable memberships without clearing bindings.
 
+Close-6C implementation checkpoint:
+
+- Status as of June 24, 2026: Close-6C is implemented in the Citus/Homer tree.
+- Added a static assertion that `CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS`
+  fits in the current one-word reset cookie.
+- Implemented reset-begin stream matching by exact
+  `peerConnectionHandle` plus `peerConnectionGeneration`.
+- `HomerServicePeerConnectionResetBegin()` now scans the fixed payload stream
+  table, marks every matching active peer-bound stream `ABORTING`, removes its
+  payload-ready queue membership, clears pending receive-doorbell readiness,
+  prevents future normal close retries/posts by clearing local/received close
+  pending flags, and returns `affectedStreamBits` to the transport as the
+  reset-complete cookie.
+- ABORTING streams now report transport-broken blocked state but are not
+  scheduler-runnable payload sources. This is intentional: Close-6D must consume
+  the reset cookie and do teardown-owned owner cleanup after QP/CQ teardown,
+  rather than letting the normal payload executor race against reset-begin.
+- The marker preserves peer binding, token identity, MR handles, and outstanding
+  owner counts. It snapshots close identity if the stream had not already
+  entered the close state machine.
+- Validation:
+  - no-stats Citus/Homer `service-bin client-bin` build completed with
+    `CPPFLAGS='-D_GNU_SOURCE'`;
+  - installed and synced `/data/dbcomm/pg-citus` to `farnet0`;
+  - restarted Homer services on `farnet1` and `farnet0`;
+  - remote RDMA basebackup smoke completed in `6.02s` cold and `4.22s` warmed;
+  - service-log scan found no reset-begin captured-stream logs during the
+    normal path and no reset recursion, stale/late payload token, tombstone,
+    protocol, send-CQ, or close-wait diagnostics.
+- Next stage remains Close-6D. It must consume the `affectedStreamBits` cookie in
+  reset-complete and abort-retire payload send owners, receiver-head ACK owners,
+  stream-owned close ops, and response tickets before clearing the binding.
+
 Close-6 fault-injection and acceptance:
 
 ```text
