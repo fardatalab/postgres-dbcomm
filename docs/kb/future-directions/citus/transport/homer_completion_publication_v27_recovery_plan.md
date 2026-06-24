@@ -5617,6 +5617,36 @@ Close-6D1 implementation checkpoint:
   make normal payload/receiver-head send-CQ retirement transition
   `POSTED -> RETIRED` before adding abort transitions.
 
+Close-6D2 implementation checkpoint:
+
+- Status as of June 24, 2026: Close-6D2 is implemented in the Citus/Homer tree
+  at commit `4e77598db`.
+- Added `HomerTrackedWrOwnerState` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  with `FREE`, `POSTED`, `RETIRED`, and `ABORTED` states.
+- Byte-ring payload completion tracking now stores a parallel
+  `payloadCompletionOwnerStates[]` entry. `HomerServiceTrackPayloadCompletion()`
+  sets `POSTED`, and `HomerServiceCompleteTrackedPayload()` requires `POSTED`
+  before changing the owner to `RETIRED`. It still advances
+  `payloadSourceByteCompletedHead`, `payloadSenderCompletedHead`, and progress
+  deltas only through the existing successful CQ path.
+- Receiver consumed-head ACKs now have an explicit FIFO:
+  `receiverHeadAckTails[]`, `receiverHeadAckOwnerStates[]`,
+  `receiverHeadAckHeadIndex`, and `receiverHeadAckTailIndex`. This fixes the
+  modeling gap where two ACK WRs can carry the same byte frontier but still need
+  distinct source-lifetime retirements.
+- `HomerServiceTrackReceiverHeadAckOwner()` records one `POSTED` owner before
+  posting the one-WR ACK. `HomerServiceRollbackLastReceiverHeadAckOwner()` rolls
+  that reservation back if the post helper fails. `HomerServiceRetireReceiverHeadAckOwners()`
+  retires FIFO owners on successful send-CQ callbacks before
+  `receiverHeadAckCompletedHead` is updated.
+- Validation: no-stats Citus/Homer `service-bin client-bin` build completed
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+- Next stage is Close-6D3: use the explicit payload owner states to abort
+  posted payload send owners from `affectedStreamBits` during reset-complete,
+  release local source reservations, and preserve successful-completion
+  frontiers as diagnostics.
+
 Close-6 later-slice dependencies:
 
 - Close-6D can land before exact reset scheduling, but do not add new call sites
