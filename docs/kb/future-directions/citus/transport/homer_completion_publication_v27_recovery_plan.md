@@ -5833,6 +5833,69 @@ Close-6E2 implementation checkpoint:
   for stale generation, double request, and reset action execution after slot
   reuse.
 
+Close-6F1 implementation checkpoint:
+
+- Status as of June 24, 2026: the first Close-6F slice is implemented in the
+  Citus/Homer tree at commit `3f8472333`.
+- This slice deliberately scoped Close-6F to the tombstone/clear-boundary work
+  that was already specified and locally checkable. It did not attempt the
+  broader operation/session failure publication or remove every
+  `payloadTransportBroken` branch, because those paths still need a separate
+  failure-surfacing design rather than another ad hoc cleanup branch.
+- `HomerRetiredPayloadBinding` now carries an explicit
+  `HomerRetiredPayloadDisposition`:
+
+```c
+typedef enum HomerRetiredPayloadDisposition
+{
+    HOMER_RETIRED_PAYLOAD_QUIESCED = 1,
+    HOMER_RETIRED_PAYLOAD_ABORTED_RESET = 2
+} HomerRetiredPayloadDisposition;
+```
+
+- Duplicate `CLOSE_SINK` requests may be answered from a retired tombstone only
+  when the disposition is `HOMER_RETIRED_PAYLOAD_QUIESCED` and the existing
+  semantic IDs, token pair, and final tail match. An
+  `HOMER_RETIRED_PAYLOAD_ABORTED_RESET` tombstone is diagnostic-only and cannot
+  certify quiescence.
+- The tombstone field formerly named `streamGeneration` has been renamed to
+  `serviceStreamIdSnapshot`, matching what the field actually stores. The
+  exchanged payload token pair remains the wire generation identity.
+- `HomerServicePayloadCloseCanClearBinding()` now treats `ABORTING` as clearable
+  only after reset-complete has set `abortOwnersReconciled` and all stream-owned
+  payload/ACK/control owners are gone. `ABORTING` alone is no longer a binding
+  clear proof.
+- `HomerServicePeerConnectionResetComplete()` now records an
+  `ABORTED_RESET` tombstone after owner reconciliation, publishes local terminal
+  state for receiver-side streams, clears the peer binding through the guarded
+  abort path, and then lets `TupleSinkServiceMaybeReclaimSinkAndSession()`
+  reclaim the local stream/session if no local handle remains.
+- Added cold-path counters:
+  `PayloadAbortTombstonesRecorded` and `PayloadBindingsAbortCleared`.
+- Validation: formatted with `git clang-format HEAD -- ...`; `git diff
+  --cached --check` passed; no-stats Citus/Homer `service-bin client-bin` build
+  passed with `CPPFLAGS='-D_GNU_SOURCE'`; installed as `dbcomm`, synced to
+  `farnet0`, and restarted both Homer services.
+- Remote RDMA basebackup after restart completed twice: run 1 cold `5.30s`,
+  run 2 warmed `4.20s`.
+- Remote RDMA pgbench c4:
+  - first post-restart run was treated as warmup/diagnostic because it had a
+    large connection outlier and reported `7959.354759 TPS`;
+  - warmed rerun completed `40000/40000` transactions with zero failures,
+    `10719.035587 TPS`, p95 `0.525 ms`, p99 `0.619 ms`.
+- Post-validation service-log scan on both hosts found no reset request,
+  reset-begin/reset-complete, owner-reconciliation, abort, late-WIMM, stale,
+  protocol, mismatch, tombstone, non-quiesced-retired-binding, error, failed,
+  or send-CQ drain-failure diagnostics.
+- After committing, the no-stats service/client binaries were rebuilt,
+  installed, and synced again so installed artifacts carry `GIT_VERSION`
+  `homer-state-machine-scheduler-milestone(sha: 3f8472333)`.
+- Remaining Close-6F work: define how a transport-aborted payload stream
+  publishes terminal failure to its owning DB/client operation, remove or
+  replace the remaining local `payloadTransportBroken` cleanup branches once
+  that failure-surfacing model exists, and add fault-injection coverage for
+  abort tombstone matching and duplicate close after reset.
+
 Close-6 later-slice dependencies:
 
 - Close-6D can land before exact reset scheduling, but do not add new call sites
@@ -5846,6 +5909,10 @@ Close-6 later-slice dependencies:
   publication, invalidated stream-MR reference cleanup, ABORTING-authorized
   binding clear, and removal of remaining ad hoc `payloadTransportBroken`
   cleanup branches.
+- Close-6F1 completed abort tombstone disposition and ABORTING-authorized
+  binding clear. Operation/session failure publication and removal of the
+  remaining ad hoc `payloadTransportBroken` cleanup branches are still future
+  Close-6F work.
 - `HomerRetiredPayloadBinding.serviceStreamIdSnapshot` and
   `HomerPeerResponsePostTicket.serviceStreamIdSnapshot` should stay named as
   snapshots, not stream generations; the wire generation identity remains the
