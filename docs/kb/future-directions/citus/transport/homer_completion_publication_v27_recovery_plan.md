@@ -5746,6 +5746,54 @@ Close-6D5 implementation checkpoint:
   payload/control protocol failures request reset from the current collector or
   callback stack and a scheduler-owned lifetime action performs the reset.
 
+Close-6E1 implementation checkpoint:
+
+- Status as of June 24, 2026: the first Close-6E slice is implemented in the
+  Citus/Homer tree at commit `264ef0ce3`.
+- Added `HomerPeerConnectionResetAction` and the public reset scheduling API in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h`:
+  `TupleSinkServiceRequestPeerConnectionResetRdma()`,
+  `TupleSinkServiceAppendPendingPeerConnectionResetActionsRdma()`, and
+  `TupleSinkServiceExecutePeerConnectionResetActionRdma()`.
+- Added per-connection `resetRequested` plus `pendingResetReason`, and
+  transport-level `pendingConnectionResetCount`. A reset request records the
+  first typed `HomerPeerConnectionResetReason`; repeated requests with a
+  different reason are diagnostic-only and do not overwrite the original poison
+  reason.
+- Split the reset implementation into a typed internal reset path and the
+  existing string-based compatibility wrapper. Exact reset actions execute the
+  typed path, while old setup/lifetime callers still use the wrapper until the
+  rest of 6E migrates them.
+- Added exact reset action materialization to the service scheduler in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  Pending resets are copied into durable `HomerProgressActionPayload` storage
+  and scheduled before critical recv-CQ and control-mailbox actions. Older exact
+  recv/control actions skip a connection once `resetRequested` is set.
+- Migrated the first dangerous reset sites:
+  - canonical recv-CQ drain failure now requests `HOMER_PEER_RESET_RECV_CQ_FAILURE`;
+  - async CM disconnect/error events now request `HOMER_PEER_RESET_CM_DISCONNECT`;
+  - peer send-CQ drain failure in the peer pump now requests
+    `HOMER_PEER_RESET_SEND_CQ_FAILURE`.
+- Normal peer-pump table scans now skip `resetRequested` connections after
+  counting them as active for listener cadence. This prevents ordinary setup,
+  recv-CQ, CM, or send-CQ work from running on a slot whose teardown is owned by
+  the reset action.
+- Validation: formatted with `git clang-format HEAD -- ...`; no-stats
+  Citus/Homer `service-bin client-bin` build completed with
+  `CPPFLAGS='-D_GNU_SOURCE'`; installed as `dbcomm`, synced to `farnet0`, and
+  restarted both Homer services. Remote RDMA basebackup completed twice after
+  restart: run 1 cold `5.98s`, run 2 warmed `4.20s`.
+- Post-validation service-log scan on both hosts found no reset request,
+  reset-begin/reset-complete, owner-reconciliation, abort, late-WIMM, stale,
+  protocol, mismatch, tombstone, error, failed, or send-CQ drain-failure
+  diagnostics in the validation run.
+- Remaining Close-6E work: migrate protocol/partial-post failures and the
+  remaining direct string-based reset call sites where reset can be requested
+  from a callback or owner path. Setup/startup compatibility reset calls may stay
+  direct until their lifecycle is reviewed, but CQ decoders, send-owner
+  callbacks, response-post paths, and payload/control protocol checks must use
+  the typed request path.
+
 Close-6 later-slice dependencies:
 
 - Close-6D can land before exact reset scheduling, but do not add new call sites
