@@ -4533,11 +4533,10 @@ Close-3 optimization checkpoint on 2026-06-24:
   remain in the current `4.1`-`4.3` second band.
 - Service-log scan on both hosts found no binding mismatch, late WIMM,
   stale-token, protocol/reset/fallback, payload-close response validation, or
-  exact `CLOSE_SINK` publish failure signatures. The receiver still logs the
-  temporary deferred final-head ACK path (`peer-close deferred final head ACK`
-  then `peer-close-drained`), which is expected until Close-4 replaces that
-  migration behavior with handler-side final-head posting and tombstone-backed
-  duplicate handling.
+  exact `CLOSE_SINK` publish failure signatures. The earlier Close-3 receiver
+  still used a temporary deferred final-head ACK path; Close-4 below replaces
+  that migration behavior with handler-side final-head posting and
+  tombstone-backed duplicate handling.
 
 Close-4 - receiver quiescence:
 
@@ -4784,6 +4783,78 @@ old token after reclaim:
   concurrent pgbench-plus-basebackup to complete with zero late-WIMM,
   stale-token, missing-tombstone, close-response-post, or binding-clear
   fail-fast signatures.
+
+Close-4 implementation progress and validation:
+
+- Status as of June 24, 2026: Close-4A through Close-4E are implemented in the
+  Citus/Homer tree on top of Citus commit `869f772f7` and are validated with
+  no-stats binaries installed as `dbcomm` and synced to `farnet0`.
+- Receiver request validation is in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21776`
+  (`TupleSinkServiceHandlePeerCloseSinkRequest`). It validates the v16 token
+  pair, direction, flags, final frontier, exact stream-bound connection, and
+  traffic class before touching live close state.
+- The transport response-post materialization boundary is in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6222`
+  (`TupleSinkServiceProcessIncomingMailboxRequest`) and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:253`
+  (`HomerPeerResponsePostTicket`). The request handler prepares a ticket, and
+  the transport invokes the service callback only after response publication
+  succeeds.
+- `HomerServiceTryPostFinalReceiverHead()` at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26198`
+  is now the shared nonblocking final-head transition used by both the exact
+  close handler and the payload close/reclaim action. It posts a signaled final
+  consumed-head WIMM on the exact stream-bound QP and never polls the send CQ.
+- `HomerServiceHandlePeerResponsePostTicket()` at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22002`
+  sets `quiescedResponsePosted` only after the exact control response publish
+  succeeds, then rearms the close/reclaim action.
+- Retired-binding tombstones are represented by `HomerRetiredPayloadBinding`
+  and are stored outside the resettable stream entry. A missing active stream
+  can answer a duplicate close request only when the token pair, semantic IDs,
+  and final tail match the tombstone exactly; otherwise missing state is a
+  protocol/lifetime error.
+- Validation exposed three important implementation corrections:
+  - Receive-side close was initially kept perpetually runnable after a close
+    request was recorded. With small payload action budgets, stale close
+    actions from earlier streams could starve later basebackup payload drain.
+    `HomerServicePayloadCloseActionReady()` at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20347`
+    now separates close-owned from close-runnable on the receiver side.
+  - The compatibility local-blackhole payload action could outrank close
+    reclaim after a stream had already drained, leaving a quiesced receiver
+    binding alive. `HomerServiceMachineBaselinePayloadActionKind()` now grants
+    `HOMER_PROGRESS_ACTION_PAYLOAD_CLOSE_RECLAIM` before
+    `HOMER_PROGRESS_ACTION_PAYLOAD_LOCAL_BLACKHOLE`.
+  - The final-head send CQE could remain undiscovered when its posted frontier
+    equaled the already-completed ordinary ACK frontier but
+    `receiverHeadAckOutstandingCount` was still nonzero. Both
+    `HomerServicePayloadSendCqMayHaveWork()` at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11652`
+    and `HomerServiceExecuteCqDrainProgressPlan()` at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11969`
+    now treat outstanding receiver-head ACK owners as send-CQ demand.
+- Validation commands/results:
+  - Focused repeated remote basebackup after clean restart:
+    `5.88`, `4.18` seconds.
+  - Warm remote c1 pgbench from `farnet0` to `farnet1`:
+    `20000/20000`, zero failures, `4385.126353 TPS`, p99 `0.246 ms`.
+  - Remote c4 pgbench:
+    `40000/40000`, zero failures, `10844.566723 TPS`, p95 `0.521 ms`,
+    p99 `0.607 ms`.
+  - Four-run remote basebackup sequence:
+    `4.30`, `4.24`, `4.20`, `4.18` seconds.
+  - Concurrent c4 plus remote basebackup:
+    pgbench `10000/10000`, zero failures, `9780.257182 TPS`, while
+    basebackup completed in `4.26` seconds.
+  - After removing repeated wait-loop debug prints, the final no-stats binary
+    was rebuilt, reinstalled, synced, and rerun through a focused two-run
+    basebackup smoke: `5.45`, `4.13` seconds.
+- Receiver log evidence showed 17 successful close-clear cycles after the
+  restart and mixed validation. The final sweep found no `lane send-CQ drain
+  failed`, `without a matching tombstone`, `late`, `failed`, `error`, `stale`,
+  `protocol`, or `payload close waiting` signatures on either host.
 
 Close-4 current-code corrections to apply while implementing:
 
@@ -5361,7 +5432,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Completion owned/runnable rearm correctness validated; remaining signaled-owner FIFO counts are performance cleanup |
-| Slice 3D    | 3D-0 through 3D-6 exact-control cleanup and Close-1 through Close-3 landed and validated; next implement Close-3 remote-head gate optimization, then Close-4A through Close-4E receiver quiescence/tombstone |
+| Slice 3D    | 3D-0 through 3D-6 exact-control cleanup, Close-1 through Close-3, the Close-3 remote-head gate optimization, and Close-4A through Close-4E receiver quiescence/tombstone are implemented and validated |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
