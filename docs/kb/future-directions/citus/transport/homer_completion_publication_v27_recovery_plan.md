@@ -5981,11 +5981,73 @@ Close-6F2 implementation checkpoint:
     reset-begin/reset-complete, owner-reconciliation, abort, late-WIMM, stale,
     protocol, mismatch, tombstone, non-quiesced-retired-binding, error, failed,
     send-CQ drain-failure, or invalid-terminal diagnostics.
-- Remaining immediate caveat: the current abort cleanup still releases producer
-  `consumedHead` in `HomerServiceAbortTrackedPayloadSendOwners()` before a
-  `FAILED` terminal status is published. Close-6F3 must move that release behind
-  failure publication before any reset path can safely wake blocked local
-  producers.
+- Close-6F3 resolves the immediate caveat recorded here: abort owner cleanup no
+  longer releases producer `consumedHead` before a terminal failure marker.
+
+Close-6F3 implementation checkpoint:
+
+- Status as of June 24, 2026: abort source-credit ordering is implemented in the
+  Citus/Homer tree at commit `f3b15208e`.
+- Added cold `HomerPayloadFailureState` to `HomerPayloadStreamState` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  Reset-begin now captures failure ownership, the typed
+  `HomerPeerConnectionResetReason`, the mapped `CitusTupleSinkFailureCode`, the
+  connection generation, and the service stream ID snapshot.
+- Added `HomerServiceFailureCodeForResetReason()` so reset paths use stable
+  failure codes rather than string classification when publishing tuple-sink
+  terminal state.
+- Changed `HomerServiceAbortTrackedPayloadSendOwners()` so teardown-owned
+  payload send cancellation only records `abortedSourceReleaseTail` in
+  `HomerPayloadAbortSummary`. It no longer stores producer-visible
+  `sendQueue.byteRingControl->consumedHead` and still does not advance successful
+  send-completion frontiers such as `payloadSourceByteCompletedHead`,
+  `payloadSenderCompletedHead`, or close success facts.
+- Added `HomerServiceMarkPayloadStreamReceivePeerFailed()` and
+  `HomerServiceMarkPayloadStreamSendFailed()`. Reset-clear now publishes shared
+  terminal `FAILED` plus transitional `PEER_CLOSED | PEER_FAILED` flags before
+  any aborted producer source credit is released. The graceful
+  `HomerServiceMarkPayloadStreamReceivePeerClosed()` path remains reserved for
+  normal quiesced close.
+- Added `HomerServiceReleaseAbortedProducerSourceCreditAfterTerminal()`. This is
+  the only reset path that release-stores aborted producer source capacity, and
+  it runs after the terminal failure publication. The store is documented as
+  physical abort-release, not successful peer delivery.
+- `HomerServiceClearAbortedPayloadStreamAfterReset()` now receives the abort
+  summary, records the `ABORTED_RESET` tombstone, publishes `FAILED`, performs
+  the ordered abort source release, clears the guarded peer binding, and then
+  attempts local stream/session reclamation.
+- Scope caveat: this slice publishes capacity-independent shared terminal
+  `FAILED`, but it does not yet implement object-family-specific operation
+  failure delivery. SQL forced command failure, basebackup operation failure,
+  WAL/future stream failure hooks, and the final `payloadTransportBroken`
+  cleanup remain Close-6F4+ work.
+- Validation:
+  - `git clang-format HEAD -- ...` over
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  - `git diff --cached --check` passed.
+  - No-stats Citus/Homer `service-bin client-bin` build passed as `dbcomm` with
+    `CPPFLAGS='-D_GNU_SOURCE'`.
+  - Citus install and runtime-prefix sync to `farnet0` completed.
+  - Validation initially exposed a runbook/process-control pitfall: `pkill -x
+    citus_tuple_sink_service` missed the resident service because Linux truncated
+    the process comm to `citus_tuple_sin`, so the first restart attempt logged
+    `rdma_bind_addr ... Address already in use`. The validation was discarded
+    and services were restarted cleanly with the truncated comm/path-based kill.
+  - Fresh process preflight showed PostgreSQL plus Homer service on `farnet1`,
+    Homer service only on `farnet0`, and no stale pgbench/basebackup/backend
+    workers.
+  - Remote RDMA basebackup after the corrected restart completed three times:
+    run 1 cold `12.83s`, run 2 still warming `9.20s`, run 3 warmed `4.26s`.
+    The first two were treated as post-restart warmup artifacts.
+  - Remote RDMA pgbench c4 after the corrected restart:
+    - first post-restart run was diagnostic/cold-shaped: `40000/40000`, zero
+      failures, `7493.156874 TPS`, p95 `0.557 ms`, p99 `0.647 ms`, max
+      `1370.880 ms`, and initial connection time `1885.392 ms`;
+    - warmed repeat completed `40000/40000` transactions with zero failures,
+      `10773.908718 TPS`, p95 `0.526 ms`, p99 `0.616 ms`, max `19.406 ms`.
+  - Post-validation service-log scan on both hosts found no reset, abort,
+    failure, stale, protocol, mismatch, fatal, late-WIMM, error, bind, or
+    initialization diagnostics.
 
 Close-6F terminal-failure design decision:
 
@@ -6113,10 +6175,11 @@ typedef struct HomerPayloadFailureState
 
 - Reset-begin sets failure ownership and captures reset reason/identity, but
   does not publish externally. Reset-complete, after `abortOwnersReconciled`,
-  maps reset reason to stable failure code, publishes operation-specific
-  failure, publishes shared terminal `FAILED`, releases aborted source credit,
-  records the `ABORTED_RESET` tombstone, clears peer binding, and keeps local
-  queue/session state until the local owner consumes/detaches.
+  maps reset reason to a stable failure code, publishes shared terminal
+  `FAILED`, releases aborted source credit, records the `ABORTED_RESET`
+  tombstone, clears peer binding, and keeps local queue/session state until the
+  local owner consumes/detaches. Operation-specific SQL/basebackup/WAL failure
+  delivery is layered on top and remains the next implementation step.
 
 Operation-specific failure publication:
 
@@ -6171,15 +6234,12 @@ Close-6F recommended remaining commits:
 1. Close-6F2 - shared terminal-status ABI v11:
    implemented at Citus/Homer commit `41696ed4d`; shared ABI, terminal flags,
    terminal helpers, graceful `QUIESCED` publication, and producer/consumer
-   terminal checks are in place. Failure publication remains intentionally
-   deferred.
+   terminal checks are in place.
 2. Close-6F3 - abort source-credit ordering:
-   add `HomerPayloadFailureState`, add the reset-reason to
-   `CitusTupleSinkFailureCode` mapping, change
-   `HomerServiceAbortTrackedPayloadSendOwners()` to return
-   `abortedSourceReleaseTail` in `HomerPayloadAbortSummary` without storing
-   producer `consumedHead`; after failure publication, release-store the aborted
-   source tail.
+   implemented at Citus/Homer commit `f3b15208e`; added
+   `HomerPayloadFailureState`, reset-reason to `CitusTupleSinkFailureCode`
+   mapping, shared terminal `FAILED` publication in reset-clear, and ordered
+   aborted source-credit release after terminal publication.
 3. Close-6F4 - object-family failure delivery:
    implement `HomerServicePublishOwningPayloadFailure()`, SQL forced completion
    failure, basebackup operation failure, and WAL/future-stream failure hooks.
@@ -6220,12 +6280,11 @@ Close-6 later-slice dependencies:
   cleanup branches.
 - Close-6F1 completed abort tombstone disposition and ABORTING-authorized
   binding clear. Close-6F2 completed the local tuple-sink terminal-status ABI
-  and boundary checks. Operation/session failure publication and removal of the
+  and boundary checks. Close-6F3 completed shared terminal `FAILED` publication
+  in reset-clear and moved aborted source-credit release behind that terminal
+  publication. Operation/session failure publication and removal of the
   remaining ad hoc `payloadTransportBroken` cleanup branches are still future
   Close-6F work.
-- Correction after Close-6F1/6F2: current abort owner cleanup still releases
-  producer source credit too early. Before implementing object-family failure
-  delivery, move aborted source-credit release behind `FAILED` publication.
 - `HomerRetiredPayloadBinding.serviceStreamIdSnapshot` and
   `HomerPeerResponsePostTicket.serviceStreamIdSnapshot` should stay named as
   snapshots, not stream generations; the wire generation identity remains the
