@@ -5339,6 +5339,43 @@ Close-6C implementation checkpoint:
   reset-complete and abort-retire payload send owners, receiver-head ACK owners,
   stream-owned close ops, and response tickets before clearing the binding.
 
+Close-6D pre-implementation note:
+
+- Stop point as of June 24, 2026: do not implement Close-6D by simply zeroing
+  stream counters. The existing code does not yet have an explicit teardown-owner
+  API for the owner classes Close-6D must reconcile.
+- Current payload send-CQ retirement path:
+  - `TupleSinkServiceHandleTaggedSendCompletion()` in
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c`
+    decodes payload WR IDs and invokes the service `payloadCompletion` callback.
+  - `HomerServiceApplyTrackedPayloadCompletionFrontier()` and
+    `HomerServiceApplyReceiverHeadAckCompletionFrontier()` in
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    update source-release, semantic, and ACK outstanding counters from those
+    callbacks.
+  - After Close-6B reset ordering, reset-complete runs after QP/CQ destruction,
+    so no normal send-CQ callback can arrive for the affected connection.
+- Current control ownership path:
+  - `TupleSinkServiceReleasePeerControlOp()` clears transport op slots, but it is
+    private to the peer transport implementation.
+  - `HomerPeerResponsePostTicket` is a stack-local ticket in
+    `TupleSinkServiceProcessIncomingMailboxRequest()`: it is reported after a
+    response publish succeeds, but there is no persistent response-ticket owner
+    table for reset-complete to cancel.
+- Therefore Close-6D needs one explicit design choice before coding:
+  - either add transport/service teardown APIs that abort-clear all outstanding
+    payload WR accounting and any stream-owned peer-control op by exact
+    connection identity and generation;
+  - or prove that, after QP/CQ destruction, all of the affected stream's
+    outstanding owner state is service-local and can be reconciled solely from
+    the stream table snapshot without touching transport op slots or response
+    tickets.
+- Required invariant for the accepted 6D design: abort cleanup must not advance
+  source or semantic frontiers as though RDMA WRs completed successfully, must
+  decrement each outstanding owner count exactly once, must leave no active
+  close op or response-post ownership for the stream, and only then may clear the
+  peer binding through the ABORTING-authorized path.
+
 Close-6 fault-injection and acceptance:
 
 ```text
