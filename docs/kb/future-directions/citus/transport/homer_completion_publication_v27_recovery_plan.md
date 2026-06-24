@@ -5907,6 +5907,86 @@ typedef enum HomerRetiredPayloadDisposition
   that failure-surfacing model exists, and add fault-injection coverage for
   abort tombstone matching and duplicate close after reset.
 
+Close-6F2 implementation checkpoint:
+
+- Status as of June 24, 2026: the shared terminal-status ABI substrate is
+  implemented in the Citus/Homer tree at commit `41696ed4d`.
+- `CITUS_TUPLE_SINK_PROTOCOL_VERSION` is now `11` in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h`.
+  The peer protocol remains v16; this is a local queue/shared-memory ABI change.
+- Added `CitusTupleSinkTerminalState`, `CitusTupleSinkFailureCode`, and
+  `CitusTupleSinkTerminalStatus` in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h`.
+  `CitusTupleSinkQueueControl`, `CitusTupleSinkPayloadRingControl`, and
+  `CitusHomerPayloadByteRingControl` now append `terminalStatus` after the
+  existing hot frontier fields.
+- Added transitional failure flags
+  `CITUS_TUPLE_SINK_QUEUE_FLAG_PEER_FAILED` and
+  `CITUS_HOMER_PAYLOAD_BYTE_RING_FLAG_PEER_FAILED`. The terminal status is the
+  authoritative state; the flags are only cheap migration checks.
+- Added local producer/consumer helpers in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c`:
+  `TupleSinkLoadTerminalState()` acquire-loads `terminalState`, and
+  `TupleSinkPublishTerminalStatus()` writes metadata before the release-store of
+  the terminal state. `TryReserveCitusTupleSinkBatch()` now treats non-`OPEN`
+  terminal status or legacy failed/closed flags as terminal at the reservation
+  boundary. `FinalizeCitusTupleSinkGeneration()` and receive-side EOS
+  observation publish `QUIESCED` before setting the legacy peer-closed flag.
+- Added public receive-side distinction in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_service.h`:
+  `CitusTupleSinkReceivePeerClosed()` remains the graceful/legacy EOF check,
+  while `CitusTupleSinkReceivePeerFailed()` and
+  `CitusTupleSinkReceiveTerminalState()` expose `FAILED` without folding it into
+  successful close semantics.
+- Added the same boundary checks in the standalone Homer client
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_client.c`:
+  `HomerClientReserveBaseBackupRecordForObject()` stops reservation when the
+  stream terminal status is non-`OPEN`, and
+  `HomerClientDrainResultSinkUntil()` reports `HOMER_RESULT_DRAIN_ERROR` rather
+  than `COMPLETE` when it observes `FAILED` at an empty-drain boundary.
+- Reset/reuse handling:
+  - `RemoteExecPrepareResultQueueGeneration()` in
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c`
+    clears only the cold terminal status for a new SQL result generation while
+    preserving monotonic byte-ring frontiers.
+  - `TupleSinkServiceEnsureLocalReceivePayloadRing()` and
+    `HomerServiceEnsureLocalReceiveByteRing()` in
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    clear terminal status at stream-open/setup time.
+  - The normal receiver close/reclaim path publishes `QUIESCED` immediately
+    before the existing peer-closed flag when the quiescence handshake has
+    completed.
+- This slice deliberately does not publish `FAILED` on reset yet. The
+  failure-code mapping helper was left out of the committed code because it is
+  unused until the next slices. Close-6F3/6F4 still own mapping
+  `HomerPeerConnectionResetReason` to `CitusTupleSinkFailureCode`, publishing
+  `FAILED`, and delivering object-family-specific failure.
+- Validation:
+  - `git clang-format HEAD -- ...` over the touched Citus files.
+  - `git diff --cached --check` passed.
+  - No-stats Citus/Homer `service-bin client-bin` build passed as `dbcomm` with
+    `CPPFLAGS='-D_GNU_SOURCE'` and no Close-6F2 warnings.
+  - Citus install, Postgres rebuild of `postgres`, `pgbench`, and
+    `pg_basebackup`, Postgres install, runtime-prefix sync to `farnet0`, and
+    service/PostgreSQL restart all completed.
+  - Remote RDMA basebackup completed twice after restart: run 1 cold `5.92s`,
+    run 2 warmed `4.44s`.
+  - Remote RDMA pgbench c4:
+    - first post-restart run was diagnostic/cold-shaped: `40000/40000`, zero
+      failures, `7909.704397 TPS`, p95 `0.523 ms`, p99 `0.611 ms`, max
+      `1365.744 ms`;
+    - warmed repeat completed `40000/40000` transactions with zero failures,
+      `10930.726792 TPS`, p95 `0.514 ms`, p99 `0.599 ms`, max `15.100 ms`.
+  - Post-validation service-log scan on both hosts found no reset request,
+    reset-begin/reset-complete, owner-reconciliation, abort, late-WIMM, stale,
+    protocol, mismatch, tombstone, non-quiesced-retired-binding, error, failed,
+    send-CQ drain-failure, or invalid-terminal diagnostics.
+- Remaining immediate caveat: the current abort cleanup still releases producer
+  `consumedHead` in `HomerServiceAbortTrackedPayloadSendOwners()` before a
+  `FAILED` terminal status is published. Close-6F3 must move that release behind
+  failure publication before any reset path can safely wake blocked local
+  producers.
+
 Close-6F terminal-failure design decision:
 
 - Verdict as of June 24, 2026: a transport-aborted payload stream must not be
@@ -6089,11 +6169,13 @@ typedef struct HomerForcedCommandFailure
 Close-6F recommended remaining commits:
 
 1. Close-6F2 - shared terminal-status ABI v11:
-   add `CitusTupleSinkTerminalStatus`, terminal/failure enums, terminal flags,
-   failure-code mapping, terminal publication helpers, and producer/consumer
-   terminal checks.
+   implemented at Citus/Homer commit `41696ed4d`; shared ABI, terminal flags,
+   terminal helpers, graceful `QUIESCED` publication, and producer/consumer
+   terminal checks are in place. Failure publication remains intentionally
+   deferred.
 2. Close-6F3 - abort source-credit ordering:
-   add `HomerPayloadFailureState`; change
+   add `HomerPayloadFailureState`, add the reset-reason to
+   `CitusTupleSinkFailureCode` mapping, change
    `HomerServiceAbortTrackedPayloadSendOwners()` to return
    `abortedSourceReleaseTail` in `HomerPayloadAbortSummary` without storing
    producer `consumedHead`; after failure publication, release-store the aborted
@@ -6137,13 +6219,13 @@ Close-6 later-slice dependencies:
   binding clear, and removal of remaining ad hoc `payloadTransportBroken`
   cleanup branches.
 - Close-6F1 completed abort tombstone disposition and ABORTING-authorized
-  binding clear. Operation/session failure publication and removal of the
+  binding clear. Close-6F2 completed the local tuple-sink terminal-status ABI
+  and boundary checks. Operation/session failure publication and removal of the
   remaining ad hoc `payloadTransportBroken` cleanup branches are still future
   Close-6F work.
-- Correction after Close-6F1: current abort owner cleanup releases producer
-  source credit too early. Before implementing object-family failure delivery,
-  add the terminal-status ABI and move aborted source-credit release behind
-  `FAILED` publication.
+- Correction after Close-6F1/6F2: current abort owner cleanup still releases
+  producer source credit too early. Before implementing object-family failure
+  delivery, move aborted source-credit release behind `FAILED` publication.
 - `HomerRetiredPayloadBinding.serviceStreamIdSnapshot` and
   `HomerPeerResponsePostTicket.serviceStreamIdSnapshot` should stay named as
   snapshots, not stream generations; the wire generation identity remains the
