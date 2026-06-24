@@ -4467,7 +4467,72 @@ Close-3 implementation checkpoint on 2026-06-23:
     expected `peer-close deferred final head ACK` then `peer-close-drained`
     sequence for pgbench and basebackup receive streams.
 
+Close-3 optimization required before Close-4:
+
+- The current sender continuation still waits for
+  `senderVisibleRemoteConsumedHead >= finalPublishedTail` before starting or
+  completing the peer close. In current code this gate lives in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  inside `TupleSinkServicePeerCloseSinkBestEffort()` after
+  `HomerServiceFreezePayloadCloseFinalTail()`.
+- This gate is too strong for close-request publication. The normal close
+  request should be sent after the sender has:
+  - frozen the producer and final published frontier;
+  - posted immutable EOS/final payload;
+  - preserved the stream entry, token binding, source ownership, and connection
+    generation snapshot.
+- The sender-visible remote consumed head is still required before reclaiming
+  the sender binding, but it must not block the first `CLOSE_SINK` request.
+  Otherwise the sender can wait for final credit while the receiver waits for
+  close to force the final-credit WIMM, creating a circular dependency.
+- Implementation step:
+  - move the `senderVisibleRemoteConsumedHead >= finalPublishedTail` test from
+    the "may post/poll CLOSE_SINK" path to the final reclaim predicate;
+  - allow `HomerServiceBuildPayloadCloseRequest()` and
+    `TupleSinkServiceStartPeerRequestOnConnectionRdma()` to run once final
+    payload/EOS is posted, even if final credit has not arrived yet;
+  - keep `HOMER_PAYLOAD_CLOSE_BLOCK_REMOTE_HEAD` set while waiting for final
+    credit, but do not let it suppress request publication;
+  - retain the final reclaim check that the validated quiesced response and
+    sender-visible remote head both cover the frozen final tail.
+- Acceptance for this micro-stage:
+  - receiver can force the final head WIMM in response to the first close
+    request;
+  - no sender-side close stalls when final credit is absent before the request;
+  - remote pgbench c1/c4 and warmed remote basebackup remain in the Close-3
+    validation band;
+  - no binding mismatch, late-WIMM, stale-token, close response validation, or
+    exact `CLOSE_SINK` publish failures appear in service logs.
+
 Close-4 - receiver quiescence:
+
+- Decision: use a hybrid ownership model.
+  - The payload-close state machine owns the final-head transition.
+  - The control request handler must advance or verify that transition before it
+    returns `QUIESCED`.
+  - Send-CQ retirement and stream reclamation remain owned by the payload
+    close/reclaim action.
+- The control handler may post the final consumed-head WIMM because the close
+  request arrived on the exact stream-bound QP. It must not wait for the final
+  head send CQE. Posting the final-head WIMM before the close response gives the
+  same-QP ordering proof; the CQE is needed only for local source lifetime and
+  reclaim.
+- The old receiver sequence remains a temporary migration path only:
+
+```text
+close request
+    -> return ACTIVE
+payload action posts/retires final head
+payload action clears binding
+later retry sees missing stream and returns QUIESCED
+```
+
+  This sequence must not remain as the final protocol because it can reclaim the
+  binding before the sender receives an identity-validated quiesced response, and
+  "missing stream" is not a proof of quiescence unless it matches a retired
+  tombstone.
+
+Close-4A - receiver request validation:
 
 - On an incoming normal close request, resolve by semantic IDs and validate:
 
@@ -4481,18 +4546,232 @@ final tail is not behind an already recorded close tail
 
 - Repeated close requests with the same tokens and final tail are idempotent.
   Repeated requests with different tokens or final tail are protocol violations.
-- Return `peerBindingStillActive = 1` and leave `QUIESCED` clear while EOS is not
-  observed, the receive ring is not drained through `finalPublishedTail`, or a
-  receive payload action is queued/active.
-- Once drained, stop ordinary thresholded head ACKs for this stream, post one
-  exact final consumed-head WIMM on the same QP, and return `QUIESCED` only after
-  that WIMM is posted before the response is posted. Do not block inside the
-  control handler waiting for the final-head send CQE; 3C send-CQ ownership
-  retires it asynchronously.
-- The receiver may keep its local stream entry until the final head WIMM's send
-  CQE retires. Reporting quiesced after posting the final head WIMM is valid
-  because no future WIMMs will be issued and same-QP order makes the final head
-  precede the response.
+- Validate `localDirection`, request flags, normal-vs-abort mode, and the exact
+  stream-bound connection before touching close state.
+- Remove the existing "missing session/stream means quiesced" behavior from
+  `TupleSinkServiceHandlePeerCloseSinkRequest()`. A missing active stream may
+  return quiesced only after Close-4E adds a matching retired-binding tombstone.
+  Until then, missing state is a protocol/lifetime error.
+- Record the immutable close request identity in the stream close state. If a
+  later request repeats the same identity, return the same logical state. If it
+  changes the token pair, final tail, direction, or peer/local ids, mark the
+  connection/stream failed.
+
+Close-4B - idempotent final-head post transition:
+
+- Add one shared helper, callable by both the control handler and the payload
+  close/reclaim action:
+
+```c
+typedef enum HomerFinalHeadPostResult
+{
+    HOMER_FINAL_HEAD_NOT_DRAINED = 0,
+    HOMER_FINAL_HEAD_BLOCKED,
+    HOMER_FINAL_HEAD_POSTED,
+    HOMER_FINAL_HEAD_ALREADY_POSTED,
+    HOMER_FINAL_HEAD_FAILED
+} HomerFinalHeadPostResult;
+
+static HomerFinalHeadPostResult
+HomerServiceTryPostFinalReceiverHead(
+    HomerServicePayloadStreamEntry *streamEntry,
+    TupleSinkServicePeerConnectionHandle *expectedConnection,
+    uint64_t expectedConnectionGeneration,
+    char *errorMessage,
+    size_t errorMessageBytes);
+```
+
+- The helper must:
+  - validate the captured token pair and connection generation;
+  - require a recorded normal close request;
+  - require EOS/final frontier visibility;
+  - require `consumedHead >= finalPublishedTail`;
+  - return `ALREADY_POSTED` if the final WIMM was already posted;
+  - stop new ordinary thresholded head ACKs by setting
+    `ordinaryHeadAcksStopped`;
+  - allow already-posted ordinary ACK WRs to remain outstanding, since the final
+    WIMM follows them on the same QP;
+  - reserve the existing receiver-head ACK source/owner without blocking;
+  - post a signaled final consumed-head `WRITE_WITH_IMM` on the exact stream
+    connection;
+  - set `finalHeadWimmPosted`, `finalConsumedHead`, and the close phase to
+    final-head-posted;
+  - never poll or wait for the send CQ.
+- If source or owner credit is unavailable, set
+  `HOMER_PAYLOAD_CLOSE_BLOCK_FINAL_HEAD_SEND_CQ` and return `BLOCKED`.
+  The canonical send-CQ retirement path later clears the reason and rearms close
+  work.
+- The existing `HomerServicePostFinalReceiverHeadAckIfNeeded()` path is not
+  sufficient for handler-side Close-4 because it can call through code that
+  drains ACK completions under source pressure. The Close-4 helper must be
+  nonblocking from the control-handler perspective: post if credit is available,
+  otherwise return `BLOCKED`.
+
+Close-4C - quiesced response boundary:
+
+- `TupleSinkServiceHandlePeerCloseSinkRequest()` should follow this ownership
+  sequence:
+
+```text
+1. Resolve active stream or matching retired tombstone.
+2. Validate request identity and exact connection/QP.
+3. Record immutable close request identity.
+4. If receiver is not drained through final tail, return ACTIVE.
+5. Try the final-head post transition.
+6. Return ACTIVE for NOT_DRAINED or BLOCKED.
+7. Return QUIESCED only for POSTED or ALREADY_POSTED.
+8. Never reclaim the stream directly.
+```
+
+- The handler returns `QUIESCED` only when:
+
+```text
+finalHeadWimmPosted == true
+ordinaryHeadAcksStopped == true
+finalConsumedHead >= finalPublishedTail
+```
+
+- The handler must not require `finalHeadWimmRetired == true`.
+- The handler prepares a response, but the transport posts it after the request
+  callback returns. Therefore it must not set `quiescedResponsePosted` directly.
+  Add a response-post ticket/result from the exact control-mailbox request path:
+
+```c
+typedef struct HomerPeerResponsePostTicket
+{
+    bool valid;
+    HomerPeerControlOpOwnerKind kind;
+    uint32_t streamIndex;
+    uint64_t streamGeneration;
+    bool quiescedCloseResponse;
+} HomerPeerResponsePostTicket;
+```
+
+- After the transport successfully posts the response on the accepted connection,
+  validate the stream index/generation and set `quiescedResponsePosted`. If
+  response publication fails, keep the stream and final-head state, do not mark
+  the response posted, and enter the existing connection abort/reset path.
+- Same-QP assertion: the accepted close-request connection must equal
+  `streamEntry->stream.peerConnectionHandle`, its generation must equal the close
+  state's connection generation, and its traffic class must match the stream's
+  traffic class. The close response must be posted through that same accepted
+  connection.
+
+Close-4D - receiver reclaim gate:
+
+- The payload close/reclaim action remains responsible for:
+  - draining receive payload;
+  - invoking `HomerServiceTryPostFinalReceiverHead()` after an earlier ACTIVE
+    response once draining completes;
+  - handling final-head source/CQ blocked state;
+  - waiting for final-head send CQ retirement;
+  - waiting for `quiescedResponsePosted`;
+  - marking the stream reclaimable;
+  - clearing the token/binding.
+- Receive-side normal reclaim requires:
+
+```text
+peer close request recorded
+EOS/final frontier observed
+ring drained through finalPublishedTail
+finalHeadWimmPosted
+quiescedResponsePosted
+finalHeadWimmRetired
+ordinaryHeadAcksStopped
+no payload-ready membership
+no active executor/candidate reference
+```
+
+- `HomerServiceMarkPayloadCloseReclaimable()` must become a phase transition
+  over already-proven facts. It must not synthesize facts such as
+  `peerQuiesced` or `finalHeadObserved`; those are set only by validated
+  responses or actual WIMM application.
+
+Close-4E - retired-binding tombstone:
+
+- Add one tombstone per stream-table slot outside the resettable live stream
+  entry:
+
+```c
+typedef struct HomerRetiredPayloadBinding
+{
+    bool valid;
+
+    uint64_t localServiceSessionId;
+    uint64_t localServiceSinkId;
+    uint64_t peerServiceSessionId;
+    uint64_t peerServiceSinkId;
+
+    uint32_t localPayloadDoorbellToken;
+    uint32_t peerPayloadDoorbellToken;
+
+    uint64_t streamGeneration;
+    uint64_t connectionGeneration;
+
+    uint64_t finalPublishedTail;
+    uint64_t finalConsumedHead;
+} HomerRetiredPayloadBinding;
+```
+
+- Create the tombstone immediately before normal binding clear/reclaim.
+- A close request for a missing active stream may return `QUIESCED` only if it
+  matches the tombstone exactly. Missing state without a matching tombstone is a
+  stale/invalid request and must fail.
+- Late payload/credit WIMMs matching a tombstone remain fatal diagnostics. The
+  tombstone explains the violation; it does not authorize the old RDMA write.
+
+Close-4 tests:
+
+```text
+close arrives before drain:
+    ACTIVE, no final head posted, binding retained
+close arrives after drain:
+    handler posts final head and same request returns QUIESCED
+final-head source/owner credit unavailable:
+    ACTIVE, send-CQ/resource relief rearms close
+payload action drains after ACTIVE:
+    action posts final head and next retry returns QUIESCED
+QUIESCED response post fails:
+    no reclaim, retry can reproduce QUIESCED or connection aborts safely
+final head posted but not CQ-retired:
+    QUIESCED may be returned, local stream cannot reclaim yet
+duplicate close before reclaim:
+    live close state returns identical response
+duplicate close after reclaim:
+    matching tombstone returns identical response
+missing stream without tombstone:
+    protocol error
+old token after reclaim:
+    fatal late-WIMM diagnostic
+```
+
+- Acceptance requires remote pgbench c1/c4, warmed remote basebackup, and
+  concurrent pgbench-plus-basebackup to complete with zero late-WIMM,
+  stale-token, missing-tombstone, close-response-post, or binding-clear
+  fail-fast signatures.
+
+Close-4 current-code corrections to apply while implementing:
+
+- `closeState.streamGeneration` currently stores `serviceStreamId`. If there is
+  a real stream-table allocation generation, use it. If not, rename the field to
+  `serviceStreamIdSnapshot` so the code does not imply stronger slot-reuse
+  protection than it has. The token pair remains the authoritative wire
+  generation identity.
+- Add receiver-side fields for the hybrid protocol, including:
+
+```c
+bool peerCloseRequestRecorded;
+bool ordinaryHeadAcksStopped;
+bool finalHeadWimmPosted;
+bool finalHeadWimmRetired;
+bool quiescedResponsePrepared;
+bool quiescedResponsePosted;
+```
+
+- The exact enum names may reuse the existing close phases, but the semantics
+  must distinguish: close received, draining, final-head postable, final-head
+  posted, quiesced response posted, final-head retired, reclaimable, and
+  aborting.
 
 Close-5 - 3C owned/runnable dependency wiring:
 
@@ -4526,7 +4805,7 @@ cold retry interval expires:
     close retry scheduler fact
 ```
 
-Close-6 - reclamation, abort, and tombstone:
+Close-6 - reclamation and abort cleanup:
 
 - Local send stream normal reclaim requires: close phase `PEER_QUIESCED`, final
   payload/EOS posted, all local payload WRs through final tail retired,
@@ -4542,26 +4821,12 @@ Close-6 - reclamation, abort, and tombstone:
   post, final-tail inconsistency, or control-op failure must reset/destroy the
   affected QP/CQ before invalidating tokens and MRs. QP teardown is the proof
   that no old-generation RDMA write or WIMM can arrive.
-- Keep one retired-binding tombstone per stream slot outside the resettable
-  entry:
-
-```c
-typedef struct HomerRetiredPayloadBinding
-{
-    bool valid;
-    uint32_t localPayloadDoorbellToken;
-    uint32_t peerPayloadDoorbellToken;
-    uint64_t streamGeneration;
-    uint64_t connectionGeneration;
-    uint64_t finalPublishedTail;
-    uint64_t finalConsumedHead;
-} HomerRetiredPayloadBinding;
-```
-
-  It diagnoses late WIMMs after claimed quiescence and can answer an idempotent
-  duplicate close request for the immediately preceding token generation. A late
-  WIMM matching the tombstone is still fatal because it proves the quiescence
-  contract was violated.
+- Close-4E owns the retired-binding tombstone implementation because duplicate
+  close after normal reclaim cannot be made correct without it. Close-6 should
+  keep only the broader cleanup around normal reclaim and abort/error teardown:
+  ensure the tombstone is populated immediately before normal clear, ensure late
+  WIMMs matching the tombstone remain fatal diagnostics, and ensure abort paths
+  reset/destroy the owning QP/CQ before invalidating tokens or MRs.
 
 3D-6 local close/credit repair checkpoint on 2026-06-23:
 
@@ -5061,7 +5326,7 @@ empty critical polls per transaction
 | Slice 3A    | Landed; persistent pending plus load-before-exchange optimization validated; sharding deferred |
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Completion owned/runnable rearm correctness validated; remaining signaled-owner FIFO counts are performance cleanup |
-| Slice 3D    | 3D-0 through 3D-6 exact-control cleanup and Close-1 through Close-3 landed and validated; receiver quiescence and final reclaim/abort remain in Close-4 through Close-6 |
+| Slice 3D    | 3D-0 through 3D-6 exact-control cleanup and Close-1 through Close-3 landed and validated; next implement Close-3 remote-head gate optimization, then Close-4A through Close-4E receiver quiescence/tombstone |
 | Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
