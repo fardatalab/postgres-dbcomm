@@ -5588,6 +5588,35 @@ payloadAbortOwnerDoubleRetire
 payloadAbortOwnerCountMismatch
 ```
 
+Close-6D1 implementation checkpoint:
+
+- Status as of June 24, 2026: Close-6D1 is implemented in the Citus/Homer tree
+  at commit `efe62c574`.
+- Added `HomerPeerConnectionAbortReport` and moved the fixed control-op and
+  response-publication slot counts into
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h`.
+- Extended `HomerPeerConnectionLifecycleObserver.onResetComplete()` to receive
+  the transport abort report. The service callback in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  currently accepts and ignores the report; later 6D sub-stages consume it when
+  validating stream-owned close ops.
+- Added the transport-private
+  `TupleSinkServiceAbortConnectionSoftwareOwnersOnReset()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c`.
+  It clears `controlOps[]` in `WAIT_RESPONSE`, `COMPLETED`, or `FAILED` phase,
+  records the slot generation and phase class in the report, clears in-use
+  `controlResponsePublishSlots[]`, and never invokes response-post callbacks or
+  semantic success paths.
+- `TupleSinkServiceResetPeerConnection()` now calls this helper after QP/CQ
+  destruction and before MR invalidation, then passes the report into
+  reset-complete. This preserves the ordering proof: old WR completions are cut
+  off before transport-private software owners are force-cleared.
+- Validation: no-stats Citus/Homer `service-bin client-bin` build completed
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+- Next stage is Close-6D2: add explicit service-side tracked-WR owner states and
+  make normal payload/receiver-head send-CQ retirement transition
+  `POSTED -> RETIRED` before adding abort transitions.
+
 Close-6 later-slice dependencies:
 
 - Close-6D can land before exact reset scheduling, but do not add new call sites
