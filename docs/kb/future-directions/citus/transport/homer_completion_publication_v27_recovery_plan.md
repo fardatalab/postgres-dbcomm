@@ -4676,15 +4676,16 @@ typedef struct HomerPeerResponsePostTicket
     bool valid;
     HomerPeerControlOpOwnerKind kind;
     uint32_t streamIndex;
-    uint64_t streamGeneration;
+    uint64_t serviceStreamIdSnapshot;
     bool quiescedCloseResponse;
 } HomerPeerResponsePostTicket;
 ```
 
 - After the transport successfully posts the response on the accepted connection,
-  validate the stream index/generation and set `quiescedResponsePosted`. If
-  response publication fails, keep the stream and final-head state, do not mark
-  the response posted, and enter the existing connection abort/reset path.
+  validate the stream index and `serviceStreamIdSnapshot`, then set
+  `quiescedResponsePosted`. If response publication fails, keep the stream and
+  final-head state, do not mark the response posted, and enter the existing
+  connection abort/reset path.
 - Same-QP assertion: the accepted close-request connection must equal
   `streamEntry->stream.peerConnectionHandle`, its generation must equal the close
   state's connection generation, and its traffic class must match the stream's
@@ -4739,7 +4740,7 @@ typedef struct HomerRetiredPayloadBinding
     uint32_t localPayloadDoorbellToken;
     uint32_t peerPayloadDoorbellToken;
 
-    uint64_t streamGeneration;
+    uint64_t serviceStreamIdSnapshot;
     uint64_t connectionGeneration;
 
     uint64_t finalPublishedTail;
@@ -5076,6 +5077,7 @@ typedef struct HomerPeerConnectionLifecycleObserver
         const HomerPeerConnectionIdentity *identity,
         HomerPeerConnectionResetReason reason,
         uint64_t semanticCookie,
+        const HomerPeerConnectionAbortReport *abortReport,
         void *context);
 
     void *context;
@@ -5102,10 +5104,12 @@ Close-6 transport reset ordering:
 4. Best-effort rdma_disconnect(); do not wait for DISCONNECTED.
 5. Destroy the QP. This is the old-WIMM/old-RDMA-write cutoff.
 6. Destroy or abandon CQs; no normal CQ owner callback runs afterward.
-7. Deregister caller-owned and connection-owned MRs.
-8. Release PD and remaining CM resources.
-9. Invoke onResetComplete() with the semantic cookie.
-10. Zero/reuse the connection table slot.
+7. Abort-clear transport-private software owners and build a
+   `HomerPeerConnectionAbortReport`.
+8. Deregister caller-owned and connection-owned MRs.
+9. Release PD and remaining CM resources.
+10. Invoke onResetComplete() with the semantic cookie and abort report.
+11. Zero/reuse the connection table slot.
 ```
 
 - Split the current resource cleanup into explicit helpers:
@@ -5150,18 +5154,30 @@ retain tokens, MR handles, connection identity, and outstanding owner counts
 Close-6 reset-complete service callback:
 
 - Iterate only the reset snapshot. Revalidate that each stream still matches the
-  captured connection generation before mutating it.
+  captured connection generation before mutating it. Reset-begin and
+  reset-complete are synchronous around one connection slot, so a mismatch is an
+  invariant failure, not a stale bit that can be silently ignored.
 - Use teardown-specific owner cleanup, not normal CQ callbacks:
 
 ```c
 HomerServiceAbortPayloadSendOwnersForConnection();
 HomerServiceAbortReceiverHeadAckOwnersForConnection();
-HomerServiceAbortPeerControlOpsForConnection();
 ```
 
 - Abort-remove payload send owners, receiver-head ACK owners, pending final-head
-  owners, source-slot owners, stream-owned close ops, and response-post tickets.
-  Decrement exact owner counts exactly once.
+  owners, and source-slot/source-range reservations. Decrement exact owner
+  counts exactly once.
+- Validate any stream-owned close async op against the transport abort report:
+  the op must be exact-connection-only, must name the reset connection handle
+  and generation, and its op index/generation must appear in
+  `abortedControlOpBits` and `abortedControlOpGenerations[]`. Then clear the
+  stream-local `closeOp` handle and `closeOpActive` flag. Do not expose
+  `TupleSinkServiceReleasePeerControlOp()` publicly and do not poll the op.
+- Response-post tickets are not persistent ownership. The transport
+  abort-clears persistent response publication slots; the service clears
+  per-stream response-post semantic flags such as
+  `quiescedResponsePrepared`/`quiescedResponsePosted`. There is no
+  response-ticket table to abort.
 - Require:
 
 ```text
@@ -5170,10 +5186,166 @@ no payload send owner remains
 no close op remains active
 ```
 
-- Then deregister/release stream MR handles, record an abort tombstone, clear
-  the peer binding through an ABORTING-authorized path, fail/cancel the owning
-  operation, and reclaim local stream storage when no non-RDMA local owner
-  remains. Do not advance semantic payload frontiers as though WRs completed.
+- Close-6D ends with the stream still in `ABORTING`: `abortOwnersReconciled`
+  is true, binding/token identity remains available, all physical/software
+  owners have been removed, and normal success facts are not synthesized.
+  Close-6F records the abort tombstone, fails/cancels the owning operation,
+  clears invalidated MR references, clears the peer binding through the
+  ABORTING-authorized path, and reclaims local stream storage. Do not advance
+  semantic payload frontiers as though WRs completed.
+
+Close-6D hybrid ownership decision:
+
+- Payload accounting is service-owned. The transport only decodes the tagged WR
+  ID and calls:
+
+```text
+payloadCompletion(completionKind, serviceSinkId, completedFrontier)
+```
+
+  Normal service callbacks such as `HomerServiceApplyTrackedPayloadCompletionFrontier()`
+  and `HomerServiceApplyReceiverHeadAckCompletionFrontier()` mean successful NIC
+  completion and must not be invoked during reset cleanup.
+- Control-op slots and response publication slots are transport-owned because
+  they live inside the peer connection state. Reset cleanup must bulk-abort
+  them inside the transport, then report exactly what was removed to the
+  service.
+- Add one aggregate transport-private abort helper that runs after QP/CQ
+  destruction:
+
+```c
+typedef struct HomerPeerConnectionAbortReport
+{
+    uint64_t abortedControlOpBits;
+    uint32_t abortedControlOpGenerations[
+        CITUS_REMOTE_EXEC_PEER_CONTROL_OP_SLOTS];
+
+    uint64_t abortedResponsePublishSlotBits;
+
+    uint32_t waitingControlOpsAborted;
+    uint32_t completedControlOpsDiscarded;
+    uint32_t failedControlOpsDiscarded;
+    uint32_t responsePublishSlotsAborted;
+
+    bool transportSoftwareOwnersCleared;
+} HomerPeerConnectionAbortReport;
+
+static void
+TupleSinkServiceAbortConnectionSoftwareOwnersOnReset(
+    TupleSinkServicePeerConnectionState *connection,
+    HomerPeerConnectionAbortReport *report);
+```
+
+- Add static assertions that the fixed control-op table and response-publish
+  slot table fit in the report bitsets. If either table grows beyond 64 entries,
+  convert the report to fixed word arrays instead of truncating.
+- Control-op reset handling:
+  - `UNUSED`: no action.
+  - `WAIT_RESPONSE`, `COMPLETED`, `FAILED`: record index and generation,
+    classify/count the old phase, and clear the transport slot without
+    delivering semantic success.
+  - A `COMPLETED` op that was not yet consumed by its owner is discarded because
+    connection reset invalidates the operation.
+- Response publication reset handling:
+  - for every in-use `controlResponsePublishSlots[]` entry, record the bit,
+    clear `inUse`, clear message/tail storage, and do not invoke the
+    response-post callback.
+
+Close-6D service owner states:
+
+- Add explicit owner state to tracked payload send and receiver-head ACK owner
+  entries:
+
+```c
+typedef enum HomerTrackedWrOwnerState
+{
+    HOMER_TRACKED_WR_OWNER_FREE = 0,
+    HOMER_TRACKED_WR_OWNER_POSTED,
+    HOMER_TRACKED_WR_OWNER_RETIRED,
+    HOMER_TRACKED_WR_OWNER_ABORTED
+} HomerTrackedWrOwnerState;
+```
+
+- Normal send-CQ retirement performs `POSTED -> RETIRED`.
+- Reset-complete performs `POSTED -> ABORTED`.
+- `FREE`, `RETIRED`, and `ABORTED` entries must not decrement owner counts
+  again. Double-retire or count mismatch is an invariant failure.
+
+Close-6D payload send owner abort:
+
+```c
+static bool
+HomerServiceAbortTrackedPayloadSendOwners(
+    HomerServicePayloadStreamEntry *stream,
+    const HomerPeerConnectionIdentity *identity,
+    HomerPayloadAbortSummary *summary,
+    char *error,
+    size_t errorBytes);
+```
+
+- For every posted payload owner belonging to the reset connection generation:
+  mark it `ABORTED`, release local source-slot/source-range ownership, decrement
+  `payloadCompletionCount`, remove it from the completion FIFO/ring, and
+  increment `payloadSendOwnersAborted`.
+- Do not call `HomerServiceApplyTrackedPayloadCompletionFrontier()`.
+- Do not update `payloadSenderCompletedTail`,
+  `payloadSourceByteCompletedHead`, semantic completed frontier, or
+  `finalPayloadSendRetired`. Those are success facts and retain their pre-reset
+  diagnostic values.
+
+Close-6D receiver-head ACK owner abort:
+
+```c
+static bool
+HomerServiceAbortReceiverHeadAckOwners(
+    HomerServicePayloadStreamEntry *stream,
+    const HomerPeerConnectionIdentity *identity,
+    HomerPayloadAbortSummary *summary,
+    char *error,
+    size_t errorBytes);
+```
+
+- For every outstanding ordinary or final head-ACK owner: transition
+  `POSTED -> ABORTED`, release its source slot, decrement
+  `receiverHeadAckOutstandingCount`, remove the entry from the ACK owner queue,
+  and increment `receiverHeadOwnersAborted`.
+- Do not call `HomerServiceApplyReceiverHeadAckCompletionFrontier()`.
+- Do not advance `receiverHeadAckCompletedHead` or set
+  `finalHeadWimmRetired`.
+- At completion, require `receiverHeadAckOutstandingCount == 0` and no ACK owner
+  entry remains `POSTED`. This preserves the equal-frontier case where ordinary
+  and final ACKs publish the same head value but remain distinct physical WR
+  owners.
+
+Close-6D abort summary:
+
+```c
+typedef struct HomerPayloadAbortSummary
+{
+    uint32_t payloadSendOwnersAborted;
+    uint32_t receiverHeadOwnersAborted;
+    uint32_t sourceReservationsReleased;
+    uint32_t closeOpsCancelled;
+
+    bool allPayloadOwnersCleared;
+    bool allHeadOwnersCleared;
+    bool closeControlStateCleared;
+} HomerPayloadAbortSummary;
+```
+
+- After each stream reset-complete cleanup:
+
+```text
+payloadCompletionCount == 0
+receiverHeadAckOutstandingCount == 0
+no payload owner is POSTED
+no ACK owner is POSTED
+closeOpActive == false
+```
+
+- Set `closeState->abortOwnersReconciled = true`.
+- Do not mark `peerQuiesced`, `finalHeadObserved`,
+  `finalPayloadSendRetired`, or `finalHeadWimmRetired`.
 
 Close-6 exact reset scheduling:
 
@@ -5238,9 +5410,12 @@ Close-6 patch sequence:
    matching streams ABORTING/non-runnable, and remove ready-queue membership
    without clearing binding.
 4. Close-6D - teardown-owned owner cleanup:
-   abort-remove payload send owners, receiver-head ACK owners, stream-owned
-   close ops, and response tickets; reconcile outstanding counts; clear binding
-   only after transport quiescence.
+   use the hybrid cleanup model: transport bulk-aborts control ops and response
+   publication slots into `HomerPeerConnectionAbortReport`; service aborts
+   payload send and receiver-head ACK owners from `affectedStreamBits`, validates
+   stream-owned close ops against the report, clears response-post semantic
+   flags, reconciles counts, and leaves binding/token identity intact for
+   Close-6F.
 5. Close-6E - exact reset scheduling:
    add reset-request API and exact reset action; convert protocol/partial-post
    failures to reset requests; prevent recursive reset inside CQ dispatch.
@@ -5336,14 +5511,15 @@ Close-6C implementation checkpoint:
     normal path and no reset recursion, stale/late payload token, tombstone,
     protocol, send-CQ, or close-wait diagnostics.
 - Next stage remains Close-6D. It must consume the `affectedStreamBits` cookie in
-  reset-complete and abort-retire payload send owners, receiver-head ACK owners,
-  stream-owned close ops, and response tickets before clearing the binding.
+  reset-complete, use the transport abort report for control/response
+  publication state, abort-retire payload send owners and receiver-head ACK
+  owners, validate/clear stream-owned close ops, clear response-post semantic
+  flags, and keep the binding intact for Close-6F.
 
 Close-6D pre-implementation note:
 
-- Stop point as of June 24, 2026: do not implement Close-6D by simply zeroing
-  stream counters. The existing code does not yet have an explicit teardown-owner
-  API for the owner classes Close-6D must reconcile.
+- Decision as of June 24, 2026: implement Close-6D with the hybrid ownership
+  model above. Do not implement it by simply zeroing stream counters.
 - Current payload send-CQ retirement path:
   - `TupleSinkServiceHandleTaggedSendCompletion()` in
     `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c`
@@ -5362,19 +5538,73 @@ Close-6D pre-implementation note:
     `TupleSinkServiceProcessIncomingMailboxRequest()`: it is reported after a
     response publish succeeds, but there is no persistent response-ticket owner
     table for reset-complete to cancel.
-- Therefore Close-6D needs one explicit design choice before coding:
-  - either add transport/service teardown APIs that abort-clear all outstanding
-    payload WR accounting and any stream-owned peer-control op by exact
-    connection identity and generation;
-  - or prove that, after QP/CQ destruction, all of the affected stream's
-    outstanding owner state is service-local and can be reconciled solely from
-    the stream table snapshot without touching transport op slots or response
-    tickets.
+- Accepted 6D split:
+  - transport bulk-aborts transport-private `controlOps[]` and
+    `controlResponsePublishSlots[]` after QP/CQ destruction and before MR
+    invalidation, then passes `HomerPeerConnectionAbortReport` to
+    reset-complete;
+  - service abort-reconciles payload send owners and receiver-head ACK owners
+    from `affectedStreamBits`;
+  - service validates and clears stream-owned close-op handles against the
+    transport report;
+  - service clears response-post semantic flags, but there is no persistent
+    response-post ticket table.
 - Required invariant for the accepted 6D design: abort cleanup must not advance
   source or semantic frontiers as though RDMA WRs completed successfully, must
   decrement each outstanding owner count exactly once, must leave no active
-  close op or response-post ownership for the stream, and only then may clear the
-  peer binding through the ABORTING-authorized path.
+  close op or response-publication ownership for the stream, and must keep the
+  peer binding/token identity intact until Close-6F records the abort tombstone
+  and performs ABORTING-authorized clear.
+
+Close-6D recommended commit sequence:
+
+1. Close-6D1 - transport owner report:
+   add `HomerPeerConnectionAbortReport`; abort-clear control-op and response
+   publication slots after QP/CQ destruction; pass the report into
+   reset-complete; no service owner cleanup yet.
+2. Close-6D2 - explicit service owner states:
+   add `HomerTrackedWrOwnerState`; convert normal payload and ACK CQ callbacks
+   to use `POSTED -> RETIRED`; preserve successful frontier semantics.
+3. Close-6D3 - payload abort cleanup:
+   abort payload send owners and source reservations from `affectedStreamBits`;
+   do not advance completed frontiers; assert exact count reconciliation.
+4. Close-6D4 - ACK and close-op cleanup:
+   abort ordinary/final ACK owners; validate close op against the transport
+   abort report; clear stream-owned close-op handle and response semantic flags.
+5. Close-6D5 - reconciled ABORTING state:
+   set `abortOwnersReconciled`, keep binding intact for Close-6F, add counters
+   and deterministic reset tests.
+
+Close-6D counters:
+
+```text
+transportControlOpsAbortCleared
+transportResponseSlotsAbortCleared
+payloadSendOwnersAbortRetired
+receiverHeadOwnersAbortRetired
+payloadSourceReservationsAbortReleased
+payloadCloseOpsAbortCancelled
+payloadAbortOwnerDoubleRetire
+payloadAbortOwnerCountMismatch
+```
+
+Close-6 later-slice dependencies:
+
+- Close-6D can land before exact reset scheduling, but do not add new call sites
+  that destroy a QP from inside recv-CQ decoding, send-CQ owner callbacks, or
+  response-post callbacks. Close-6E owns typed reset requests and exact reset
+  actions.
+- The current string-based reset reason classifier is temporary. Close-6E must
+  replace it with typed reset requests carrying `HomerPeerConnectionResetReason`
+  directly.
+- Close-6F owns abort tombstone disposition, operation/session failure
+  publication, invalidated stream-MR reference cleanup, ABORTING-authorized
+  binding clear, and removal of remaining ad hoc `payloadTransportBroken`
+  cleanup branches.
+- `HomerRetiredPayloadBinding.serviceStreamIdSnapshot` and
+  `HomerPeerResponsePostTicket.serviceStreamIdSnapshot` should stay named as
+  snapshots, not stream generations; the wire generation identity remains the
+  exchanged payload token pair.
 
 Close-6 fault-injection and acceptance:
 
