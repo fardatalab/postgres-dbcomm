@@ -5705,6 +5705,47 @@ Close-6D4 implementation checkpoint:
   assertions/counters, keep binding intact for Close-6F, and run real
   cross-machine validation.
 
+Close-6D5 implementation checkpoint:
+
+- Status as of June 24, 2026: Close-6D5 is implemented in the Citus/Homer tree
+  at commit `e24ea66c8`.
+- Added cold-path abort reconciliation counters in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`:
+  `PayloadSendOwnersAbortRetired`, `ReceiverHeadOwnersAbortRetired`,
+  `PayloadSourceReservationsAbortReleased`, `PayloadCloseOpsAbortCancelled`,
+  and `PayloadAbortOwnerCountMismatch`.
+- Added `abortOwnersReconciled` to `HomerPayloadCloseState`. Reset-begin sets
+  it false when a stream enters `ABORTING`; reset-complete sets it true only
+  after all service-owned payload, receiver-head ACK, and close-op owners have
+  been reconciled.
+- Added `HomerServicePayloadAbortOwnersAreReconciled()` as the final
+  reset-complete invariant check. It requires the abort summary flags to be
+  true, `payloadCompletionCount == 0`,
+  `payloadCompletionOutstandingWrs == 0`,
+  `receiverHeadAckOutstandingCount == 0`, `closeOpActive == false`, and no
+  payload or ACK owner entry still in `POSTED`.
+- The reconciliation checkpoint still deliberately keeps the stream binding and
+  token identity intact. Close-6D ends with `phase == ABORTING` and
+  `abortOwnersReconciled == true`; Close-6F remains responsible for recording
+  an `ABORTED_RESET` tombstone, failing/canceling the owning operation, and
+  clearing the binding through the ABORTING-authorized path.
+- Validation: no-stats Citus/Homer `service-bin client-bin` build completed
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`. The committed binaries were
+  installed as `dbcomm`, synced to `farnet0`, and both services were restarted.
+  Remote RDMA basebackup completed twice after the restart: run 1 was the cold
+  warmup at `5.48s`, and run 2 was the warmed result at `4.24s`.
+- Post-validation service-log scan on both `farnet1` and `farnet0` found no
+  reset-begin/reset-complete, owner-reconciliation, abort, late-WIMM,
+  tombstone, stale, protocol, mismatch, error, failed, or send-CQ drain-failure
+  diagnostics in the validation run.
+- Operational note: service restarts should avoid `pkill -f
+  citus_tuple_sink_service` inside a shell command that also contains the
+  service path; the pattern can match the invoking shell. Use an exact process
+  name or split cleanup and start into separate commands.
+- Next stage is Close-6E: add typed reset requests and exact reset actions so
+  payload/control protocol failures request reset from the current collector or
+  callback stack and a scheduler-owned lifetime action performs the reset.
+
 Close-6 later-slice dependencies:
 
 - Close-6D can land before exact reset scheduling, but do not add new call sites
