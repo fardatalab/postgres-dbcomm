@@ -5249,6 +5249,27 @@ Close-6 patch sequence:
    where applicable, reclaim streams sharing the failed connection, and remove
    remaining ad hoc `payloadTransportBroken` cleanup branches.
 
+Close-6A implementation checkpoint:
+
+- Status as of June 24, 2026: Close-6A is implemented in the Citus/Homer tree.
+- Added `HomerPeerConnectionIdentity`,
+  `HomerPeerConnectionResetReason`, and
+  `HomerPeerConnectionLifecycleObserver` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h`.
+- Extended `TupleSinkServiceCreatePeerTransportState()` to accept the lifecycle
+  observer, and stored the copied observer in
+  `TupleSinkServicePeerTransportState`.
+- Registered service-side reset-begin/reset-complete callbacks from
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  These callbacks are intentionally no-ops in Close-6A: reset-begin returns
+  cookie `0`, reset-complete does nothing, and no reset ordering or semantic
+  cleanup behavior changes in this stage.
+- Validation: no-stats Citus/Homer `service-bin client-bin` build completed
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+- Next stage remains Close-6B. It must be the first behavior-changing reset
+  patch: add `resetInProgress`, snapshot connection identity, call the observer
+  around teardown, and reorder QP/CQ destruction before MR invalidation.
+
 Close-6 fault-injection and acceptance:
 
 ```text
