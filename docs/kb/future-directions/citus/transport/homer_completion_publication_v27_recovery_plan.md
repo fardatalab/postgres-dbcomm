@@ -6049,6 +6049,90 @@ Close-6F3 implementation checkpoint:
     failure, stale, protocol, mismatch, fatal, late-WIMM, error, bind, or
     initialization diagnostics.
 
+Close-6F4 implementation checkpoint:
+
+- Status as of June 24, 2026: object-family payload failure delivery is
+  implemented in the Citus/Homer tree at commit `8fd743bcf`. This slice sits on
+  top of the Close-6F2 shared terminal-status ABI and Close-6F3 abort
+  source-credit ordering.
+- Added a cold `HomerForcedCommandFailure` field to
+  `TupleSinkServiceSessionState` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  The field records the owning command sequence, result generation, service
+  stream ID, and stable `CitusTupleSinkFailureCode` when a tuple-result payload
+  stream is aborted by transport reset.
+- Added `tupleResultCommandSequence` to `HomerPayloadStreamState`. The current
+  backend bridge derives tuple-result `resultGeneration` from the backend
+  command sequence in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c`,
+  but the service now stores an explicitly named command-sequence snapshot at
+  `HomerServicePrepareTupleResultStreamForCommand()` rather than treating the
+  result-generation field name as the owning-command contract. The helper
+  fail-fast checks that `resultGeneration == commandSequence` until the
+  open/completion ABI carries separate identities.
+- `HomerServiceCompletionMachineHasWork()` and
+  `HomerServiceCompletionMachineRunnable()` now include pending forced command
+  failure as completion-machine-owned/runnable work. The backend-completion
+  ready-set builder permits this source even for the frontend-side
+  `clientSqlRemoteSender` session, whose normal backend completion mailbox is
+  not service-consumed.
+- `TupleSinkServiceConsumeCompletionMailbox()` now services
+  `HomerForcedCommandFailure` before staged peer-client publication or backend
+  mailbox consumption. The forced path fills normal `currentCommand*` fields with
+  `commandState=FAILED`, `postCommandState=FAILED`, and
+  `resultFlags=TUPLE_SINK_FAILED`, then uses the existing
+  `TupleSinkServicePublishClientCommandCompletion()` frontend completion
+  publisher. This preserves the existing frontend completion mailbox
+  peek/apply/ack pipeline instead of adding another SQL failure channel.
+- Added `HomerServiceAbandonRemoteCommandAwaitingTerminalAfterReset()`. Forced
+  local failure replaces a peer-client terminal completion that cannot arrive
+  after the connection reset; the transport already cleared physical critical
+  recv-CQ demand during reset, so this helper clears only the session semantic
+  demand ticket before the normal local completion publisher reaches terminal
+  cleanup.
+- Added `HomerServicePublishOwningPayloadFailure()` as the object-family
+  dispatch point from reset-complete cleanup:
+  - frontend-side tuple-result receive streams arm a forced SQL command failure
+    and retain the completion pending bit;
+  - backend-side tuple-result send streams do not attempt to publish a peer
+    completion over the reset connection, because their local producer already
+    sees the shared terminal `FAILED` status;
+  - basebackup streams are marked operation-notified by the byte-ring terminal
+    `FAILED` status, which the producer/consumer already checks on reservation
+    and drain slow paths.
+- `TupleSinkServiceCommandStillInFlight()` treats a pending forced command
+  failure as in-flight work, preventing session reclamation between stream abort
+  cleanup and frontend terminal completion publication. After forced completion
+  publication, `TupleSinkServiceConsumeCompletionMailbox()` applies the same
+  idle-retirement check used by normal backend completion consumption.
+- Validation:
+  - `git clang-format HEAD -- ...` over
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  - `git diff --check` and `git diff --cached --check` passed.
+  - No-stats Citus/Homer `service-bin client-bin` build passed as `dbcomm` with
+    `CPPFLAGS='-D_GNU_SOURCE'`.
+  - Citus install and runtime-prefix sync to `farnet0` completed.
+  - Clean restart/preflight showed PostgreSQL plus one Homer service on
+    `farnet1`, one Homer service on `farnet0`, and no stale
+    pgbench/basebackup/backend workers. Both service logs started with only the
+    normal `HOMER_PROGRESS_POLICY=machine-baseline` line.
+  - Remote RDMA pgbench c1 smoke completed `20000/20000` transactions with zero
+    failures. It was cold-shaped: `3341.603803 TPS`, p95 `0.244 ms`, p99
+    `0.256 ms`, max `1371.636 ms`, initial connection time `1698.267 ms`.
+  - Remote RDMA pgbench c4 warmed repeats completed `40000/40000` transactions
+    with zero failures:
+    - repeat 1: `10809.589619 TPS`, p95 `0.521 ms`, p99 `0.606 ms`, max
+      `16.728 ms`;
+    - repeat 2: `9975.557391 TPS`, p95 `0.558 ms`, p99 `0.653 ms`, max
+      `15.304 ms`.
+  - Remote RDMA basebackup completed three repeats: run 1 warmup `7.85s`, run 2
+    warmed `4.17s`, run 3 warmed `4.23s`.
+  - Post-validation service-log scan on both hosts found no reset, abort,
+    forced-failure, stale, protocol, mismatch, fatal, late-WIMM, error, bind, or
+    initialization diagnostics. Healthy runs therefore validate the non-regressed
+    normal path; fault-injection coverage for the new forced-failure branch
+    remains Close-6F8 work.
+
 Close-6F terminal-failure design decision:
 
 - Verdict as of June 24, 2026: a transport-aborted payload stream must not be
@@ -6241,8 +6325,10 @@ Close-6F recommended remaining commits:
    mapping, shared terminal `FAILED` publication in reset-clear, and ordered
    aborted source-credit release after terminal publication.
 3. Close-6F4 - object-family failure delivery:
-   implement `HomerServicePublishOwningPayloadFailure()`, SQL forced completion
-   failure, basebackup operation failure, and WAL/future-stream failure hooks.
+   implemented at Citus/Homer commit `8fd743bcf`; added
+   `HomerServicePublishOwningPayloadFailure()`, SQL forced completion failure
+   through the existing frontend completion publisher, and basebackup byte-ring
+   terminal-status delivery. WAL/future-stream hooks remain future work.
 4. Close-6F5 - failure-aware local reclamation:
    keep local queue/session storage until all local handles detach or the
    owning operation consumes/stages terminal failure; replace receive-side abort
