@@ -4944,23 +4944,30 @@ Close-5 residual normal-close audit:
   can start the exact stream-bound close request after freezing the final
   published tail; the sender-visible final head remains a reclamation
   prerequisite rather than a request-publication prerequisite.
-- One cleanup remains before Close-6 implementation: `HomerServiceMarkPayloadCloseReclaimable()`
+- Pre-Close-6 cleanup completed on June 24, 2026: `HomerServiceMarkPayloadCloseReclaimable()`
   in `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20323`
-  still sets `peerQuiesced` and `finalHeadObserved` while marking a stream
-  reclaimable. That violates the intended invariant that these facts are set
-  only by their real events:
+  no longer sets `peerQuiesced` or `finalHeadObserved` while marking a stream
+  reclaimable. It now fails fast unless the side-specific facts were already
+  established by their real events:
   - `peerQuiesced` by a validated `QUIESCED` close response;
   - `finalHeadObserved` by an actual sender-side credit WIMM or equivalent
     receiver-side final-head fact.
-- Before Close-6A, split `HomerServiceMarkPayloadCloseReclaimable()` into a pure
-  phase transition over already-proven facts. The caller must establish those
-  facts before invoking it, and the helper should assert rather than synthesize
-  them.
-- Add diagnostic counters for blackhole priority hardening:
+- Diagnostic counters for blackhole priority hardening were added under
+  `HOMER_SERVICE_PROGRESS_STATS`:
   `blackholeActionsSelectedAfterDrain` and
   `blackholeActionsSelectedAfterQuiescedResponse`. These should normally be
   zero; the current close-before-blackhole priority rule should not conceal
   stale blackhole readiness.
+- Validation for this cleanup:
+  - no-stats compile passed;
+  - `HOMER_SERVICE_PROGRESS_STATS=1` compile passed;
+  - repeated remote basebackup after service restart: `6.09`, `4.18` seconds;
+  - remote pgbench c1: `5000/5000`, zero failures, p99 `0.256 ms` with a cold
+    first-connection max-latency outlier;
+  - remote pgbench c4: `10000/10000`, zero failures, `10599.800300 TPS`,
+    p99 `0.614 ms`;
+  - service-log sweep found no `refusing to mark`, late-WIMM, stale, protocol,
+    tombstone, or send-CQ failure signatures.
 
 Close-6 - reclamation and abort cleanup:
 
