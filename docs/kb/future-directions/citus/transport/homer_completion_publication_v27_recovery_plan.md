@@ -4504,6 +4504,41 @@ Close-3 optimization required before Close-4:
   - no binding mismatch, late-WIMM, stale-token, close response validation, or
     exact `CLOSE_SINK` publish failures appear in service logs.
 
+Close-3 optimization checkpoint on 2026-06-24:
+
+- Implemented in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`:
+  - `TupleSinkServicePeerCloseSinkBestEffort()` now records
+    `HOMER_PAYLOAD_CLOSE_BLOCK_REMOTE_HEAD` when final sender-visible credit has
+    not arrived, but it continues into the exact `CLOSE_SINK` publish/poll path
+    once the final tail is frozen.
+  - The final `senderVisibleRemoteConsumedHead >= finalPublishedTail` check
+    remains immediately before normal sender-side binding clear/reclaim.
+  - `HomerServicePayloadCloseActionReady()` and
+    `HomerServicePayloadStreamSourceReadyForScheduler()` now treat the
+    post-quiescence remote-head wait as blocked close work, so a quiesced sender
+    waiting only for the final credit WIMM does not become a hot-spin runnable
+    payload source.
+- Validation used no-stats Citus/Homer binaries, installed as `dbcomm`, synced
+  to `farnet0`, and restarted both Homer services from a clean process baseline.
+- Remote RDMA pgbench from `farnet0` to `farnet1`:
+  - cold c1: `20000/20000`, zero failures, `3373.952915 TPS`, p99 `0.256 ms`,
+    cold max `1319.741 ms`;
+  - warmed c1: `20000/20000`, zero failures, `4313.164187 TPS`, p99
+    `0.253 ms`, max `6.476 ms`;
+  - c4: `40000/40000`, zero failures, `10828.590185 TPS`, p95 `0.520 ms`,
+    p99 `0.600 ms`, max `16.459 ms`.
+- Remote RDMA basebackup to the `farnet0` service passed four repeats:
+  `5.85`, `4.28`, `4.15`, `4.28` seconds. Treat run 1 as warmup; warmed runs
+  remain in the current `4.1`-`4.3` second band.
+- Service-log scan on both hosts found no binding mismatch, late WIMM,
+  stale-token, protocol/reset/fallback, payload-close response validation, or
+  exact `CLOSE_SINK` publish failure signatures. The receiver still logs the
+  temporary deferred final-head ACK path (`peer-close deferred final head ACK`
+  then `peer-close-drained`), which is expected until Close-4 replaces that
+  migration behavior with handler-side final-head posting and tombstone-backed
+  duplicate handling.
+
 Close-4 - receiver quiescence:
 
 - Decision: use a hybrid ownership model.
