@@ -4856,13 +4856,14 @@ Close-4 implementation progress and validation:
   failed`, `without a matching tombstone`, `late`, `failed`, `error`, `stale`,
   `protocol`, or `payload close waiting` signatures on either host.
 
-Close-4 current-code corrections to apply while implementing:
+Close-4 current-code corrections applied while implementing:
 
-- `closeState.streamGeneration` currently stores `serviceStreamId`. If there is
-  a real stream-table allocation generation, use it. If not, rename the field to
-  `serviceStreamIdSnapshot` so the code does not imply stronger slot-reuse
-  protection than it has. The token pair remains the authoritative wire
-  generation identity.
+- `closeState.streamGeneration` stored `serviceStreamId`, which implied a
+  stronger allocation-generation proof than the code actually had. It has been
+  renamed to `serviceStreamIdSnapshot` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1199`
+  so the code matches the protocol model. The token pair remains the
+  authoritative wire generation identity.
 - Add receiver-side fields for the hybrid protocol, including:
 
 ```c
