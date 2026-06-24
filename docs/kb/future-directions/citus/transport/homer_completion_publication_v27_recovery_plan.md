@@ -6133,6 +6133,76 @@ Close-6F4 implementation checkpoint:
     normal path; fault-injection coverage for the new forced-failure branch
     remains Close-6F8 work.
 
+Close-6F5 implementation checkpoint:
+
+- Status as of June 24, 2026: failure-aware local reclamation is implemented in
+  the Citus/Homer tree at commit `5f777425f`. This slice preserves the
+  Close-6F2/6F3 capacity-independent terminal failure ordering and the Close-6F4
+  object-family failure publication boundary.
+- `HomerServicePublishOwningPayloadFailure()` no longer marks a frontend-side
+  SQL tuple-result stream as operation-notified when it merely arms
+  `HomerForcedCommandFailure`. That stream is now considered operation-notified
+  only after `HomerServicePublishForcedCommandFailure()` publishes the forced
+  `FAILED` command completion through the existing frontend completion mailbox.
+  This keeps stream/session reclamation behind the normal SQL apply/ack
+  pipeline instead of treating scheduling a forced completion as delivery.
+- Added `HomerServicePayloadFailureDefersLocalReclaim()` and wired
+  `TupleSinkServiceMaybeReclaimSinkAndSession()` to defer reclamation while:
+
+```text
+failureState.owned == true
+failureState.published == true
+failureState.operationNotified == false
+```
+
+  The deferral logs the session/sink/failure code on the cold path. It is not on
+  the per-payload hot path.
+- `HomerServicePublishForcedCommandFailure()` now looks up the affected payload
+  stream by the forced failure's `serviceStreamId`, marks
+  `failureState.operationNotified = true` after the frontend completion is
+  published, and then reruns `TupleSinkServiceMaybeReclaimSinkAndSession()`.
+  This makes the operation-specific notification the release point for
+  failed-stream local reclamation.
+- Backend-side tuple-result send streams still mark the failure as
+  operation-notified immediately because their local producer observes the
+  shared terminal `FAILED` status directly; the frontend receive-side stream is
+  responsible for the user-visible SQL failure.
+- `HomerServiceClearAbortedPayloadStreamAfterReset()` no longer calls `exit(1)`
+  when the owning session has already disappeared. The reset cleanup now records
+  the `ABORTED_RESET` tombstone, publishes the appropriate shared terminal
+  `FAILED` state on the orphaned stream, releases aborted producer source credit
+  after that terminal publication, clears the abort-authorized peer binding, and
+  resets the orphaned stream entry. A missing session remains a diagnostic
+  condition, but it no longer kills the service on a teardown path.
+- Validation:
+  - `git clang-format HEAD -- ...` over
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  - `git diff --cached --check` passed before commit.
+  - No-stats Citus/Homer `service-bin client-bin` build passed as `dbcomm` with
+    `CPPFLAGS='-D_GNU_SOURCE'`.
+  - Citus install and runtime-prefix sync to `farnet0` completed.
+  - Clean restart/preflight showed PostgreSQL plus one Homer service on
+    `farnet1`, one Homer service on `farnet0`, and no stale
+    pgbench/basebackup/backend workers. Both service logs started with only the
+    normal `HOMER_PROGRESS_POLICY=machine-baseline` line.
+  - Remote RDMA pgbench c1 smoke completed `20000/20000` transactions with zero
+    failures. It was cold-shaped after restart: `3104.056832 TPS`, p95
+    `0.282 ms`, p99 `0.297 ms`, max `1373.229 ms`, initial connection time
+    `2081.653 ms`.
+  - Remote RDMA pgbench c4 warmed repeats completed `40000/40000` transactions
+    with zero failures:
+    - repeat 1: `11199.208440 TPS`, p95 `0.502 ms`, p99 `0.573 ms`, max
+      `15.073 ms`;
+    - repeat 2: `11163.240343 TPS`, p95 `0.506 ms`, p99 `0.588 ms`, max
+      `14.456 ms`.
+  - Remote RDMA basebackup completed three repeats: run 1 cold/warmup `18.10s`,
+    run 2 warmed `4.32s`, run 3 warmed `4.24s`.
+  - Post-validation service-log scan on both hosts found no reset, abort,
+    forced-failure, failed-reclaim deferral, stale, protocol, mismatch, fatal,
+    late-WIMM, error, bind, or initialization diagnostics. As with Close-6F4,
+    healthy runs validate the normal path; deterministic fault injection for
+    abort delivery/reclaim remains Close-6F8 work.
+
 Close-6F terminal-failure design decision:
 
 - Verdict as of June 24, 2026: a transport-aborted payload stream must not be
@@ -6330,10 +6400,10 @@ Close-6F recommended remaining commits:
    through the existing frontend completion publisher, and basebackup byte-ring
    terminal-status delivery. WAL/future-stream hooks remain future work.
 4. Close-6F5 - failure-aware local reclamation:
-   keep local queue/session storage until all local handles detach or the
-   owning operation consumes/stages terminal failure; replace receive-side abort
-   peer-closed marking with peer-failed marking; do not `exit(1)` merely because
-   the owning session is already absent on reset cleanup.
+   implemented at Citus/Homer commit `5f777425f`; local reclamation now waits
+   for operation-specific failure notification, orphaned reset cleanup no longer
+   exits the service, and frontend SQL forced failures mark the stream notified
+   only after publishing the normal frontend completion.
 5. Close-6F6 - cleanup old failure scaffolding:
    remove/replace remaining `payloadTransportBroken` branches; classify old
    assignments into pre-binding setup failure, post-binding exact reset,
@@ -6368,8 +6438,11 @@ Close-6 later-slice dependencies:
   binding clear. Close-6F2 completed the local tuple-sink terminal-status ABI
   and boundary checks. Close-6F3 completed shared terminal `FAILED` publication
   in reset-clear and moved aborted source-credit release behind that terminal
-  publication. Operation/session failure publication and removal of the
-  remaining ad hoc `payloadTransportBroken` cleanup branches are still future
+  publication. Close-6F4 completed object-family failure delivery for SQL
+  tuple-result and basebackup streams. Close-6F5 completed failure-aware local
+  reclamation around operation notification and orphaned reset cleanup. Removal
+  of remaining ad hoc `payloadTransportBroken` cleanup branches, central
+  reset-request write gating, and fault-injection coverage remain future
   Close-6F work.
 - `HomerRetiredPayloadBinding.serviceStreamIdSnapshot` and
   `HomerPeerResponsePostTicket.serviceStreamIdSnapshot` should stay named as
