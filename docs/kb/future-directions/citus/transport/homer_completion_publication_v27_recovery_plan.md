@@ -4912,6 +4912,31 @@ cold retry interval expires:
     close retry scheduler fact
 ```
 
+Close-5 implementation checkpoint:
+
+- Status as of June 24, 2026: the normal-close owned/runnable wiring required
+  by Close-5 is implemented as part of the Close-3 and Close-4 code.
+- Close blockage reasons are defined in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1181`.
+- Receiver-side close ownership is no longer advertised as runnable while the
+  receive payload is still draining, while the exact control response has not
+  been posted, or while final credit is waiting on the canonical recv-CQ path.
+  The predicate is `HomerServicePayloadCloseActionReady()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20347`.
+- Sender-side remote-head blocking is cleared by
+  `HomerServiceApplyPayloadSenderCreditDoorbell()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22308`.
+- Receiver final-head send-CQ blocking is exposed through exact send-CQ demand:
+  both `HomerServicePayloadSendCqMayHaveWork()` and
+  `HomerServiceExecuteCqDrainProgressPlan()` treat a nonzero
+  `receiverHeadAckOutstandingCount` as work, even when the byte frontier equals
+  the already-completed ordinary ACK frontier.
+- Exact close-response publication rearms close/reclaim through
+  `HomerServiceHandlePeerResponsePostTicket()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22002`.
+- The cold retry interval remains on the sender-side `WAIT_PEER` path; it
+  suppresses hot retry after an active close response.
+
 Close-6 - reclamation and abort cleanup:
 
 - Local send stream normal reclaim requires: close phase `PEER_QUIESCED`, final
@@ -4934,6 +4959,23 @@ Close-6 - reclamation and abort cleanup:
   ensure the tombstone is populated immediately before normal clear, ensure late
   WIMMs matching the tombstone remain fatal diagnostics, and ensure abort paths
   reset/destroy the owning QP/CQ before invalidating tokens or MRs.
+- Implementation-readiness caveat: normal reclaim and tombstones are now
+  implemented, but abort/error teardown is not yet implementation-ready from
+  this note alone. Current payload code generally marks
+  `payloadTransportBroken` on protocol or transport errors, while
+  `TupleSinkServiceResetPeerConnection()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4228`
+  tears down the transport slot and states that callers must separately repair
+  semantic state. There is not yet a service-owned reverse index from a peer
+  connection to all payload streams bound to that connection, nor a single
+  connection-led abort owner that can:
+  - mark every affected stream as `HOMER_PAYLOAD_CLOSE_ABORTING`;
+  - remove payload-ready membership and close/runnable facts;
+  - reset or destroy the affected QP/CQ as the old-WIMM proof;
+  - only then invalidate payload tokens, MRs, and stream bindings.
+- Do not implement Close-6 as another local `payloadTransportBroken` branch.
+  First decide the connection-to-stream ownership/index shape and the exact
+  entry point that connection reset calls before or during QP teardown.
 
 3D-6 local close/credit repair checkpoint on 2026-06-23:
 
