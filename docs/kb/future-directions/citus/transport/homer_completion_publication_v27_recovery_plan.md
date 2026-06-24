@@ -4937,6 +4937,31 @@ Close-5 implementation checkpoint:
 - The cold retry interval remains on the sender-side `WAIT_PEER` path; it
   suppresses hot retry after an active close response.
 
+Close-5 residual normal-close audit:
+
+- The initial `CLOSE_SINK` request is no longer gated on already observing the
+  final remote consumed head. `HomerServiceProgressPayloadCloseAndReclaim()`
+  can start the exact stream-bound close request after freezing the final
+  published tail; the sender-visible final head remains a reclamation
+  prerequisite rather than a request-publication prerequisite.
+- One cleanup remains before Close-6 implementation: `HomerServiceMarkPayloadCloseReclaimable()`
+  in `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20323`
+  still sets `peerQuiesced` and `finalHeadObserved` while marking a stream
+  reclaimable. That violates the intended invariant that these facts are set
+  only by their real events:
+  - `peerQuiesced` by a validated `QUIESCED` close response;
+  - `finalHeadObserved` by an actual sender-side credit WIMM or equivalent
+    receiver-side final-head fact.
+- Before Close-6A, split `HomerServiceMarkPayloadCloseReclaimable()` into a pure
+  phase transition over already-proven facts. The caller must establish those
+  facts before invoking it, and the helper should assert rather than synthesize
+  them.
+- Add diagnostic counters for blackhole priority hardening:
+  `blackholeActionsSelectedAfterDrain` and
+  `blackholeActionsSelectedAfterQuiescedResponse`. These should normally be
+  zero; the current close-before-blackhole priority rule should not conceal
+  stale blackhole readiness.
+
 Close-6 - reclamation and abort cleanup:
 
 - Local send stream normal reclaim requires: close phase `PEER_QUIESCED`, final
@@ -4976,6 +5001,293 @@ Close-6 - reclamation and abort cleanup:
 - Do not implement Close-6 as another local `payloadTransportBroken` branch.
   First decide the connection-to-stream ownership/index shape and the exact
   entry point that connection reset calls before or during QP teardown.
+
+Close-6 ownership decision:
+
+- Do not add a persistent connection-to-stream reverse index. Use the stream
+  table as the authoritative ownership source because reset is a cold path,
+  `CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS` is currently `64U`, and every
+  active stream already carries:
+
+```text
+peerConnectionHandle
+peerConnectionGeneration
+```
+
+- On connection reset, scan the fixed stream table and select entries matching
+  both the connection handle and generation. Use a reset-time snapshot bitset:
+
+```c
+uint64_t affectedStreamBits;
+```
+
+- Add a static assertion that the fixed stream-table capacity is at most 64
+  while this cookie is represented as one `uint64_t`. If the table grows later,
+  replace the cookie with a fixed word array instead of truncating the snapshot.
+- The transport treats the bitset as an opaque semantic cookie: the service
+  computes it during reset-begin, and the transport returns it during
+  reset-complete after QP/CQ teardown.
+
+Close-6 lifecycle ABI:
+
+- Keep this separate from `HomerPeerRecvDispatcher`, which remains the
+  steady-state CQE decoder. Add a connection lifecycle observer to
+  `TupleSinkServicePeerTransportState`:
+
+```c
+typedef struct HomerPeerConnectionIdentity
+{
+    TupleSinkServicePeerConnectionHandle *handle;
+
+    bool incoming;
+    uint32_t connectionIndex;
+    uint64_t connectionGeneration;
+
+    HomerTransportTrafficClass trafficClass;
+    int32_t peerNodeId;
+} HomerPeerConnectionIdentity;
+
+typedef enum HomerPeerConnectionResetReason
+{
+    HOMER_PEER_RESET_CM_DISCONNECT = 1,
+    HOMER_PEER_RESET_RECV_CQ_FAILURE,
+    HOMER_PEER_RESET_SEND_CQ_FAILURE,
+    HOMER_PEER_RESET_PAYLOAD_PROTOCOL,
+    HOMER_PEER_RESET_PARTIAL_POST,
+    HOMER_PEER_RESET_CLOSE_PROTOCOL,
+    HOMER_PEER_RESET_SERVICE_SHUTDOWN
+} HomerPeerConnectionResetReason;
+
+typedef struct HomerPeerConnectionLifecycleObserver
+{
+    uint64_t (*onResetBegin)(
+        const HomerPeerConnectionIdentity *identity,
+        HomerPeerConnectionResetReason reason,
+        void *context);
+
+    void (*onResetComplete)(
+        const HomerPeerConnectionIdentity *identity,
+        HomerPeerConnectionResetReason reason,
+        uint64_t semanticCookie,
+        void *context);
+
+    void *context;
+} HomerPeerConnectionLifecycleObserver;
+```
+
+- `onResetBegin()` must not fail or invoke transport progress. For the current
+  service, it returns `affectedStreamBits`.
+- `onResetComplete()` runs only after QP/CQ teardown proves no old WIMM or RDMA
+  write can arrive.
+
+Close-6 transport reset ordering:
+
+- Refactor `TupleSinkServiceResetPeerConnection()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4228`
+  so abort reset follows this order:
+
+```text
+1. Snapshot connection identity.
+2. Remove connection from scheduler facts; set recv-CQ owner TEARDOWN,
+   bootstrapComplete=false, resetInProgress=true.
+3. Invoke onResetBegin(); service marks matching streams ABORTING but keeps
+   tokens, MRs, bindings, and owner counts.
+4. Best-effort rdma_disconnect(); do not wait for DISCONNECTED.
+5. Destroy the QP. This is the old-WIMM/old-RDMA-write cutoff.
+6. Destroy or abandon CQs; no normal CQ owner callback runs afterward.
+7. Deregister caller-owned and connection-owned MRs.
+8. Release PD and remaining CM resources.
+9. Invoke onResetComplete() with the semantic cookie.
+10. Zero/reuse the connection table slot.
+```
+
+- Split the current resource cleanup into explicit helpers:
+
+```c
+TupleSinkServiceDestroyConnectionQp();
+TupleSinkServiceDestroyConnectionCqs();
+TupleSinkServiceInvalidateRegisteredMemoryRegions();
+TupleSinkServiceReleaseConnectionMemoryResources();
+TupleSinkServiceReleaseConnectionCmResources();
+```
+
+- The important ordering correction is that QP destruction precedes MR
+  deregistration on abort/reset paths. The current reset path invalidates
+  registered MRs before `TupleSinkServiceReleaseConnectionResources()`, which is
+  not the right proof when outstanding WRs may still reference those MRs.
+
+Close-6 reset-begin service callback:
+
+- Scan the fixed stream table and set one bit for every active stream where:
+
+```text
+stream.peerConnectionHandle == identity.handle
+stream.peerConnectionGeneration == identity.connectionGeneration
+```
+
+- For every matching stream:
+
+```text
+closeState.phase = HOMER_PAYLOAD_CLOSE_ABORTING
+payloadTransportBroken = true
+remove payload-ready membership
+clear receivePayloadDoorbellPending
+clear close-runnable state
+cancel future CLOSE_SINK retries
+prevent new payload/head/control posts
+retain tokens, MR handles, connection identity, and outstanding owner counts
+```
+
+- Do not call `HomerServiceClearPayloadStreamPeerBinding()` from reset-begin.
+
+Close-6 reset-complete service callback:
+
+- Iterate only the reset snapshot. Revalidate that each stream still matches the
+  captured connection generation before mutating it.
+- Use teardown-specific owner cleanup, not normal CQ callbacks:
+
+```c
+HomerServiceAbortPayloadSendOwnersForConnection();
+HomerServiceAbortReceiverHeadAckOwnersForConnection();
+HomerServiceAbortPeerControlOpsForConnection();
+```
+
+- Abort-remove payload send owners, receiver-head ACK owners, pending final-head
+  owners, source-slot owners, stream-owned close ops, and response-post tickets.
+  Decrement exact owner counts exactly once.
+- Require:
+
+```text
+receiverHeadAckOutstandingCount == 0
+no payload send owner remains
+no close op remains active
+```
+
+- Then deregister/release stream MR handles, record an abort tombstone, clear
+  the peer binding through an ABORTING-authorized path, fail/cancel the owning
+  operation, and reclaim local stream storage when no non-RDMA local owner
+  remains. Do not advance semantic payload frontiers as though WRs completed.
+
+Close-6 exact reset scheduling:
+
+- Do not destroy a QP from inside a recv-CQ decoder or send-CQ owner callback.
+  Add:
+
+```c
+bool TupleSinkServiceRequestPeerConnectionResetRdma(
+    TupleSinkServicePeerConnectionHandle *connection,
+    uint64_t expectedGeneration,
+    HomerPeerConnectionResetReason reason);
+```
+
+- This sets exact reset-pending state. A close/lifetime scheduler action later
+  performs reset:
+
+```c
+typedef struct HomerPeerConnectionResetAction
+{
+    bool incoming;
+    uint32_t connectionIndex;
+    uint64_t connectionGeneration;
+    HomerPeerConnectionResetReason reason;
+} HomerPeerConnectionResetAction;
+```
+
+- Prioritize reset ahead of further work on the affected connection.
+- Convert these failures to reset requests: live payload token/connection
+  generation mismatch, consumed-head regression or head beyond posted tail,
+  partial multi-WR publication, payload/control send-CQ failure, final-tail
+  inconsistency, close token/frontier mismatch, `QUIESCED` response publication
+  failure after final-head post, late WIMM matching a retired binding, and owner
+  table corruption.
+- A normal backend/query error with valid transport should use `ERROR+EOS` and
+  normal close, not QP reset.
+
+Close-6 tombstone disposition:
+
+- Extend tombstones with disposition:
+
+```c
+typedef enum HomerRetiredPayloadDisposition
+{
+    HOMER_RETIRED_PAYLOAD_QUIESCED = 1,
+    HOMER_RETIRED_PAYLOAD_ABORTED_RESET = 2
+} HomerRetiredPayloadDisposition;
+```
+
+- Only `HOMER_RETIRED_PAYLOAD_QUIESCED` may answer a duplicate close request
+  with `QUIESCED`. `HOMER_RETIRED_PAYLOAD_ABORTED_RESET` is diagnostic only.
+
+Close-6 patch sequence:
+
+1. Close-6A - lifecycle ABI:
+   add connection identity, reset reason enum, lifecycle observer, and service
+   observer registration; no semantic behavior change.
+2. Close-6B - safe transport teardown:
+   add `resetInProgress`, reorder QP/CQ destruction before MR deregistration,
+   and call reset-begin/reset-complete observers while preserving identity.
+3. Close-6C - payload reset snapshot:
+   implement the bounded stream-table scan, return `affectedStreamBits`, mark
+   matching streams ABORTING/non-runnable, and remove ready-queue membership
+   without clearing binding.
+4. Close-6D - teardown-owned owner cleanup:
+   abort-remove payload send owners, receiver-head ACK owners, stream-owned
+   close ops, and response tickets; reconcile outstanding counts; clear binding
+   only after transport quiescence.
+5. Close-6E - exact reset scheduling:
+   add reset-request API and exact reset action; convert protocol/partial-post
+   failures to reset requests; prevent recursive reset inside CQ dispatch.
+6. Close-6F - tombstone and session failure:
+   add normal-versus-abort tombstone disposition, publish terminal local failure
+   where applicable, reclaim streams sharing the failed connection, and remove
+   remaining ad hoc `payloadTransportBroken` cleanup branches.
+
+Close-6 fault-injection and acceptance:
+
+```text
+two payload streams share one QP; one stream detects protocol error:
+    both enter ABORTING and one QP reset cleans both
+reset with outstanding final-head ACK owner:
+    owner abort-retired exactly once
+reset with ordinary and final ACKs carrying same frontier:
+    outstanding owner count still reaches zero
+reset with payload send WRs outstanding:
+    no semantic frontier is advanced as completed
+reset with Close-3 async op in flight:
+    close op cancelled by teardown owner
+reset after final-head WIMM post before quiesced-response post:
+    abort tombstone only, no duplicate QUIESCED response
+reset after quiesced-response post before final-head send CQ retirement:
+    owner cleanup retires local lifetime before clear
+partial payload batch post:
+    accepted WRs are handled by reset, not normal completion
+stream ready-queue entry exists during reset:
+    ready membership removed before binding clear
+connection slot immediately reused:
+    stale reset action/cookie cannot target new generation
+late old-token WIMM after claimed reset cutoff:
+    impossible or fatal diagnostic
+normal close and 20 sequential basebackups:
+    use quiesced path, no reset
+concurrent c4 plus basebackup with forced connection reset:
+    no old-token WIMM reaches reused stream
+```
+
+- Add counters:
+
+```text
+peerConnectionResetRequests
+peerConnectionResetBegins
+peerConnectionResetCompletes
+payloadStreamsMarkedAborting
+payloadSendOwnersAbortRetired
+receiverHeadOwnersAbortRetired
+payloadCloseOpsAbortCancelled
+payloadBindingsAbortCleared
+payloadAbortTombstonesRecorded
+lateWimmAfterQpReset
+connectionResetStreamSnapshotMismatch
+```
 
 3D-6 local close/credit repair checkpoint on 2026-06-23:
 
