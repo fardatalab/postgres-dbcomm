@@ -5270,6 +5270,42 @@ Close-6A implementation checkpoint:
   patch: add `resetInProgress`, snapshot connection identity, call the observer
   around teardown, and reorder QP/CQ destruction before MR invalidation.
 
+Close-6B implementation checkpoint:
+
+- Status as of June 24, 2026: Close-6B is implemented in the Citus/Homer tree.
+- Added `resetInProgress` to the peer connection state and made
+  `TupleSinkServiceResetPeerConnection()` reject recursive reset attempts with a
+  diagnostic instead of reentering teardown.
+- Added a reset identity snapshot helper and lifecycle observer begin/complete
+  calls around the physical teardown boundary. The service callbacks still
+  return/do nothing until Close-6C adds the payload-stream snapshot.
+- Split the previous all-in-one connection cleanup into explicit teardown
+  phases:
+  - `TupleSinkServiceDestroyConnectionQp()`;
+  - `TupleSinkServiceDestroyConnectionCqs()`;
+  - `TupleSinkServiceInvalidateRegisteredMemoryRegions()`;
+  - `TupleSinkServiceReleaseConnectionMemoryResources()`;
+  - `TupleSinkServiceReleaseConnectionCmResources()`.
+- The reset path now sets recv-CQ ownership to `TEARDOWN`, clears
+  `bootstrapComplete`, sets `resetInProgress`, invokes reset-begin, optionally
+  performs best-effort disconnect, destroys QP/CQs, and only then invalidates
+  registered MRs and releases connection-owned memory/CM resources.
+- Temporary caveat: reset call sites still pass diagnostic strings. Close-6B
+  maps those strings to `HomerPeerConnectionResetReason` for the lifecycle
+  observer; Close-6E should replace this with exact reset requests carrying the
+  typed reason directly.
+- Validation:
+  - no-stats Citus/Homer `service-bin client-bin` build completed with
+    `CPPFLAGS='-D_GNU_SOURCE'`;
+  - installed and synced `/data/dbcomm/pg-citus` to `farnet0`;
+  - restarted Homer services on `farnet1` and `farnet0`;
+  - remote RDMA basebackup smoke completed in `5.41s` cold and `4.22s` warmed;
+  - service-log scan found no reset recursion, stale/late payload token,
+    tombstone, protocol, send-CQ, or close-wait diagnostics.
+- Next stage remains Close-6C: implement the reset-begin payload stream-table
+  scan, return `affectedStreamBits`, mark matching streams `ABORTING`, and
+  remove ready/runnable memberships without clearing bindings.
+
 Close-6 fault-injection and acceptance:
 
 ```text
