@@ -7805,6 +7805,41 @@ Close-6F6-F3 payload send-owner naming checkpoint:
     `send-owner`, rollback, commit, reservation, abort, late, reset, protocol,
     failed, invalid, mismatch, underflow, overflow, or payload-broken diagnostics.
 
+Close-6F7 reset-ready cleanup checkpoint:
+
+- Implemented the remaining reset-ready queue cleanup from Close-6F7 in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+- Added `HomerServicePayloadReadyQueueContainsExact()` to check whether an exact
+  payload ready queue entry remains by stream index and service-stream generation
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20849`).
+- Added `HomerServiceRemovePayloadReadyForReset()` as the reset-begin cleanup
+  owner. It calls the normal exact claim path, clears stream-local ready state if
+  the queue was already stale, compacts the small fixed ready queue, and logs a
+  diagnostic if the exact entry remains afterward
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20875`).
+- `HomerServiceMarkPayloadStreamAbortingOnConnectionReset()` now calls this
+  helper instead of ignoring the result of `HomerServiceClaimPayloadReady()`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20418`).
+- Validation:
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    made no further changes.
+  - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
+  - Homer service/client build passed as `dbcomm` with
+    `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS=-D_GNU_SOURCE`.
+  - No-stats Citus/Homer service/client binaries were installed as `dbcomm`, and
+    `/data/dbcomm/pg-citus` was synced to `farnet0`.
+  - Fresh service restart used exact PIDs. Remote c1 cold setup after restart:
+    `5000/5000`, zero failures, `1912.001288 TPS`, initial connection
+    `1708.342 ms`; this is not a warm sample.
+  - Warm remote c1 repeat: `10000/10000`, zero failures, `4388.366966 TPS`, p99
+    `0.247 ms`.
+  - Service-log scans on both hosts, run as `dbcomm`, found no reset-ready cleanup,
+    stale-ready, send-owner, rollback, commit, reservation, abort, late, reset,
+    protocol, failed, invalid, mismatch, underflow, or overflow diagnostics.
+- Scope note: this is normal-path validation plus compile coverage. The helper is
+  specifically for reset/fault paths; deterministic reset-ready queue fault
+  injection remains part of Close-6F8.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
@@ -8113,8 +8148,9 @@ Close-6 later-slice dependencies:
   tuple-result and basebackup streams. Close-6F5 completed failure-aware local
   reclamation around operation notification and orphaned reset cleanup. Removal
   of remaining ad hoc `payloadTransportBroken` cleanup branches, central
-  reset-request write gating, and fault-injection coverage remain future
-  Close-6F work.
+  reset-request write gating, and reset-ready queue cleanup were completed by
+  Close-6F6-F2/F3 and Close-6F7. Deterministic fault-injection coverage remains
+  future Close-6F work.
 - `HomerRetiredPayloadBinding.serviceStreamIdSnapshot` and
   `HomerPeerResponsePostTicket.serviceStreamIdSnapshot` should stay named as
   snapshots, not stream generations; the wire generation identity remains the
