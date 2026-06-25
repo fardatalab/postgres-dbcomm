@@ -7225,10 +7225,10 @@ Close-6F6-E scheduler-ownership implementation checkpoint:
   - The exact action currently targets the machine-baseline scheduler, which is
     the validation path. Older experimental policies should not be treated as
     acceptance paths for this failure model.
-  - The remaining review corrections are still open: typed exact `CLOSE_SINK`
-    request publication results, semantic `ERROR+EOS` ownership, terminal
-    generation consistency, `QUIESCED -> FAILED` handling, reset-ready queue
-    exact removal checks, and deterministic fault-injection coverage.
+  - The remaining review corrections are still open: semantic `ERROR+EOS`
+    ownership, terminal generation consistency, `QUIESCED -> FAILED` handling,
+    reset-ready queue exact removal checks, and deterministic fault-injection
+    coverage.
 
 Close-6F6-C5 receive-side local endpoint cleanup checkpoint:
 
@@ -7275,6 +7275,71 @@ Close-6F6-C5 receive-side local endpoint cleanup checkpoint:
   publication/owner branches around outgoing byte-ring and fixed-slot payload
   send, and need their own classification because some are retryable pressure,
   some are semantic producer errors, and some are bound transport poison.
+
+Close-6F6-C6 exact `CLOSE_SINK` request publication result checkpoint:
+
+- Added `TupleSinkServiceStartPeerRequestOnConnectionResultRdma()` as the
+  typed-status form of the exact same-QP peer-control request publisher
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h:443`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:9230`).
+  The old bool `TupleSinkServiceStartPeerRequestOnConnectionRdma()` remains as a
+  compatibility wrapper for callers that have not yet been migrated
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:9287`).
+- Threaded `HomerPeerPostResult` through the exact control request publication
+  path:
+  - `TupleSinkServicePublishControlMessage()` now marks peer control-mailbox
+    credit exhaustion as `HOMER_PEER_POST_WOULD_BLOCK` instead of leaving the
+    caller with only a boolean failure
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6223`,
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6271`).
+  - `TupleSinkServicePostControlWriteWithImmediateResult()` classifies the
+    single full-message control WIMM using the same `HomerPeerPostResult` status
+    model as payload publications
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:8076`).
+  - `TupleSinkServicePublishPeerControlAsyncOpOnConnection()` treats a full
+    control-op table as `WOULD_BLOCK`, releases the reserved op if the mailbox
+    post fails, and requests connection reset only for hard zero-WR or partial
+    publication failures
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:9043`,
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:9075`,
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:9094`).
+- Migrated sender-side close continuation in
+  `TupleSinkServicePeerCloseSinkBestEffort()` to call the typed exact publisher
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22659`).
+  `HOMER_PEER_POST_WOULD_BLOCK` now keeps `localPeerClosePending` owned and
+  cold-retryable through `HOMER_PAYLOAD_CLOSE_RETRY_INTERVAL_PASSES`, while hard
+  zero-WR and partial failures request typed bound-payload reset instead of
+  writing `payloadTransportBroken = true`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22664`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22686`).
+- This checkpoint deliberately does not change endpoint-routed peer-control
+  callers. They still use the bool wrappers and retain their old behavior. The
+  slice only fixes the exact stream-close path that needed to distinguish
+  retryable request-publication pressure from transport poison.
+- Validation:
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c
+    src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h
+    src/backend/distributed/utils/homer/tuple_sink_service_process.c` was
+    applied.
+  - `git diff --check` passed.
+  - Homer service/client rebuilt and installed as `dbcomm` with
+    `CPPFLAGS='-D_GNU_SOURCE'`; installed prefix was synced to `farnet0`.
+  - Remote RDMA pgbench c1 cold setup run after service restart: `20000/20000`,
+    zero failures, `3350.791516 TPS`, initial connection `1720.247 ms`; this is
+    not a warm performance sample.
+  - Warm remote RDMA pgbench c1 repeat: `20000/20000`, zero failures,
+    `4404.926382 TPS`, p99 `0.249 ms`.
+  - Warm remote RDMA pgbench c4: `40000/40000`, zero failures,
+    `10847.995982 TPS`, p99 `0.612 ms`.
+  - Remote RDMA basebackup blackhole: warmup `5.65 s`, warmed repeat `4.16 s`.
+  - Service-log scans found no reset, abort, forced-failure, stale-token,
+    protocol, mismatch, fatal, late-WIMM, owner-corruption, partial-post, or
+    `CLOSE_SINK` publish-failure diagnostics. Remote log matches were only
+    false positives from the word `compatibility` containing `partial`.
+- Remaining caveat: exact close request publication still uses a cold retry
+  interval for `WOULD_BLOCK`; later 3C/6F dependency wiring can replace this
+  with exact rearm from control-op/response-slot/send-CQ relief if this ever
+  shows up in counters. No normal validation path hit this branch.
 
 Close-6F6 pulls one safety item from 6F7 forward:
 
