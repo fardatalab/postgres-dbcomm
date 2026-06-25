@@ -6679,6 +6679,25 @@ Close-6F6-B2 receiver-head ACK post migration checkpoint:
   optimization; the correctness change should not be hidden behind benchmark
   noise.
 
+Close-6F6-B3 close-protocol poison checkpoint:
+
+- Migrated two clean sender-side close poison branches in
+  `TupleSinkServicePeerCloseSinkBestEffort()`:
+  - async close-op poll failure now calls `HomerServiceRequestBoundPayloadReset()`
+    at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22295`.
+  - close response validation failure now calls the same typed helper at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22318`.
+- Both branches are already past peer binding and close ownership, so the correct
+  classification is `HOMER_PEER_RESET_CLOSE_PROTOCOL` with
+  `CITUS_TUPLE_SINK_FAILURE_CLOSE_PROTOCOL`.
+- Validation: formatted `tuple_sink_service_process.c` with
+  `git clang-format HEAD` and rebuilt Homer service/client with
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+  Runtime validation was not repeated for this checkpoint because these are rare
+  close error branches and the prior B2 runtime run had already exercised normal
+  close/quiescence.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
