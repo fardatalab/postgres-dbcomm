@@ -6453,6 +6453,72 @@ HomerServicePayloadFailureDeliveryReady(
    - Remove the field and require `git grep payloadTransportBroken` to return
      zero matches.
 
+Close-6F6-A implementation checkpoint:
+
+- Implemented typed scaffolding in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`:
+  - `HomerFailureDeliveryResult` at line 919.
+  - `HomerPayloadFailureOrigin`, `HomerPayloadFailurePhase`, and the expanded
+    `HomerPayloadFailureState` at lines 1279-1317. The legacy
+    `owned`/`published`/`failureDeliveryCommitted` booleans remain during the
+    migration so old behavior can be checked against the new phase model.
+  - `HomerServiceRejectPayloadOpen()` at line 3669,
+    `HomerServiceRequestBoundPayloadReset()` at line 3698,
+    `HomerServiceQueuePayloadSemanticError()` at line 3737, and
+    `HomerServicePublishLocalPayloadFailure()` at line 21815. These helpers are
+    deliberately not wired into all call sites yet; they encode the transition
+    contracts before the remaining broad `payloadTransportBroken` branches are
+    migrated.
+  - `operationNotified` was renamed to `failureDeliveryCommitted`. Current
+    updates are in `HomerServicePublishForcedCommandFailure()` at line 18171,
+    `HomerServicePayloadFailureDefersLocalReclaim()` at line 20876, and
+    `HomerServicePublishOwningPayloadFailure()` at lines 23432, 23485, and
+    23502.
+  - Reset-begin now records typed `TRANSPORT_RESET` / `RESETTING` state in
+    `HomerServiceMarkPayloadStreamAbortingOnConnectionReset()` at lines
+    20048-20057 while preserving the old `payloadTransportBroken` bit.
+- Implemented the pulled-forward 6F7 write cutoff in
+  `TupleSinkServicePrepareConnectionForWrite()` at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:6318`.
+  The helper now rejects writes when `resetRequested` or `resetInProgress` is
+  set before it drains CM events or posts WRs.
+- Validation so far: formatted the touched C files with `git clang-format HEAD`
+  and rebuilt Homer service/client with
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+  Installed with `sudo -n -u dbcomm make install-headers install-service-bin
+  install`, synced `/data/dbcomm/pg-citus` to `farnet0`, and validated:
+  - remote RDMA c1 smoke: `20000/20000`, 0 failures, `3327 TPS`; first
+    post-restart run, so treated as correctness rather than warmed performance.
+  - remote RDMA c4 repeats: `40000/40000`, 0 failures, `11090 TPS` and
+    `11106 TPS`.
+  - remote RDMA basebackup: warmup `5.48s`, warmed repeat `4.25s`.
+  - `farnet1` service log had no reset/failure/protocol diagnostic matches.
+    `farnet0` retained an old printable bind-collision line in its historical
+    binary log, but current process preflight and successful runs showed one
+    active service and normal close/reclaim tails.
+
+Close-6F6-A `payloadTransportBroken` migration inventory:
+
+| Site | Current role | 6F6 classification | Target transition |
+| --- | --- | --- | --- |
+| Field/comment in `HomerPayloadStreamState`, `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1356` and line 1387 | Legacy generic broken bit and old scheduler comment | Migration scaffolding only | Delete in 6F6-F after all readers/writers move to typed predicates |
+| `HomerServiceRequestBoundPayloadReset()`, line 3724 | New helper temporarily preserves legacy bit | Bound transport poison | Keep only until old readers are gone; helper owns exact reset request |
+| `HomerServiceClearPayloadStreamPeerBinding()` guard, line 6265 | Allows abort/broken binding clear | Bound reset / abort reclaim | Replace with close `ABORTING` plus failure phase |
+| `HomerServicePayloadStreamReasonMasks()`, lines 10898 and 10963 | Marks transport-broken payload action readiness/blocking | Scheduler read | Replace with `HomerServicePayloadNormalProgressAllowed()` and failure-delivery predicate |
+| `HomerServicePayloadStreamSourceReadyForScheduler()`, line 11130 | Schedules generic broken stream action | Scheduler read | Replace with exact reset/failure-delivery/semantic-error readiness |
+| `HomerServiceMarkPayloadStreamAbortingOnConnectionReset()`, line 20054 | Reset-begin marks all affected streams broken | Bound transport reset | Already records typed `TRANSPORT_RESET` / `RESETTING`; old bit remains for comparison |
+| `HomerServicePayloadCloseActionReady()` and close/reclaim predicates, lines 21139, 25099, 25184, 25594, 25654, 25934, 25940, 26013, 26272, 26361, 27175, 27542 | Suppresses normal close or drives abort cleanup | Close/reset ownership | Replace with close phase `ABORTING`, failure phase, and owner reconciliation predicates |
+| Payload open/binding setup line bands 22220-22291 and 22858 | Setup/open failures currently mark broken | Pre-binding or early binding failure | Classify each as `HomerServiceRejectPayloadOpen()` until peer binding is visible; use exact reset only after binding is exposed |
+| Close protocol line bands 24029, 24924-25087, 25137-25474, 25650-25705, 25804-26306, 26374-26515 | Token/frontier/connection mismatch and partial close/post failures | Bound close-protocol or partial-post poison | Migrate to `HomerServiceRequestBoundPayloadReset()` with stable reset reason; source/owner credit remains blocked/rearmed, not failure |
+| Payload send/publish line bands 26881-26892, 27195-27430, 27567-27804, 28125-28144 | Payload post, send-CQ, or source-owner failures | Mix of retryable pressure, partial post, and bound transport poison | Requires typed `HomerPeerPostResult` before migration so zero-WR pressure blocks while partial post resets |
+
+Inventory caveat:
+
+- The line-band rows intentionally group adjacent assignments and checks by
+  owning function area. The remaining migration work should still inspect each
+  assignment independently before replacement, because several bands contain a
+  mix of retryable source/SQ pressure and true transport poison.
+
 Post-result classification dependency:
 
 - Before migrating multi-WR payload post failures, introduce a typed post result
