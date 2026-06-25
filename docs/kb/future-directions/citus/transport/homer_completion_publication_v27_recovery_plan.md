@@ -7139,6 +7139,97 @@ Close-6F6-C4 final-head close failure classification checkpoint:
   Runtime validation was not repeated because this checkpoint changes close
   error branches rather than the normal pgbench/basebackup data path.
 
+Close-6F6-E scheduler-ownership implementation checkpoint:
+
+- Implemented an exact, service-local payload-failure action instead of letting
+  the legacy `payloadTransportBroken` bit keep ordinary payload work runnable.
+  The new scheduler state is `PayloadFailureReadyStreams`, with durable
+  `HomerPayloadFailureAction` payloads copied into the execution plan
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3019`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2464`).
+- Added `HOMER_PROGRESS_ACTION_PROGRESS_PAYLOAD_FAILURE` and the intermediate
+  `HOMER_PAYLOAD_FAILURE_DELIVERY_STAGED` phase. `DELIVERY_STAGED` means the
+  failure has been durably handed to another owner, currently the forced SQL
+  completion pipeline, but the frontend terminal completion has not yet reached
+  the publication boundary
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2045`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1304`).
+- `HomerServicePublishLocalPayloadFailure()` now publishes only the
+  capacity-independent terminal marker for the correct endpoint direction, then
+  arms exact payload-failure readiness. It no longer marks failure delivery
+  committed by itself and no longer publishes both send and receive endpoint
+  status for one failure
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22144`).
+- `HomerServicePublishOwningPayloadFailure()` now returns
+  `HomerFailureDeliveryResult`, allowing the exact action to distinguish
+  committed queue/basebackup delivery, durably staged SQL forced-terminal
+  delivery, blocked local-resource delivery, and failure
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23742`).
+- Added `HomerServiceProgressPayloadFailure()` as the sole exact scheduler owner
+  for object-family failure delivery and final local cleanup. It validates
+  `streamIndex` plus `serviceStreamId`, moves `TERMINAL_PUBLISHED` to
+  `DELIVERY_COMMITTED` or `DELIVERY_STAGED`, requests exact reset if delivery
+  fails while a peer binding is still active, and only attempts local reclamation
+  from `RECLAIMABLE`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23849`).
+- `HomerServiceClearAbortedPayloadStreamAfterReset()` now stops after publishing
+  terminal FAILED, releasing aborted source credit in the already-decided order,
+  clearing the aborted peer binding, and arming the exact failure action. It no
+  longer performs object-family failure delivery or local reclamation inline
+  during reset cleanup
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23978`).
+- `HomerServicePublishForcedCommandFailure()` now re-arms the exact
+  payload-failure action after the forced frontend terminal completion actually
+  reaches the completion-publication boundary. This is the transition from
+  `DELIVERY_STAGED` to `DELIVERY_COMMITTED`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18366`).
+- `HomerServicePayloadStreamReasonMasks()` and
+  `HomerServicePayloadStreamSourceReadyForScheduler()` no longer treat
+  `payloadTransportBroken` as ordinary payload readiness. The old field remains
+  only as migration scaffolding and debug/shadow state until 6F6-F deletes it
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11075`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:11240`).
+- `HomerServiceAppendPayloadFailureActions()` enumerates the exact
+  `PayloadFailureReadyStreams` bitmap non-destructively for runnable phases and
+  clears stale or non-runnable bits. Transitions such as forced completion
+  publication, reset completion, and local detach are responsible for re-arming
+  the exact bit when progress becomes possible again
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:33265`).
+- Local basebackup blackhole structural failures now treat successful terminal
+  failure ownership as progress and return true, instead of returning false after
+  publishing local failure state. This keeps the service from interpreting a
+  durable local failure as an executor error
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26856`).
+- Validation:
+  - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    was applied.
+  - Homer service/client rebuilt and installed as `dbcomm` with
+    `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`
+    and `sudo -n -u dbcomm make install-headers install-service-bin install`.
+  - Installed prefix was synced to `farnet0`.
+  - Remote RDMA pgbench c1 from `farnet0` to `farnet1`: `20000/20000`
+    transactions, zero failures, `3358.741090 TPS`.
+  - Remote RDMA pgbench c4 from `farnet0` to `farnet1`: `40000/40000`
+    transactions, zero failures, `10876.578837 TPS`.
+  - Remote RDMA basebackup blackhole warmed run: warmup `5.55 s`, warmed repeat
+    `4.17 s`.
+  - Service-log scan found no reset, abort, forced-failure, stale-token,
+    protocol, mismatch, fatal, late-WIMM, owner-corruption, or partial-post
+    diagnostics. The only matching binding messages were normal
+    `peer-binding-cleared` close/reclaim lines.
+- Remaining caveats before 6F6 is complete:
+  - `payloadTransportBroken` still has writers and diagnostic readers. It is no
+    longer a scheduler liveness source, but 6F6-F still must delete the field and
+    require `git grep payloadTransportBroken` to return zero matches.
+  - The exact action currently targets the machine-baseline scheduler, which is
+    the validation path. Older experimental policies should not be treated as
+    acceptance paths for this failure model.
+  - The remaining review corrections are still open: typed exact `CLOSE_SINK`
+    request publication results, semantic `ERROR+EOS` ownership, terminal
+    generation consistency, `QUIESCED -> FAILED` handling, reset-ready queue
+    exact removal checks, and deterministic fault-injection coverage.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
