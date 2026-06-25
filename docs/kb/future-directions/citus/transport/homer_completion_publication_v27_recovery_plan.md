@@ -6747,9 +6747,8 @@ Close-6F6-C1 local blackhole structural failure checkpoint:
   helper publishes local terminal `FAILED` state and does not request a peer QP
   reset.
 - Intentionally did not migrate invalid local blackhole producer records in this
-  checkpoint. Those may be semantic producer/contract failures and need the 6F6-D
-  `ERROR+EOS`/semantic-error classification rather than a blanket local terminal
-  conversion.
+  checkpoint. They needed a separate classification decision rather than a
+  blanket local terminal conversion; see the C3 checkpoint below.
 - Validation: formatted `tuple_sink_service_process.c` with
   `git clang-format HEAD` and rebuilt Homer service/client with
   `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
@@ -6784,6 +6783,36 @@ Close-6F6-C2 forced-terminal duplicate suppression checkpoint:
   `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
   Runtime validation was not repeated because this is a defensive reset-race
   path, not a normal-path scheduler or transport hot-path change.
+
+Close-6F6-C3 local blackhole malformed-record failure checkpoint:
+
+- Classified the remaining local blackhole malformed-record branches in
+  `HomerServicePumpLocalBaseBackupBlackhole()` as local terminal failures, not
+  peer transport poison and not in-band semantic `OBJECT_ERROR`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26505`).
+  A deliberate basebackup semantic error is already represented by
+  `CITUS_REMOTE_BASEBACKUP_OBJECT_ERROR`; these branches mean the local producer
+  published a malformed transport/object record for the smoke receiver.
+- Replaced the direct `HomerServiceMarkPayloadStreamSendTerminal()` plus
+  `payloadTransportBroken = true` pattern with
+  `HomerServicePublishLocalPayloadFailure()` and an immediate false return for:
+  - invalid local basebackup transport header
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26599`);
+  - incomplete byte-ring record
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26629`);
+  - invalid local basebackup object
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26652`);
+  - transport/object payload-size mismatch
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26666`).
+- This remains a local smoke-test path. It does not implement the remote
+  semantic `ERROR+EOS` state for healthy peer transport; that is still the
+  broader 6F6-D work.
+- Validation: `git diff --check` passed, `git clang-format HEAD` left
+  `tuple_sink_service_process.c` unchanged, and Homer service/client rebuilt
+  successfully with
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+  Runtime validation was not repeated because these are local error branches,
+  not the remote RDMA pgbench/basebackup normal path.
 
 Close-6F6 pulls one safety item from 6F7 forward:
 
