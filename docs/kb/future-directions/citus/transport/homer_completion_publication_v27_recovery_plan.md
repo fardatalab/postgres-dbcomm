@@ -6792,8 +6792,40 @@ HomerServicePayloadFailureDeliveryReady(
      finalization; semantic-error pending keeps the payload `ERROR+EOS` action
      runnable.
 6. 6F6-F - Delete `payloadTransportBroken`:
+   - Start with the payload send-owner invariant that came out of the June 25,
+     2026 owner/frontier review. The current post path must not allow
+     `ibv_post_send()` to accept payload WRs before the service has durable
+     retirement/abort state for the resulting signaled CQE.
+   - Implement bounded-capacity plus reserve-before-post for payload
+     send-owner tracking:
+     - keep the existing design bound: one selected grant has a bounded
+       descriptor/WQE count and the stream has bounded in-flight signaled
+       publication owners;
+     - reserve the local send-owner slot before building/posting the WR chain;
+     - commit the owner only after a full post succeeds;
+     - rollback only when zero WRs were accepted;
+     - classify partial post as exact connection poison handled by reset
+       cleanup, not by retrying or by clearing the binding locally.
+   - Rename or at least clearly document `payloadCompletion*` fields as payload
+     send-owner state. These arrays track local send-CQ retirement ownership for
+     signaled payload publication grants; they are not remote byte-ring tail
+     state and not semantic completion state.
+   - Migrate every remaining `payloadTransportBroken` writer to one of the typed
+     transitions already defined in 6F6:
+     - bound transport/protocol poison -> `HomerServiceRequestBoundPayloadReset()`;
+     - local endpoint failure -> `HomerServicePublishLocalPayloadFailure()` plus
+       exact reset only when the live peer binding also needs a QP cutoff;
+     - semantic producer error -> in-band `ERROR+EOS` and normal close;
+     - retryable resource pressure -> blocked/runnable rearm, not failure.
+   - Replace remaining diagnostic reads with typed phase predicates:
+     `failureState.phase`, `closeState.phase`, `resetRequested`, and
+     `resetInProgress`.
    - Remove the field and require `git grep payloadTransportBroken` to return
      zero matches.
+   - Keep byte-ring/fixed-slot unification, fewer-WR byte-ring publication, and
+     in-band tail derivation out of 6F6-F. Those are recorded as a separate
+     follow-up in
+     [`homer_payload_publication_owner_frontier_plan.md`](homer_payload_publication_owner_frontier_plan.md).
 
 Close-6F6-A implementation checkpoint:
 
@@ -8440,12 +8472,11 @@ empty critical polls per transaction
   follow-up design note in
   [`homer_payload_publication_owner_frontier_plan.md`](homer_payload_publication_owner_frontier_plan.md).
   Slice 6F6-F must not treat "payload WRs accepted but owner tracking could not
-  be enqueued" as a normal reset path. The target invariant is reserve owner
-  state before posting, then commit, rollback, or reset based on typed post
-  outcome. The same note records the future byte-ring direction: keep the WIMM
-  immediate as the receiver-issued payload token and derive the byte-ring tail
-  from in-band records so the normal byte-ring path can eventually make the
-  final payload WR itself the WIMM publication WR.
+  be enqueued" as a normal reset path. The immediate 6F6-F step is bounded
+  capacity plus reserve-before-post owner state. The same note records later
+  work that is intentionally outside 6F6-F: byte-ring/fixed-slot unification,
+  fewer-WR byte-ring publication, and deriving the byte-ring tail from in-band
+  records while keeping the WIMM immediate as the receiver-issued payload token.
 - Slices 6 and 7 are not implementation-ready from this note alone. Before a
   developer starts either one, expand the target slice with: files/functions
   changed, new fields/API, state transitions, failure behavior, ABI bump,
