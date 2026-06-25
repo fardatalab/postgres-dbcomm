@@ -8975,6 +8975,27 @@ Recovery implementation plan:
 
    - Do not reorder CQEs inside one CQ batch. Semantic priority starts only
      after CQEs have been decoded into typed readiness.
+   - Status as of June 25, 2026: implemented and validated. The machine-baseline
+     pump now executes three explicit phases inside `TupleSinkServicePumpOnce()`:
+     reset, collector, then semantic. Each phase rebuilds the ready set and
+     machine/collector candidates before planning its grants, so semantic actions
+     see CQ/mailbox readiness materialized by the collector phase instead of the
+     stale facts sampled before physical polling. The generic policy callback is
+     retained but builds only the semantic phase; machine-baseline uses the
+     explicit phase wrapper. Validation artifacts are in
+     `/tmp/homer_4BR3_1782421732`. Results:
+
+     ```text
+     remote c1 smoke: 1000/1000, 0 failures, 540.225750 TPS
+     warm remote c1: 10000/10000, 0 failures, 4271.275544 TPS
+     warm remote c4: 40000/40000, 0 failures, 10845.860528 TPS
+     remote RDMA basebackup: run 1 6.00 s, run 2 4.15 s
+     ```
+
+     Caveat: this stage restores the collector-before-semantic execution
+     boundary, but the peer recv-CQ/CM/lifetime collector still uses the existing
+     compatible peer-collector bundle. Per-lane bounded liveness and exact
+     foreground/bulk poll-gap tracking remain 4B-R4 work.
 5. 4B-R4 - guarantee bounded physical discovery:
    - Maintain per connection:
 
