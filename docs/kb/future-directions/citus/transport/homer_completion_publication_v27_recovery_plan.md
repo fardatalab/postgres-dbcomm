@@ -8585,6 +8585,27 @@ Slice 4B scheduler-priority checkpoint on 2026-06-25:
 - Validation: no-stats Citus/Homer `service-bin client-bin` compiled
   successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
 
+Slice 4C budget/backoff checkpoint on 2026-06-25:
+
+- Raised the default machine-baseline payload grant budget from two to three
+  grants per pass in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  This is the smallest budget that can express the planned two foreground
+  payload grants plus one bulk payload grant in one pass.
+- Foreground payload admission is now capped at two grants per pass. When both
+  graceful close/reclaim and bulk payload are ready, foreground is capped at one
+  grant so the three-grant budget can still admit one close/reclaim grant and
+  one bulk grant.
+- Exact/nonblind collectors no longer use feedback backoff at the local-control
+  slot collector or heartbeat collector admission sites. Send-CQ relief and
+  exact critical recv-CQ demand already bypassed feedback backoff. Blind
+  peer-collector backoff remains only in the late peer collector bundle.
+- The already-landed exact critical recv-CQ action still uses one poll batch and
+  eight CQEs per grant. Exact control-mailbox scheduling still grants at most
+  two actions per pass with sixteen messages per action.
+- Validation: no-stats Citus/Homer `service-bin client-bin` compiled
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+
 ## Slice 5: Remove Remaining Client Hot-Path Copies
 
 ### 5A Completion View
