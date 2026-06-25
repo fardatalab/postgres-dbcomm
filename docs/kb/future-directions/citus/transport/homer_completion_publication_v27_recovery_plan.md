@@ -6694,9 +6694,47 @@ Close-6F6-B3 close-protocol poison checkpoint:
 - Validation: formatted `tuple_sink_service_process.c` with
   `git clang-format HEAD` and rebuilt Homer service/client with
   `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
-  Runtime validation was not repeated for this checkpoint because these are rare
-  close error branches and the prior B2 runtime run had already exercised normal
-  close/quiescence.
+	  Runtime validation was not repeated for this checkpoint because these are rare
+	  close error branches and the prior B2 runtime run had already exercised normal
+	  close/quiescence.
+
+Close-6F6-B4 receive-side payload-protocol/send-CQ checkpoint:
+
+- Added narrow typed transition wrappers in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`:
+  - `HomerServiceRequestBoundPayloadProtocolReset()` for a live peer binding whose
+    peer-visible payload header, object, sequence, or doorbell state is no longer
+    trustworthy.
+  - `HomerServiceRequestBoundPayloadSendCqReset()` for hard receiver-credit ACK
+    send-CQ/accounting failures after temporary source/SQ pressure has already
+    been separated by `HomerServiceHandleReceiverHeadAckPostFailure()`.
+- Migrated the receive-side hard-failure branches in:
+  - `HomerServicePublishReceiverCreditForStream()` immediate-data failure.
+  - `HomerServicePumpIncomingByteRingPayload()` ACK-CQ drain failure, head-ACK
+    immediate-data failures, invalid incoming byte-ring transport header, invalid
+    byte-ring boundary crossing, and invalid received byte-ring object.
+  - `HomerServicePumpIncomingPayloadStream()` ACK-CQ drain failure, head-ACK
+    immediate-data failure, invalid incoming payload transport header, published
+    header mismatch, receive sequence mismatch, and invalid received fixed-slot
+    payload object.
+- Kept local missing queue/ring state, local blackhole validation, sender-side
+  producer/object validation, final-head ambiguous failures, and exact
+  `CLOSE_SINK` publication failure out of this checkpoint. Those are not all
+  proven transport poison:
+  - local missing queue/ring state belongs to 6F6-C local endpoint/pre-binding
+    classification;
+  - semantic producer failures belong to 6F6-D `ERROR+EOS` and normal close;
+  - `TupleSinkServiceStartPeerRequestOnConnectionRdma()` still returns only
+    `bool`, so classifying all exact-close publication failures as reset would
+    risk treating resource pressure as protocol poison.
+- Reconfirmed that the central reset write gate already exists in
+  `TupleSinkServicePrepareConnectionForWrite()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c`.
+- Validation: formatted `tuple_sink_service_process.c` with
+  `git clang-format HEAD` and rebuilt Homer service/client with
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+  Runtime validation was not repeated for this checkpoint because it changes hard
+  failure branches only; normal-path runtime validation remains the B2 run above.
 
 Close-6F6 pulls one safety item from 6F7 forward:
 
