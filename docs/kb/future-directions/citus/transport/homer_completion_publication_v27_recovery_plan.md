@@ -8584,6 +8584,10 @@ Slice 4B scheduler-priority checkpoint on 2026-06-25:
   guarantee.
 - Validation: no-stats Citus/Homer `service-bin client-bin` compiled
   successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+- Status after commit-boundary validation: this implementation is superseded by
+  the Slice 4B recovery plan below. The priority intent remains correct, but
+  the implementation used one single-phase plan, late physical discovery, and a
+  payload-band exclusion that can invert payload/close dependencies.
 
 Slice 4C budget/backoff checkpoint on 2026-06-25:
 
@@ -8753,6 +8757,280 @@ Slice 4 commit-boundary validation on 2026-06-25:
   critical-completion observation or late peer-collector work to remain hot
   while the result-sink payload/completion path needed by `pgbench` is not
   granted in the right order or is not rearmed as expected.
+
+Slice 4 recovery decision after the 4B commit-boundary failure:
+
+- Slice 4A is sound and remains the baseline instrumentation slice.
+- Slice 4E is independent of the scheduler bug and should be retained, but it
+  must be revalidated on a known-correct scheduler baseline.
+- Slice 4B is the first bad commit. Slice 4C and Slice 4D inherit its
+  correctness failure and are not valid performance data until 4B is replaced.
+- The failure is not just a slightly bad priority order. The deeper defect is
+  that the 4B planner treats ready actions on one machine as substitutable.
+  They are not: close/reclaim can depend on normal payload progress; terminal
+  completion can depend on payload and send-CQ progress; semantic readiness can
+  depend on physical recv-CQ discovery.
+
+Concrete 4B defects to fix:
+
+1. The band helper in
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+   `HomerServiceMachineBaselineAppendMachineActionsInBand()`, filters machines
+   by a required action bit but then calls the generic
+   `HomerServiceMachineBaselineAppendMachineAction()`. The generic helper
+   independently chooses an action from the full `readyActionMask`. Therefore a
+   "close band" currently means "machines that contain close/reclaim" rather
+   than "append exactly `PAYLOAD_CLOSE_RECLAIM`."
+2. The compensating `excludeCloseReclaim` argument skips an entire payload
+   stream in foreground/bulk bands whenever close/reclaim is present. That is
+   unsafe because one stream can simultaneously have normal payload bytes/EOS
+   ready and close ownership that cannot complete until those bytes are posted,
+   retired, consumed, or acknowledged.
+3. Physical recv-CQ discovery was moved late into a bounded, single-phase plan.
+   A foreground payload WIMM cannot create a payload-ready fact until the
+   foreground recv CQ is polled. Exact critical-completion recv-CQ demand polls
+   the critical-control lane only; it does not discover foreground payload
+   WIMMs.
+4. Dependency collectors that can satisfy owned-but-blocked machines were
+   treated as late liveness work. Some collector families are dependency
+   satisfiers, not optional maintenance.
+
+Likely 4B deadlock shape:
+
+```text
+backend produces result payload and terminal/EOS
+payload stream has normal payload work and close/reclaim ownership
+foreground/bulk payload band skips the stream because close is present
+close band selects close/reclaim or keeps it hot
+close cannot complete because required payload frontier is not posted/drained
+terminal completion remains blocked on result payload
+frontend waits, while critical-completion observation remains active
+```
+
+A second possible and compatible failure is foreground recv-CQ discovery
+starvation:
+
+```text
+critical completion demand remains hot
+foreground payload CQ polling is late, backed off, or omitted
+payload WIMM is not decoded into typed readiness
+result payload remains invisible to the semantic scheduler
+terminal completion remains blocked
+```
+
+Recovery implementation plan:
+
+1. 4B-R0 - restore a correct scheduler baseline:
+   - Temporarily restore the 4A machine-baseline planner.
+   - Keep 4A instrumentation and the 4E basebackup terminal-check throttling.
+   - Disable/revert the 4B priority planner, the 4C budget policy, and the 4D
+     bitset enumeration while rebuilding correctness.
+   - Acceptance: remote c1 smoke, warmed c1, warmed c4, one result-returning SQL
+     command, and warmed remote basebackup all complete.
+   - Do not fix this by raising `max_plan`, `max_machine`, or `max_payload`;
+     that can hide the inversion without restoring the dependency contract.
+2. 4B-R1 - make requested machine actions explicit:
+   - Add:
+
+     ```c
+     typedef enum HomerPlanAppendResult
+     {
+         HOMER_PLAN_APPEND_NOT_READY = 0,
+         HOMER_PLAN_APPEND_APPENDED,
+         HOMER_PLAN_APPEND_BUDGET_FULL,
+         HOMER_PLAN_APPEND_ERROR
+     } HomerPlanAppendResult;
+     ```
+
+   - Add an action-specific append helper:
+
+     ```c
+     static HomerPlanAppendResult
+     HomerServiceMachineBaselineAppendMachineActionKind(
+         HomerMachineBaselinePlanBudget *budget,
+         HomerProgressExecutionPlan *plan,
+         const HomerProgressMachineFacts *machine,
+         HomerProgressActionKind actionKind);
+     ```
+
+   - It must require the requested action bit, append exactly `actionKind`, and
+     return `BUDGET_FULL` without consuming readiness.
+   - Delete `excludeCloseReclaim`. A band must select an action, not suppress a
+     whole machine because another action is also ready.
+3. 4B-R2 - define normal payload versus close precedence:
+   - A stream with normal payload work and close/reclaim work should first get
+     the normal payload action. In the first implementation, do not append close
+     for the same stream in the same semantic phase.
+   - A stream with close/reclaim ready but no normal payload prerequisite can
+     get the close/reclaim action.
+   - Add:
+
+     ```c
+     static bool
+     HomerServicePayloadMustProgressBeforeClose(
+         const HomerServicePayloadStreamEntry *stream);
+     ```
+
+   - For a local send stream, return true while producer-published bytes,
+     required final tail, fragment state, EOS, or final payload publication still
+     need normal payload progress.
+   - For a local receive stream, return true while receive frontier exceeds
+     consumed frontier, ready-queue membership remains, or an active payload
+     executor still owns the stream generation.
+   - `PAYLOAD_CLOSE_RECLAIM` must not be marked runnable while this predicate is
+     true, except for an independently runnable close sub-transition such as
+     send-CQ retirement that does not depend on normal payload execution.
+   - Add a diagnostic counter: `closeSelectedWhileNormalPayloadReady`; acceptance
+     requires zero in normal validation.
+4. 4B-R3 - make the service pass collector-first:
+   - Split a pass into:
+
+     ```text
+     Phase 0: exact connection reset actions
+     Phase 1: physical/local event collectors
+     Phase 2: rebuild typed machine facts and execute semantic actions
+     ```
+
+   - Concrete flow:
+
+     ```text
+     HomerServiceBuildResetPlan()
+     HomerServiceExecutePlan()
+
+     HomerServiceBuildCollectorPlan()
+     HomerServiceExecutePlan()
+
+     HomerServiceRefreshMachineCandidates()
+     HomerServiceBuildSemanticPlan()
+     HomerServiceExecutePlan()
+     ```
+
+   - Collector phase order:
+
+     ```text
+     1. command/completion send-CQ relief
+     2. payload/head-ACK send-CQ relief
+     3. exact critical-completion recv-CQ demand
+     4. due critical-control recv-CQ liveness
+     5. due foreground-payload recv-CQ liveness
+     6. local-control slot collection
+     7. due bulk recv-CQ and CM/lifetime maintenance
+     ```
+
+   - Do not reorder CQEs inside one CQ batch. Semantic priority starts only
+     after CQEs have been decoded into typed readiness.
+5. 4B-R4 - guarantee bounded physical discovery:
+   - Maintain per connection:
+
+     ```c
+     uint64_t lastRecvCqPollServicePass;
+     uint64_t nextRecvCqLivenessPass;
+     ```
+
+   - Initial maximum poll gaps:
+
+     ```text
+     critical control: 1-4 service passes
+     foreground result-payload lanes: 1-4 service passes while a result stream is active
+     bulk lanes: 8-64 service passes when no exact ready fact exists
+     ```
+
+   - Split `HomerServiceMachineBaselineAppendWaitingCollectorActions()` into
+     exact dependency collectors, blind discovery collectors, and maintenance
+     collectors. Exact dependency collectors are early and not feedback-backed
+     off; blind discovery collectors use bounded liveness; maintenance remains
+     late and backoff eligible.
+6. 4B-R5 - add per-band fairness:
+   - Add round-robin cursors for command sessions, remote command senders,
+     foreground payload, close/reclaim, bulk payload, and control mailbox.
+   - A "two foreground grants per pass" quota is fair only if the starting
+     stream rotates.
+
+4C recovery after 4B-R1 through 4B-R5 pass:
+
+- Reintroduce budget tuning as quotas, not insertion-order side effects:
+
+  ```text
+  foreground payload: up to 2 grants per pass
+  close/reclaim: up to 1 grant per pass, only when payload prerequisites are absent
+  bulk payload: at least 1 grant per pass when ready
+  ```
+
+- Do not use extra full candidate-set scans to decide whether to reserve bulk
+  or close capacity. Candidate construction should maintain summary counts such
+  as:
+
+  ```c
+  uint16_t foregroundPayloadReadyCount;
+  uint16_t closePayloadReadyCount;
+  uint16_t bulkPayloadReadyCount;
+  ```
+
+  The planner then reads O(1) summaries instead of scanning all candidates for
+  `bulkPayloadReady` and `closePayloadReady`, then scanning again per band.
+- Heartbeat and other maintenance collectors must be due-based, not
+  unconditional every-pass collectors. Disabling feedback backoff must not turn
+  them into a hot empty-poll source.
+
+4D recovery after repaired 4B/4C:
+
+- Reapply bitset session-machine enumeration only after the scheduler passes
+  correctness validation.
+- Add diagnostic invariant audit counters:
+
+  ```text
+  commandOwnedInvariantViolations
+  completionOwnedInvariantViolations
+  staleSessionPendingBits
+  ```
+
+- Acceptance requires zero invariant violations.
+- Verify every transition that increments
+  `clientSqlRemoteCommandOutstandingWriteCount` retains or sets the command
+  pending bit before returning to the service loop.
+
+Additional Slice 4 instrumentation for the next reproduction:
+
+```text
+payloadDataAndCloseReady
+payloadDataSkippedForClose
+closeSelectedWhilePayloadRequired
+foregroundPayloadCandidates
+foregroundPayloadGrants
+closeCandidates
+closeGrants
+
+criticalRecvCqPolls
+foregroundRecvCqPolls
+bulkRecvCqPolls
+maxCriticalRecvPollGap
+maxForegroundRecvPollGap
+
+terminalCompletionBlockedOnPayload
+terminalCompletionRearmedByPayload
+terminalCompletionRearmedBySendCq
+
+peerCollectorBundleCandidates
+peerCollectorBundleGrants
+peerCollectorBundleBudgetOmissions
+peerCollectorBundleBackoffSkips
+```
+
+On a stall, dump one diagnostic line for the affected command/result stream:
+
+```text
+command sequence
+result generation
+required result tail
+sender posted/completed tail
+receiver published/consumed tail
+readyActionMask
+selected action
+close phase
+failure phase
+send-owner count
+critical/foreground CQ last-poll passes
+```
 
 ## Slice 5: Remove Remaining Client Hot-Path Copies
 
@@ -9032,7 +9310,7 @@ empty critical polls per transaction
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Completion owned/runnable rearm correctness validated; remaining signaled-owner FIFO counts are performance cleanup |
 | Slice 3D    | 3D-0 through 3D-6 exact-control cleanup, Close-1 through Close-3, the Close-3 remote-head gate optimization, and Close-4A through Close-4E receiver quiescence/tombstone are implemented and validated |
-| Slice 4     | Updated after Close-6F; implementation-ready as scheduler priority/budget work starting with 4A baseline counters |
+| Slice 4     | 4A instrumentation validated and 4E retained; 4B is first bad and must be replaced by 4B-R0 through 4B-R5 before reapplying 4C/4D |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
 | Slice 6     | Backlog summary; needs a stage-template expansion before implementation              |
