@@ -6754,6 +6754,37 @@ Close-6F6-C1 local blackhole structural failure checkpoint:
   `git clang-format HEAD` and rebuilt Homer service/client with
   `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
 
+Close-6F6-C2 forced-terminal duplicate suppression checkpoint:
+
+- Implemented the executable duplicate rule for reset-driven SQL tuple-result
+  failures. `TupleSinkServiceSessionState` now retains
+  `locallyForcedTerminalCommitted` and `locallyForcedTerminalSequence` after the
+  transient `forcedCommandFailure` request is cleared
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1022`).
+- `HomerServicePublishForcedCommandFailure()` records that marker only after the
+  frontend-local forced terminal completion is actually published
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18325`).
+  This is intentionally narrower than merely arming a forced failure request:
+  unsupported or non-delivered paths must not suppress a later terminal record.
+- `TupleSinkServiceConsumeCompletionMailbox()` now checks
+  `HomerServiceCompletionSupersededByForcedFailure()` before copying a backend
+  completion into the session current-command fields
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17138`).
+  When a terminal completion for the already-forced sequence arrives, the service
+  acknowledges exactly that mailbox epoch, retains any remaining local pending
+  completion work through `HomerServiceRetainRemainingCompletionMailboxWork()`,
+  and returns without publishing a second frontend-visible terminal completion.
+- This checkpoint does not implement the broader 6F6-D semantic `ERROR+EOS`
+  state. It only closes the concrete forced-failure idempotence rule needed when
+  a backend/peer terminal was already in flight before the local reset-driven
+  terminal committed.
+- Validation: `git diff --check` passed, `git clang-format HEAD` left
+  `tuple_sink_service_process.c` unchanged, and Homer service/client rebuilt
+  successfully with
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+  Runtime validation was not repeated because this is a defensive reset-race
+  path, not a normal-path scheduler or transport hot-path change.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
