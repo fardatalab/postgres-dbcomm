@@ -6736,6 +6736,24 @@ Close-6F6-B4 receive-side payload-protocol/send-CQ checkpoint:
   Runtime validation was not repeated for this checkpoint because it changes hard
   failure branches only; normal-path runtime validation remains the B2 run above.
 
+Close-6F6-C1 local blackhole structural failure checkpoint:
+
+- Migrated two no-peer-binding local basebackup blackhole structural failures in
+  `HomerServicePumpLocalBaseBackupBlackhole()` from direct
+  `payloadTransportBroken = true` to `HomerServicePublishLocalPayloadFailure()`:
+  - missing local producer byte ring;
+  - zero-sized local producer byte ring.
+- These are local endpoint/setup-state failures, not peer-transport poison. The
+  helper publishes local terminal `FAILED` state and does not request a peer QP
+  reset.
+- Intentionally did not migrate invalid local blackhole producer records in this
+  checkpoint. Those may be semantic producer/contract failures and need the 6F6-D
+  `ERROR+EOS`/semantic-error classification rather than a blanket local terminal
+  conversion.
+- Validation: formatted `tuple_sink_service_process.c` with
+  `git clang-format HEAD` and rebuilt Homer service/client with
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
