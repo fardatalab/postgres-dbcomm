@@ -8382,8 +8382,21 @@ zero semantic fallback mailbox scans remain
 
 Do not add another QP/CQ as the next step. The current transport already maps
 traffic classes onto separate QP/CQ-owning connections, and basebackup opens on
-the replication lane. Stage 7d should tune the two-phase collector/semantic
-service pass from Slice 2 into service CPU/progress isolation:
+the replication lane. Stage 7d should tune the existing lane-separated
+transport and typed action scheduler. It must not reopen the ownership
+contracts repaired by Slices 2/3 and Close-6:
+
+- canonical recv-CQ ownership is established;
+- payload readiness is direct token/generation state;
+- exact critical recv-CQ demand exists;
+- exact control-mailbox readiness exists;
+- typed post results exist;
+- exact reset and payload-failure actions exist;
+- `payloadTransportBroken` has been removed.
+
+Slice 4 is therefore scheduler-budget and fairness work: candidate enumeration
+cost, action ordering, per-pass budgets, blind collector backoff, and fairness
+between foreground SQL, control, graceful close, failure/reset, and bulk payload.
 
 1. Assert lane placement at bind/open:
    `CRITICAL_CONTROL` for client command/completion,
@@ -8392,16 +8405,26 @@ service pass from Slice 2 into service CPU/progress isolation:
 2. Use fixed service-loop priority with bounded per-pass work:
 
    ```text
-   pending CPU completion publications: up to 32
-   critical recv-CQ: one CQ batch per demanded connection
-   remote command forwarding: up to 8 commands
-   source-pressure send-CQ retirement: one CQ batch
-   foreground payload: up to 2 grants
-   peer control: one grant
-   bulk payload: at least one grant when ready
-   maintenance/lifetime: once every 64 passes or immediately when overdue
+   1. exact connection reset actions
+   2. reset-complete / payload failure delivery / failure finalization
+   3. send-CQ/source-owner relief for critical command/completion lanes
+   4. pending CPU completion publications: up to 32
+   5. exact critical client-completion recv-CQ demand: one CQ batch per
+      demanded connection
+   6. remote command forwarding: up to 8 commands
+   7. exact control-mailbox actions
+   8. foreground SQL payload: up to 2 grants
+   9. graceful payload close/reclaim
+   10. bulk/basebackup payload: at least one grant when ready
+   11. blind liveness collectors and maintenance
    ```
 
+   Reset runs first because QP teardown is the physical cutoff that prevents
+   old WIMMs/RDMA writes from reaching reclaimed state. Failure delivery must not
+   starve behind normal payload. Send-CQ/source-owner relief precedes or is
+   co-equal with critical recv-CQ because the rejected 3B path showed that hot
+   empty CQ polling can starve owner retirement and block the producer side that
+   must generate the desired terminal event.
 3. Suppress basebackup's bounded producer-frontier busy spin while critical
    command demand is nonzero.
 4. Prioritize which connection/CQ is polled first in the collector phase:
@@ -8423,6 +8446,32 @@ their values without changing ownership semantics. Basebackup producer-frontier
 busy spin is disabled whenever any critical connection has
 `clientCommandsAwaitingTerminal > 0`.
 
+Slice 4 instrumentation:
+
+```text
+actionsBuiltByKind[]
+actionsExecutedByKind[]
+actionsSkippedStaleByKind[]
+actionsRearmedByKind[]
+collectorPollsByLane[]
+collectorEmptyPollsByLane[]
+semanticProgressByKind[]
+planBudgetExhaustedByKind[]
+payloadFailureActions
+resetActions
+```
+
+Validation must show:
+
+```text
+reset/failure actions do not remain ready across many passes
+critical recv-CQ empty polls are bounded
+send-CQ relief executes while critical demand exists
+bulk payload gets at least one grant when ready
+foreground c4 has zero failed transactions
+basebackup makes progress during c4+basebackup
+```
+
 Minimum no-stats medians before calling Stage 7d performance recovered:
 
 ```text
@@ -8433,7 +8482,75 @@ concurrent c1 p99 increase: below 10%
 concurrent c4: zero failures and zero completion mismatches
 ```
 
-The target band remains roughly `4.5k` c1 and `11.2k` c4.
+Also apply a regression guard against the latest post-6F no-stats baseline:
+
+```text
+remote c1 median: no worse than 3% below the latest 6F median
+remote c4 median: no worse than 3% below the latest 6F median
+remote basebackup median: no worse than 3% above the latest 6F median
+```
+
+The target band remains roughly `4.5k` c1 and `11.2k` c4. Because current
+warmed remote basebackup has been around `4.17-4.18 s`, do not accept a
+`4.39 s` basebackup result merely because it passes the older `4.4 s` absolute
+threshold.
+
+Implementation order:
+
+1. Slice 4A - Baseline after 6F:
+   run and record warmed c1, warmed c4, warmed remote basebackup, and concurrent
+   c4 plus basebackup before changing scheduling. Prefer five warmed repeats for
+   c1/c4/basebackup and three concurrent repeats when time permits. Collect the
+   action/grant counters before using a single run to guide tuning.
+2. Slice 4B - Scheduler priority update:
+   implement reset/failure first, send-CQ relief before or co-equal with
+   critical recv-CQ, and at least one bulk grant when bulk is ready. No ABI
+   changes.
+3. Slice 4C - Budget and backoff tuning:
+   start with critical recv-CQ at one batch / eight CQEs, control mailbox at two
+   actions per pass, foreground payload at two grants per pass, bulk at least
+   one grant per pass, and blind-collector backoff only for empty blind
+   collectors. Do not back off exact reset, failure, send-CQ relief, or
+   critical-demand actions.
+4. Slice 4D - Scan reduction:
+   measure `schedulerReadyMachinesScanned` and active table scans. Replace only
+   the highest-cost remaining scan with exact ready facts. Do not redesign the
+   whole scheduler in one patch.
+5. Slice 4E - Basebackup micro-optimization:
+   first throttle terminal-state checks in the reserve busy-wait loop. Then, as
+   a separate measured A/B sub-slice, test 64-byte byte-ring-control padding.
+   Padding requires a local ABI bump and is not a required Slice 4 dependency.
+6. Slice 4F - Concurrent validation:
+   run warmed c4, warmed basebackup, concurrent c4 plus basebackup, a semantic
+   `ERROR+EOS` runtime test, and a small reset/failure smoke. Full deterministic
+   Close-6F8 fault-injection remains valuable but is not a Slice 4 prerequisite
+   when the normal workloads remain clean.
+
+Slice 4A instrumentation checkpoint on 2026-06-25:
+
+- Added the missing action-budget diagnostics in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`:
+  `progressActionGrantCountByKind[]`, `staleActionGrantCountByKind[]`,
+  `rearmedActionGrantCountByKind[]`,
+  `budgetExhaustedActionGrantCountByKind[]`,
+  `collectorPollsByTrafficClass[]`, and
+  `collectorEmptyPollsByTrafficClass[]`.
+- `HomerServiceProgressStatsRecordActionGrantResult()` now records action-level
+  productive grants, rearmed grants, and budget-exhausted grants from the
+  scheduler-facing `HomerProgressResult`.
+- Exact stale skips are counted at the executor validation boundary for critical
+  recv-CQ actions, exact control-mailbox actions, exact reset actions,
+  target-completion publication actions, and payload actions selected with a
+  stale owner.
+- Lane poll stats are recorded only when the executor reports an exact physical
+  CQ poll count. Today that is the demanded critical-control recv-CQ drain via
+  `TupleSinkServiceDrainCriticalCompletionRecvCqRdma()`. Broad peer pumps must
+  not synthesize lane poll counts from message progress or connection scans.
+- Validation: Citus/Homer `service-bin client-bin` compiled successfully with
+  normal no-stats `CPPFLAGS='-D_GNU_SOURCE'`, compiled successfully with
+  `HOMER_SERVICE_PROGRESS_STATS=1` and
+  `HOMER_SERVICE_PEER_TRANSPORT_STATS=1`, and was rebuilt again in no-stats mode
+  before performance-sensitive work.
 
 ## Slice 5: Remove Remaining Client Hot-Path Copies
 
@@ -8713,7 +8830,7 @@ empty critical polls per transaction
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Completion owned/runnable rearm correctness validated; remaining signaled-owner FIFO counts are performance cleanup |
 | Slice 3D    | 3D-0 through 3D-6 exact-control cleanup, Close-1 through Close-3, the Close-3 remote-head gate optimization, and Close-4A through Close-4E receiver quiescence/tombstone are implemented and validated |
-| Slice 4     | Sufficiently detailed to start after Slice 2/3 readiness                             |
+| Slice 4     | Updated after Close-6F; implementation-ready as scheduler priority/budget work starting with 4A baseline counters |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
 | Slice 6     | Backlog summary; needs a stage-template expansion before implementation              |
@@ -8733,7 +8850,8 @@ empty critical polls per transaction
    control indexed readiness, resource-pressure bitmap.
 
 4. Critical-first Stage 7d service scheduling:
-   no additional QP, no dedicated thread, suppress bulk spin under foreground load.
+   no additional QP, no dedicated thread, reset/failure first, send-CQ relief
+   before hot recv-CQ demand, and suppress bulk spin under foreground load.
 
 5. Remove client legacy completion reconstruction and full pre-arm copies.
 
