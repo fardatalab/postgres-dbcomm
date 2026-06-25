@@ -7512,6 +7512,42 @@ Close-6F6-D3 tuple-view semantic error producer API checkpoint:
   - Runtime RDMA validation was not repeated because the new API is not yet
     called by any semantic producer path.
 
+Close-6F6-D4 socketless SQL semantic error wiring checkpoint:
+
+- Wired tuple-view semantic error publication into the socketless SQL producer
+  path in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c`.
+  `RemoteExecBackendExecuteSqlCommand()` now handles executor errors while its
+  `RemoteExecSqlResultDestReceiver` is still live.
+- Added `RemoteExecSqlResultPublishSemanticError()`. When a tuple-result stream
+  has already been opened and the producer catches a SQL error, it publishes one
+  `CitusTupleSinkErrorRecord` through `PublishCitusTupleSinkErrorRecord()`,
+  marks the result stream as failed/EOS in local metadata, and then lets the
+  original PostgreSQL exception continue unwinding.
+- The outer command-loop catch still owns transaction abort and failed command
+  completion publication. It now passes the result metadata into
+  `PublishCompletionToMailbox()` so the failed command completion can carry the
+  already-created tuple-sink descriptor plus `TUPLE_SINK_EOS` and
+  `TUPLE_SINK_FAILED` flags.
+- This is intentionally limited to live tuple-view producer failures. If a
+  failure happens before the result stream is opened, no in-band payload error
+  is published and the normal failed command completion remains the only
+  terminal event. Transport/reset failures still use the out-of-band terminal
+  `FAILED` channel and must not call this path.
+- The helper uses the PostgreSQL SQLSTATE as both the current `sqlState` and
+  provisional `errorCode`. A later stable Homer semantic-error enum can refine
+  `errorCode` without changing the transport record shape.
+- Validation:
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/remote_execution_backend_bridge.c`
+    was applied.
+  - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
+  - Broader Citus extension build passed as `dbcomm` with
+    `sudo -n -u dbcomm make -j8 CPPFLAGS='-D_GNU_SOURCE'`.
+  - Runtime semantic-error validation is still needed after install/sync: issue
+    a row-producing SQL command that fails after result-stream startup and
+    verify the peer consumes exactly one tuple-view `ERROR+EOS` and one failed
+    command completion, with no duplicate terminal completion.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
