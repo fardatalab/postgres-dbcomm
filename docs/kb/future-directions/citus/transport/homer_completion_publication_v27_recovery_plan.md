@@ -7230,6 +7230,52 @@ Close-6F6-E scheduler-ownership implementation checkpoint:
     generation consistency, `QUIESCED -> FAILED` handling, reset-ready queue
     exact removal checks, and deterministic fault-injection coverage.
 
+Close-6F6-C5 receive-side local endpoint cleanup checkpoint:
+
+- Added `HomerServiceFailReceivePayloadAndResetPeer()` for receive-side local
+  endpoint defects discovered after a peer binding exists. The helper publishes
+  local terminal `FAILED` when the local queue/byte-ring control still exists,
+  then requests exact `HOMER_PEER_RESET_PAYLOAD_PROTOCOL` reset because QP
+  teardown remains the only old-WIMM/old-RDMA cutoff for a bound stream
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22208`).
+- Migrated the tuple byte-ring receive branch in
+  `HomerServicePumpIncomingByteRingPayload()` from direct
+  `payloadTransportBroken = true` to the new helper when the backend-visible
+  receive byte-ring control is missing or zero-sized
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:27734`).
+- Migrated the basebackup/non-tuple byte-ring receive branch in the same
+  function from direct `payloadTransportBroken = true` to the new helper when
+  the local receive byte-ring control/storage is missing or invalid
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:27843`).
+- These branches now return successful service progress once exact reset
+  ownership is established, rather than surfacing the payload executor itself as
+  failed. If local terminal publication is impossible because the local control
+  object is already absent, the helper logs that fact and still requests reset
+  for the transport cutoff.
+- Validation:
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    was applied.
+  - `git diff --check` passed.
+  - Homer service/client rebuilt and installed as `dbcomm`, and the installed
+    prefix was synced to `farnet0`.
+  - Fresh-service remote c1 cold setup run: `20000/20000`, zero failures,
+    `3321.672602 TPS`, initial connection `1204.971 ms`; this is not a warm
+    performance sample.
+  - Warm remote c1 repeat: `20000/20000`, zero failures, `4374.103035 TPS`,
+    p99 `0.249 ms`.
+  - Warm remote c4: first repeat `10574.418262 TPS`, second repeat
+    `10888.054199 TPS`, both `40000/40000` with zero failures.
+  - Remote RDMA basebackup blackhole: warmup `5.49 s`, warmed repeat `4.18 s`.
+  - Service-log scans on both hosts found no reset, abort, forced-failure,
+    stale-token, protocol, mismatch, fatal, late-WIMM, owner-corruption,
+    partial-post, receive-failure, or payload-failure-action diagnostics on the
+    normal validation path.
+- Remaining direct `payloadTransportBroken = true` writers are intentionally not
+  bulk-replaced in this checkpoint. They are mostly send-side and mixed
+  publication/owner branches around outgoing byte-ring and fixed-slot payload
+  send, and need their own classification because some are retryable pressure,
+  some are semantic producer errors, and some are bound transport poison.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
