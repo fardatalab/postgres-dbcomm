@@ -9016,7 +9016,7 @@ Recovery implementation plan:
      keyed by service pass:
 
      ```c
-     #define HOMER_RECV_CQ_LIVENESS_WHEEL_SLOTS 64U
+     #define HOMER_RECV_CQ_LIVENESS_WHEEL_SLOTS 128U
 
      typedef struct HomerRecvCqLivenessWheelSlot
      {
@@ -9089,6 +9089,66 @@ Recovery implementation plan:
      collectors. Exact dependency collectors are early and not feedback-backed
      off; blind discovery collectors use bounded liveness; maintenance remains
      late and backoff eligible.
+
+   Implementation attempt and current blocker on 2026-06-25:
+
+   - The current unvalidated implementation adds exact
+     `HomerRecvCqLivenessAction` payloads, a transport-owned timing wheel, and
+     per-connection liveness fields in
+     `src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c`.
+     The wheel uses 128 slots rather than 64 so the maximum bulk/maintenance
+     delay of 64 passes cannot alias the current bucket.
+   - `TupleSinkServicePumpOnce()` now advances one stable service-pass counter
+     before the machine-baseline reset/collector/semantic phases, and
+     `HomerServiceBuildProgressCollectorCandidates()` asks the transport for
+     exact due recv-CQ liveness actions. The broad peer-collector bundle no
+     longer includes `TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_RECV_CQ`.
+   - Two small corrections were made during validation:
+     - post-bootstrap liveness is armed for the next service pass rather than
+       the current pass, because setup can finish after the current pass's
+       collector candidates were already sampled;
+     - exact timing-wheel liveness actions are not charged against
+       `maxBlindCollectorGrants`, because they are already paced by the wheel and
+       are now the only discovery path for WIMMs that have no semantic ready fact
+       yet.
+   - Validation is not complete and the Citus changes must not be committed as a
+     completed stage. A contaminated first run accidentally reused old services
+     and therefore is not acceptance evidence. Clean runs fail:
+
+     ```text
+     /tmp/homer_4BR4_clean_1782423605:
+       remote c1 smoke failed after setup timeout
+       farnet1: timed out progressing outgoing RDMA setup phase=3
+       farnet0: send-CQ drain failure status=10
+
+     /tmp/homer_4BR4_retry_1782424152:
+       remote c1 smoke timed out waiting for Homer service progress
+       farnet1: recv-CQ drain failure, opcode=21909, status=5
+       farnet0: send-CQ drain failure, opcode=0, status=10
+
+     /tmp/homer_4BR4_stats_1782424309:
+       same failure with progress/peer-transport stats enabled
+       farnet1: canonical critical-control recv CQ reset after status=5
+       farnet0: critical-control send CQ reset after status=10
+     ```
+
+   - Leading diagnosis: the first setup-timeout failure was caused by admitting
+     blind recv-CQ liveness before CM/setup and listener progress; moving the
+     peer setup/send/lifetime bundle before liveness removed that symptom. The
+     remaining failure is stronger: the exact liveness path reaches canonical
+     polling, then the critical-control QP enters error/teardown during the first
+     remote c1 command. This suggests that removing broad recv-CQ polling exposed
+     another ordering/lifetime dependency around initial critical-control WIMMs
+     or setup handoff, not merely a scheduler-budget starvation.
+   - Next investigation should not increase plan budgets to hide the failure.
+     Inspect the exact ordering between:
+     - `TupleSinkServiceFinishPeerConnectionSetup()` posting notification recvs
+       and arming liveness;
+     - the first exact liveness poll on the critical-control incoming lane;
+     - the first remote command WIMM post and send-CQ retirement on the outgoing
+       lane;
+     - reset request execution after a failed CQE. The target remains exact
+       timing-wheel liveness with no scheduler-side connection-table scan.
 6. 4B-R5 - add per-band fairness:
    - Add round-robin cursors for command sessions, remote command senders,
      foreground payload, close/reclaim, bulk payload, and control mailbox.
