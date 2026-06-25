@@ -6579,6 +6579,37 @@ OK:
     normal owner tracking
 ```
 
+Close-6F6-B0 typed post-result checkpoint:
+
+- Implemented the typed post-result ABI in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h`.
+  `HomerPeerPostStatus` and `HomerPeerPostResult` are defined near line 153.
+- Added typed transport entry points while preserving the old bool wrappers:
+  - `TupleSinkServicePostPeerRegisteredPayloadBatchWithImmediateResultRdma()`
+    in
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:8078`.
+  - `TupleSinkServicePostPeerRegisteredPayloadBatchWithTailImmediateResultRdma()`
+    in
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:8313`.
+  - `TupleSinkServicePostPeerUint64WithImmediateResultRdma()` in
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:8671`.
+- The compatibility wrappers still return the old `bool` behavior. This
+  checkpoint intentionally changes no service policy yet.
+- `TupleSinkServiceMarkPeerPostFailure()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:8029`
+  counts accepted WRs before `badWorkRequest`. A nonzero accepted prefix is
+  classified as `HOMER_PEER_POST_FAILED_PARTIAL`; zero accepted WRs with
+  `ENOMEM`, `EAGAIN`, or `EBUSY` are classified as
+  `HOMER_PEER_POST_WOULD_BLOCK`; other zero-WR failures are
+  `HOMER_PEER_POST_FAILED_ZERO_WR`.
+- Tightened `TupleSinkServicePostWriteScatterGatherInternal()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:4100`
+  so single-WR wrappers preserve the actual post error in `errno`. This avoids
+  classifying a receiver-head ACK post from stale process-global errno.
+- Validation: formatted the touched transport files with `git clang-format HEAD`
+  and rebuilt Homer service/client with
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
