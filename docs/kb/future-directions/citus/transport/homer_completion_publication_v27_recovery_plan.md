@@ -6646,6 +6646,39 @@ Close-6F6-B1 multi-WR payload post migration checkpoint:
   subsequent 6F6 work, not yet as a proven regression: the current result still
   sits inside the recent roughly `10.4k-11.1k` warmed band.
 
+Close-6F6-B2 receiver-head ACK post migration checkpoint:
+
+- Migrated receiver consumed-head ACK publication to the typed single-WR post
+  API:
+  - `HomerServicePostReceiverHeadAck()` now calls
+    `TupleSinkServicePostPeerUint64WithImmediateResultRdma()` at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26914`.
+  - `HomerServiceTryPostFinalReceiverHead()` now uses the same typed helper at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28149`.
+- Added `HomerServiceHandleReceiverHeadAckPostFailure()` at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13413`.
+  Zero-WR `HOMER_PEER_POST_WOULD_BLOCK` rolls back the ACK owner and records
+  local send-resource pressure; hard post failure requests exact connection
+  reset. The close-specific `FINAL_HEAD_SEND_CQ` blocked reason is set only when
+  a close state is active.
+- Migrated normal ACK call sites at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26969`,
+  `:27366`, `:27574`, and `:27892`. These sites no longer mark
+  `payloadTransportBroken` merely because the one-WR ACK post returned
+  retryable resource pressure.
+- Validation after install/sync/service restart:
+  - remote RDMA c1 smoke: `20000/20000`, 0 failures, `3315 TPS`; first
+    post-restart run, correctness only.
+  - remote RDMA c4 warmed repeats: `40000/40000` at `10608 TPS` and
+    `40000/40000` at `10696 TPS`; both had 0 failures.
+  - remote RDMA basebackup: warmup `6.51s`, warmed repeat `4.19s`.
+  - Service log scan on both hosts found no `post_status=`, reset, late-WIMM,
+    protocol, owner-corruption, partial-post, or transport-broken diagnostics.
+- Performance note: the ACK migration preserves the post-B1 c4 band rather than
+  recovering the prior 11.1k pair. Keep this visible for later 6F6/6F7
+  optimization; the correctness change should not be hidden behind benchmark
+  noise.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
