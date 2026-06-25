@@ -7578,8 +7578,20 @@ Close-6F6-E scheduler normal-progress predicate checkpoint:
   - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
   - Homer service/client build passed as `dbcomm` with
     `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
-  - Runtime normal-path validation is still required after no-stats install and
-    sync, because this slice touches payload scheduler entry predicates.
+  - No-stats Citus/Homer service/client binaries were rebuilt and installed as
+    `dbcomm`, and `/data/dbcomm/pg-citus` was synced to `farnet0`.
+  - Fresh-service remote c1 cold setup run: `20000/20000`, zero failures,
+    `3324.078545 TPS`, initial connection `1760.933 ms`; this is not a warm
+    performance sample.
+  - Warm remote c1 repeat: `20000/20000`, zero failures, `4354.096933 TPS`,
+    p99 `0.258 ms`.
+  - Warm remote c4: `40000/40000`, zero failures, `10925.334896 TPS`, p99
+    `0.577 ms`.
+  - Remote RDMA basebackup blackhole: warmup `5.69 s`, warmed repeat `4.25 s`.
+  - Service-log scans found no reset, abort, forced-failure, stale-token,
+    protocol, mismatch, fatal, late-WIMM, owner-corruption, partial-post,
+    failure, or payload-broken diagnostics. The only `farnet0` matches were
+    false positives from compatibility-session lines containing `owner`.
 
 Close-6F6 pulls one safety item from 6F7 forward:
 
