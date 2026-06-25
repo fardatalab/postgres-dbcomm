@@ -7548,6 +7548,39 @@ Close-6F6-D4 socketless SQL semantic error wiring checkpoint:
     verify the peer consumes exactly one tuple-view `ERROR+EOS` and one failed
     command completion, with no duplicate terminal completion.
 
+Close-6F6-E scheduler normal-progress predicate checkpoint:
+
+- Added the planned scheduler predicates in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`:
+  `HomerServicePayloadNormalProgressAllowed()` and
+  `HomerServicePayloadFailureDeliveryReady()`.
+- Routed ordinary payload scheduler/executor entry guards through
+  `HomerServicePayloadNormalProgressAllowed()` for:
+  `HomerServicePayloadStreamCanTryOutgoing()`,
+  `HomerServiceReceiverCreditPublishReady()`,
+  `HomerServicePayloadStreamReasonMasks()`,
+  `HomerServicePumpOutgoingPayloadStream()`,
+  `HomerServicePumpLocalBaseBackupBlackhole()`,
+  `HomerServicePumpIncomingByteRingPayload()`, and
+  `HomerServicePumpIncomingPayloadStream()`.
+- `HomerServicePayloadFailureActionReady()` now uses
+  `HomerServicePayloadFailureDeliveryReady()` as its first exact-action phase
+  filter, so failure delivery remains represented by the service-owned exact
+  failure-ready bit rather than by rediscovering shared queue terminal state.
+- This checkpoint intentionally does not delete `payloadTransportBroken`.
+  `HomerServicePayloadNormalProgressAllowed()` still treats the legacy boolean
+  as a safety block until 6F6-F classifies the remaining writer sites and the
+  field can be removed. Remaining direct reads are intra-executor post-error
+  checks after an executor branch has already marked the stream broken.
+- Validation:
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    was applied.
+  - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
+  - Homer service/client build passed as `dbcomm` with
+    `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+  - Runtime normal-path validation is still required after no-stats install and
+    sync, because this slice touches payload scheduler entry predicates.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
