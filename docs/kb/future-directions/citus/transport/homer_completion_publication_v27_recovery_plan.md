@@ -7426,11 +7426,10 @@ Close-6F6-D1 typed tuple-view error-record substrate checkpoint:
   `FAILED`: semantic producer failure comes from a live producer over a healthy
   queue, while transport/reset failure remains the separate
   `CitusTupleSinkTerminalStatus(FAILED)` channel.
-- This checkpoint deliberately does not yet wire semantic producers or
-  `PollRemoteRecvBatch()` to consume `ERROR`. The next 6F6-D slice must add
-  durable `semanticErrorPending` ownership, emit the error record at the exact
-  result frontier, and migrate the remote tuple-view consumer to the typed poll
-  API.
+- This checkpoint deliberately does not yet wire semantic producers. The next
+  6F6-D slices must add durable `semanticErrorPending` ownership, emit the
+  error record at the exact result frontier, and migrate tuple-view consumers to
+  the typed poll API before any producer can safely generate `ERROR+EOS`.
 - Validation:
   - `git clang-format --force HEAD -- src/include/distributed/homer/tuple_sink_protocol.h
     src/include/distributed/homer/tuple_sink_service.h
@@ -7443,6 +7442,40 @@ Close-6F6-D1 typed tuple-view error-record substrate checkpoint:
     `tuple_sink_service.c` into `citus.so`.
   - Runtime RDMA pgbench/basebackup validation was not repeated because this
     slice is dormant until an `ERROR+EOS` producer or typed consumer is wired.
+
+Close-6F6-D2 typed remote tuple-view consumer checkpoint:
+
+- Migrated `PollRemoteRecvBatch()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c`
+  to call `PollCitusTupleSinkRecord()` instead of the legacy batch-only poller.
+  Existing callers keep the same `PollRemoteRecvBatch()` contract: `DATA` and
+  `EOS` produce a `RemoteRecvBatch`, and `NOT_READY` still returns `NULL`.
+- Added `RemoteExecutionRaiseTupleSinkErrorRecord()` in the same file as the
+  explicit backend-facing consumer for tuple-view semantic `ERROR+EOS`. It
+  copies the bounded detail string and stable identity fields out of the error
+  record, releases the receive handle to acknowledge the terminal record, and
+  then raises a PostgreSQL error with the producer-provided SQLSTATE when
+  present.
+- The release-before-`ereport(ERROR)` ordering is intentional: the error record
+  is terminal, all diagnostic fields needed by the backend have already been
+  copied, and keeping the byte-ring handle pinned after the backend error would
+  make a live semantic terminal record look retryable.
+- Unsupported typed statuses still fail explicitly, and any non-null record
+  handle is released before the error path reports the bad status.
+- Remaining 6F6-D work is now producer-side: add durable
+  `semanticErrorPending` ownership, ensure failed tuple-view producers publish a
+  single `CitusTupleSinkErrorRecord` plus EOS on a healthy transport, and keep
+  basebackup on its existing `CITUS_REMOTE_BASEBACKUP_OBJECT_ERROR` object
+  record semantics.
+- Validation:
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/remote_execution_session.c`
+    was applied.
+  - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
+  - Broader Citus extension build passed as `dbcomm` with
+    `sudo -n -u dbcomm make -j8 CPPFLAGS='-D_GNU_SOURCE'`.
+  - Runtime RDMA pgbench/basebackup validation was not repeated because no
+    semantic `ERROR+EOS` producer is wired yet; normal DATA/EOS consumers
+    remain on the same public `PollRemoteRecvBatch()` API.
 
 Close-6F6 pulls one safety item from 6F7 forward:
 
