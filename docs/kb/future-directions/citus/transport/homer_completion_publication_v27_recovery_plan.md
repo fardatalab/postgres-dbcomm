@@ -8692,6 +8692,68 @@ Slice 4F validation stop on 2026-06-25:
 - Cleanup after capture: killed the remote `pgbench`, both Homer services, the
   `farnet1` remote-exec backend, and stopped PostgreSQL on `farnet1`.
 
+Slice 4 commit-boundary validation on 2026-06-25:
+
+- Goal: replay the Slice 4 commits as clean detached commit boundaries, install
+  each into `/data/dbcomm/pg-citus`, sync the runtime prefix to `farnet0`, and
+  identify the first commit that loses remote pgbench correctness.
+- Validation harness caveat: an initial 4A attempt used a broad `pgrep -f`
+  cleanup pattern that matched the shell command text and killed the harness
+  itself. That attempt was discarded. All accepted runs below used exact
+  `comm`-based cleanup for `citus_tuple_sin`, `postgres`, `pgbench`, and
+  `pg_basebackup`.
+- Slice 4A, Citus commit `d3940c38f`:
+  - Remote c1 smoke: `1000/1000`, 0 failures, `548.055718 TPS`. This short
+    smoke includes cold setup and is not a steady-state performance number.
+  - Warm remote c1: `10000/10000`, 0 failures, `4396.512686 TPS`.
+  - Warm remote c4: `40000/40000`, 0 failures, `11106.551255 TPS`.
+  - Remote RDMA basebackup: run 1 `6.04 s`, run 2 `4.54 s`. Run 2 is slower
+    than the recent `4.17-4.26 s` band, but this is one warmed sample and 4A
+    did not expose the c1 correctness bug.
+  - Conclusion: Slice 4A diagnostics are not the first bad point.
+- Slice 4B, Citus commit `dcb59b222`:
+  - Remote c1 smoke `-t 1000` did not complete. The SSH wrapper was interrupted
+    after the local harness exceeded the expected timeout window; it reported
+    `c1_smoke_rc=255` and no pgbench output.
+  - Live process state showed remote `pgbench`, both Homer services, and one
+    `farnet1` remote-exec backend still active.
+  - Service logs showed only peer connection setup and receive-sink
+    provisioning, with no terminal completion or payload-close diagnostics.
+  - Stack evidence:
+    - `farnet0` `pgbench` sampled in `HomerClientPeekNextCompletionEvent()` from
+      `receiveHomerCommand()`;
+    - `farnet1` remote-exec backend sampled in
+      `RemoteExecBackendReadStableCommandRecord()` with
+      `expectedCommandSequence=6`;
+    - `farnet0` service sampled in
+      `TupleSinkServiceNextCriticalCompletionRecvDemandRdma()` while enumerating
+      exact critical recv-CQ demand;
+    - `farnet1` service sampled in
+      `HomerServiceBuildPayloadReadySources()` /
+      `HomerServiceSyncPayloadProgressSourceMetadata()`.
+  - Conclusion: Slice 4B is the first commit that exposes the remote c1 hang.
+    The failure appears when the machine-baseline scheduler priority order is
+    changed, before the Slice 4C payload budget increase, Slice 4D session-scan
+    reduction, or Slice 4E basebackup reserve-loop micro-optimization.
+- Slice 4C, Citus commit `43d3e42f6`: remote c1 smoke `-t 1000` timed out with
+  local wrapper status `124`; warm c1/c4/basebackup were skipped.
+- Slice 4D, Citus commit `a7e78bc72`: remote c1 smoke `-t 1000` timed out with
+  local wrapper status `124`; warm c1/c4/basebackup were skipped.
+- Slice 4E, Citus commit `a7564f690`: remote c1 smoke `-t 1000` timed out with
+  local wrapper status `124`; warm c1/c4/basebackup were skipped.
+- Artifact directories for the accepted commit-boundary runs:
+  `/tmp/homer_slice4_4A_1782412370`,
+  `/tmp/homer_slice4_4B_1782412457`,
+  `/tmp/homer_slice4_4C_1782412714`,
+  `/tmp/homer_slice4_4D_1782412765`, and
+  `/tmp/homer_slice4_4E_1782412815`.
+- Updated diagnosis: the Slice 4F hang should be investigated as a Slice 4B
+  priority-order regression. The leading suspect is not 4E and not the 4D
+  session bitset scan reduction. The scheduler reorder likely allows exact
+  critical-completion observation or late peer-collector work to remain hot
+  while the result-sink payload/completion path needed by `pgbench` is not
+  granted in the right order or is not rearmed as expected.
+
 ## Slice 5: Remove Remaining Client Hot-Path Copies
 
 ### 5A Completion View
