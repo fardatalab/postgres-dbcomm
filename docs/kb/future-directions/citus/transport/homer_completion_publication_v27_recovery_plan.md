@@ -6713,6 +6713,63 @@ Close-6F6 implementation sequence:
    - Add durable `semanticErrorPending` state. Keep it owned while blocked on
      ring/source credit and clear it only after `ERROR+EOS` is successfully
      published.
+   - Tuple-view semantic producer failure uses a tuple-view-specific terminal
+     error record, not a fake zero-tuple batch and not the basebackup object
+     header. The current protocol already reserves
+     `CITUS_TUPLE_SINK_RECORD_KIND_ERROR` in
+     `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h`,
+     while `PollCitusTupleSinkBatch()` in
+     `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c`
+     currently accepts only `DATA` and `EOS`. Therefore this slice must add an
+     explicit receive-side record-status API instead of pushing error records
+     through `BorrowNextTupleViewFromCitusTupleSinkBatch()`.
+   - The tuple-view `ERROR+EOS` record is published as one immutable transport
+     record at the exact result frontier:
+
+```c
+typedef struct CitusTupleSinkErrorRecord
+{
+    uint32_t protocolVersion;
+    uint32_t headerBytes;
+    uint32_t errorCode;
+    uint32_t sqlState;
+    uint64_t commandSequence;
+    uint64_t resultGeneration;
+    uint32_t detailBytes;
+    uint32_t reserved0;
+    char detail[];
+} CitusTupleSinkErrorRecord;
+```
+
+     The enclosing `CitusTupleSinkTransportHeader` uses
+     `recordKind = CITUS_TUPLE_SINK_RECORD_KIND_ERROR`,
+     `flags = CITUS_TUPLE_SINK_TRANSPORT_FLAG_EOS`, the current
+     result-generation identity, and the next sink sequence. Unpublished partial
+     batches are discarded before this record is emitted.
+   - Tuple-view consumer semantics:
+     - `PollCitusTupleSinkBatch()` must not return an error record as a normal
+       batch handle.
+     - Add a typed polling surface, for example `PollCitusTupleSinkRecord()` or
+       a status-returning variant, that distinguishes `NOT_READY`, `DATA`,
+       `EOS`, `ERROR`, and `TRANSPORT_FAILED`.
+     - `PollRemoteRecvBatch()` in
+       `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c`
+       must convert semantic `ERROR` into the normal remote-operation failure
+       path. `BorrowNextTupleViewFromCitusTupleSinkBatch()` and
+       `CopyOutNextTupleViewFromCitusTupleSinkBatch()` remain tuple-data-only.
+   - Basebackup semantic producer failure uses the existing basebackup object
+     protocol instead of the tuple-view error record. Publish a normal
+     `CITUS_TUPLE_SINK_RECORD_KIND_DATA` transport record whose
+     `CitusRemoteBaseBackupMessageHeader.objectKind` is
+     `CITUS_REMOTE_BASEBACKUP_OBJECT_ERROR`; put bounded detail bytes in the
+     object payload and use the name field only for object/category metadata.
+     Then close through the normal v16 payload-close handshake.
+   - Keep the distinction from reset/local failure explicit:
+     - in-band tuple-view `ERROR+EOS` and basebackup `OBJECT_ERROR` mean a live
+       producer intentionally reported semantic failure over a healthy transport;
+     - `CitusTupleSinkTerminalStatus` with `terminalState = FAILED` remains the
+       capacity-independent local transport/reset failure channel and must not be
+       represented solely by an in-band record.
 5. 6F6-E - Scheduler migration:
    - Implement this slice before any more local receive-side failure migration.
      Replace all scheduler reads of `payloadTransportBroken` with typed
@@ -7341,6 +7398,52 @@ Close-6F6-C6 exact `CLOSE_SINK` request publication result checkpoint:
   with exact rearm from control-op/response-slot/send-CQ relief if this ever
   shows up in counters. No normal validation path hit this branch.
 
+Close-6F6-D1 typed tuple-view error-record substrate checkpoint:
+
+- Added the tuple-view semantic error payload ABI,
+  `CitusTupleSinkErrorRecord`, immediately next to `CitusTupleSinkBatchHeader`
+  in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h`.
+  This is a tuple-view-only error shape: basebackup continues to use
+  `CitusRemoteBaseBackupMessageHeader` with
+  `CITUS_REMOTE_BASEBACKUP_OBJECT_ERROR`.
+- Added the receive-side typed polling surface in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_service.h`:
+  `CitusTupleSinkRecordStatus`, `PollCitusTupleSinkRecord()`, and
+  `CitusTupleSinkRecordError()`. `ERROR` records reuse the opaque receive handle
+  lifetime; the error pointer remains valid only until the caller releases the
+  handle through `ReleaseCitusTupleSinkBatch()`.
+- Refactored `PollCitusTupleSinkBatch()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c`
+  through the typed poller while preserving historical DATA/EOS behavior. The
+  batch-only wrapper now fails explicitly if an `ERROR+EOS` record reaches it,
+  rather than returning a fake zero-tuple batch.
+- Hardened `CitusTupleSinkBatchTupleCount()`,
+  `BorrowNextTupleViewFromCitusTupleSinkBatch()`, and
+  `CopyOutNextTupleViewFromCitusTupleSinkBatch()` so tuple-data helpers reject
+  non-DATA/EOS record handles before row decoding.
+- `ERROR+EOS` records publish local terminal status as `QUIESCED`, never
+  `FAILED`: semantic producer failure comes from a live producer over a healthy
+  queue, while transport/reset failure remains the separate
+  `CitusTupleSinkTerminalStatus(FAILED)` channel.
+- This checkpoint deliberately does not yet wire semantic producers or
+  `PollRemoteRecvBatch()` to consume `ERROR`. The next 6F6-D slice must add
+  durable `semanticErrorPending` ownership, emit the error record at the exact
+  result frontier, and migrate the remote tuple-view consumer to the typed poll
+  API.
+- Validation:
+  - `git clang-format --force HEAD -- src/include/distributed/homer/tuple_sink_protocol.h
+    src/include/distributed/homer/tuple_sink_service.h
+    src/backend/distributed/utils/homer/tuple_sink_service.c` was applied.
+  - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
+  - Standalone Homer service/client rebuilt as `dbcomm` with
+    `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+  - Broader Citus extension build also passed with
+    `sudo -n -u dbcomm make -j8 CPPFLAGS='-D_GNU_SOURCE'`, which compiled
+    `tuple_sink_service.c` into `citus.so`.
+  - Runtime RDMA pgbench/basebackup validation was not repeated because this
+    slice is dormant until an `ERROR+EOS` producer or typed consumer is wired.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
@@ -7370,10 +7473,10 @@ partial multi-WR post:
     exact reset; all streams on QP fail once
 
 semantic SQL error:
-    ERROR+EOS; normal close; no QP reset
+    tuple-view-specific ERROR+EOS record; normal close; no QP reset
 
 basebackup semantic producer error:
-    OBJECT_ERROR/ERROR+EOS; normal close
+    CITUS_REMOTE_BASEBACKUP_OBJECT_ERROR record; normal close
 
 local basebackup destination failure:
     local FAILED; shared QP remains usable
@@ -8048,8 +8151,10 @@ semantics. It should not be hidden inside the hot pgbench path.
 - **Bounded result-header mismatch escalation**: retain head/tail/generation and
   header fingerprint; retry while observations change; hard error after eight
   identical event-loop retries.
-- **Failed-query `ERROR+EOS`**: publish a terminal error record at the exact
-  result frontier, discarding unpublished partial batches.
+- **Failed-query `ERROR+EOS`**: publish a tuple-view-specific terminal error
+  record at the exact result frontier, discarding unpublished partial batches.
+  Do not encode it as a zero-tuple batch and do not reuse the basebackup
+  `OBJECT_ERROR` payload shape.
 - **Generation-safe stale grants**: carry stream index plus generation in every
   payload grant; stale grants perform no stream access and increment
   `staleGrantRejected`.
