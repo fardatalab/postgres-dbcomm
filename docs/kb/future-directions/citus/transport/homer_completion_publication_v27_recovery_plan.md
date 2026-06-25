@@ -8997,13 +8997,82 @@ Recovery implementation plan:
      compatible peer-collector bundle. Per-lane bounded liveness and exact
      foreground/bulk poll-gap tracking remain 4B-R4 work.
 5. 4B-R4 - guarantee bounded physical discovery:
-   - Maintain per connection:
+   - Do not implement this as a scheduler-side connection-table scan. The
+     scheduler must not periodically walk all peer connections to discover which
+     recv CQs are due. That would reintroduce the scan cost Slice 4 is trying to
+     remove.
+   - Add transport-owned recv-CQ liveness scheduling state. Each canonical
+     connection should maintain:
 
      ```c
      uint64_t lastRecvCqPollServicePass;
      uint64_t nextRecvCqLivenessPass;
+     uint16_t recvCqLivenessEmptyPollStreak;
+     uint16_t recvCqLivenessWheelSlot;
+     bool recvCqLivenessArmed;
      ```
 
+   - Back the per-connection fields with a fixed transport-owned timing wheel,
+     keyed by service pass:
+
+     ```c
+     #define HOMER_RECV_CQ_LIVENESS_WHEEL_SLOTS 64U
+
+     typedef struct HomerRecvCqLivenessWheelSlot
+     {
+         uint64_t incomingBits[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+         uint64_t outgoingBits[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+     } HomerRecvCqLivenessWheelSlot;
+
+     typedef struct HomerRecvCqLivenessWheel
+     {
+         uint64_t servicePass;
+         HomerRecvCqLivenessWheelSlot slots[HOMER_RECV_CQ_LIVENESS_WHEEL_SLOTS];
+     } HomerRecvCqLivenessWheel;
+     ```
+
+   - The wheel is a fixed ring of exact connection-index bitsets, not a heap or
+     wall-clock timer. It is sufficient because the policy uses service-pass
+     delays, not real-time deadlines.
+   - Service-pass time must advance exactly once per `TupleSinkServicePumpOnce()`.
+     After 4B-R3, machine-baseline rebuilds candidates for reset, collector, and
+     semantic phases inside one pump. Therefore do not increment transport time
+     inside `TupleSinkServiceGetPeerSchedulerFactsRdma()`, which may be called
+     more than once per pump in future refactors. Prefer passing an explicit
+     stable `servicePass` from the service pump to the transport due-action API,
+     or adding one explicit `TupleSinkServiceBeginPeerSchedulerPassRdma()` call
+     before the three phases.
+   - Add a transport API that returns exact, generation-bearing liveness actions
+     without requiring scheduler scans:
+
+     ```c
+     bool TupleSinkServiceAppendDueRecvCqLivenessActionsRdma(
+         TupleSinkServicePeerTransportState *transport,
+         uint64_t servicePass,
+         HomerRecvCqCollectorAction *actions,
+         uint16_t actionCapacity,
+         uint16_t *actionCount,
+         char *error,
+         size_t errorBytes);
+     ```
+
+   - Candidate construction should consume that API in
+     `HomerServiceBuildProgressCollectorCandidates()` and append exact recv-CQ
+     liveness actions, similar to how exact critical recv demand already uses
+     `TupleSinkServiceNextCriticalCompletionRecvDemandRdma()`. The existing
+     aggregate `TupleSinkServicePeerSchedulerFacts` may expose summary counters,
+     but it must not be the only way to route a due recv-CQ poll.
+   - Lifecycle:
+     - canonical setup arms the connection for an immediate or near-immediate
+       liveness poll;
+     - successful recv-CQ polling updates `lastRecvCqPollServicePass`;
+     - CQEs observed reset the empty streak and schedule the next poll soon;
+     - empty polls increase the empty streak and schedule the next poll using a
+       capped service-pass backoff;
+     - reset/teardown removes the connection from the wheel before the slot can
+       be reused;
+     - action execution still validates connection index, generation, canonical
+       owner phase, and traffic class before polling.
    - Initial maximum poll gaps:
 
      ```text
@@ -9012,6 +9081,9 @@ Recovery implementation plan:
      bulk lanes: 8-64 service passes when no exact ready fact exists
      ```
 
+   - Foreground/bulk classification should come from the connection traffic
+     class already captured in the connection and the returned exact action. Do
+     not add extra QPs/CQs or reorder CQEs within a CQ batch.
    - Split `HomerServiceMachineBaselineAppendWaitingCollectorActions()` into
      exact dependency collectors, blind discovery collectors, and maintenance
      collectors. Exact dependency collectors are early and not feedback-backed
