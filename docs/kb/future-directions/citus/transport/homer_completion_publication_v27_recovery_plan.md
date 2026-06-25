@@ -6519,6 +6519,27 @@ Inventory caveat:
   assignment independently before replacement, because several bands contain a
   mix of retryable source/SQ pressure and true transport poison.
 
+Close-6F6-B start:
+
+- Migrated the clean payload WIMM binding-mismatch site in
+  `TupleSinkServiceDispatchPeerPayloadDoorbell()` at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:24011`.
+  The active-stream case now calls `HomerServiceRequestBoundPayloadReset()` so
+  the stream records typed `TRANSPORT_RESET` / `RESET_REQUESTED` ownership before
+  the exact payload-protocol connection reset is requested. The fallback direct
+  reset request remains for inactive or already-unbound table entries, preserving
+  the old connection-poison behavior when no live stream state can own the
+  failure.
+- Validation for this narrow migration: formatted
+  `tuple_sink_service_process.c` and rebuilt Homer service/client with
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+- Stop condition before wider 6F6-B migration: the remaining payload
+  post/send/close line bands include bool-return paths where retryable
+  source/SQ pressure, hard zero-WR failures, and partial multi-WR publication
+  are not distinguishable at the caller. Continue with the typed
+  `HomerPeerPostResult` dependency below before replacing those assignments with
+  `HomerServiceRequestBoundPayloadReset()`.
+
 Post-result classification dependency:
 
 - Before migrating multi-WR payload post failures, introduce a typed post result
