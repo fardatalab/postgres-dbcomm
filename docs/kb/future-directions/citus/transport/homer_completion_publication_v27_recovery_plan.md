@@ -8875,6 +8875,18 @@ Recovery implementation plan:
      return `BUDGET_FULL` without consuming readiness.
    - Delete `excludeCloseReclaim`. A band must select an action, not suppress a
      whole machine because another action is also ready.
+   - Status as of June 25, 2026: implemented as a behavior-neutral structural
+     refactor on top of 4B-R0. The legacy generic appender now chooses the 4A
+     default action and routes through
+     `HomerServiceMachineBaselineAppendMachineActionKind()`, which validates and
+     appends exactly the requested action. No priority bands were reintroduced
+     in this stage. Validation artifacts are in `/tmp/homer_4BR1_1782421078`.
+     Results:
+
+     ```text
+     remote c1 smoke: 1000/1000, 0 failures, 540.798955 TPS
+     warm remote c4: 40000/40000, 0 failures, 10872.247826 TPS
+     ```
 3. 4B-R2 - define normal payload versus close precedence:
    - A stream with normal payload work and close/reclaim work should first get
      the normal payload action. In the first implementation, do not append close
