@@ -8653,6 +8653,45 @@ Slice 4E basebackup reserve-loop checkpoint on 2026-06-25:
 - Validation: no-stats Citus/Homer `service-bin client-bin` compiled
   successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
 
+Slice 4F validation stop on 2026-06-25:
+
+- Installed Citus/Homer commit `a7564f690` and rebuilt/reinstalled the
+  PostgreSQL binaries that link `libhomer_client.a`, then synced
+  `/data/dbcomm/pg-citus` to `farnet0`.
+- Started fresh services on `farnet1` and `farnet0` with
+  `HOMER_PROGRESS_POLICY=machine-baseline max_plan=16 max_collectors=6
+  max_machines=12 max_payload=3 max_blind_collectors=2`.
+- Remote RDMA c1 validation from `farnet0` to `farnet1` did not complete:
+  first `-t 20000` run was still running after roughly 75 seconds; after
+  cleaning and restarting services, a bounded `timeout 30s ... -t 1000` smoke
+  also failed to complete and left `pgbench` running.
+- Service logs only showed peer connection setup and receive-sink provisioning:
+  `created peer compatibility session=2 op=5 ...` and
+  `peer-provisioned receive sink session=2 sink=1 ...`; no later terminal
+  completion or payload-close diagnostics appeared in the default no-stats log.
+- Stack evidence captured before cleanup:
+  - remote `pgbench` was in `HomerDrainPendingResultSink()` from
+    `receiveHomerCommand()`, waiting for SQL result payload/terminal progress;
+  - the `farnet1` remote-exec backend was in
+    `RemoteExecBackendReadStableCommandRecord()` with
+    `expectedCommandSequence=6`, which means it had reached the next-command
+    wait point while the frontend was still waiting for result-sink progress;
+  - the `farnet1` service sampled in
+    `HomerServiceMachineBaselineFindCollector()` while appending the late
+    peer-collector bundle;
+  - the `farnet0` service sampled in
+    `TupleSinkServiceNextCriticalCompletionRecvDemandRdma()` while building
+    collector candidates for exact critical recv-CQ demand.
+- Interpretation: this is an unexpected Slice 4F correctness failure, not a
+  performance-only regression. The most likely area to audit next is whether
+  Slice 4B-4D priority/scan changes can leave result-sink payload progress
+  unplanned while critical-completion observation remains hot. The backend being
+  at command sequence 6 suggests command forwarding itself made progress at
+  least through earlier commands; the frontend-side wait is on result-sink
+  delivery/visibility.
+- Cleanup after capture: killed the remote `pgbench`, both Homer services, the
+  `farnet1` remote-exec backend, and stopped PostgreSQL on `farnet1`.
+
 ## Slice 5: Remove Remaining Client Hot-Path Copies
 
 ### 5A Completion View
