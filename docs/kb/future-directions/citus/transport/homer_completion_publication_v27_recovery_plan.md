@@ -6203,6 +6203,360 @@ failureState.operationNotified == false
     healthy runs validate the normal path; deterministic fault injection for
     abort delivery/reclaim remains Close-6F8 work.
 
+Close-6F6 refined design decision after 6F5 review:
+
+- Verdict as of June 24, 2026: `payloadTransportBroken` must not be replaced by
+  a single new generic `failureState.owned` bit. The current boolean at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1320`
+  still conflates four different outcomes:
+  1. pre-binding/open failure;
+  2. bound transport or protocol poison that requires exact connection reset;
+  3. local endpoint/operation failure where the peer connection may remain
+     usable;
+  4. semantic producer failure that should travel as in-band `ERROR+EOS` and a
+     normal close.
+- 6F2 through 6F5 remain the correct foundation: the terminal-status ABI gives a
+  capacity-independent failure channel, reset abort-credit release now happens
+  after terminal `FAILED` publication, SQL tuple-result transport failure is
+  routed through the normal frontend completion publisher, and 6F5 delays local
+  reclamation until that operation-specific delivery point.
+- But 6F5 exposed naming and state precision issues that 6F6 should fix rather
+  than paper over:
+  - `operationNotified` should be renamed to `failureDeliveryCommitted` because
+    it means "failure has been committed or durably staged to the owning local
+    operation," not necessarily that a frontend has already applied and ACKed
+    the event. For frontend SQL, the commit point is the call to
+    `TupleSinkServicePublishClientCommandCompletion()` from
+    `HomerServicePublishForcedCommandFailure()` in
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17962`.
+    For backend-side tuple-result producers and basebackup, the shared terminal
+    `FAILED` status is the operation-visible delivery point.
+  - Failure delivery should return an explicit result:
+
+```c
+typedef enum HomerFailureDeliveryResult
+{
+    HOMER_FAILURE_DELIVERY_COMMITTED,
+    HOMER_FAILURE_DELIVERY_DURABLY_STAGED,
+    HOMER_FAILURE_DELIVERY_BLOCKED,
+    HOMER_FAILURE_DELIVERY_FAILED
+} HomerFailureDeliveryResult;
+```
+
+    Only `COMMITTED` or `DURABLY_STAGED` may unblock local reclamation. A void
+    helper followed by unconditional notification is too ambiguous once source
+    credit, completion-mailbox capacity, or peer-publication staging can block.
+  - The terminal-status identity field is currently named `streamGeneration` in
+    `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:211`,
+    but service-side publishers sometimes use service-stream identity while SQL
+    tuple-result handles are bound to result/command generation. Add one helper:
+
+```c
+static uint64_t
+HomerServicePayloadTerminalGeneration(
+    const HomerServicePayloadStreamEntry *stream);
+```
+
+    Rule:
+
+```text
+SQL tuple-result:
+    tupleResultGeneration
+
+basebackup and stream-lifetime object families:
+    serviceStreamId
+```
+
+    Replace raw terminal-status `memset()` during generation setup with an
+    explicit `HomerResetTerminalStatusForGeneration(status, generation)` helper,
+    and only call it after the old generation has no active semantic owner.
+  - Terminal transition rules need to be direction-aware:
+
+```text
+OPEN:
+    FAILED may be published
+
+FAILED:
+    identical generation/code is idempotent;
+    different identity is an invariant failure
+
+QUIESCED:
+    do not overwrite the local endpoint status;
+    record transport failure in HomerPayloadFailureState and notify the
+    end-to-end owning operation separately
+```
+
+    This avoids crashing a sender endpoint that locally completed gracefully
+    before the remote delivery path later failed.
+  - A forced local SQL terminal failure must leave an executable duplicate rule.
+    Add:
+
+```c
+uint64_t locallyForcedTerminalSequence;
+bool locallyForcedTerminalCommitted;
+```
+
+    Once the frontend receives a forced local terminal completion for command
+    sequence `N`, any later peer-client terminal completion for the same
+    sequence must be validated and discarded as superseded. This is not the
+    expected healthy reset path; it is a defensive idempotence rule for races
+    where a peer terminal completion was already in flight or already decoded
+    before the local reset-driven failure committed. The current receive-side
+    peer-completion gate is
+    `TupleSinkServiceHandlePeerClientCompletionDoorbell()` at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23524`,
+    and the local forced publisher is
+    `HomerServicePublishForcedCommandFailure()` at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17962`.
+
+Close-6F6 target state:
+
+- Extend `HomerPayloadFailureState` from overlapping booleans into typed origin
+  and phase state:
+
+```c
+typedef enum HomerPayloadFailureOrigin
+{
+    HOMER_PAYLOAD_FAILURE_ORIGIN_NONE = 0,
+    HOMER_PAYLOAD_FAILURE_ORIGIN_TRANSPORT_RESET,
+    HOMER_PAYLOAD_FAILURE_ORIGIN_LOCAL_ENDPOINT,
+    HOMER_PAYLOAD_FAILURE_ORIGIN_SERVICE_SHUTDOWN
+} HomerPayloadFailureOrigin;
+
+typedef enum HomerPayloadFailurePhase
+{
+    HOMER_PAYLOAD_FAILURE_NONE = 0,
+    HOMER_PAYLOAD_FAILURE_OWNED,
+    HOMER_PAYLOAD_FAILURE_RESET_REQUESTED,
+    HOMER_PAYLOAD_FAILURE_RESETTING,
+    HOMER_PAYLOAD_FAILURE_TERMINAL_PUBLISHED,
+    HOMER_PAYLOAD_FAILURE_DELIVERY_COMMITTED,
+    HOMER_PAYLOAD_FAILURE_RECLAIMABLE
+} HomerPayloadFailurePhase;
+```
+
+- After migration, remove the overlapping `owned`, `published`, and
+  `operationNotified` booleans. During migration, keep them only long enough for
+  comparison assertions.
+- Add four narrow transition helpers instead of a generic `SetPayloadFailed()`:
+
+```c
+static bool
+HomerServiceRejectPayloadOpen(
+    HomerServicePayloadStreamEntry *stream,
+    const char *detail,
+    char *error,
+    size_t errorBytes);
+
+static bool
+HomerServiceRequestBoundPayloadReset(
+    HomerServicePayloadStreamEntry *stream,
+    HomerPeerConnectionResetReason resetReason,
+    CitusTupleSinkFailureCode failureCode,
+    const char *detail);
+
+static HomerFailureDeliveryResult
+HomerServicePublishLocalPayloadFailure(
+    TupleSinkServiceSessionState *session,
+    HomerServicePayloadStreamEntry *stream,
+    CitusTupleSinkFailureCode failureCode,
+    const char *detail);
+
+static bool
+HomerServiceQueuePayloadSemanticError(
+    HomerServicePayloadStreamEntry *stream,
+    uint32_t semanticErrorCode,
+    const char *detail);
+```
+
+Helper contracts:
+
+- `HomerServiceRejectPayloadOpen()` is for failures before a peer token/QP
+  binding is visible. It fails the current open/control request, releases local
+  setup resources, publishes local terminal failure only if a local queue
+  descriptor was already exposed, and never requests peer reset.
+- `HomerServiceRequestBoundPayloadReset()` is for an active peer binding whose
+  transport/protocol state is poisoned. It records the first failure detail,
+  moves to `RESET_REQUESTED`, removes normal payload runnable facts, requests an
+  exact connection reset, and never publishes terminal status or clears binding
+  directly. Reset-begin moves `RESET_REQUESTED` to `RESETTING`; other streams
+  sharing the same QP enter `RESETTING` with the connection-wide reset reason.
+- `HomerServicePublishLocalPayloadFailure()` is for local endpoint failures that
+  do not prove the shared peer connection is corrupted. It publishes local
+  terminal `FAILED`, delivers object-family failure, stops local payload work,
+  and leaves peer notification to normal semantic close/error handling.
+- `HomerServiceQueuePayloadSemanticError()` is for a live producer and valid
+  transport. It publishes in-band `ERROR+EOS`, waits for successful payload
+  publication, and then uses the normal v16 close handshake. It does not publish
+  terminal transport failure and does not request connection reset.
+
+Close-6F6 assignment-classification matrix:
+
+| Failure site | Required action |
+| --- | --- |
+| Queue allocation, mapping, or contract validation before peer bind | Reject open |
+| MR registration before binding is exposed | Reject open |
+| Doorbell token/generation mismatch | Exact payload-protocol reset |
+| Consumed-head regression or head beyond posted tail | Exact payload-protocol reset |
+| Recv/send CQ failure | Exact CQ reset |
+| Partial multi-WR publication | Exact partial-post reset |
+| Close token/frontier mismatch | Exact close-protocol reset |
+| Owner accounting corruption | Exact reset plus debug assertion |
+| Local destination/disk/consumer failure | Local terminal failure and peer semantic abort |
+| SQL/backend semantic error | In-band `ERROR+EOS`, normal close |
+| Basebackup producer semantic error | `OBJECT_ERROR`/`ERROR+EOS`, normal close |
+| Source, owner, or SQ credit unavailable | Block and rearm; not failure |
+| Service shutdown | `SERVICE_SHUTDOWN` terminal state, then forced teardown |
+
+Close-6F6 implementation sequence:
+
+1. 6F6-A - Inventory and helper scaffolding:
+   - Create a KB inventory table with one row per current
+     `payloadTransportBroken` read/write, including function, binding state,
+     failure class, whether any WR may already have been accepted, chosen helper,
+     and expected scheduler owner.
+   - Add failure origin/phase enums and the four helper shells.
+   - Retain `payloadTransportBroken` temporarily for assertions only.
+2. 6F6-B - Bound transport failures:
+   - Migrate WIMM/token/frontier validation, CQ failures, partial posts, close
+     protocol failures, and owner corruption to
+     `HomerServiceRequestBoundPayloadReset()`.
+   - Temporarily assert that old boolean state matches `RESET_REQUESTED` or
+     `RESETTING`.
+3. 6F6-C - Pre-binding and local endpoint failures:
+   - Migrate setup/open failures and local consumer failures. No branch in this
+     group may reset a shared connection merely because a local allocation or
+     consumer failed.
+4. 6F6-D - Semantic `ERROR+EOS`:
+   - Add durable `semanticErrorPending` state. Keep it owned while blocked on
+     ring/source credit and clear it only after `ERROR+EOS` is successfully
+     published.
+5. 6F6-E - Scheduler migration:
+   - Replace all scheduler reads of `payloadTransportBroken` with typed
+     predicates:
+
+```c
+static bool
+HomerServicePayloadNormalProgressAllowed(
+    const HomerServicePayloadStreamEntry *stream);
+
+static bool
+HomerServicePayloadFailureDeliveryReady(
+    const HomerServicePayloadStreamEntry *stream);
+```
+
+   - `RESET_REQUESTED` and `RESETTING` allow only exact reset progress;
+     `TERMINAL_PUBLISHED` makes operation-specific failure delivery runnable;
+     `DELIVERY_COMMITTED` leaves only detach/reclaim work; semantic-error
+     pending keeps the payload `ERROR+EOS` action runnable.
+6. 6F6-F - Delete `payloadTransportBroken`:
+   - Remove the field and require `git grep payloadTransportBroken` to return
+     zero matches.
+
+Post-result classification dependency:
+
+- Before migrating multi-WR payload post failures, introduce a typed post result
+  so callers do not conflate retryable SQ pressure with partial publication:
+
+```c
+typedef enum HomerPeerPostStatus
+{
+    HOMER_PEER_POST_OK = 0,
+    HOMER_PEER_POST_WOULD_BLOCK,
+    HOMER_PEER_POST_FAILED_ZERO_WR,
+    HOMER_PEER_POST_FAILED_PARTIAL
+} HomerPeerPostStatus;
+
+typedef struct HomerPeerPostResult
+{
+    HomerPeerPostStatus status;
+    uint32_t postedWrCount;
+    uint32_t failedWrIndex;
+    int errorNumber;
+} HomerPeerPostResult;
+```
+
+Rules:
+
+```text
+WOULD_BLOCK with zero accepted WRs:
+    register resource blockage and retry
+
+FAILED_ZERO_WR with hard connection/protocol error:
+    request exact reset
+
+FAILED_PARTIAL:
+    always request exact reset
+
+OK:
+    normal owner tracking
+```
+
+Close-6F6 pulls one safety item from 6F7 forward:
+
+- Add the central reset write gate before migrating post-failure branches:
+
+```c
+if (connection->resetRequested || connection->resetInProgress)
+{
+    return HOMER_PEER_POST_FAILED_ZERO_WR;
+}
+```
+
+  The gate belongs in `TupleSinkServicePrepareConnectionForWrite()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c`.
+  Without it, an already-built action plan can post another WR after a different
+  action has requested reset for the same QP.
+
+Close-6F6 correctness validation:
+
+```text
+pre-bind MR failure:
+    request fails; no peer reset
+
+retryable zero-WR pressure:
+    blocks/rearms; no terminal failure
+
+partial multi-WR post:
+    exact reset; all streams on QP fail once
+
+semantic SQL error:
+    ERROR+EOS; normal close; no QP reset
+
+basebackup semantic producer error:
+    OBJECT_ERROR/ERROR+EOS; normal close
+
+local basebackup destination failure:
+    local FAILED; shared QP remains usable
+
+late peer terminal after forced local SQL failure:
+    validated and suppressed; no duplicate completion
+
+send endpoint already QUIESCED when reset occurs:
+    no invalid terminal transition
+
+double reset request:
+    first failure reason retained; one terminal publication
+```
+
+Close-6F6 performance notes:
+
+- The current evidence does not prove a basebackup regression: Close-6F4 warmed
+  basebackup was `4.17s` and `4.23s`; Close-6F5 warmed basebackup was `4.32s`
+  and `4.24s`, while warmed c4 improved to `11.16-11.20k TPS`.
+- Still, two concrete basebackup optimization candidates should be tested after
+  correctness:
+  1. `HomerClientReserveBaseBackupRecordForObject()` currently reloads terminal
+     state on every busy-wait spin. Change it to check terminal on entry, after
+     observed `consumedHead` movement, every 64-256 pause iterations while idle,
+     and once before returning a reservation. This preserves ordering because
+     reset publishes `FAILED` before releasing aborted `consumedHead`.
+  2. `CitusHomerPayloadByteRingControl` is now 48 bytes after appending
+     terminal status, so byte storage begins at a 48-byte offset. Test a v12
+     local ABI patch that pads this control block to 64 bytes and asserts
+     `sizeof(CitusHomerPayloadByteRingControl) == 64`. Treat this as A/B
+     performance work, not an assumed improvement.
+
 Close-6F terminal-failure design decision:
 
 - Verdict as of June 24, 2026: a transport-aborted payload stream must not be
@@ -6405,15 +6759,19 @@ Close-6F recommended remaining commits:
    exits the service, and frontend SQL forced failures mark the stream notified
    only after publishing the normal frontend completion.
 5. Close-6F6 - cleanup old failure scaffolding:
-   remove/replace remaining `payloadTransportBroken` branches; classify old
-   assignments into pre-binding setup failure, post-binding exact reset,
-   semantic `ERROR+EOS`, or service-shutdown terminal failure.
+   implement the refined 6F6 plan above: inventory every
+   `payloadTransportBroken` read/write, add typed failure origin/phase state,
+   add narrow transition helpers for reject-open, bound reset, local terminal
+   failure, and semantic `ERROR+EOS`, migrate post failures with typed post
+   results, replace scheduler reads with typed predicates, and only then delete
+   the boolean. Pull the central reset write gate into this slice before
+   migrating post-failure branches.
 6. Close-6F7 - write-gate and reset-ready cleanup:
-   make `TupleSinkServicePrepareConnectionForWrite()` centrally reject
-   `resetRequested` and `resetInProgress`, so an already-built plan cannot post
-   a later WR to a poisoned QP. Also tighten reset-ready queue removal so the
-   exact index/generation is removed or the small fixed queue is rebuilt and
-   asserted absent.
+   after 6F6 pulls the central write gate forward, this slice should retain the
+   remaining reset-ready cleanup: tighten reset-ready queue removal so the exact
+   index/generation is removed or the small fixed queue is rebuilt and asserted
+   absent. Keep any additional reset lifecycle cleanup here only if it is not a
+   prerequisite for correctly classifying `payloadTransportBroken` assignments.
 7. Close-6F8 - fault injection and repeated performance validation:
    cover full-ring producer abort, receive partial-data abort, SQL forced
    failed completion, basebackup abort failure, two streams sharing one reset
