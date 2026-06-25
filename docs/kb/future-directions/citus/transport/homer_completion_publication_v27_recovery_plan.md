@@ -8829,6 +8829,24 @@ Recovery implementation plan:
      command, and warmed remote basebackup all complete.
    - Do not fix this by raising `max_plan`, `max_machine`, or `max_payload`;
      that can hide the inversion without restoring the dependency contract.
+   - Status as of June 25, 2026: implemented and validated. The Citus scheduler
+     source file was restored to the 4A implementation while retaining the
+     independent 4E `homer_client.c` basebackup reserve-loop optimization.
+     Validation artifacts are in `/tmp/homer_4BR0_1782420879`.
+     Results:
+
+     ```text
+     remote c1 smoke: 1000/1000, 0 failures, 541.621441 TPS
+     warm remote c1: 10000/10000, 0 failures, 4423.514341 TPS
+     warm remote c4: 40000/40000, 0 failures, 11057.280583 TPS
+     remote RDMA basebackup: run 1 5.51 s, run 2 4.26 s
+     ```
+
+     A first attempted harness at `/tmp/homer_4BR0_1782420847` was discarded
+     because it reused the broad `pkill -f 'postgres: remote exec backend'`
+     pattern and killed its own shell before starting useful validation. The
+     accepted run used exact process-name cleanup plus a `ps | awk` backend
+     filter.
 2. 4B-R1 - make requested machine actions explicit:
    - Add:
 
