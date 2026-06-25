@@ -7477,6 +7477,41 @@ Close-6F6-D2 typed remote tuple-view consumer checkpoint:
     semantic `ERROR+EOS` producer is wired yet; normal DATA/EOS consumers
     remain on the same public `PollRemoteRecvBatch()` API.
 
+Close-6F6-D3 tuple-view semantic error producer API checkpoint:
+
+- Added `PublishCitusTupleSinkErrorRecord()` to the tuple-sink producer API in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_service.h`
+  and implemented it in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c`.
+- The helper publishes one immutable tuple-view `ERROR+EOS` record in the same
+  byte-ring format as DATA/EOS records:
+  `CitusTupleSinkTransportHeader.recordKind =
+  CITUS_TUPLE_SINK_RECORD_KIND_ERROR`, transport `EOS` flag set, and payload
+  `CitusTupleSinkErrorRecord` carrying command sequence, result generation,
+  error code, SQLSTATE, and bounded detail bytes.
+- The helper takes `CitusTupleSinkBatchHandle *unpublishedBatchHandle`. If a
+  caller has a reserved but unpublished DATA batch, the helper discards and
+  nulls that handle before publishing the terminal error. This preserves the
+  semantic rule that producer failure supersedes partial, not-yet-visible tuple
+  data for the result generation.
+- After publishing the record, the helper publishes the local terminal status as
+  `QUIESCED` and sets `CITUS_HOMER_PAYLOAD_BYTE_RING_FLAG_PEER_CLOSED`; it does
+  not publish `FAILED`, because this path represents semantic producer failure
+  over a healthy queue rather than transport/reset failure.
+- This checkpoint intentionally does not classify or migrate semantic failure
+  call sites. The next 6F6-D step must add durable
+  `semanticErrorPending` ownership and wire only true semantic producer failures
+  to this API; local endpoint failures and transport poison must continue to use
+  their typed failure/reset paths.
+- Validation:
+  - `git clang-format --force HEAD -- src/include/distributed/homer/tuple_sink_service.h
+    src/backend/distributed/utils/homer/tuple_sink_service.c` was applied.
+  - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
+  - Broader Citus extension build passed as `dbcomm` with
+    `sudo -n -u dbcomm make -j8 CPPFLAGS='-D_GNU_SOURCE'`.
+  - Runtime RDMA validation was not repeated because the new API is not yet
+    called by any semantic producer path.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
