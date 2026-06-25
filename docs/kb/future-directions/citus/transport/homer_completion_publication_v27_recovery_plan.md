@@ -7762,6 +7762,49 @@ Close-6F6-F2 delete `payloadTransportBroken` checkpoint:
     failed, invalid, mismatch, underflow, overflow, or payload-broken diagnostics
     after the clean validation run.
 
+Close-6F6-F3 payload send-owner naming checkpoint:
+
+- Renamed the service-owned payload send-CQ owner fields from
+  `payloadCompletion*` to `payloadSendOwner*` in
+  `HomerPayloadStreamState`. The fields now describe what they own: local
+  signaled payload publication WR lifetime, source-frontier release, and
+  teardown abort accounting
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1428`).
+- The transport callback member `payloadCompletion` remains unchanged because it
+  is the transport-facing CQE callback name, not the stream-owned owner ring.
+- The important renamed fields are:
+  - `payloadSendOwnerTokens`, `payloadSendOwnerByteTails`,
+    `payloadSendOwnerSemanticTails`, `payloadSendOwnerWrCounts`, and
+    `payloadSendOwnerStates`;
+  - `payloadSendOwnerHeadIndex`, `payloadSendOwnerTailIndex`,
+    `payloadSendOwnerCount`, `payloadSendOwnerNextToken`,
+    `payloadSendOwnerCompletedToken`, and `payloadSendOwnerOutstandingWrs`.
+- The F1 reserve/commit/rollback/retire/abort helpers now use those names:
+  `HomerServiceReservePayloadSendOwner()`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13700`)
+  and `HomerServiceCompleteTrackedPayload()`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13872`).
+- Validation:
+  - `rg payloadCompletion` in `tuple_sink_service_process.c` now only finds
+    `callbacks.payloadCompletion`, the transport callback installation.
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    was applied.
+  - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
+  - Homer service/client build passed as `dbcomm` with
+    `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS=-D_GNU_SOURCE`.
+  - No-stats Citus/Homer service/client binaries were installed as `dbcomm`, the
+    installed prefix was synced to `farnet0`, and both Homer services were
+    restarted using exact PIDs rather than broad `pkill -f`.
+  - Remote c1 cold setup after service restart: `5000/5000`, zero failures,
+    `1913.327782 TPS`, initial connection `1954.358 ms`; this is not a warm
+    performance sample.
+  - Warm remote c1 repeat: `10000/10000`, zero failures, `4389.093104 TPS`, p99
+    `0.246 ms`.
+  - Remote RDMA basebackup blackhole: warmup `5.46 s`, warmed repeat `4.26 s`.
+  - Service-log scans on both hosts, run as `dbcomm`, found no
+    `send-owner`, rollback, commit, reservation, abort, late, reset, protocol,
+    failed, invalid, mismatch, underflow, overflow, or payload-broken diagnostics.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
