@@ -8910,8 +8910,34 @@ Recovery implementation plan:
    - `PAYLOAD_CLOSE_RECLAIM` must not be marked runnable while this predicate is
      true, except for an independently runnable close sub-transition such as
      send-CQ retirement that does not depend on normal payload execution.
-   - Add a diagnostic counter: `closeSelectedWhileNormalPayloadReady`; acceptance
-     requires zero in normal validation.
+   - Add diagnostic counters:
+     - `payloadDataAndCloseReady`: a close-ready stream also had normal payload
+       work visible.
+     - `payloadDataSkippedForClose`: close/reclaim was suppressed because normal
+       payload progress still owns a prerequisite.
+     - `closeSelectedWhilePayloadRequired`: close/reclaim was still selected while
+       the predicate required normal payload progress first.
+   - Acceptance requires `closeSelectedWhilePayloadRequired = 0` in normal
+     validation.
+   - Status as of June 25, 2026: implemented and validated. The implementation
+     adds `HomerServicePayloadMustProgressBeforeClose()` in
+     `tuple_sink_service_process.c` and uses it in
+     `HomerServicePayloadStreamReasonMasks()` so close/reclaim is not advertised
+     as runnable while normal payload progress must still publish/drain the
+     prerequisite frontier. This is intentionally a readiness predicate, not a
+     planner-side whole-machine skip. Validation artifacts are in
+     `/tmp/homer_4BR2_1782421397`. Results:
+
+     ```text
+     remote c1 smoke: 1000/1000, 0 failures, 541.293377 TPS
+     warm remote c1: 10000/10000, 0 failures, 4403.441554 TPS
+     warm remote c4: 40000/40000, 0 failures, 10658.097556 TPS
+     remote RDMA basebackup: run 1 6.02 s, run 2 4.21 s
+     ```
+
+     The single warmed c4 sample is below the 4B-R1 sample but remains within the
+     current post-6F/4A correctness-validation band. Treat it as a checkpoint
+     number, not final Slice 4 performance validation.
 4. 4B-R3 - make the service pass collector-first:
    - Split a pass into:
 
