@@ -9269,6 +9269,55 @@ Recovery implementation plan:
    This repair can land as one implementation commit if it remains tightly
    scoped to liveness due ownership, execution revalidation, counters, and KB
    progress. Do not combine it with 4B-R5 fairness or 4C budget tuning.
+
+   2026-06-25 implementation attempt:
+   - Implemented the durable due-set model in
+     `remote_execution_peer_transport_rdma.c`:
+     - added `HomerRecvCqLivenessDueSet` under
+       `HomerRecvCqLivenessWheel`;
+     - moved the current wheel bucket into the due set from
+       `TupleSinkServiceBeginPeerSchedulerPassRdma()`;
+     - changed `TupleSinkServiceAppendDueRecvCqLivenessActionsRdma()` to
+       enumerate due bits non-destructively;
+     - cleared due bits only in `TupleSinkServiceDrainRecvCqLivenessRdma()`
+       when the exact generation-bearing action is executed or found stale;
+     - added reset-safe liveness execution checks and liveness counters
+       (`recvCqLivenessDueActions`, `recvCqLivenessActionsAppended`,
+       `recvCqLivenessActionsExecuted`, `recvCqLivenessLostDueBit`,
+       `recvCqLivenessStaleActions`, `recvCqLivenessMaxOverduePasses`).
+   - Compile validation passed:
+     - `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`
+     - `sudo -n -u dbcomm make install-headers install-service-bin install`
+   - Runtime validation did not pass. A remote c1 smoke from `farnet0` to
+     `farnet1` timed out waiting for Homer service progress twice:
+     - first after normal process restart;
+     - again after hard-cleaning Homer `/dev/shm` regions on both hosts,
+       restarting PostgreSQL on `farnet1`, restarting both Homer services, and
+       rerunning the same remote c1 command.
+   - Repeated service symptoms:
+
+     ```text
+     farnet1:
+       requesting peer connection reset after recv-CQ drain failure
+       direction=incoming index=0 generation=1 traffic_class=1
+       detail=peer recv completion failed host=10.10.1.100 opcode=32765/32767 status=5
+
+     farnet0:
+       requesting outgoing peer transport reset host=10.10.1.101 traffic_class=1
+       after send-CQ drain failure
+       detail=async send completion failed: opcode=0 status=10
+       clearing 1 client-completion recv-CQ demand entries during peer connection reset
+     ```
+
+   - Status: do not mark 4B-R4 complete and do not commit the code attempt as an
+     accepted slice. The durable due-set repair may still be structurally right,
+     but it did not eliminate the first critical-control send/recv CQ failure.
+     The next review should determine whether this is:
+     - a remaining liveness quota/ordering bug before the first critical-control
+       WIMM;
+     - a peer-control write/address/rkey lifetime bug that 4B-R4 exposed;
+     - or an error-classification/reset cascade where status `5` is teardown
+       evidence and status `10` is the first real failure.
 6. 4B-R5 - add per-band fairness:
    - Add round-robin cursors for command sessions, remote command senders,
      foreground payload, close/reclaim, bulk payload, and control mailbox.
