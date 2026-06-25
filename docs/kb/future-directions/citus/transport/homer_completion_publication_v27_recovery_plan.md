@@ -6330,6 +6330,7 @@ typedef enum HomerPayloadFailurePhase
     HOMER_PAYLOAD_FAILURE_RESET_REQUESTED,
     HOMER_PAYLOAD_FAILURE_RESETTING,
     HOMER_PAYLOAD_FAILURE_TERMINAL_PUBLISHED,
+    HOMER_PAYLOAD_FAILURE_DELIVERY_STAGED,
     HOMER_PAYLOAD_FAILURE_DELIVERY_COMMITTED,
     HOMER_PAYLOAD_FAILURE_RECLAIMABLE
 } HomerPayloadFailurePhase;
@@ -6408,6 +6409,281 @@ Close-6F6 assignment-classification matrix:
 | Source, owner, or SQ credit unavailable | Block and rearm; not failure |
 | Service shutdown | `SERVICE_SHUTDOWN` terminal state, then forced teardown |
 
+Close-6F6-E scheduler-ownership decision:
+
+- Decision after the 6F6-C4 review: implement 6F6-E now, before migrating any
+  additional local receive-side failures. Do not restore
+  `payloadTransportBroken` as a compatibility liveness bit. The old bit may
+  survive for at most one transition commit as a shadow assertion, but no
+  scheduler or reclamation predicate should depend on it after 6F6-E.
+- Root gap: durable terminal failure publication is not the same as scheduler
+  ownership for operation delivery and local reclamation:
+
+```text
+terminal FAILED status published
+    !=
+stream has exact scheduler readiness for failure delivery/finalization
+```
+
+  The current helper scaffolding can move a stream to
+  `DELIVERY_COMMITTED`, but scheduler readiness is still mostly derived from the
+  legacy broken-stream latch in paths such as
+  `HomerServicePayloadStreamReasonMasks()`,
+  `HomerServicePayloadStreamSourceReadyForScheduler()`, and several
+  close/reclaim predicates in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  Any further migration of local receive-side failure branches would therefore
+  risk publishing a typed failure that no exact scheduler action owns.
+- Replacement model: add exact, service-local payload-failure readiness, not
+  another generic broken-payload action.
+
+```c
+static uint64_t PayloadFailureReadyStreams;
+
+typedef struct HomerPayloadFailureAction
+{
+    uint32_t streamIndex;
+    uint64_t serviceStreamIdSnapshot;
+} HomerPayloadFailureAction;
+```
+
+  Add `HOMER_PROGRESS_ACTION_PROGRESS_PAYLOAD_FAILURE` and store the action by
+  value in `HomerProgressActionPayload`, following the durable action-payload
+  pattern already used for exact critical recv-CQ and exact control-mailbox
+  work. Candidate construction enumerates `PayloadFailureReadyStreams`,
+  validates the active stream and `serviceStreamIdSnapshot`, checks the typed
+  failure phase for current runnability, and appends a generation-safe action
+  without clearing the bit during planning.
+- Ready rules:
+
+```text
+TERMINAL_PUBLISHED:
+    runnable for object-family failure delivery
+
+DELIVERY_STAGED:
+    not runnable by this action; another exact machine owns progress
+
+DELIVERY_COMMITTED:
+    runnable only if finalization can currently make progress
+
+RECLAIMABLE:
+    runnable for final local cleanup
+
+RESET_REQUESTED / RESETTING:
+    not payload-failure runnable; exact connection reset owns progress
+```
+
+  `DELIVERY_STAGED` is a required phase because
+  `HomerFailureDeliveryResult` distinguishes durable staging from committed
+  delivery. For frontend SQL, forced failure delivery can be durably staged into
+  the normal completion machine before the stream may be reclaimed; a later
+  exact completion-publisher callback should transition it to
+  `DELIVERY_COMMITTED` and rearm the failure-ready bit.
+- `DELIVERY_COMMITTED` must not be treated as permanently runnable. It is
+  runnable only when a concrete finalization transition is available, such as:
+
+```text
+peer binding is still active and must enter exact reset ownership
+local handle count is zero
+an explicitly staged local cleanup prerequisite became satisfied
+```
+
+  While waiting for a backend/client handle to detach, clear the ready bit and
+  rely on the detach/close callback to rearm it.
+- Failure-action priority should be:
+
+```text
+1. exact connection reset
+2. payload failure delivery/finalization
+3. graceful payload close/reclaim
+4. foreground payload
+5. local blackhole
+6. bulk payload
+```
+
+  A stream in `RESET_REQUESTED` or `RESETTING` must not receive a
+  payload-failure action before the exact reset action.
+- Exact executor contract:
+
+```c
+static bool
+HomerServiceProgressPayloadFailure(
+    TupleSinkServiceSessionState *sessionStates,
+    HomerServicePayloadStreamEntry *streamEntries,
+    const HomerPayloadFailureAction *action,
+    HomerProgressResult *progressResult,
+    char *errorMessage,
+    size_t errorMessageBytes);
+```
+
+  At execution, validate the stream index and service-stream snapshot. A stale
+  action after slot reuse increments a stale-action counter and must not mutate
+  the new stream. The ready bit may be cleared only after rechecking the current
+  stream entry, because the same table index may already hold a different
+  stream generation with its own failure.
+- Executor phase handling:
+
+```text
+TERMINAL_PUBLISHED:
+    call result-returning HomerServicePublishOwningPayloadFailure()
+
+COMMITTED:
+    phase = DELIVERY_COMMITTED
+    continue to finalization check
+
+DURABLY_STAGED:
+    phase = DELIVERY_STAGED
+    clear failure-ready bit
+    wait for exact owning-machine callback
+
+BLOCKED:
+    retain TERMINAL_PUBLISHED
+    retain or dependency-rearm exact ready bit
+
+FAILED:
+    if peer binding remains active, request exact reset;
+    otherwise retain cleanup/failure ownership
+
+DELIVERY_STAGED:
+    clear ready bit and return; this should normally only be observed from a
+    stale ready bit
+
+DELIVERY_COMMITTED:
+    if peer binding is active, request exact reset and clear ready bit;
+    if local handles remain, clear ready bit and wait for detach rearm;
+    otherwise phase = RECLAIMABLE and continue
+
+RECLAIMABLE:
+    call TupleSinkServiceMaybeReclaimSinkAndSession();
+    clear the ready bit once the entry no longer owns failure work
+```
+
+- Exact rearm points:
+  - `HomerServicePublishLocalPayloadFailure()` records the first failure,
+    publishes direction-specific terminal `FAILED`, sets
+    `TERMINAL_PUBLISHED`, arms `PayloadFailureReadyStreams`, and returns
+    success. It must not set `DELIVERY_COMMITTED` directly.
+  - Successful frontend SQL forced-failure publication transitions
+    `DELIVERY_STAGED -> DELIVERY_COMMITTED` and rearms the exact failure-ready
+    bit. The callback must be tied to the real publication result, not merely
+    to a void helper call.
+  - Local handle detach from `DELIVERY_COMMITTED` rearms the bit if
+    finalization can now progress.
+  - Reset-complete moves `RESETTING -> TERMINAL_PUBLISHED` after owner
+    reconciliation and local terminal publication, unless object-family failure
+    delivery was already durably committed inside reset-complete.
+  - Stream entry reset always clears the failure-ready bit before slot reuse.
+- For the current milestone, a local receive-side failure after peer binding
+  must reset the exact bound connection. This is intentionally conservative:
+  QP reset is the only implemented proof that the peer can no longer issue
+  old-token RDMA writes or WIMMs. A future stream-scoped abort handshake could
+  avoid resetting a shared traffic-class QP, but that protocol does not exist
+  today.
+
+Close-6F6 review corrections before further migration:
+
+- Local failure currently claims commitment too early. The scaffolded
+  `HomerServicePublishLocalPayloadFailure()` must stop at
+  `TERMINAL_PUBLISHED` and arm the exact failure action. It cannot directly set
+  `DELIVERY_COMMITTED`, because SQL may need forced completion staging, a queue
+  control may be absent, and cleanup still needs scheduler progress.
+- The local blackhole C1/C3 migrations should not return executor failure once
+  terminal failure ownership is successfully established. Replace the current
+  false-return shape with:
+
+```text
+begin/publish local payload failure
+mark progress
+return true
+```
+
+  A false return should mean the service failed to establish any durable failure
+  owner.
+- A missing local ring is not safely delivered merely by calling
+  `HomerServicePublishLocalPayloadFailure(NULL, ...)`. If no queue control can
+  be reached and no session is passed, the operation still needs a durable
+  owner. Classify missing local state before open as reject-open; after open,
+  stage the owning SQL/basebackup operation failure explicitly.
+- Local terminal failure publication must be direction-specific. A local send
+  stream publishes to the producer-visible send control; a local receive stream
+  publishes to the consumer-visible receive control. Do not mark both endpoint
+  controls failed just because both pointers exist.
+- Payload-doorbell token/binding mismatch must reset the actual connection that
+  delivered the CQE. If the token index was reused and the token generation
+  mismatches, the stream-table entry may already belong to a new connection;
+  resetting that current stream binding would poison an innocent new stream.
+  Only mark a stream entry failed when token generation and service-stream
+  identity match the live entry.
+- Partial-post source ownership is incomplete. On
+  `HOMER_PEER_POST_FAILED_PARTIAL`, record a teardown-only owner before
+  requesting reset:
+
+```c
+typedef struct HomerPartialPayloadPostOwner
+{
+    bool active;
+    uint32_t acceptedWrCount;
+    uint64_t sourceReleaseTail;
+    uint64_t connectionGeneration;
+} HomerPartialPayloadPostOwner;
+```
+
+  Reset-complete folds `sourceReleaseTail` into
+  `abortedSourceReleaseTail`, publishes terminal failure, and releases source
+  credit. It must not treat the accepted prefix as successful payload delivery
+  or advance semantic frontiers.
+- `ibv_post_send()` error extraction must not classify from stale `errno`.
+  Use the verbs return value as the authoritative error when it is positive:
+
+```c
+int postStatus = ibv_post_send(...);
+int postError =
+    postStatus > 0 ? postStatus :
+    (postStatus < 0 && errno != 0 ? errno : EIO);
+```
+
+- Reset-request failures must not be ignored. Replace the helper's boolean
+  ambiguity with an explicit transition result:
+
+```c
+typedef enum HomerPayloadResetTransitionResult
+{
+    HOMER_PAYLOAD_RESET_OWNED,
+    HOMER_PAYLOAD_RESET_ALREADY_OWNED,
+    HOMER_PAYLOAD_RESET_NO_VALID_CONNECTION
+} HomerPayloadResetTransitionResult;
+```
+
+  `NO_VALID_CONNECTION` is an invariant/lifecycle failure and must not be
+  discarded by `(void)` casts.
+- Reset-begin must preserve first-failure ownership. If a local endpoint
+  failure first requested reset, reset-begin should preserve the local origin,
+  failure code, and detail, record the physical reset reason separately, and
+  move the phase to `RESETTING`; it should not rebuild the state as a generic
+  transport reset.
+- `HomerServiceFinalHeadCloseProtocolFailure()` has an unowned case: when the
+  stream is null/inactive or has no active binding, the stream-bound reset
+  helper cannot request reset. Pass the accepted connection handle/generation
+  into that helper and reset the actual exact connection when stream identity is
+  unavailable.
+- Exact `CLOSE_SINK` publication remains untyped because
+  `TupleSinkServiceStartPeerRequestOnConnectionRdma()` still returns `bool`.
+  Add the same post-result distinction for exact control request publication
+  before migrating that branch. Do not classify all exact-close publication
+  failures as close-protocol poison.
+- Additional open caveats remain:
+  - `QUIESCED -> FAILED` terminal-state handling for a local producer whose
+    remote delivery later fails;
+  - consistent terminal-generation identity and validation;
+  - actual 6F6-D semantic `ERROR+EOS` ownership;
+  - reset-ready queue exact removal from 6F7;
+  - deterministic fault injection from 6F8;
+  - moving cold diagnostic detail out of the hot stream-table entry. The inline
+    `char detail[CITUS_REMOTE_EXEC_PEER_ERROR_BYTES]` in every stream entry is
+    debug-friendly but enlarges healthy stream-table state. Move dynamic
+    details to a cold side table or store a compact failure-site enum before
+    performance-sensitive cleanup.
+
 Close-6F6 implementation sequence:
 
 1. 6F6-A - Inventory and helper scaffolding:
@@ -6424,16 +6700,23 @@ Close-6F6 implementation sequence:
    - Temporarily assert that old boolean state matches `RESET_REQUESTED` or
      `RESETTING`.
 3. 6F6-C - Pre-binding and local endpoint failures:
-   - Migrate setup/open failures and local consumer failures. No branch in this
-     group may reset a shared connection merely because a local allocation or
-     consumer failed.
+   - The first local blackhole and duplicate-terminal checkpoints have landed,
+     but further local receive-side failure migration is paused until 6F6-E
+     removes scheduler dependence on `payloadTransportBroken`.
+   - After 6F6-E, migrate setup/open failures and local consumer failures. No
+     branch in this group may reset a shared connection merely because a local
+     allocation or consumer failed. After peer binding is active, local
+     receive-side failure must publish local terminal failure and then request
+     exact bound-connection reset, because QP reset is the only current
+     old-WIMM/old-RDMA cutoff.
 4. 6F6-D - Semantic `ERROR+EOS`:
    - Add durable `semanticErrorPending` state. Keep it owned while blocked on
      ring/source credit and clear it only after `ERROR+EOS` is successfully
      published.
 5. 6F6-E - Scheduler migration:
-   - Replace all scheduler reads of `payloadTransportBroken` with typed
-     predicates:
+   - Implement this slice before any more local receive-side failure migration.
+     Replace all scheduler reads of `payloadTransportBroken` with typed
+     predicates and exact payload-failure readiness:
 
 ```c
 static bool
@@ -6446,9 +6729,11 @@ HomerServicePayloadFailureDeliveryReady(
 ```
 
    - `RESET_REQUESTED` and `RESETTING` allow only exact reset progress;
-     `TERMINAL_PUBLISHED` makes operation-specific failure delivery runnable;
-     `DELIVERY_COMMITTED` leaves only detach/reclaim work; semantic-error
-     pending keeps the payload `ERROR+EOS` action runnable.
+     `TERMINAL_PUBLISHED` arms the exact payload-failure action for
+     operation-specific delivery; `DELIVERY_STAGED` waits for the owning
+     machine callback; `DELIVERY_COMMITTED` leaves only currently-runnable
+     finalization; semantic-error pending keeps the payload `ERROR+EOS` action
+     runnable.
 6. 6F6-F - Delete `payloadTransportBroken`:
    - Remove the field and require `git grep payloadTransportBroken` to return
      zero matches.
