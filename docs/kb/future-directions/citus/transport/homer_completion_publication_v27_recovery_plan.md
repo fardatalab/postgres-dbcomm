@@ -9024,16 +9024,26 @@ Recovery implementation plan:
          uint64_t outgoingBits[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
      } HomerRecvCqLivenessWheelSlot;
 
+     typedef struct HomerRecvCqLivenessDueSet
+     {
+         uint64_t incomingBits[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+         uint64_t outgoingBits[HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT];
+         uint32_t dueCount;
+     } HomerRecvCqLivenessDueSet;
+
      typedef struct HomerRecvCqLivenessWheel
      {
          uint64_t servicePass;
          HomerRecvCqLivenessWheelSlot slots[HOMER_RECV_CQ_LIVENESS_WHEEL_SLOTS];
+         HomerRecvCqLivenessDueSet due;
      } HomerRecvCqLivenessWheel;
      ```
 
    - The wheel is a fixed ring of exact connection-index bitsets, not a heap or
      wall-clock timer. It is sufficient because the policy uses service-pass
-     delays, not real-time deadlines.
+     delays, not real-time deadlines. The wheel slot is only a timer source; it
+     must not be the durable scheduler-ready state. Due readiness is owned by
+     `HomerRecvCqLivenessDueSet` until the exact liveness action executes.
    - Service-pass time must advance exactly once per `TupleSinkServicePumpOnce()`.
      After 4B-R3, machine-baseline rebuilds candidates for reset, collector, and
      semantic phases inside one pump. Therefore do not increment transport time
@@ -9043,13 +9053,13 @@ Recovery implementation plan:
      or adding one explicit `TupleSinkServiceBeginPeerSchedulerPassRdma()` call
      before the three phases.
    - Add a transport API that returns exact, generation-bearing liveness actions
-     without requiring scheduler scans:
+     from the durable due set without requiring scheduler scans:
 
      ```c
      bool TupleSinkServiceAppendDueRecvCqLivenessActionsRdma(
          TupleSinkServicePeerTransportState *transport,
          uint64_t servicePass,
-         HomerRecvCqCollectorAction *actions,
+         HomerRecvCqLivenessAction *actions,
          uint16_t actionCapacity,
          uint16_t *actionCount,
          char *error,
@@ -9065,6 +9075,13 @@ Recovery implementation plan:
    - Lifecycle:
      - canonical setup arms the connection for an immediate or near-immediate
        liveness poll;
+     - at the beginning of each peer scheduler pass,
+       `TupleSinkServiceBeginPeerSchedulerPassRdma()` moves the current wheel
+       bucket into `recvCqLivenessWheel.due`, clears that wheel bucket, and
+       leaves already-due bits in place;
+     - candidate construction enumerates due bits non-destructively;
+     - exact liveness execution clears the due bit for the validated
+       connection/generation immediately before polling;
      - successful recv-CQ polling updates `lastRecvCqPollServicePass`;
      - CQEs observed reset the empty streak and schedule the next poll soon;
      - empty polls increase the empty streak and schedule the next poll using a
@@ -9090,7 +9107,7 @@ Recovery implementation plan:
      off; blind discovery collectors use bounded liveness; maintenance remains
      late and backoff eligible.
 
-   Implementation attempt and current blocker on 2026-06-25:
+   Reviewed implementation attempt and current blocker on 2026-06-25:
 
    - The current unvalidated implementation adds exact
      `HomerRecvCqLivenessAction` payloads, a transport-owned timing wheel, and
@@ -9132,23 +9149,126 @@ Recovery implementation plan:
        farnet0: critical-control send CQ reset after status=10
      ```
 
-   - Leading diagnosis: the first setup-timeout failure was caused by admitting
-     blind recv-CQ liveness before CM/setup and listener progress; moving the
-     peer setup/send/lifetime bundle before liveness removed that symptom. The
-     remaining failure is stronger: the exact liveness path reaches canonical
-     polling, then the critical-control QP enters error/teardown during the first
-     remote c1 command. This suggests that removing broad recv-CQ polling exposed
-     another ordering/lifetime dependency around initial critical-control WIMMs
-     or setup handoff, not merely a scheduler-budget starvation.
-   - Next investigation should not increase plan budgets to hide the failure.
-     Inspect the exact ordering between:
-     - `TupleSinkServiceFinishPeerConnectionSetup()` posting notification recvs
-       and arming liveness;
-     - the first exact liveness poll on the critical-control incoming lane;
-     - the first remote command WIMM post and send-CQ retirement on the outgoing
-       lane;
-     - reset request execution after a failed CQE. The target remains exact
-       timing-wheel liveness with no scheduler-side connection-table scan.
+   - Reviewed diagnosis: the core bug is non-durable due ownership. The current
+     timing-wheel implementation treats `slots[servicePass % 128]` as the ready
+     set. If a due bit is sampled but the action is not appended or executed in
+     that exact pass, no poll result runs and therefore no rearm runs. The bit is
+     stranded until wheel wrap or some unrelated rearm. That is unsafe because
+     after 4B-R4 exact liveness is the WIMM discovery path for control, payload,
+     client-command, and client-completion CQEs that have no semantic ready fact
+     yet.
+   - The two small validation fixes remain useful but are not sufficient:
+     arming first liveness for the next pass avoids one current-pass sampling
+     race, and not charging liveness against the blind quota avoids one budget
+     omission path. Neither makes due readiness durable across candidate
+     capacity, collector-budget, reset-priority, setup/lifetime, stale-action, or
+     future phase omissions.
+   - The observed critical-control recv-CQ status `5` and send-CQ status `10`
+     should be treated as consequences or evidence of the broken discovery/reset
+     interaction until the durable due-set repair is tested. The repair target
+     remains exact timing-wheel liveness with no scheduler-side connection-table
+     scan and no restored broad `RECV_CQ` fallback.
+
+   Implementable repair sequence:
+
+   1. 4B-R4a - due-set ownership:
+      - Add `HomerRecvCqLivenessDueSet` to `HomerRecvCqLivenessWheel`.
+      - In `TupleSinkServiceBeginPeerSchedulerPassRdma()`, move the current
+        wheel bucket into `wheel.due`, clear the current wheel bucket, and update
+        `dueCount` without clearing already-due bits.
+      - Change `TupleSinkServiceAppendDueRecvCqLivenessActionsRdma()` to
+        enumerate `wheel.due`, not `slots[currentSlot]`.
+      - Candidate construction must be non-destructive: do not clear due bits
+        while building actions.
+      - `TupleSinkServiceArmRecvCqLiveness()` should disarm the old future wheel
+        bit or old due bit before inserting the new future wheel bit and updating
+        `nextRecvCqLivenessPass`.
+   2. 4B-R4b - execution boundary owns due clear:
+      - `TupleSinkServiceDrainRecvCqLivenessRdma()` resolves the exact
+        connection, validates generation and canonical ownership, clears the due
+        bit for that exact connection/generation, polls the recv CQ, records the
+        poll result, and rearms the next future wheel slot.
+      - If an action is stale because reset is already requested/in progress,
+        clear the due bit for the still-matching stale generation and return a
+        stale/no-op result without polling.
+      - If an action is not selected due budget, the due bit remains set and the
+        next service pass sees it again.
+   3. 4B-R4c - overdue and lost-bit diagnostics:
+      - During due-action construction, if a connection has
+        `recvCqLivenessArmed == true` and
+        `nextRecvCqLivenessPass <= servicePass` but the due bit is absent,
+        increment `recvCqLivenessLostDueBit`, reinsert the due bit, and assert
+        in diagnostic builds.
+      - Record:
+
+        ```text
+        recvCqLivenessDueActions
+        recvCqLivenessActionsAppended
+        recvCqLivenessActionsExecuted
+        recvCqLivenessBudgetDeferred
+        recvCqLivenessMaxOverduePasses
+        recvCqLivenessLostDueBit
+        recvCqLivenessStaleActions
+        ```
+
+      - Acceptance requires `recvCqLivenessLostDueBit == 0` and bounded maximum
+        overdue passes.
+   4. 4B-R4d - non-lossy liveness quota:
+      - Keep the correction that exact liveness is not charged as a blind
+        collector.
+      - Reserve a small exact-liveness quota in the collector phase:
+
+        ```text
+        critical-control liveness: at least one due action if any due
+        foreground liveness:      at least one due action if any due
+        bulk liveness:            at least one due action every bounded interval
+        ```
+
+      - Heartbeat and maintenance must not consume the only collector slots
+        before due liveness.
+      - If a due liveness action cannot be appended, increment
+        `recvCqLivenessBudgetDeferred` and leave the due bit set.
+   5. 4B-R4e - reset-safe execution revalidation:
+      - Before polling, revalidate:
+
+        ```text
+        connection active
+        connection generation matches action
+        setupPhase == READY
+        bootstrapComplete == true
+        recvCqOwnerPhase == CANONICAL
+        resetRequested == false
+        resetInProgress == false
+        cmId != NULL
+        qp != NULL
+        recvCompletionQueue != NULL
+        ```
+
+      - If reset is already requested or in progress, treat the action as stale
+        and do not poll a CQ that reset owns.
+   6. 4B-R4f - CQ error classification:
+      - On non-success recv CQE, if reset is already requested/in progress, treat
+        it as teardown-owned flush and do not request another reset.
+      - Otherwise request exact reset with `HOMER_PEER_RESET_RECV_CQ_FAILURE`
+        and log status, opcode, `wr_id`, direction, connection index,
+        generation, and traffic class.
+      - Apply the same no-recursive-reset rule to send-CQ errors.
+   7. 4B-R4g - validation:
+      - Run remote c1 smoke, warm remote c1, warm remote c4, and remote
+        basebackup.
+      - In one stats build, require:
+
+        ```text
+        liveness due actions > 0
+        recvCqLivenessLostDueBit == 0
+        recvCqLivenessMaxOverduePasses bounded
+        critical-control recv failures == 0
+        send-CQ failures == 0
+        ```
+
+   This repair can land as one implementation commit if it remains tightly
+   scoped to liveness due ownership, execution revalidation, counters, and KB
+   progress. Do not combine it with 4B-R5 fairness or 4C budget tuning.
 6. 4B-R5 - add per-band fairness:
    - Add round-robin cursors for command sessions, remote command senders,
      foreground payload, close/reclaim, bulk payload, and control mailbox.
