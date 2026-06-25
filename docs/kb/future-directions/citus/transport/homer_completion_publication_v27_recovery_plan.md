@@ -8552,6 +8552,39 @@ Slice 4A instrumentation checkpoint on 2026-06-25:
   `HOMER_SERVICE_PEER_TRANSPORT_STATS=1`, and was rebuilt again in no-stats mode
   before performance-sensitive work.
 
+Slice 4B scheduler-priority checkpoint on 2026-06-25:
+
+- `HomerServiceBuildMachineBaselineProgressActionPlan()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  now builds the machine-baseline execution plan in explicit Slice 4 priority
+  bands rather than in incidental candidate order.
+- Exact peer-connection reset actions and payload-failure actions are planned
+  first. This preserves the Close-6 rule that reset is the physical QP cutoff
+  and local failure delivery must not sit behind normal payload work.
+- Command send-CQ and peer-control send-CQ relief are planned before exact
+  critical recv-CQ demand. This directly addresses the 3B failure mode where
+  empty demanded recv-CQ polling starved the producer-side owner retirement
+  needed to publish the terminal event.
+- Local-control slot collection and local-control continuations remain early,
+  but only after reset/failure and CQ relief. They are setup/lifetime-sensitive
+  service work not named in the simplified priority list; keeping them early
+  avoids open/close requests waiting behind a full command/payload burst.
+- Command-session completion publication is planned before critical recv-CQ
+  observation, so an already-local terminal event is published before spending a
+  grant on more observation.
+- Payload stream grants are split into foreground payload, graceful
+  close/reclaim, bulk payload, and maintenance payload bands. Foreground grants
+  are capped at one when bulk is already known ready, preserving a bulk slot
+  under the current default two-payload-grant budget when no close/reclaim work
+  consumes it.
+- Caveat for Slice 4C: the current default
+  `HOMER_SERVICE_MACHINE_BASELINE_MAX_PAYLOAD_GRANTS=2` cannot simultaneously
+  provide two foreground grants and one guaranteed bulk grant. Slice 4B changes
+  ordering only; Slice 4C owns the budget tuning for the stronger fairness
+  guarantee.
+- Validation: no-stats Citus/Homer `service-bin client-bin` compiled
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+
 ## Slice 5: Remove Remaining Client Hot-Path Copies
 
 ### 5A Completion View
