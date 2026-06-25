@@ -7620,10 +7620,87 @@ Close-6F6-E scheduler normal-progress predicate checkpoint:
   - Warm remote c4: `40000/40000`, zero failures, `10925.334896 TPS`, p99
     `0.577 ms`.
   - Remote RDMA basebackup blackhole: warmup `5.69 s`, warmed repeat `4.25 s`.
-  - Service-log scans found no reset, abort, forced-failure, stale-token,
-    protocol, mismatch, fatal, late-WIMM, owner-corruption, partial-post,
-    failure, or payload-broken diagnostics. The only `farnet0` matches were
-    false positives from compatibility-session lines containing `owner`.
+	  - Service-log scans found no reset, abort, forced-failure, stale-token,
+	    protocol, mismatch, fatal, late-WIMM, owner-corruption, partial-post,
+	    failure, or payload-broken diagnostics. The only `farnet0` matches were
+	    false positives from compatibility-session lines containing `owner`.
+
+Close-6F6-F1 payload send-owner reserve-before-post checkpoint:
+
+- Implemented explicit payload send-owner reservation in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`:
+  - `HomerTrackedWrOwnerState` now has `HOMER_TRACKED_WR_OWNER_RESERVED`
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1222`).
+  - `HomerPayloadSendOwnerReservation` carries the pre-post owner slot and CQE
+    token by value
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1230`).
+  - `HomerServiceReservePayloadSendOwner()` records the token, source frontier,
+    semantic frontier, WR count, and owner state before `ibv_post_send()` can
+    accept any payload WR
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13707`).
+  - `HomerServiceCommitPayloadSendOwnerReservation()` is the only normal
+    post-success transition from `RESERVED` to `POSTED`; it also advances
+    `payloadCompletionNextToken`
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13784`).
+  - `HomerServiceRollbackPayloadSendOwnerReservation()` is legal only for
+    zero-accepted-WR post failures
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13833`).
+- Converted the byte-ring sender in `HomerServicePumpOutgoingByteRingPayload()`
+  to reserve before posting. On `HOMER_PEER_POST_FAILED_PARTIAL`, the reserved
+  owner remains visible for reset cleanup; on zero-WR failures, the reservation
+  is rolled back before pressure/reset classification
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26381`).
+- Converted the fixed-slot sender in `HomerServicePumpOutgoingPayloadStream()`
+  to the same reserve-before-post model
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:27020`).
+  This required moving fixed-slot send-CQE retirement through
+  `HomerServiceCompleteTrackedPayload()` in
+  `HomerServiceApplySequencePayloadCompletionFrontier()` so the new owner entries
+  retire normally
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14075`).
+- Reset cleanup in `HomerServiceAbortTrackedPayloadSendOwners()` now treats both
+  `POSTED` and `RESERVED` payload send owners as abortable after QP/CQ teardown
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:23648`).
+- Corrected fixed-slot payload progress accounting to count the actual payload
+  WR chain. Unlike byte-ring publication, the fixed-slot path uses its final
+  payload WR as the WIMM and has no separate tail-WIMM WR
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:27106`).
+- Validation:
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    was applied.
+  - Homer service/client build passed as `dbcomm` with
+    `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS=-D_GNU_SOURCE`.
+  - No-stats Citus/Homer service/client binaries were installed as `dbcomm` with
+    `sudo -n -u dbcomm make install-headers install-service-bin install`, and
+    `/data/dbcomm/pg-citus` was synced to `farnet0`.
+  - The first validation attempt exposed a dirty receiver-service setup: the
+    `farnet0` service log contained `rdma_bind_addr failed ... Address already in
+    use`, so those first results were treated as diagnostic-only.
+  - After killing the exact old service PIDs and starting fresh services on both
+    hosts, fresh logs began only with the expected `HOMER_PROGRESS_POLICY`
+    startup line.
+  - Clean remote c1 cold setup run: `10000/10000`, zero failures,
+    `2678.714453 TPS`, initial connection `1546.700 ms`; this is not a warm
+    performance sample.
+  - Clean warm remote c1 repeat: `10000/10000`, zero failures, `4431.335569 TPS`,
+    p99 `0.250 ms`.
+  - Clean remote RDMA basebackup blackhole: warmup `6.05 s`, warmed repeats
+    `4.18 s` and `4.18 s`.
+  - Clean warm remote c4: `40000/40000`, zero failures, `11024.452788 TPS`, p99
+    `0.543 ms`.
+  - Service-log scans on both hosts found no `send-owner`, rollback, commit,
+    reservation, abort, late, reset, protocol, failed, invalid, mismatch,
+    underflow, or overflow diagnostics after the clean validation run.
+- Remaining 6F6-F work:
+  - Continue classifying/deleting the remaining `payloadTransportBroken` field and
+    direct writers.
+  - Rename or further document the legacy `payloadCompletion*` field names as
+    payload send-owner state. This checkpoint changed behavior but did not perform
+    the broad field rename.
+  - Keep byte-ring tail derivation, fewer-WR byte-ring publication, and substrate
+    unification in
+    [`homer_payload_publication_owner_frontier_plan.md`](homer_payload_publication_owner_frontier_plan.md),
+    not in 6F6-F.
 
 Close-6F6 pulls one safety item from 6F7 forward:
 
