@@ -7308,9 +7308,10 @@ Close-6F6-E scheduler-ownership implementation checkpoint:
     diagnostics. The only matching binding messages were normal
     `peer-binding-cleared` close/reclaim lines.
 - Remaining caveats before 6F6 is complete:
-  - `payloadTransportBroken` still has writers and diagnostic readers. It is no
-    longer a scheduler liveness source, but 6F6-F still must delete the field and
-    require `git grep payloadTransportBroken` to return zero matches.
+  - Superseded by Close-6F6-F2 below: `payloadTransportBroken` still had writers
+    and diagnostic readers at this checkpoint. It was no longer a scheduler
+    liveness source, and 6F6-F2 later deleted the field and made
+    `rg payloadTransportBroken` return zero matches.
   - The exact action currently targets the machine-baseline scheduler, which is
     the validation path. Older experimental policies should not be treated as
     acceptance paths for this failure model.
@@ -7692,8 +7693,6 @@ Close-6F6-F1 payload send-owner reserve-before-post checkpoint:
     reservation, abort, late, reset, protocol, failed, invalid, mismatch,
     underflow, or overflow diagnostics after the clean validation run.
 - Remaining 6F6-F work:
-  - Continue classifying/deleting the remaining `payloadTransportBroken` field and
-    direct writers.
   - Rename or further document the legacy `payloadCompletion*` field names as
     payload send-owner state. This checkpoint changed behavior but did not perform
     the broad field rename.
@@ -7701,6 +7700,67 @@ Close-6F6-F1 payload send-owner reserve-before-post checkpoint:
     unification in
     [`homer_payload_publication_owner_frontier_plan.md`](homer_payload_publication_owner_frontier_plan.md),
     not in 6F6-F.
+
+Close-6F6-F2 delete `payloadTransportBroken` checkpoint:
+
+- Removed the legacy generic `payloadTransportBroken` field from
+  `HomerPayloadStreamState`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1376`
+  before this checkpoint). `rg payloadTransportBroken` now returns zero matches in
+  `tuple_sink_service_process.c`.
+- `HomerServicePayloadNormalProgressAllowed()` is now the only ordinary-payload
+  scheduler predicate and is based on typed ownership only:
+  `closeState.phase != HOMER_PAYLOAD_CLOSE_ABORTING` and
+  `failureState.phase == HOMER_PAYLOAD_FAILURE_NONE`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6365`).
+- `HomerServiceRequestBoundPayloadReset()` records `RESET_REQUESTED` and requests
+  exact connection reset without setting a shadow broken bit
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3733`).
+  Reset-begin similarly records `RESETTING` in
+  `HomerServiceMarkPayloadStreamAbortingOnConnectionReset()` without a shadow field
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20429`).
+- Converted the remaining outgoing payload send-path hard-failure branches:
+  - byte-ring sender validation, frontier, fragment-append, target-validation, and
+    publish-tail validation failures now call
+    `HomerServiceRequestBoundPayloadProtocolReset()`
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25657`);
+  - byte-ring typed send-CQ drain/wait failures now call
+    `HomerServiceRequestBoundPayloadSendCqReset()`;
+  - fixed-slot sender registration, immediate-data, geometry, object-validation,
+    descriptor-overflow, and frontier failures now call
+    `HomerServiceRequestBoundPayloadProtocolReset()`
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26465`);
+  - fixed-slot typed send-CQ drain/wait failures now call
+    `HomerServiceRequestBoundPayloadSendCqReset()`.
+- The remaining `HomerServiceMarkPayloadStreamSendTerminal()` call sites are
+  graceful/local-close compatibility points (`peer-binding-cleared` and
+  `local-peer-binding-close`), not bound transport-poison classification.
+- Validation:
+  - `git clang-format --force HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+    was applied.
+  - `git diff --check` passed in `/data/dbcomm/citus-dbcomm`.
+  - Homer service/client build passed as `dbcomm` with
+    `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS=-D_GNU_SOURCE`.
+  - No-stats Citus/Homer service/client binaries were installed as `dbcomm` with
+    `sudo -n -u dbcomm make install-headers install-service-bin install`, and
+    `/data/dbcomm/pg-citus` was synced to `farnet0`.
+  - Service restart caveat: a broad `pkill -f` command matched its own shell and
+    exited with signal 143; the run was recovered by using exact service PIDs and
+    then starting fresh Homer services on both hosts. This is a runbook caution,
+    not a validation failure.
+  - Remote c1 cold setup run after service restart: `10000/10000`, zero failures,
+    `2667.241368 TPS`, initial connection `2175.345 ms`; this is not a warm
+    performance sample.
+  - Warm remote c1 repeat: `10000/10000`, zero failures, `4417.212818 TPS`, p99
+    `0.246 ms`.
+  - Warm remote c4: `40000/40000`, zero failures, `11006.094625 TPS`, p99
+    `0.538 ms`.
+  - Remote RDMA basebackup blackhole: warmup `6.32 s`, warmed repeats `4.18 s`
+    and `4.17 s`.
+  - Service-log scans on both hosts, run as `dbcomm`, found no
+    `send-owner`, rollback, commit, reservation, abort, late, reset, protocol,
+    failed, invalid, mismatch, underflow, overflow, or payload-broken diagnostics
+    after the clean validation run.
 
 Close-6F6 pulls one safety item from 6F7 forward:
 
