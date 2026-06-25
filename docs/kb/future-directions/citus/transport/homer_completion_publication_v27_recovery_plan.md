@@ -8436,6 +8436,16 @@ empty critical polls per transaction
   comments. After validation, create or update a factual implementation KB note
   under `docs/kb/implementations/...` that records the landed ABI, helper names,
   version number, and validation evidence.
+- Payload send-owner tracking and byte-ring tail publication have a focused
+  follow-up design note in
+  [`homer_payload_publication_owner_frontier_plan.md`](homer_payload_publication_owner_frontier_plan.md).
+  Slice 6F6-F must not treat "payload WRs accepted but owner tracking could not
+  be enqueued" as a normal reset path. The target invariant is reserve owner
+  state before posting, then commit, rollback, or reset based on typed post
+  outcome. The same note records the future byte-ring direction: keep the WIMM
+  immediate as the receiver-issued payload token and derive the byte-ring tail
+  from in-band records so the normal byte-ring path can eventually make the
+  final payload WR itself the WIMM publication WR.
 - Slices 6 and 7 are not implementation-ready from this note alone. Before a
   developer starts either one, expand the target slice with: files/functions
   changed, new fields/API, state transitions, failure behavior, ABI bump,
