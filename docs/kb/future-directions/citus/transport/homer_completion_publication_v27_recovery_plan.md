@@ -8632,6 +8632,27 @@ Slice 4D scan-reduction checkpoint on 2026-06-25:
 - Validation: no-stats Citus/Homer `service-bin client-bin` compiled
   successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
 
+Slice 4E basebackup reserve-loop checkpoint on 2026-06-25:
+
+- `HomerClientReserveBaseBackupRecordForObject()` in
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_client.c` no longer acquire-loads the
+  byte-ring terminal status and flags on every busy-wait spin.
+- Added `HomerClientBaseBackupStreamStillOpenForReserve()` as the single
+  reserve-path terminal check. The reserve loop now checks terminal state on
+  entry, whenever `consumedHead` changes, every
+  `HOMER_CLIENT_BASEBACKUP_TERMINAL_CHECK_INTERVAL` unchanged wait spins, and
+  immediately before returning a reservation.
+- The final pre-reservation check preserves the Close-6F ordering invariant:
+  transport reset publishes `FAILED` before releasing aborted producer credit,
+  so a producer awakened by released capacity still observes terminal failure
+  before it can publish another basebackup record.
+- No local ABI change was made in this slice. The 64-byte
+  `CitusHomerPayloadByteRingControl` padding remains a separate measured A/B
+  sub-slice because it requires a local protocol bump and should not be mixed
+  with the terminal-check throttling result.
+- Validation: no-stats Citus/Homer `service-bin client-bin` compiled
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+
 ## Slice 5: Remove Remaining Client Hot-Path Copies
 
 ### 5A Completion View
