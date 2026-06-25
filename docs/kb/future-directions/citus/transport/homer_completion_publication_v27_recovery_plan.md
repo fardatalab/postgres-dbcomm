@@ -6814,6 +6814,46 @@ Close-6F6-C3 local blackhole malformed-record failure checkpoint:
   Runtime validation was not repeated because these are local error branches,
   not the remote RDMA pgbench/basebackup normal path.
 
+Close-6F6-C4 final-head close failure classification checkpoint:
+
+- Moved final consumed-head WIMM failure classification into
+  `HomerServiceTryPostFinalReceiverHead()` instead of leaving the two callers to
+  set `payloadTransportBroken` generically.
+- Added `HomerServiceFinalHeadCloseProtocolFailure()` for close-state/connection
+  proof failures where the receiver cannot construct the same-QP final-head
+  close proof from the live binding
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3773`).
+  The helper requests an exact `HOMER_PEER_RESET_CLOSE_PROTOCOL` reset.
+- The final-head helper now requests exact typed reset for:
+  - missing active binding, missing recorded close request, non-stream-bound
+    connection, or traffic-class mismatch
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28191`);
+  - consumed-head lookup, mirror descriptor, or immediate-data validation
+    failures
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28219`);
+  - final-head owner tracking failure, as a send-CQ/owner-accounting poison
+    (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28251`).
+- The existing typed post-result path remains authoritative for final-head WIMM
+  post failures: `HomerServiceHandleReceiverHeadAckPostFailure()` still treats
+  zero-WR pressure as blocked/retryable and hard or partial post failure as
+  reset-worthy
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28262`).
+- Removed the caller-side `payloadTransportBroken = true` assignments for
+  `HOMER_FINAL_HEAD_FAILED` in the close request handler and deferred close
+  action. Also migrated deferred final-head ACK completion-drain failure to
+  `HomerServiceRequestBoundPayloadSendCqReset()`
+  (`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28354`).
+- Deliberately left exact `CLOSE_SINK` request publication failure out of this
+  checkpoint because `TupleSinkServiceStartPeerRequestOnConnectionRdma()` still
+  returns only `bool`; classifying all such failures as close-protocol reset
+  would risk treating resource pressure as protocol poison.
+- Validation: `git diff --check` passed, `git clang-format --force HEAD` left
+  `tuple_sink_service_process.c` clean after formatting, and Homer service/client
+  rebuilt successfully with
+  `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
+  Runtime validation was not repeated because this checkpoint changes close
+  error branches rather than the normal pgbench/basebackup data path.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
