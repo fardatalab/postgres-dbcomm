@@ -8606,6 +8606,32 @@ Slice 4C budget/backoff checkpoint on 2026-06-25:
 - Validation: no-stats Citus/Homer `service-bin client-bin` compiled
   successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
 
+Slice 4D scan-reduction checkpoint on 2026-06-25:
+
+- Replaced the command/completion session-machine candidate scan in
+  `HomerServiceBuildSessionMachineCandidates()` with enumeration over
+  `SessionPendingState.commandOwnedSessions`,
+  `SessionPendingState.commandRunnableSessions`,
+  `SessionPendingState.completionOwnedSessions`, and
+  `SessionPendingState.completionRunnableSessions`, plus the exact
+  target-completion session when present.
+- `HomerServiceCommandMachineHasWork()` now treats outstanding remote command
+  WRs as command-machine ownership. The send-CQ retirement path calls
+  `HomerServiceFinalizeCommandPendingBit()` after decrementing
+  `clientSqlRemoteCommandOutstandingWriteCount`, so the pending bit is retained
+  while a command WRITE owner is live and cleared when CQ retirement proves no
+  command work remains.
+- Stale pending bits above `ActiveSessionScanLimit` or pointing at inactive
+  sessions are cleared during bit enumeration before any table-slot access.
+- The payload stream scan remains intentionally unchanged in this slice:
+  receive-side payload readiness already uses the exact payload-ready queues,
+  payload failure uses `PayloadFailureReadyStreams`, and outgoing payload
+  discovery still needs producer-frontier facts until a separate exact
+  producer-side ready structure is added. Slice 4D therefore removes only the
+  session-machine scan rather than redesigning payload discovery.
+- Validation: no-stats Citus/Homer `service-bin client-bin` compiled
+  successfully with `CPPFLAGS='-D_GNU_SOURCE'`.
+
 ## Slice 5: Remove Remaining Client Hot-Path Copies
 
 ### 5A Completion View
