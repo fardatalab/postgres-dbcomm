@@ -6610,6 +6610,42 @@ Close-6F6-B0 typed post-result checkpoint:
   and rebuilt Homer service/client with
   `sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`.
 
+Close-6F6-B1 multi-WR payload post migration checkpoint:
+
+- Migrated the two normal multi-WR payload publication call sites to the typed
+  post-result API:
+  - `HomerServicePumpOutgoingByteRingPayload()` now calls
+    `TupleSinkServicePostPeerRegisteredPayloadBatchWithTailImmediateResultRdma()`
+    at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25718`.
+  - `HomerServicePumpOutgoingPayloadStream()` now calls
+    `TupleSinkServicePostPeerRegisteredPayloadBatchWithImmediateResultRdma()` at
+    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:26336`.
+- Added `HomerServiceHandlePayloadBatchPostFailure()` at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13386`.
+  The helper keeps zero-WR `HOMER_PEER_POST_WOULD_BLOCK` as local send-resource
+  pressure and requests exact connection reset for `FAILED_PARTIAL` or hard
+  zero-WR failures. This is the first replacement of a payload publish
+  `payloadTransportBroken = true` branch with typed failure ownership.
+- The success path still advances the same payload posted/completion frontiers as
+  before. The behavioral change is limited to post-failure classification.
+- Remaining 6F6-B caveat: receiver-head ACK/final-head ACK helpers still return
+  service-level `bool`, so their call sites still need a small typed return or
+  out-parameter before the same retry-versus-reset policy can be applied there.
+- Validation after install/sync/restart:
+  - remote RDMA c1 smoke from `farnet0` to `farnet1`: `20000/20000`, 0
+    failures, `3320 TPS`; first post-restart run, correctness only.
+  - remote RDMA c4 warmed repeats: `40000/40000` at `10785 TPS`, `40000/40000`
+    at `10779 TPS`, `40000/40000` at `10691 TPS`, and a longer `80000/80000`
+    sample at `10790 TPS`; all had 0 failures.
+  - remote RDMA basebackup: warmup `6.25s`, warmed repeat `4.23s`.
+  - Service log scan on both hosts found no `post_status=`, reset, late-WIMM,
+    protocol, owner-corruption, partial-post, or transport-broken diagnostics.
+- Performance note: c4 is correct but slightly below the immediately preceding
+  6F6-A pair (`11090` and `11106 TPS`). Treat this as a small caveat to watch in
+  subsequent 6F6 work, not yet as a proven regression: the current result still
+  sits inside the recent roughly `10.4k-11.1k` warmed band.
+
 Close-6F6 pulls one safety item from 6F7 forward:
 
 - Add the central reset write gate before migrating post-failure branches:
