@@ -9935,18 +9935,76 @@ Recovery implementation plan:
           Mixed-workload fairness is still owned by later 4C/4F work; this
           checkpoint deliberately optimizes the foreground pgbench path first.
 
-   - Required command-mailbox lifetime repair:
-     - do not reset/deregister a peer-owned `CLIENT_SQL_SESSION` command mailbox
-       solely because one SQL command failed;
-     - preserve the peer command mailbox MR until the peer closes the command
-       session or the connection reset path proves no further writes can arrive;
+	   - Required command-mailbox lifetime repair:
+	     - do not reset/deregister a peer-owned `CLIENT_SQL_SESSION` command mailbox
+	       solely because one SQL command failed;
+	     - preserve the peer command mailbox MR until the peer closes the command
+	       session or the connection reset path proves no further writes can arrive;
      - publish the failed SQL completion to the frontend and allow explicit
        cleanup commands (`TX_ABORT`, then session close) to arrive on the still
        valid command mailbox;
-     - if a failed command truly makes the backend unusable, mark backend-loop
-       reuse separately from command-mailbox/MR lifetime instead of conflating it
-       with session storage reclamation.
-6. 4B-R5 - add per-band fairness:
+	     - if a failed command truly makes the backend unusable, mark backend-loop
+	       reuse separately from command-mailbox/MR lifetime instead of conflating it
+	       with session storage reclamation.
+	     - Implemented checkpoint:
+	       - `HomerPeerCommandSessionLifetime` in
+	         `citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:941`
+	         records peer command-mailbox ownership separately from backend reuse.
+	         `TupleSinkServiceHandlePeerOpenCommandSessionRequest()` snapshots the
+	         exact peer connection generation and opens this lifetime only after
+	         the peer command mailbox MR, peer completion publication source MR, and
+	         backend spawn all succeed
+	         (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:33184`
+	         and `:33267`).
+	       - `TupleSinkServiceApplyClientSqlPeerLifetimeCompletion()` updates
+	         backend reuse state when a backend completion is consumed, but only
+	         marks peer writers quiesced for explicit
+	         `CLIENT_SQL_SESSION_CLOSE`
+	         (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17986`
+	         and `:20991`). A failed SQL command now records
+	         `HOMER_BACKEND_REUSE_REQUIRES_ABORT`; it does not by itself close the
+	         peer-writable command mailbox.
+	       - `TupleSinkServiceSessionShouldRetireWhenIdle()` now treats backend-node
+	         peer `CLIENT_SQL_SESSION` receivers as reclaimable only after
+	         `peerWritersQuiesced` or `connectionResetComplete`
+	         (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20822`).
+	         The table-pressure fallback in `TupleSinkServiceAllocateSession()`
+	         also obeys this predicate before stealing an idle slot.
+	       - `TupleSinkServiceResetSession()` now fails fast if a peer
+	         `CLIENT_SQL_SESSION` command mailbox would be deregistered before the
+	         peer close/reset proof
+	         (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:20679`).
+	         This guard is intentionally diagnostic and should remain cold-path
+	         only.
+	       - `TupleSinkServiceCommandStillInFlight()` includes
+	         `peerClientCompletionPublishPending`
+	         (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:19490`),
+	         so an explicit close completion is not lost by immediate session
+	         retirement while the peer-visible completion publication is still
+	         staged.
+	       - `HomerServicePeerConnectionResetComplete()` marks matching peer
+	         client-SQL sessions reset-complete before payload-stream cleanup, using
+	         the captured connection handle/generation as the authority
+	         (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:25025`
+	         and `:25075`).
+	     - Validation on the no-stats build after this checkpoint:
+	       - remote c1 smoke completed `1000/1000`, zero failures;
+	       - warmed remote c1 completed `20000/20000`, zero failures, about
+	         `4059 TPS`, p99 about `0.267 ms`;
+	       - remote c4 completed `40000/40000`, zero failures, about
+	         `10.72k TPS`, p99 about `0.564 ms`;
+	       - remote RDMA basebackup completed; the first post-restart run was cold
+	         at `5.60 s`, and the warmed repeat was `4.25 s`;
+	       - service-log signature scan over the validation window found no
+	         `IBV_WC_REM_ACCESS_ERR` / `status=10`, no `status=5`, and no
+	         command-mailbox premature-reset guard trip.
+	     - Remaining follow-up:
+	       - this checkpoint prevents stale-rkey teardown after one failed SQL
+	         command, but it does not yet define a dedicated "backend failed,
+	         explicit TX_ABORT cannot execute" peer response. That remains part of
+	         the later failed-backend abort semantics rather than this MR-lifetime
+	         repair.
+	6. 4B-R5 - add per-band fairness:
    - Add round-robin cursors for command sessions, remote command senders,
      foreground payload, close/reclaim, bulk payload, and control mailbox.
    - A "two foreground grants per pass" quota is fair only if the starting
