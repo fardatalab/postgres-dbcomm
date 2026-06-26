@@ -10196,6 +10196,29 @@ Slice 4D-R implementation checkpoint on 2026-06-26:
   checks were clean for the final no-stats smoke. The installed service was
   rebuilt and resynced without stats macros after the stats run.
 
+Slice 4E-R validation checkpoint on 2026-06-26:
+
+- The retained basebackup terminal-state check throttling was validated on top
+  of the repaired 4B scheduler and 4D session scan reduction with no additional
+  code changes.
+- Remote RDMA basebackup command:
+
+  ```text
+  pg_basebackup -X none -c fast
+      -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2,slots=8,bytes=8388608'
+  ```
+
+- Results:
+
+  ```text
+  run 1 (cold): 6.02 s
+  warmed runs: 4.12 s, 4.17 s, 4.25 s, 4.24 s, 4.27 s
+  ```
+
+  The warmed runs remain in the expected post-6F/Slice-4 band. Service logs were
+  clean for the same tracked RDMA, local-control, protocol, and invariant
+  failure signatures used for 4D-R validation.
+
 Additional Slice 4 instrumentation for the next reproduction:
 
 ```text
