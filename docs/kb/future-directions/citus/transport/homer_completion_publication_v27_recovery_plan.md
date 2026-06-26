@@ -10136,6 +10136,66 @@ Recovery implementation plan:
   `clientSqlRemoteCommandOutstandingWriteCount` retains or sets the command
   pending bit before returning to the service loop.
 
+Slice 4D-R implementation checkpoint on 2026-06-26:
+
+- Implemented the session-machine scan reduction in
+  `src/backend/distributed/utils/homer/tuple_sink_service_process.c` by
+  enumerating `SessionPendingState.commandOwnedSessions` and
+  `SessionPendingState.completionOwnedSessions` instead of scanning every slot up
+  to `ActiveSessionScanLimit` when building command/completion machine
+  candidates.
+- The command owned-work predicate now includes outstanding command-send WR
+  ownership, and both command-post branches retain the command pending bit
+  immediately after incrementing
+  `clientSqlRemoteCommandOutstandingWriteCount`. This preserves exact send-CQ
+  retirement ownership without a session-table scan.
+- The completion owned-work predicate now includes the wait-only cases that the
+  old active-session scan used to rediscover: `backendLoopActive`,
+  `peerCommandResponsePending`, `terminalCompletionPendingPeerPoll`,
+  deferred/pending peer-client completion publication, forced local command
+  failure, and peer-client SQL cleanup commands. The open/start session handlers
+  retain completion pending state when they activate the backend loop.
+- Added stats-only audit counters:
+
+  ```text
+  commandOwnedInvariantViolations
+  completionOwnedInvariantViolations
+  staleSessionPendingBits
+  ```
+
+  The audit deliberately checks service-owned command facts, such as outstanding
+  command WR retirement, rather than the raw frontend command-mailbox frontier.
+  A frontend can release-publish a command slot before setting the shared ready
+  bit while the diagnostic scan runs; treating that as a Slice 4D invariant would
+  create false positives. `staleSessionPendingBits` is likewise reserved for
+  inactive/reused/out-of-range pending bits, not for normal coalesced signals
+  that are already drained before candidate construction.
+- Validation:
+
+  ```text
+  no-stats remote c1 smoke:
+      1000/1000, 0 failed, TPS 505.545, p99 0.296 ms
+  no-stats warm remote c1:
+      20000/20000, 0 failed, TPS 4036.598, p99 0.272 ms
+  no-stats remote c4:
+      40000/40000, 0 failed, TPS 10252.388, p99 0.592 ms
+  no-stats remote RDMA basebackup:
+      cold 5.91 s, warmed 4.17 s
+  stats remote c1 smoke after audit correction:
+      1000/1000, 0 failed
+      commandOwnedInvariantViolations = 0
+      completionOwnedInvariantViolations = 0
+      staleSessionPendingBits = 0
+  final no-stats remote c1 smoke:
+      1000/1000, 0 failed, TPS 505.046, p99 0.295 ms
+  ```
+
+  The service logs were also checked for the tracked failure signatures:
+  `status=10`, `status=5`, `REM_ACCESS`, `WR_FLUSH`, async send/recv CQ drain
+  failures, local-control timeout, protocol error, and invariant violation. The
+  checks were clean for the final no-stats smoke. The installed service was
+  rebuilt and resynced without stats macros after the stats run.
+
 Additional Slice 4 instrumentation for the next reproduction:
 
 ```text
