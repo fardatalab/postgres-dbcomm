@@ -1,5 +1,47 @@
 # Homer Peer-Client Completion Publication Pipeline Plan
 
+## June 26, 2026 supersession audit
+
+Status: historical design note. Do not implement the slice sequence in this file
+directly.
+
+The current canonical plan and accepted validation record live in
+[`homer_completion_publication_v27_recovery_plan.md`](homer_completion_publication_v27_recovery_plan.md).
+That recovery work implemented or superseded the peer-client completion
+publication pipeline described here:
+
+- Slot-local frontend completion readiness and stable reads are implemented with
+  `readyEpochSlots[]`, trailing completion seals, and the frontend
+  peek/apply/ack lease path.
+- Per-session peer-client completion source rings, staged publication state,
+  typed send-CQ retirement, source-credit blockage, and scheduler-visible retry
+  facts are implemented in the service.
+- The three-WR memory-polled path, the receiver-service WIMM bridge, and the
+  direct WIMM-to-frontend-ready-word path recorded below were all rejected or
+  superseded during validation. The accepted publication contract is now a
+  **full-slot `RDMA_WRITE_WITH_IMM` to the client completion slot image**, with
+  the receiver service validating the body/seal and any descriptor side-table
+  state before CPU-publishing the frontend-polled `readyEpochSlots[]` and
+  `publishedEpoch`.
+- The frontend client no longer treats aggregate `publishedEpoch` as a
+  visibility proof. It is only a hint; the slot-local ready epoch, stable slot
+  copy, command identity, seal, and descriptor validation define consumability.
+- The tuple-result generation/EOS ownership repair and the local-control
+  scheduler repairs that this plan discovered are also incorporated in the v27
+  recovery plan.
+
+Items from this file that remain as future caveats are intentionally tracked in
+the recovery plan rather than here:
+
+- partial-post/reset semantics for rare multi-WR failure paths;
+- deliberately failing SQL / tuple-view `ERROR+EOS` semantics;
+- remote completion-mailbox credit stress under artificial tiny geometry;
+- broader foreground-scaling and scheduler-policy tuning.
+
+Keep this file as provenance for the rejected intermediate publication designs
+and for the pitfalls at the end of the document. Use the v27 recovery plan as the
+implementation roadmap.
+
 ## Scope
 
 - **What this doc explains**: the targeted plan for fixing cross-node client-SQL
@@ -1425,10 +1467,13 @@ Performance checks:
 4. Acceptance for the first async source-ring version is correctness plus no
    remote c1/c4 regression. The target is to remove the per-completion blocking
    local CQ wait and improve c1 latency/TPS while preserving c4 stability.
-5. The current accepted performance baseline is Slice 4c plus Slice 4d/4d-r:
-   body WRITE plus WIMM ready-word self-publication, frontend peek/apply/ack,
-   immutable generation-tagged tuple-result records, and the local-blackhole
-   scheduler admission fix.
+5. Historical note: the old accepted performance baseline in this file was Slice
+   4c plus Slice 4d/4d-r: body WRITE plus WIMM ready-word self-publication,
+   frontend peek/apply/ack, immutable generation-tagged tuple-result records,
+   and the local-blackhole scheduler admission fix. That baseline has been
+   superseded by the v27 recovery contract: full-slot WIMM publication to the
+   client completion slot image, receiver-service validation, and receiver CPU
+   publication of frontend-polled ready words.
 
 ## Pitfalls, caveats, and hidden constraints
 
@@ -1446,13 +1491,17 @@ Performance checks:
   fast path. The client polls memory; the immediate belongs to the receiver
   service's transport CQ path unless a separate client CQ/event path is explicitly
   designed.
-- Do not put receiver-service token decode/session demux on the normal
-  peer-client completion visibility path. If the WIMM WR already writes the
-  slot-local ready word, the frontend can observe completion readiness without a
-  receiver CPU store.
-- Do not describe recv-CQ handling as the host-client publication mechanism in
-  Slice 4c. The receiver should drain CQEs promptly for credit/repost and
-  diagnostics, but host-client visibility comes from the WIMM-written memory gate.
+- Superseded Slice 4c caveat: the old direct WIMM-to-ready-word design tried to
+  avoid receiver-service token decode/session demux on the normal peer-client
+  completion visibility path. That design was rejected. In the accepted v27
+  contract, the receiver service must drain the recv CQ, validate the full-slot
+  completion body/seal and descriptor side-table state, and then CPU-publish the
+  frontend-polled ready word.
+- Do not describe recv-CQ handling as optional diagnostic work for peer-client
+  completion publication. In the accepted v27 path it is the canonical
+  publication boundary for cross-node peer-client completions, even though the
+  frontend client itself still polls ordinary shared memory rather than consuming
+  RDMA immediates.
 - Do not collapse the fallback two-WR path into one `[body][ready]` WIMM unless
   the target MR/MKey and QP ordering evidence proves that ready visibility implies
   prior body visibility for the same WR.

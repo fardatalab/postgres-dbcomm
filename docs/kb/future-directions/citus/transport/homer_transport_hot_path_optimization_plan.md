@@ -1,5 +1,69 @@
 # Homer Transport Hot-Path Optimization Plan
 
+## June 26, 2026 audit against the v27 recovery work
+
+Status: partially implemented and partially superseded. This document should not
+be treated as a linear implementation plan anymore. The accepted current-state
+and validation record for normal c1/c4 pgbench plus basebackup is
+[`homer_completion_publication_v27_recovery_plan.md`](homer_completion_publication_v27_recovery_plan.md).
+Use this file as a source of preserved hot-path constraints, rejected
+experiments, and lower-priority future ideas.
+
+Summary of what the v27 recovery work and subsequent wrap-up covered:
+
+| Area from this plan | Current status |
+| --- | --- |
+| Stage 0 measurement discipline and destructive completion-wrapper documentation | Covered. The measured pgbench path uses explicit frontend peek/apply/ack, and `HomerClientTryCommandCompletion()` remains documented as a destructive compatibility wrapper. |
+| Stage 2 send-CQ ownership direction | Mostly covered for the accepted paths. The service now has typed send-CQ relief and peer-client completion source retirement, but this is not a declaration that every legacy callback-absent compatibility branch has been deleted. |
+| Stage 3a nonblocking result drain | Covered for the pgbench result path through `HomerClientDrainResultSinkUntil()` and the pgbench retry/apply loop. |
+| Stage 3b/4a compact completion plus descriptor side table | Partially scaffolded, not fully completed. The current protocol has compact hot-completion and descriptor-table helpers, and the receiver validates descriptor side-table state before CPU-publishing peer completions, but legacy completion events still carry inline descriptor/contract material until a separate hot-record migration is done. |
+| Stage 4b/4c pre-arm and STARTED suppression | Covered for the current pgbench hot path by the exact direct-command reservation/pre-arm contract. The reservation is intentionally narrow and is not a general async command reservation API. |
+| Stage 4d compact command publication | Covered. The command path now has compact byte-counted command records, stable backend reads, accepted-vs-retired frontiers, inline fast-retire when safe, and exact reservation validation for pre-arm. |
+| Stage 5a/5b successful tuple-result DATA/EOS and bounded-grant work | Covered for normal successful pgbench workloads. Failed-query tuple-view `ERROR+EOS` is still deferred to Slice 6 in the recovery plan. |
+| Stage 6 producer-set ready bitmaps and typed facts | Covered in the accepted scheduler/ownership work where it matters for normal workloads: persistent pending state, exact demand/readiness, owned-versus-runnable rearm, local-control admission, and durable recv-CQ liveness. Cache-line sharding and some diagnostic-only bitmap refinements remain optional. |
+| Stage 7a-7c basebackup hot-path cleanup | Covered by the accepted checkpoints already recorded below: semantic-header shrinkage, tuned range publication, and direct registered producer byte rings. |
+| Stage 7d QP/CQ isolation | Not pursued. Later Slice 4 decisions explicitly kept the current QP/CQ topology and focused on scheduler priority, exact facts, and foreground-first tuning. The final clean concurrent c4+basebackup run completed correctly without adding QPs/CQs, so this remains optional future design input, not the next step. |
+
+Current normal-workload wrap-up evidence from the canonical recovery plan:
+
+```text
+postgres-citus:
+    52a959a4da4 Record Homer normal workload wrap-up validation
+
+citus-dbcomm:
+    90651939c Constrain Homer direct command reservation
+
+remote c1 warmed:
+    10000/10000 each, 0 failed
+    median about 3952 TPS
+
+remote c4:
+    20000/20000 each, 0 failed
+    median about 10169 TPS
+
+remote RDMA basebackup warmed:
+    median about 4.24 s
+
+concurrent c4 + remote RDMA basebackup:
+    pgbench 10000/10000, 0 failed in all three runs
+    pgbench TPS: 9360, 9313, 9247
+    basebackup: 4.30 s, 4.22 s, 4.31 s
+```
+
+Known deferred caveats that still matter if this plan is revived:
+
+- failed-query tuple-view `ERROR+EOS` and abort-completion lifecycle remain Slice
+  6 work in the recovery plan;
+- partial-post/reset behavior for rare multi-WR failure paths needs a per-path
+  matrix before implementation;
+- the legacy inline descriptor-heavy completion layout is still present in live
+  completion events, despite descriptor-table scaffolding;
+- lower-priority basebackup fragment identity, exact reservation geometry, and
+  teardown assertions remain Slice 7 cleanup;
+- any future major scheduler overhaul should harvest the constraints here, but
+  should not replay this plan's old Stage 7d QP/CQ-isolation path as the default
+  answer.
+
 ## Scope
 
 - **What this doc explains**: an implementation-ready staged optimization plan
@@ -98,12 +162,15 @@ without making each patch rediscover the ABI, ownership, and failure behavior.
   [`HomerServiceBuildPayloadMachineCandidates()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:27075)
   still rebuild readiness through active-table scans.
 
-## Current behavior and performance baselines
+## Historical behavior and performance baselines
 
-- Current accepted validation after the generation/EOS and peek/apply/ack fixes
+- Historical accepted validation after the generation/EOS and peek/apply/ack fixes
   is: remote c1 correct at about `4.17k` and `3.76k TPS`; remote c4 correct at
   about `10.47k` and `10.39k TPS`; local blackhole basebackup `10.44s`; remote
   RDMA basebackup warmed repeats `4.43s` and `4.32s`.
+- The current wrap-up baseline after the v27 recovery and exact direct-command
+  reservation fix is recorded in the June 26 audit above and in
+  [`homer_completion_publication_v27_recovery_plan.md`](homer_completion_publication_v27_recovery_plan.md).
 - Historical performance ceilings observed before later latent correctness
   defects were fixed:
 
