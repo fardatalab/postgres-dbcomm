@@ -14,9 +14,9 @@ Summary of what the v27 recovery work and subsequent wrap-up covered:
 | Area from this plan | Current status |
 | --- | --- |
 | Stage 0 measurement discipline and destructive completion-wrapper documentation | Covered. The measured pgbench path uses explicit frontend peek/apply/ack, and `HomerClientTryCommandCompletion()` remains documented as a destructive compatibility wrapper. |
-| Stage 2 send-CQ ownership direction | Mostly covered for the accepted paths. The service now has typed send-CQ relief and peer-client completion source retirement, but this is not a declaration that every legacy callback-absent compatibility branch has been deleted. |
+| Stage 2 send-CQ ownership direction | Covered for steady-state accepted paths after the June 26 cleanup. The only exported steady-state send-CQ collector is `TupleSinkServiceDrainPeerSendCqRdma()` with typed owner callbacks; internal callback-absent drains are retained only as cold control/bootstrap helpers and are fenced to fail if service-owned command, payload, or peer-client-completion CQEs appear. |
 | Stage 3a nonblocking result drain | Covered for the pgbench result path through `HomerClientDrainResultSinkUntil()` and the pgbench retry/apply loop. |
-| Stage 3b/4a compact completion plus descriptor side table | Partially scaffolded, not fully completed. The current protocol has compact hot-completion and descriptor-table helpers, and the receiver validates descriptor side-table state before CPU-publishing peer completions, but legacy completion events still carry inline descriptor/contract material until a separate hot-record migration is done. |
+| Stage 3b/4a compact completion plus descriptor side table | Deferred. The current protocol has compact hot-completion and descriptor-table helpers, and the receiver validates descriptor side-table state before CPU-publishing peer completions, but live completion events still carry inline descriptor/contract material. Migrating the live ABI is intentionally left for a separate hot-completion deployment stage. |
 | Stage 4b/4c pre-arm and STARTED suppression | Covered for the current pgbench hot path by the exact direct-command reservation/pre-arm contract. The reservation is intentionally narrow and is not a general async command reservation API. |
 | Stage 4d compact command publication | Covered. The command path now has compact byte-counted command records, stable backend reads, accepted-vs-retired frontiers, inline fast-retire when safe, and exact reservation validation for pre-arm. |
 | Stage 5a/5b successful tuple-result DATA/EOS and bounded-grant work | Covered for normal successful pgbench workloads. Failed-query tuple-view `ERROR+EOS` is still deferred to Slice 6 in the recovery plan. |
@@ -57,7 +57,8 @@ Known deferred caveats that still matter if this plan is revived:
 - partial-post/reset behavior for rare multi-WR failure paths needs a per-path
   matrix before implementation;
 - the legacy inline descriptor-heavy completion layout is still present in live
-  completion events, despite descriptor-table scaffolding;
+  completion events, despite descriptor-table scaffolding; this is explicitly
+  deferred as a live completion-mailbox ABI migration, not a small cleanup;
 - lower-priority basebackup fragment identity, exact reservation geometry, and
   teardown assertions remain Slice 7 cleanup;
 - any future major scheduler overhaul should harvest the constraints here, but

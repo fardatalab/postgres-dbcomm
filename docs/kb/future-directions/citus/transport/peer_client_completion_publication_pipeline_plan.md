@@ -16,6 +16,11 @@ publication pipeline described here:
 - Per-session peer-client completion source rings, staged publication state,
   typed send-CQ retirement, source-credit blockage, and scheduler-visible retry
   facts are implemented in the service.
+- The June 26 send-CQ ownership cleanup removed the unused exported
+  callback-capable compatibility wrapper. The canonical steady-state drain is
+  now `TupleSinkServiceDrainPeerSendCqRdma()` with typed owner callbacks; cold
+  internal control-only drains remain, but they fail if command, payload, or
+  peer-client-completion owner namespaces appear without callbacks.
 - The three-WR memory-polled path, the receiver-service WIMM bridge, and the
   direct WIMM-to-frontend-ready-word path recorded below were all rejected or
   superseded during validation. The accepted publication contract is now a
@@ -37,6 +42,13 @@ the recovery plan rather than here:
 - deliberately failing SQL / tuple-view `ERROR+EOS` semantics;
 - remote completion-mailbox credit stress under artificial tiny geometry;
 - broader foreground-scaling and scheduler-policy tuning.
+
+The compact hot-completion plus descriptor side-table migration is deliberately
+not part of the June 26 cleanup. The scaffolding exists, and the receiver already
+validates descriptor side-table state before frontend publication, but live
+mailbox slots still expose the legacy inline completion image. Switching that
+layout requires a separate protocol/version bump and coordinated publisher,
+receiver, client-lease, and pgbench apply changes.
 
 Keep this file as provenance for the rejected intermediate publication designs
 and for the pitfalls at the end of the document. Use the v27 recovery plan as the
