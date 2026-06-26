@@ -9312,12 +9312,113 @@ Recovery implementation plan:
    - Status: do not mark 4B-R4 complete and do not commit the code attempt as an
      accepted slice. The durable due-set repair may still be structurally right,
      but it did not eliminate the first critical-control send/recv CQ failure.
-     The next review should determine whether this is:
-     - a remaining liveness quota/ordering bug before the first critical-control
-       WIMM;
-     - a peer-control write/address/rkey lifetime bug that 4B-R4 exposed;
-     - or an error-classification/reset cascade where status `5` is teardown
-       evidence and status `10` is the first real failure.
+   - Follow-up diagnostic on 2026-06-25 pinned the initiating failure:
+     - farnet0's critical-control outgoing send CQ reports status `10`
+       (`IBV_WC_REM_ACCESS_ERR`);
+     - farnet1's incoming recv CQ status `5` is secondary flush/teardown
+       evidence;
+     - the failing WR is a command-mailbox RDMA write, not a payload WR, not a
+       control response, and not the recv-CQ liveness action itself.
+   - The diagnostic build added `HOMER_PEER_RDMA_DIAG` logging around send-post
+     metadata and client-SQL command descriptor publication. Evidence:
+
+     ```text
+     farnet1 registers peer command mailbox:
+       descriptor_addr=140676797599744 rkey=1549924 bytes=3202072 token=1
+
+     farnet0 stores and uses the same descriptor:
+       sequence=5 kind=6 SQL_EXECUTE slot=4 record_addr=140676797799896
+       sequence=6 kind=4 TX_ABORT    slot=5 record_addr=140676797849928
+
+     farnet1 resets the session after sequence 5:
+       current_sequence=5 current_kind=6 current_state=4
+       post_command_state=3
+       detail="timed out waiting for Homer service progress"
+
+     farnet0 then posts sequence 6 TX_ABORT to the now-deregistered mailbox MR:
+       remote_addr=140676797849928 rkey=1549924 bytes=50024 status=10
+       next readySeq WR is flushed with status=5
+     ```
+
+   - Corrected root-priority diagnosis after follow-up review:
+     - The first correctness failure is the sequence-5 `SQL_EXECUTE` timeout,
+       not the later `IBV_WC_REM_ACCESS_ERR`.
+     - The failed SQL completion is legal protocol state in general, but in
+       this trace it carries an internal progress failure:
+
+       ```text
+       detail="timed out waiting for Homer service progress"
+       ```
+
+     - That timeout is emitted by
+       `RemoteExecWaitForControlResponse()` in
+       `remote_execution_backend_bridge.c` when the socketless backend waits
+       for its local Homer service to answer a local control request and sees no
+       heartbeat progress for the timeout interval. The known call sites during
+       row-producing SQL are:
+       - `RemoteExecOpenServiceOwnedResultSink()` waiting for
+         `"open client SQL result sink"`;
+       - `RemoteExecCloseServiceOwnedResultSink()` waiting for
+         `"close client SQL result sink"` when a result-shape change or cleanup
+         closes the persistent service-owned result sink.
+     - The current peer completion detail preserved only `errmsg`, not the
+       backend bridge `errdetail`, so this run does not yet prove which
+       operation timed out. The next diagnostic must preserve or separately log:
+
+       ```text
+       operationName
+       ownerPid
+       requestSequence
+       control slot state
+       service heartbeat before/after
+       service pass / scheduler phase when the request is visible
+       ```
+
+     - Investigation priority: first identify why the local service did not
+       progress the backend bridge control request in step 3. Candidate classes
+       are:
+       - service loop stalled or blocked without advancing `heartbeatCounter`;
+       - local control request not collected after the Slice 4 collector/semantic
+         phase split;
+       - local open/close result-sink action built but budget-deferred without a
+         durable ready fact;
+       - service progress exists but `heartbeatCounter` is not updated at the
+         point the backend bridge uses as liveness evidence.
+   - Consequence / required robustness repair: after the timeout, the receiver
+     invalidates the peer command-mailbox binding too early.
+     `TupleSinkServiceSessionShouldRetireWhenIdle()` treats any
+     `CLIENT_SQL_SESSION` failed command as reclaimable, and
+     `TupleSinkServiceConsumeCompletionMailbox()` then calls
+     `TupleSinkServiceResetSession()`, which deregisters
+     `clientSqlPeerCommandMailboxRegionHandle`. The peer frontend still owns the
+     client SQL session and can legitimately send follow-up transaction cleanup
+     commands such as `TX_ABORT`. That write uses the descriptor returned by the
+     peer-open response, but the receiver has already invalidated the rkey.
+     Fixing this lifetime bug is still required, but it does not explain why
+     sequence 5 timed out in the first place.
+   - Compact inline command publication is not the sole cause. Rebuilding with
+     `HOMER_SERVICE_COMPACT_CLIENT_SQL_COMMAND_RDMA=0` still reproduces the same
+     lifetime failure; the final failing WR becomes the large command-slot body
+     write for sequence 6, followed by a flushed tagged readySeq checkpoint.
+   - Required diagnostic/repair order before accepting 4B-R4:
+     - first, reproduce with backend bridge operation detail preserved and pin
+       the exact local control request that times out;
+     - then fix the scheduler/service-progress cause that prevents the local
+       control response from being produced;
+     - in parallel or immediately after, keep the command-mailbox lifetime fix
+       below so a legal failed SQL command cannot make subsequent cleanup writes
+       hit a stale rkey.
+   - Required command-mailbox lifetime repair:
+     - do not reset/deregister a peer-owned `CLIENT_SQL_SESSION` command mailbox
+       solely because one SQL command failed;
+     - preserve the peer command mailbox MR until the peer closes the command
+       session or the connection reset path proves no further writes can arrive;
+     - publish the failed SQL completion to the frontend and allow explicit
+       cleanup commands (`TX_ABORT`, then session close) to arrive on the still
+       valid command mailbox;
+     - if a failed command truly makes the backend unusable, mark backend-loop
+       reuse separately from command-mailbox/MR lifetime instead of conflating it
+       with session storage reclamation.
 6. 4B-R5 - add per-band fairness:
    - Add round-robin cursors for command sessions, remote command senders,
      foreground payload, close/reclaim, bulk payload, and control mailbox.
