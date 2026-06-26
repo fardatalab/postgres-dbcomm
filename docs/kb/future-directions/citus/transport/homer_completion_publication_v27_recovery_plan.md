@@ -10492,6 +10492,38 @@ Return to event loop:
     debug assert reservation.active == false
 ```
 
+#### 5C Rejected First Attempt
+
+Status: not implemented.
+
+An initial uncommitted attempt added a session-local
+`HomerClientDirectCommandReservation` and changed pgbench from
+`HomerClientPredictNextCommandSequence()` to a reserve/pre-arm/start flow. It
+compiled, but validation rejected it:
+
+```text
+remote c1 smoke:
+    1000/1000 transactions, 0 failed
+
+remote warmed c1:
+    failed with backend SQL syntax error near "bbalance"
+```
+
+The symptom indicates command-slot publication or command-record corruption,
+not a performance-only issue. The attempted code was reverted and must not be
+treated as the accepted 5C design.
+
+Next 5C attempt requirements:
+
+* Add diagnostics before changing behavior: log the reserved sequence, slot
+  index, published/consumed epochs, `readySeq`, command kind, SQL byte count,
+  and first bytes of SQL at reservation, fill, and publish.
+* If a reservation is kept, preserve the invariant that no shared slot field
+  becomes visible to the service until the command record has been fully
+  initialized and `readySeq`/`publishedEpoch` are release-stored.
+* Validate with a warmed c1 run after the c1 smoke; the smoke alone did not
+  expose the corruption.
+
 - no second reservation while one is active;
 - failure before command publication clears only the reservation; no reader can
   observe unpublished slot bytes, so do not zero or mark the slot unused;
