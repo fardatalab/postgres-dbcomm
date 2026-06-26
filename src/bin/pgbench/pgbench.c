@@ -3515,6 +3515,16 @@ static bool HomerQueueDescriptorSamePhysicalSink(const CitusTupleSinkQueueDescri
 		   memcmp(left->queueShmName, right->queueShmName, sizeof(left->queueShmName)) == 0;
 }
 
+static bool HomerQueueDescriptorSamePhysicalAttachment(const CitusTupleSinkQueueDescriptor *left,
+													   const CitusTupleSinkQueueAttachment *right)
+{
+	return left != NULL && right != NULL && left->protocolVersion == right->protocolVersion &&
+		   left->slotCount == right->slotCount && left->slotCapacityBytes == right->slotCapacityBytes &&
+		   left->slotReservedPrefixBytes == right->slotReservedPrefixBytes && left->direction == right->direction &&
+		   left->descriptorFlags == right->descriptorFlags &&
+		   memcmp(left->queueShmName, right->queueShmName, sizeof(left->queueShmName)) == 0;
+}
+
 static bool HomerPrearmedResultBindingMatchesCompletion(CState *st, const CitusRemoteExecCommandCompletion *completion)
 {
 	const HomerClientResultSink *resultSink = &st->homer_result_sink;
@@ -3530,6 +3540,28 @@ static bool HomerPrearmedResultBindingMatchesCompletion(CState *st, const CitusR
 				  sizeof(resultSink->tupleViewContract)) == 0 &&
 		   resultSink->resultGeneration == completion->resultQueueDescriptor.resultGeneration &&
 		   resultSink->startByteTail == completion->resultQueueDescriptor.startByteTail;
+}
+
+static bool HomerPrearmedResultBindingMatchesCompletionView(CState *st, const HomerClientCompletionView *completionView)
+{
+	const HomerClientResultSink *resultSink = &st->homer_result_sink;
+
+	if (completionView == NULL ||
+		(completionView->hot.resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) == 0)
+		return true;
+
+	if (!st->homer_pending_result_sink_bound || !st->homer_result_sink_open || !resultSink->open)
+		return true;
+
+	if (completionView->descriptor == NULL)
+		return false;
+
+	return HomerQueueDescriptorSamePhysicalAttachment(&resultSink->queueDescriptor,
+													  &completionView->descriptor->queueAttachment) &&
+		   memcmp(&resultSink->tupleViewContract, &completionView->descriptor->tupleViewContract,
+				  sizeof(resultSink->tupleViewContract)) == 0 &&
+		   resultSink->resultGeneration == completionView->hot.resultGeneration &&
+		   resultSink->startByteTail == completionView->hot.resultStartByteTail;
 }
 
 static void HomerRememberStableResultBinding(CState *st, const CitusRemoteExecCommandCompletion *completion)
@@ -3557,7 +3589,6 @@ static void HomerRememberStableResultBinding(CState *st, const CitusRemoteExecCo
 static bool HomerTryPrearmStableResultBinding(CState *st, uint32 commandKind, uint32 resultMode, uint64 commandSequence,
 											  const char *operationName)
 {
-	CitusRemoteExecCommandCompletion prearmCompletion;
 	char errorMessage[HOMER_CLIENT_ERROR_BYTES];
 
 	if (commandKind != CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE || resultMode != CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE ||
@@ -3568,19 +3599,13 @@ static bool HomerTryPrearmStableResultBinding(CState *st, uint32 commandKind, ui
 		return false;
 	}
 
-	memset(&prearmCompletion, 0, sizeof(prearmCompletion));
-	prearmCompletion.protocolVersion = CITUS_REMOTE_EXEC_CONTROL_PROTOCOL_VERSION;
-	prearmCompletion.commandKind = commandKind;
-	prearmCompletion.commandState = CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED;
-	prearmCompletion.commandSequence = commandSequence;
-	prearmCompletion.resultFlags = CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY;
-	prearmCompletion.resultQueueDescriptor = st->homer_result_sink.queueDescriptor;
-	prearmCompletion.resultQueueDescriptor.resultGeneration = commandSequence;
-	prearmCompletion.resultQueueDescriptor.startByteTail = st->homer_stable_result_drained_tail;
-	prearmCompletion.resultQueueDescriptor.firstRingRecordOrdinal = 0;
-	prearmCompletion.resultTupleViewContract = st->homer_result_sink.tupleViewContract;
-
-	if (!HomerClientOpenResultSink(&prearmCompletion, &st->homer_result_sink, errorMessage, sizeof(errorMessage)))
+	/*
+	 * Pre-arm only changes the command-local binding of an already mapped,
+	 * already validated result sink. Avoid synthesizing a full legacy
+	 * completion just to drive this hot path.
+	 */
+	if (!HomerClientRebindResultSink(&st->homer_result_sink, st->homer_result_sink.descriptorVersion, commandSequence,
+									 st->homer_stable_result_drained_tail, 0, errorMessage, sizeof(errorMessage)))
 	{
 		/*
 		 * Pre-arm is an optimization predicate. A miss must fall back to the
@@ -3672,8 +3697,10 @@ static HomerCompletionApplyResult HomerDrainPendingResultSink(CState *st, const 
  * only point where pgbench advances its command state and updates the
  * transaction attachment flag.
  */
-static HomerCompletionApplyResult
-HomerApplyCommandCompletion(CState *st, const CitusRemoteExecCommandCompletion *completion, bool *commandComplete)
+static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
+															  const CitusRemoteExecCommandCompletion *completion,
+															  const HomerClientCompletionView *completionView,
+															  bool *commandComplete)
 {
 	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
 	HomerClientResultSink *resultSink = &st->homer_result_sink;
@@ -3685,11 +3712,22 @@ HomerApplyCommandCompletion(CState *st, const CitusRemoteExecCommandCompletion *
 	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED ||
 		completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED)
 	{
-		if ((completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0 &&
+		if (completionView == NULL && (completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0 &&
 			!HomerPrearmedResultBindingMatchesCompletion(st, completion))
 		{
 			pg_log_error("client %d Homer pre-armed result binding for %s did not match STARTED descriptor", st->id,
 						 operationName);
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+			HomerInvalidateStableResultBinding(st);
+			clearHomerPendingCommand(st);
+			return HOMER_COMPLETION_APPLY_FATAL;
+		}
+		if (completionView != NULL &&
+			(completionView->hot.resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0 &&
+			!HomerPrearmedResultBindingMatchesCompletionView(st, completionView))
+		{
+			pg_log_error("client %d Homer pre-armed result binding for %s did not match STARTED descriptor view",
+						 st->id, operationName);
 			st->estatus = ESTATUS_OTHER_SQL_ERROR;
 			HomerInvalidateStableResultBinding(st);
 			clearHomerPendingCommand(st);
@@ -3700,9 +3738,19 @@ HomerApplyCommandCompletion(CState *st, const CitusRemoteExecCommandCompletion *
 			(completion->resultFlags &
 			 CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
 		{
-			if (!HomerClientOpenResultSink(completion, resultSink,
-										   errorMessage,
-										   sizeof(errorMessage)))
+			bool opened = false;
+
+			if (completionView != NULL &&
+				(completionView->hot.resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
+			{
+				opened = HomerClientOpenResultSinkFromCompletionView(completionView, resultSink, errorMessage,
+																	 sizeof(errorMessage));
+			}
+			else
+			{
+				opened = HomerClientOpenResultSink(completion, resultSink, errorMessage, sizeof(errorMessage));
+			}
+			if (!opened)
 			{
 				pg_log_error("client %d failed to open Homer result sink for %s: %s",
 							 st->id, operationName, errorMessage);
@@ -3853,7 +3901,7 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 	memset(&st->homer_pending_drain_target, 0, sizeof(st->homer_pending_drain_target));
 	st->homer_pending_operation_name = operationName;
 
-	switch (HomerApplyCommandCompletion(st, &completion, &commandComplete))
+	switch (HomerApplyCommandCompletion(st, &completion, NULL, &commandComplete))
 	{
 	case HOMER_COMPLETION_APPLIED_CONTINUE:
 	case HOMER_COMPLETION_APPLIED_TERMINAL_SUCCESS:
@@ -3953,7 +4001,7 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 	}
 
 	st->homer_pending_drain_target = lease->resultDrainTarget;
-	applyResult = HomerApplyCommandCompletion(st, &lease->completion, commandComplete);
+	applyResult = HomerApplyCommandCompletion(st, &lease->completion, &lease->view, commandComplete);
 	if (applyResult == HOMER_COMPLETION_NOT_APPLIED_RETRY)
 	{
 		*commandComplete = false;

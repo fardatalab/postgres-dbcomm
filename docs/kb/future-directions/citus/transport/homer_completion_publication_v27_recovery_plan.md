@@ -10383,6 +10383,59 @@ bool HomerClientRebindResultSink(
 
 It updates only command-generation binding and consumed-head fields.
 
+### Slice 5A/5B Implementation Checkpoint
+
+Status: implemented and validated for the pgbench result path.
+
+Current code:
+
+* `HomerClientCompletionLease` now carries a lease-owned
+  `HomerClientCompletionView` plus `HomerClientCachedResultDescriptor` in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_client.h`.
+* `HomerClientReadHotCompletionView()` in
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_client.c` copies the compact
+  `CitusRemoteExecCommandCompletionHot` and resolves the descriptor table into
+  session-owned lease storage.
+* `HomerClientMaterializeLegacyCompletionFromView()` remains the compatibility
+  path. Non-destructive peek materializes only hot legacy fields; destructive
+  legacy wrappers request full descriptor reconstruction before returning a
+  `CitusRemoteExecCommandCompletion`.
+* `HomerClientOpenResultSinkFromCompletionView()` and
+  `HomerClientRebindResultSink()` in
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_client.c` bind result sinks from the
+  compact view or retarget an already mapped sink without synthetic
+  full-completion construction.
+* pgbench’s Homer path in
+  `/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c` now pre-arms by
+  calling `HomerClientRebindResultSink()` directly, and pushed completions bind
+  result sinks from `lease->view`.
+
+Validation:
+
+```text
+Citus client/service compile:
+    sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+
+Postgres pgbench compile:
+    sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build src/bin/pgbench/pgbench
+
+remote c1 smoke:
+    1000/1000 transactions, 0 failed
+
+remote warmed c1:
+    20000/20000 transactions, 0 failed, 4052 TPS
+
+remote c4 smoke:
+    20000/20000 transactions, 0 failed, 10253 TPS
+```
+
+Remaining Slice 5 work:
+
+* Slice 5C direct command sequence reservation is still future work.
+* Some compatibility APIs still materialize the full legacy completion on
+  demand. That is intentional for now; measured peek/apply pgbench avoids the
+  descriptor reconstruction for result-sink binding.
+
 ### 5C Exact Command Sequence Reservation
 
 The audited plan proposes:
