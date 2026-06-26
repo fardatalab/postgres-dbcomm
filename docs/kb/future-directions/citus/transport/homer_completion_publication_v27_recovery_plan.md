@@ -10587,6 +10587,110 @@ zero failures. This supports the diagnosis that the rejected attempt let
 reservation ownership escape the exact row-producing pre-arm path, allowing a
 later pgbench command to be associated with stale reservation/slot state.
 
+#### Normal-Workload Wrap-Up Validation
+
+Status: current normal c1/c4/basebackup workloads are correctness-clean on the
+committed Slice 4/5 state; performance is usable but not all older aspirational
+thresholds were met in the final clean run set.
+
+Committed code validated:
+
+```text
+postgres-citus:
+    a2800423ce7 Use exact Homer command reservations for prearm
+
+citus-dbcomm:
+    90651939c Constrain Homer direct command reservation
+```
+
+The final validation intentionally restarted both Homer services with exact
+command-line `pkill -f` cleanup before running the accepted matrix. An earlier
+attempted restart used process-name matching and left an existing service bound
+to port `9717`; that run was treated as contaminated and not used as the final
+clean validation result.
+
+Clean preflight:
+
+```text
+farnet1:
+    PostgreSQL running
+    one citus_tuple_sink_service process
+    no stale pgbench, pg_basebackup, walsender, or remote exec backend
+
+farnet0:
+    one citus_tuple_sink_service process
+    no stale pgbench, pg_basebackup, walsender, or remote exec backend
+```
+
+Foreground pgbench validation from `farnet0` to `farnet1`:
+
+```text
+remote c1:
+    run 1 cold after service restart:
+        10000/10000, 0 failed, 2301 TPS, max latency 1828 ms
+
+    warmed runs 2-6:
+        10000/10000 each, 0 failed
+        TPS: 4018, 3641, 3611, 3951, 3975
+        warmed median: about 3952 TPS
+
+remote c4:
+    runs 1-3:
+        20000/20000 each, 0 failed
+        TPS: 10169, 10227, 10111
+        median: about 10169 TPS
+```
+
+Remote RDMA basebackup validation:
+
+```text
+run 1 cold after service restart:
+    completed, real 6.17 s
+
+warmed runs 2-4:
+    completed
+    real: 4.24 s, 4.15 s, 4.25 s
+    warmed median: about 4.24 s
+```
+
+Concurrent c4 pgbench plus remote RDMA basebackup:
+
+```text
+artifacts:
+    /tmp/homer_final_clean_concurrent_1782485623
+
+run 1:
+    pgbench 10000/10000, 0 failed, 9360 TPS
+    basebackup completed, real 4.30 s
+
+run 2:
+    pgbench 10000/10000, 0 failed, 9313 TPS
+    basebackup completed, real 4.22 s
+
+run 3:
+    pgbench 10000/10000, 0 failed, 9247 TPS
+    basebackup completed, real 4.31 s
+```
+
+Recent service-log sweep after the clean matrix found no `REM_ACCESS`,
+`WR_FLUSH`, async send/recv completion failure, timeout, assertion, or fatal
+lines in the inspected log tail on either host.
+
+Acceptance interpretation:
+
+- Normal c1/c4 pgbench, remote RDMA basebackup, and concurrent c4+basebackup
+  completed with zero benchmark-level failures.
+- Basebackup remains within the expected warmed band.
+- Remote c1 correctness is stable, but the final warmed median is slightly below
+  the older 4.0k TPS target.
+- Remote c4 correctness is stable, but the final median is below the older
+  10.8k TPS target and remains a future foreground-scaling/tuning item rather
+  than a correctness blocker.
+- The failed-query `ERROR+EOS` / transaction-abort edge path is still deferred
+  to Slice 6. Normal pgbench validation does not exercise it.
+- Slice 7 basebackup fragment/reservation/teardown cleanup remains
+  lower-priority; the current normal basebackup workload completed cleanly.
+
 ## Slice 6: Close Earlier Correctness Caveats
 
 - **Partial-post reset semantics**: zero WRs posted means normal rollback; one
@@ -10761,9 +10865,9 @@ empty critical polls per transaction
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Completion owned/runnable rearm correctness validated; remaining signaled-owner FIFO counts are performance cleanup |
 | Slice 3D    | 3D-0 through 3D-6 exact-control cleanup, Close-1 through Close-3, the Close-3 remote-head gate optimization, and Close-4A through Close-4E receiver quiescence/tombstone are implemented and validated |
-| Slice 4     | 4A through repaired 4E-R validated for normal c1/c4/basebackup and concurrent c4+basebackup; failed-query `ERROR+EOS` exits are a deferred Slice 6 caveat |
+| Slice 4     | 4A through repaired 4E-R validated for normal c1/c4/basebackup and concurrent c4+basebackup; final clean wrap-up is correctness-clean, with c1/c4 performance below older aspirational thresholds; failed-query `ERROR+EOS` exits are a deferred Slice 6 caveat |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
-| Slice 5C    | Correct and intentionally narrow                                                     |
+| Slice 5C    | Correct and intentionally narrow; final clean validation used the committed exact-reservation fix |
 | Slice 6     | Backlog summary; includes deferred failed-query `ERROR+EOS` / abort-completion lifecycle and needs a stage-template expansion before implementation |
 | Slice 7     | Lower-priority summary; needs a stage-template expansion before implementation        |
 
