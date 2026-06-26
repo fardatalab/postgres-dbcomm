@@ -3586,15 +3586,52 @@ static void HomerRememberStableResultBinding(CState *st, const CitusRemoteExecCo
 	st->homer_stable_result_drained_tail = resultSink->consumedHead;
 }
 
+static bool HomerCanTryPrearmStableResultBinding(CState *st, uint32 commandKind, uint32 resultMode)
+{
+	return commandKind == CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE && resultMode == CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE &&
+		   st->homer_stable_result_binding_valid && st->homer_result_sink_open && st->homer_result_sink.open &&
+		   st->homer_result_sink.eosSeen && st->homer_result_sink.consumedHead == st->homer_stable_result_drained_tail;
+}
+
+#ifndef HOMER_CLIENT_COMMAND_RESERVATION_DIAG
+#define HOMER_CLIENT_COMMAND_RESERVATION_DIAG 0
+#endif
+
+static void HomerLogCommandSqlPreview(CState *st, const char *label, uint32 commandKind, uint32 resultMode,
+									  uint64 commandSequence, const char *operationName, const char *sql)
+{
+#if HOMER_CLIENT_COMMAND_RESERVATION_DIAG
+	char preview[97];
+	size_t sqlBytes = sql != NULL ? strlen(sql) : 0;
+	size_t previewBytes = sqlBytes;
+
+	if (previewBytes > sizeof(preview) - 1U)
+		previewBytes = sizeof(preview) - 1U;
+	if (sql != NULL && previewBytes > 0)
+		memcpy(preview, sql, previewBytes);
+	preview[previewBytes] = '\0';
+	fprintf(stderr,
+			"pgbench-homer command %s client=%d operation=%s kind=%u result_mode=%u sequence=%llu sql_bytes=%zu "
+			"sql_preview=\"%s\"\n",
+			label, st != NULL ? st->id : -1, operationName != NULL ? operationName : "<null>", commandKind, resultMode,
+			(unsigned long long)commandSequence, sqlBytes, sql != NULL ? preview : "<null>");
+#else
+	(void)st;
+	(void)label;
+	(void)commandKind;
+	(void)resultMode;
+	(void)commandSequence;
+	(void)operationName;
+	(void)sql;
+#endif
+}
+
 static bool HomerTryPrearmStableResultBinding(CState *st, uint32 commandKind, uint32 resultMode, uint64 commandSequence,
 											  const char *operationName)
 {
 	char errorMessage[HOMER_CLIENT_ERROR_BYTES];
 
-	if (commandKind != CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE || resultMode != CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE ||
-		commandSequence == 0 || !st->homer_stable_result_binding_valid || !st->homer_result_sink_open ||
-		!st->homer_result_sink.open || !st->homer_result_sink.eosSeen ||
-		st->homer_result_sink.consumedHead != st->homer_stable_result_drained_tail)
+	if (commandSequence == 0 || !HomerCanTryPrearmStableResultBinding(st, commandKind, resultMode))
 	{
 		return false;
 	}
@@ -3853,6 +3890,7 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 	CitusRemoteExecCommandCompletion completion;
 	bool		commandComplete = false;
 	bool resultBindingPrearmed = false;
+	bool directCommandReserved = false;
 
 	if (st->homer_command_pending)
 	{
@@ -3864,14 +3902,27 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 		return false;
 	}
 
-	if (HomerClientPredictNextCommandSequence(&st->homer_session, &predictedCommandSequence, errorMessage,
-											  sizeof(errorMessage)) &&
-		HomerTryPrearmStableResultBinding(st, commandKind, resultMode, predictedCommandSequence, operationName))
+	if (HomerCanTryPrearmStableResultBinding(st, commandKind, resultMode) &&
+		HomerClientReserveDirectCommand(&st->homer_session, &predictedCommandSequence, errorMessage,
+										sizeof(errorMessage)))
 	{
-		commandFlags |= CITUS_REMOTE_EXEC_COMMAND_FLAG_RESULT_BINDING_PREARMED;
-		resultBindingPrearmed = true;
+		directCommandReserved = true;
+		HomerLogCommandSqlPreview(st, "reserved", commandKind, resultMode, predictedCommandSequence, operationName,
+								  sql);
+		if (HomerTryPrearmStableResultBinding(st, commandKind, resultMode, predictedCommandSequence, operationName))
+		{
+			commandFlags |= CITUS_REMOTE_EXEC_COMMAND_FLAG_RESULT_BINDING_PREARMED;
+			resultBindingPrearmed = true;
+		}
+		else
+		{
+			HomerClientAbortDirectCommandReservation(&st->homer_session);
+			directCommandReserved = false;
+		}
 	}
 
+	HomerLogCommandSqlPreview(st, resultBindingPrearmed ? "start-prearmed" : "start", commandKind, resultMode,
+							  predictedCommandSequence, operationName, sql);
 	if (!HomerClientStartCommandWithCompletionFlags(&st->homer_session, commandKind, commandFlags, NULL, sql,
 													resultMode, &commandSequence, &completion, errorMessage,
 													sizeof(errorMessage)))
@@ -3881,6 +3932,8 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 		st->estatus = ESTATUS_OTHER_SQL_ERROR;
 		if (resultBindingPrearmed)
 			HomerInvalidateStableResultBinding(st);
+		if (directCommandReserved)
+			HomerClientAbortDirectCommandReservation(&st->homer_session);
 		return false;
 	}
 	if (resultBindingPrearmed && commandSequence != predictedCommandSequence)

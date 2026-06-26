@@ -10536,6 +10536,57 @@ If a future caller wants to reserve and then perform arbitrary fallible work
 before commit, that should be a separate API design with explicit abort
 semantics. It should not be hidden inside the hot pgbench path.
 
+#### 5C Diagnostic Follow-Up
+
+Status: fix identified and implemented for validation.
+
+The `bbalance` failure was initially suspicious as a SQL-text truncation bug.
+The diagnostic reservation build narrowed that interpretation:
+
+```text
+pgbench branch update:
+    UPDATE pgbench_branches SET bbalance = ...
+
+old failure:
+    syntax error near "bbalance"
+```
+
+That error shape means the backend saw a self-consistent SQL command containing
+a suffix of the pgbench branch update, not a command record rejected by
+`commandBytes` / `bodyEpoch` validation. A merely too-small `sqlBytes` would be
+expected to produce either a validated shorter prefix or a backend command-record
+validation failure.
+
+The accepted repair is to keep reservation narrower than the rejected first
+attempt:
+
+```text
+if stable tuple-result pre-arm is possible:
+    reserve exact direct command sequence
+    pre-arm result sink for that sequence
+    publish the command immediately through HomerClientStartDirectCommand()
+else:
+    do not reserve; use the ordinary direct command publisher
+```
+
+Diagnostics from the repaired path showed:
+
+```text
+SELECT abalance:
+    reserve
+    fill-reserved
+    publish-reserved
+
+UPDATE pgbench_branches SET bbalance = ...
+    fill-unreserved
+    publish-unreserved
+```
+
+The warmed diagnostic run completed `20000/20000` remote c1 transactions with
+zero failures. This supports the diagnosis that the rejected attempt let
+reservation ownership escape the exact row-producing pre-arm path, allowing a
+later pgbench command to be associated with stale reservation/slot state.
+
 ## Slice 6: Close Earlier Correctness Caveats
 
 - **Partial-post reset semantics**: zero WRs posted means normal rollback; one
