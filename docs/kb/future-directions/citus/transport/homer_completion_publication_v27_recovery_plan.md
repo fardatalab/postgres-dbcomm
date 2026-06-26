@@ -10034,10 +10034,43 @@ Recovery implementation plan:
 		         command-mailbox premature-reset guard trip, and no synthetic cleanup
 		         path in normal workloads.
 	6. 4B-R5 - add per-band fairness:
-   - Add round-robin cursors for command sessions, remote command senders,
-     foreground payload, close/reclaim, bulk payload, and control mailbox.
-   - A "two foreground grants per pass" quota is fair only if the starting
-     stream rotates.
+   - Status: implemented and validated.
+   - The machine-baseline policy now keeps per-band cursors for local-control
+     continuations, remote command senders, command-completion sessions,
+     foreground payload streams, close/reclaim payload streams, and bulk payload
+     streams
+     (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2755`).
+   - The planner uses `HomerServiceMachineBaselineAppendMachineBandRoundRobin()`
+     to rotate the start point inside each explicit action band while preserving
+     the Slice 4B-R3 priority order and the Slice 4B-R2 payload-before-close
+     readiness contract
+     (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9747`,
+     `citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9865`,
+     `citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10216`).
+   - Payload bands are separated from the per-pass candidate snapshot rather
+     than by rescanning stream state: foreground/bulk classification uses the
+     machine fact's traffic class, and close/reclaim is an explicit payload
+     action band only when the stream readiness predicate has already decided
+     close can run
+     (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9757`).
+   - Peer control-mailbox fairness was already transport-owned from Slice 3D:
+     `TupleSinkServiceAppendReadyControlMailboxActionsRdma()` walks traffic-class
+     priority, alternates incoming/outgoing direction, and advances per-direction
+     indexed cursors
+     (`citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:2615`).
+   - Validation after 4B-R5:
+     - no-stats Homer service/client build and install completed cleanly;
+     - remote c1 smoke completed `1000/1000`, zero failures;
+     - warmed remote c1 completed `20000/20000`, zero failures, about
+       `3981 TPS`, p99 about `0.275 ms`;
+     - remote c4 completed `40000/40000`, zero failures, about `10.29k TPS`,
+       p99 about `0.581 ms`;
+     - remote RDMA basebackup completed; the first post-restart run was cold at
+       `5.95 s`, and the warmed repeat was `4.27 s`;
+     - service-log signature scan over the validation window found no
+       `IBV_WC_REM_ACCESS_ERR` / `status=10`, no `status=5`, no async send or
+       recv-CQ failure, no local-control timeout, and no peer
+       `CLIENT_SQL_SESSION` premature-reset or synthetic-cleanup warning.
 
 4C recovery after 4B-R1 through 4B-R5 pass:
 
