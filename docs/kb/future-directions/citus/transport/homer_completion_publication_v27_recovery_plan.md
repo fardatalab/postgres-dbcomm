@@ -10283,6 +10283,27 @@ Slice 4F semantic-error validation blocker on 2026-06-26:
   like an `ERROR+EOS` / transaction-abort completion lifecycle issue rather than
   a recurrence of the earlier `REM_ACCESS_ERR` path.
 
+Deferred edge-case decision on 2026-06-26:
+
+- This failed-query `ERROR+EOS` / abort-completion edge case is intentionally
+  deferred because it does not affect the current normal pgbench/basebackup
+  workloads used for Slice 4 scheduler validation. Do not treat it as a blocker
+  for moving from Slice 4 scheduler tuning to Slice 5 hot-path copy removal.
+- Keep the issue prominent: the Slice Readiness Assessment below marks Slice 4
+  as normal-workload validated with this caveat, and Slice 6 retains the
+  failed-query `ERROR+EOS` item as the place to design and implement the full
+  semantic-error lifecycle. When revisiting it, start from this reproduction:
+
+  ```sql
+  BEGIN;
+  select 1/0;
+  COMMIT;
+  ```
+
+  Expected final behavior is: pgbench reports the semantic error, the command
+  session completes its abort/close lifecycle, and the client process exits
+  without leaving a remote `pgbench` process behind.
+
 Additional Slice 4 instrumentation for the next reproduction:
 
 ```text
@@ -10604,10 +10625,10 @@ empty critical polls per transaction
 | Slice 3B    | R0 through R6 landed and validated; remaining owned/runnable generalization moves into 3C |
 | Slice 3C    | Completion owned/runnable rearm correctness validated; remaining signaled-owner FIFO counts are performance cleanup |
 | Slice 3D    | 3D-0 through 3D-6 exact-control cleanup, Close-1 through Close-3, the Close-3 remote-head gate optimization, and Close-4A through Close-4E receiver quiescence/tombstone are implemented and validated |
-| Slice 4     | 4A instrumentation validated and 4E retained; 4B is first bad and must be replaced by 4B-R0 through 4B-R5 before reapplying 4C/4D |
+| Slice 4     | 4A through repaired 4E-R validated for normal c1/c4/basebackup and concurrent c4+basebackup; failed-query `ERROR+EOS` exits are a deferred Slice 6 caveat |
 | Slice 5A/5B | Implementation-ready with descriptor-cache lifetime clarification                    |
 | Slice 5C    | Correct and intentionally narrow                                                     |
-| Slice 6     | Backlog summary; needs a stage-template expansion before implementation              |
+| Slice 6     | Backlog summary; includes deferred failed-query `ERROR+EOS` / abort-completion lifecycle and needs a stage-template expansion before implementation |
 | Slice 7     | Lower-priority summary; needs a stage-template expansion before implementation        |
 
 ## Final Order
