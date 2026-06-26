@@ -9408,6 +9408,533 @@ Recovery implementation plan:
      - in parallel or immediately after, keep the command-mailbox lifetime fix
        below so a legal failed SQL command cannot make subsequent cleanup writes
        hit a stale rkey.
+   - Decision after 2026-06-25 local-control progress review: the primary
+     timeout bug is a local control-plane progress inversion. The durable
+     recv-CQ due-set repair remains necessary, but 4B-R4 also made exact RDMA
+     liveness durable enough that it can repeatedly consume bounded collector
+     admission before backend-local IPC and heartbeat work run. Backend-local
+     control is not blind maintenance: a socketless backend can synchronously
+     wait inside `RemoteExecWaitForControlResponse()` while executing the SQL
+     command, so the service must guarantee local-control admission independent
+     of RDMA collector pressure.
+   - Current-code facts that motivate the repair:
+     - `RemoteExecWaitForControlResponse()` publishes
+       `CITUS_REMOTE_EXEC_CONTROL_SLOT_REQUEST_READY`, waits for
+       `CITUS_REMOTE_EXEC_CONTROL_SLOT_RESPONSE_READY`, and currently reports a
+       service-progress timeout if `heartbeatCounter` is unchanged.
+     - `CitusRemoteExecControlSlotState` has only `FREE`, `CLIENT_OWNED`,
+       `REQUEST_READY`, and `RESPONSE_READY`; it cannot distinguish "not yet
+       claimed by the service" from "claimed and waiting on an async service
+       continuation".
+     - `HomerServiceLocalControlSourceReadyForScheduler()` still discovers fresh
+       local control work by scanning the fixed slot table, and async
+       continuations are normally exposed only on the
+       `HOMER_SERVICE_LOCAL_CONTROL_ASYNC_PUMP_INTERVAL` cadence.
+     - `HOMER_PROGRESS_COLLECTOR_LOCAL_CONTROL_SLOTS` and
+       `HOMER_PROGRESS_COLLECTOR_HEARTBEAT_MAINTENANCE` are built as scheduler
+       collector candidates. Heartbeat publication is therefore not an
+       outer-loop liveness invariant today.
+
+   Local-control timeout repair plan:
+
+   1. 4B-R4-L1 - heartbeat is an outer-loop invariant:
+      - Add a service-thread heartbeat state:
+
+        ```c
+        typedef struct HomerServiceHeartbeatState
+        {
+            uint64_t servicePass;
+            uint64_t lastPublishedPass;
+        } HomerServiceHeartbeatState;
+        ```
+
+      - Add a small inline helper called at the beginning of every real service
+        progress pass:
+
+        ```c
+        static inline void
+        HomerServiceBeginProgressPass(CitusRemoteExecControlRegion *region,
+                                      HomerServiceHeartbeatState *heartbeat);
+        ```
+
+      - Increment the local `servicePass` every pass and release-store
+        `region->heartbeatCounter` on a fixed cadence, initially every 256
+        passes, independent of scheduler grants.
+      - Force immediate heartbeat publication when:
+        - a local control `REQUEST_READY` slot is claimed;
+        - an async local-control continuation changes state;
+        - a local control response is published.
+      - Delete the normal heartbeat collector action, or leave it compiled only
+        as diagnostic scaffolding. No correctness path may require selecting
+        `HOMER_PROGRESS_COLLECTOR_HEARTBEAT_MAINTENANCE`.
+      - Every nested/target-completion pump that performs legitimate service
+        progress must enter through the same heartbeat boundary. A nested helper
+        must not advance peer or local work while the backend's heartbeat
+        evidence remains stale.
+
+   2. 4B-R4-L2 - exact local-control readiness:
+      - Bump the local control protocol ABI. Add a producer-owned ready bitmap
+        to `CitusRemoteExecControlRegion`:
+
+        ```c
+        uint64_t requestReadySlots;
+        ```
+
+      - Add service-owned durable pending state:
+
+        ```c
+        static uint64_t LocalControlPendingSlots;
+        ```
+
+      - Add a new control slot state:
+
+        ```c
+        CITUS_REMOTE_EXEC_CONTROL_SLOT_SERVICE_OWNED = 3,
+        CITUS_REMOTE_EXEC_CONTROL_SLOT_RESPONSE_READY = 4
+        ```
+
+      - Backend/client publication order:
+        - write request body and identity;
+        - release-store slot state to `REQUEST_READY`;
+        - release `fetch_or` the slot bit into `requestReadySlots`.
+      - At service pass start, after heartbeat and reset collection:
+
+        ```c
+        newlyReady = atomic_exchange(&region->requestReadySlots, 0);
+        LocalControlPendingSlots |= newlyReady;
+        ```
+
+      - Candidate construction must enumerate `LocalControlPendingSlots`
+        non-destructively. It must not scan all control slots as the normal
+        discovery path.
+      - The exact action payload must copy stable identity:
+
+        ```c
+        typedef struct HomerLocalControlAction
+        {
+            uint32_t slotIndex;
+            uint32_t ownerPid;
+            uint64_t requestSequence;
+        } HomerLocalControlAction;
+        ```
+
+      - Execution claims the slot with
+        `REQUEST_READY -> SERVICE_OWNED` compare-exchange, validates slot index,
+        owner PID, request sequence, protocol version, and request kind, then
+        clears `LocalControlPendingSlots` only at the execution boundary.
+      - Synchronous completion writes the response body, release-stores
+        `RESPONSE_READY`, clears the pending bit, and publishes heartbeat
+        immediately.
+      - Asynchronous completion keeps the slot in `SERVICE_OWNED`, clears the
+        runnable bit while blocked, and retains a durable continuation keyed by
+        slot/index/PID/sequence. Do not return an async-owned slot to
+        `REQUEST_READY`.
+
+   3. 4B-R4-L3 - dedicated local IPC phase and quota:
+      - Split the service pass into four explicit phases:
+
+        ```text
+        Phase 0: exact connection resets
+        Phase 1: local IPC
+            collect requestReadySlots
+            execute at least one pending local-control action
+        Phase 2: physical collectors
+            send-CQ relief
+            critical recv-CQ demand
+            bounded recv-CQ liveness
+            CM/setup/lifetime
+        Phase 3: semantic machines
+        ```
+
+      - Define:
+
+        ```c
+        #define HOMER_SERVICE_LOCAL_CONTROL_ACTIONS_PER_PASS 4U
+        ```
+
+      - Contract: if `LocalControlPendingSlots != 0`, at least one
+        local-control action must execute in that pass unless reset/shutdown is
+        already tearing the service down.
+      - Local IPC actions must not consume `maxCollectorGrants`,
+        `maxBlindCollectorGrants`, or recv-CQ liveness quota. Durable recv-CQ due
+        bits make this ordering safe because physical liveness remains pending
+        when local IPC runs first.
+      - Add counters:
+
+        ```text
+        localControlSignalsCollected
+        localControlPendingHighWater
+        localControlCandidatesBuilt
+        localControlActionsExecuted
+        localControlActionsDeferred
+        localControlRequestsClaimed
+        localControlResponsesPublished
+        localControlMaxPendingPasses
+        ```
+
+      - Acceptance: ordinary c1 result-sink open/close paths should show
+        `localControlMaxPendingPasses <= 1`.
+
+   4. 4B-R4-L4 - async local-control continuations are dependency-driven:
+      - Audit `OPEN_SESSION`, `CLOSE_SESSION`, `START_COMMAND`, and
+        `POLL_COMMAND_COMPLETION` local-control handlers.
+      - A handler reached from the local IPC phase must not spin waiting for a
+        backend, synchronously wait on a peer response, synchronously poll CQ
+        progress, or run a nested progress loop that excludes local IPC.
+      - Add/standardize continuation states:
+
+        ```c
+        typedef enum HomerLocalControlContinuationState
+        {
+            HOMER_LOCAL_CONTROL_NEW = 0,
+            HOMER_LOCAL_CONTROL_WAIT_PEER_SETUP,
+            HOMER_LOCAL_CONTROL_WAIT_PEER_RESPONSE,
+            HOMER_LOCAL_CONTROL_WAIT_RESOURCE,
+            HOMER_LOCAL_CONTROL_READY_TO_RESPOND,
+            HOMER_LOCAL_CONTROL_FAILED
+        } HomerLocalControlContinuationState;
+        ```
+
+      - Exact rearm points:
+        - peer setup becomes canonical;
+        - control mailbox response is applied;
+        - send-CQ/control-op credit is released;
+        - payload stream allocation becomes available.
+      - The current periodic
+        `HOMER_SERVICE_LOCAL_CONTROL_ASYNC_PUMP_INTERVAL` may remain as a
+        diagnostic repair cadence, but not as the normal liveness mechanism.
+
+   5. 4B-R4-L5 - backend wait diagnostics and timeout semantics:
+      - Replace the fixed 100-million-spin heartbeat comparison with monotonic
+        deadlines. Track:
+
+        ```c
+        uint64_t lastHeartbeat;
+        uint64_t lastHeartbeatChangeNs;
+        uint64_t requestStartNs;
+        ```
+
+      - Report two distinct failures:
+        - `Homer service heartbeat stalled` when heartbeat does not advance for
+          the stall timeout;
+        - `Homer local control request made no completion progress` when
+          heartbeat advances but the specific request exceeds its timeout.
+      - Include operation name, slot index, slot state, owner PID, request
+        sequence, initial heartbeat, current heartbeat, and elapsed time.
+      - Put `operationName` in the primary `errmsg`, not only in `errdetail`,
+        because the remote completion publication path preserved the primary
+        message but lost the backend bridge detail in the failing trace.
+      - The new `SERVICE_OWNED` state must make the next failure actionable:
+
+        ```text
+        REQUEST_READY:
+            scheduler/admission never claimed it
+        SERVICE_OWNED:
+            handler or continuation stalled
+        ```
+
+   6. Diagnostic trace for the next reproduction:
+      - Backend publication line:
+
+        ```text
+        local_control_publish operation slot owner_pid request_sequence heartbeat
+        ```
+
+      - Service lines:
+
+        ```text
+        local_control_visible service_pass phase slot sequence
+        local_control_claimed service_pass phase slot sequence
+        local_control_continuation_state service_pass slot sequence state
+        local_control_response service_pass slot sequence status
+        ```
+
+      - Interpretation:
+
+        ```text
+        publish, no visible:
+            request-ready signal/collection bug
+        visible, no claimed:
+            local IPC admission bug
+        claimed, no response:
+            handler/continuation dependency bug
+        response published, backend still waits:
+            slot-state ordering or mapping bug
+        ```
+
+   7. Local-control timeout validation:
+      - Collector saturation: force `maxCollectorGrants = 1` with incoming and
+        outgoing critical liveness due plus one local result-sink request. The
+        local request must still complete.
+      - Row-producing first query: force a fresh result sink and verify
+        `OPEN_SESSION` response.
+      - Result-shape change: force close followed by reopen and verify both
+        responses.
+      - Async peer setup: publish local result-sink open while the peer lane is
+        still setting up. Slot must become `SERVICE_OWNED`, then complete from
+        exact setup rearm.
+      - Normal matrix after the targeted tests:
+
+        ```text
+        repeated remote c1 smoke
+        warmed remote c1
+        warmed remote c4
+        remote basebackup
+        concurrent c4 plus basebackup
+        ```
+
+      - Counters must show local-control pending is not starved, heartbeat
+        advances independently of collector budget, recv-CQ due bits remain
+        non-lossy, and there are zero unexpected `REM_ACCESS_ERR` /
+        `WR_FLUSH_ERR` events.
+
+   8. 4B-R4-L1 through L3 implementation checkpoint on 2026-06-25:
+      - Implemented the first local-control timeout repair slice:
+        - local protocol ABI `27 -> 28`;
+        - `CitusRemoteExecControlRegion.requestReadySlots`;
+        - `CITUS_REMOTE_EXEC_CONTROL_SLOT_SERVICE_OWNED`;
+        - producer-side `REQUEST_READY` publication through release
+          `requestReadySlots` bits;
+        - service-owned `LocalControlPendingSlots`;
+        - outer-loop heartbeat cadence plus forced heartbeat publication at
+          local-control claim/response boundaries;
+        - a dedicated `HOMER_MACHINE_BASELINE_PLAN_LOCAL_IPC` phase before RDMA
+          collector work;
+        - local-control claim by
+          `REQUEST_READY -> SERVICE_OWNED` compare-exchange.
+      - Code pointers for the implemented attempt:
+        - protocol ABI and ready word:
+          `src/include/distributed/homer/remote_execution_control_protocol.h`;
+        - backend bridge publication and timeout message:
+          `src/backend/distributed/utils/homer/remote_execution_backend_bridge.c`;
+        - PostgreSQL-side control producers:
+          `src/backend/distributed/utils/homer/remote_execution_session.c`;
+        - service heartbeat, pending local-control collection, local IPC phase,
+          and slot claiming:
+          `src/backend/distributed/utils/homer/tuple_sink_service_process.c`;
+        - standalone client producer:
+          `src/bin/homer_client.c`.
+      - Build and install validation passed:
+        - Citus/Homer:
+          `sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'`;
+        - Citus/Homer install:
+          `sudo -n -u dbcomm make install-headers install-service-bin install`;
+        - Postgres users of the local ABI:
+          `sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build src/backend/postgres src/bin/pgbench/pgbench src/bin/pg_basebackup/pg_basebackup`;
+        - Postgres install:
+          `sudo -n -u dbcomm meson install -C build --no-rebuild`;
+        - installed prefix synced to `farnet0`.
+      - Runtime validation did not pass, so this code is not an accepted 4B-R4
+        slice and should not be committed as complete. A remote c1 smoke from
+        `farnet0` to `farnet1` failed quickly with:
+
+        ```text
+        pgbench: error: client 0 Homer sql_execute failed:
+          Homer control request failed
+        ```
+
+      - The failure mode changed from the earlier backend
+        `RemoteExecWaitForControlResponse()` heartbeat timeout to an async
+        local-control open failure inside peer setup:
+
+        ```text
+        farnet1:
+          async local open failed phase=7 request=1
+          detail=timed out progressing outgoing RDMA setup host=10.10.1.100 phase=3
+
+        farnet0:
+          requesting peer connection reset after recv-CQ drain failure
+          direction=outgoing index=0 generation=1 traffic_class=1
+          detail=peer recv completion failed host=10.10.1.101 opcode=977 status=5
+        ```
+
+      - Interpretation:
+        - the local IPC request is now visible/claimed far enough to start the
+          asynchronous peer-open continuation, so the original local-control
+          admission timeout is no longer the first observed stop point;
+        - setup phase `3` is
+          `TUPLE_SINK_SERVICE_PEER_CONNECTION_SETUP_OUTGOING_WAIT_ESTABLISHED`
+          in `remote_execution_peer_transport_rdma.c`, so the next diagnosis
+          must focus on setup/lifetime progress around
+          `TupleSinkServiceProgressOutgoingPeerConnectionSetup()`, not on
+          command-mailbox rkeys or local-control request publication;
+        - the recv-CQ `WR_FLUSH_ERR` on the peer may be secondary teardown
+          evidence after setup timeout/reset. The initiating event is not yet
+          proven.
+      - Required next diagnostic before accepting 4B-R4:
+        - add exact setup-phase trace around outgoing/incoming CM events,
+          bootstrap recv/send posting, and reset request boundaries;
+        - confirm whether the async local-control continuation is relying on a
+          nested setup progress path that can still starve the peer-side setup
+          or lifetime collector;
+        - distinguish "CM established event not received" from "event received
+          but not admitted/executed" and from "connection reset raced setup";
+        - keep L1-L3 uncommitted until a remote c1 smoke completes.
+
+   9. 4B-R4-L6 - durable listener-CM liveness:
+      - Diagnosis after the L1-L3 validation stop: the failure is most likely
+        passive listener polling starvation. `farnet1` starts the reverse
+        outgoing connection to `farnet0` and times out in
+        `TUPLE_SINK_SERVICE_PEER_CONNECTION_SETUP_OUTGOING_WAIT_ESTABLISHED`.
+        At that point the active side has called `rdma_connect()` and is waiting
+        for `RDMA_CM_EVENT_ESTABLISHED`. The peer must poll its listener CM fd,
+        accept the `RDMA_CM_EVENT_CONNECT_REQUEST`, and progress the incoming
+        setup. If the listener fd is treated as cold aggregate maintenance, the
+        connect request can remain undiscovered until the active side's setup
+        deadline fires.
+      - Current-code caveat: `listenerPollSkipCounter` is advanced only when
+        the peer CM setup collector itself runs. With the machine-baseline
+        active peer-control cooldown and the transport active-listener interval,
+        the effective listener poll gap can become:
+
+        ```text
+        HOMER_SERVICE_ACTIVE_PEER_PUMP_INTERVAL
+            * CITUS_REMOTE_EXEC_PEER_ACTIVE_LISTENER_POLL_INTERVAL
+        ```
+
+        That is not an acceptable setup-time liveness bound.
+      - Add transport-owned listener liveness facts:
+
+        ```c
+        uint64_t lastListenerPollServicePass;
+        uint64_t nextListenerPollServicePass;
+        bool listenerLivenessDue;
+        ```
+
+      - At `TupleSinkServiceBeginPeerSchedulerPassRdma()`:
+        - if `servicePass >= nextListenerPollServicePass`, set
+          `listenerLivenessDue`;
+        - while there is any incomplete incoming or outgoing setup, cap the
+          listener gap at 1-4 service passes;
+        - otherwise use the larger active/idle listener interval.
+      - `TupleSinkServiceGetPeerSchedulerFactsRdma()` must expose
+        `listenerPollDue` from this durable due bit, not from the old
+        `listenerPollSkipCounter` threshold.
+      - `TupleSinkServicePumpPeerRequestsRdma()` clears/rearms the listener due
+        bit only when it actually executes the listener poll boundary. If the
+        peer CM setup collector is not selected in a pass, the due bit remains
+        set and is visible again next pass.
+      - The listener liveness fact is correctness-visible setup discovery, not
+        blind maintenance. It must not be suppressed by aggregate peer cooldown
+        while setup is incomplete.
+      - Acceptance:
+        - reverse incoming connect requests are accepted before the active
+          setup deadline;
+        - remote c1 smoke reaches at least the next post-setup stage;
+        - no setup timeout remains at outgoing phase 3;
+        - listener due facts do not require restoring broad recv-CQ polling or a
+          scheduler-side connection-table scan.
+      - Implementation checkpoint: listener liveness was converted from
+        `listenerPollSkipCounter` to durable transport facts
+        `lastListenerPollServicePass`, `nextListenerPollServicePass`, and
+        `listenerLivenessDue`. Setup-stage validation then progressed past the
+        previous outgoing phase-3 timeout: the critical-control and
+        foreground-payload connections reached canonical setup on both hosts.
+      - New validation stop after L6: the backend local-control slot for
+        `open client SQL result sink` reached `SERVICE_OWNED`, and the farnet1
+        service was waiting in `STREAM_WAIT_PEER_OPEN` on a foreground-payload
+        peer control request. On farnet0, the matching incoming foreground
+        connection had:
+
+        ```text
+        controlDoorbellArrivedTail = 0
+        controlMailboxReady = false
+        recvCqLivenessWheel.due.incomingBits[FOREGROUND_PAYLOAD] set
+        lastRecvCqPollServicePass = 0
+        ```
+
+        That means the peer-open WIMM had not been discovered by the canonical
+        recv-CQ collector even though an exact liveness due fact existed.
+      - Root cause for the new stop: durable due ownership is necessary but not
+        sufficient if exact liveness admission remains behind aggregate
+        collector grants. The collector phase still admitted command send-CQ
+        relief, generic waiting collectors, and the broad peer setup/send-CQ/
+        lifetime bundle before exact recv-CQ liveness. Those categories can
+        consume the bounded collector quota, leaving the due bit durable but
+        never executed.
+      - Fix: exact recv-CQ liveness actions must be admitted immediately after
+        command send-CQ relief and explicit peer CM setup/listener progress,
+        before generic waiting collectors, the remaining broad peer collector
+        bundle, and critical recv-CQ demand. This preserves the
+        collector-first contract:
+
+        ```text
+        command send-CQ relief
+        peer CM setup / listener-CM liveness
+        exact recv-CQ liveness discovery
+        dependency collectors
+        remaining broad peer send-CQ/lifetime bundle
+        critical recv-CQ demand
+        ```
+
+        The due bit still remains non-destructive; if a liveness action is not
+        selected, it remains in the durable due set for a later pass.
+      - The peer CM setup/listener collector must be appended explicitly before
+        exact recv-CQ liveness. Keeping setup/listener only inside the broad
+        peer bundle lets due recv-CQ liveness actions consume the collector
+        quota while a reverse `CONNECT_REQUEST` is still waiting on the
+        listener CM event channel, which reproduces the outgoing phase-3 setup
+        timeout.
+      - Validation then exposed a concrete candidate-set reset defect:
+        `HomerProgressMachineCandidateSetReset()` reset critical recv-demand,
+        control-mailbox, reset, and failure candidate counts, but did not reset
+        `recvCqLivenessActionCount` or
+        `droppedRecvCqLivenessActionCount`. Because the candidate set is reused
+        across scheduler phases and passes, stale exact liveness candidates
+        accumulated. A live breakpoint showed repeated execution of the same
+        outgoing critical-control liveness action while the foreground incoming
+        liveness bit remained due. Reset both counters with the rest of the
+        candidate-set owned counts.
+      - Post-fix validation status:
+        - remote c1 smoke completed `1000/1000`, zero failures;
+        - warmed remote c1 completed `5000/5000`, zero failures, about
+          `3759 TPS`;
+        - longer warmed remote c1 completed `20000/20000`, zero failures, but
+          only about `3522-3551 TPS` after a `pgbench_history` truncate and
+          vacuum refresh;
+        - remote c4 completed `10000/10000` and `20000/20000`, zero failures,
+          about `10.27k-10.32k TPS`;
+        - remote RDMA basebackup completed, with the warmed repeat at `4.16 s`.
+      - Targeted pgbench-first tuning checkpoint:
+        - Attempted to reduce per-pass scheduler work by pruning collector
+          candidate construction from phases that cannot execute collectors.
+          The first attempt was incorrect and hung remote c1:
+          - exact peer control-mailbox actions were built in
+            `HomerServiceBuildProgressCollectorCandidates()` but consumed from
+            the semantic phase; pruning the builder from semantic made
+            peer-open control requests undispatchable;
+          - command, completion, and payload machines also depend on lightweight
+            collector candidates as semantic scan triggers. Removing those
+            triggers left `SessionPendingState.commandOwnedSessions` and
+            `commandRunnableSessions` set while no command machine was
+            scheduled.
+        - Accepted correction:
+          - local IPC phase builds only local-control machine candidates and
+            appends `ADVANCE_LOCAL_CONTROL_MACHINE` grants for already-owned
+            `SERVICE_OWNED` continuations before peer collectors;
+          - semantic phase still builds lightweight command/completion/payload
+            scan-trigger candidates and exact control-mailbox action
+            candidates;
+          - semantic phase does not build physical peer setup, recv-CQ
+            liveness, critical-demand, reset, or aggregate collector facts;
+          - the broad `TupleSinkServiceAuditRecvCqLivenessDueSet()` repair scan
+            is gated behind `HOMER_RECV_CQ_LIVENESS_DUE_AUDIT` and is off in
+            normal no-stats builds. The durable due set remains the production
+            owner; the broad scan is validation-only.
+        - Validation after the correction:
+          - remote c1 cold/warmup completed `1000/1000`, zero failures; one
+            setup-era outlier remained in the warmup run and was not used as a
+            steady-state number;
+          - warmed remote c1 completed `20000/20000`, zero failures, about
+            `4094 TPS`, p99 about `0.265 ms`;
+          - remote c4 completed `40000/40000`, zero failures, about
+            `10.91k TPS`, p99 about `0.546 ms`;
+          - remote RDMA basebackup still completed; the first post-restart run
+            was cold at `6.38 s`, and the warmed repeat was `4.27 s`.
+        - Status: 4B-R4 is acceptable for the pgbench-first Slice 4 direction.
+          Mixed-workload fairness is still owned by later 4C/4F work; this
+          checkpoint deliberately optimizes the foreground pgbench path first.
+
    - Required command-mailbox lifetime repair:
      - do not reset/deregister a peer-owned `CLIENT_SQL_SESSION` command mailbox
        solely because one SQL command failed;
