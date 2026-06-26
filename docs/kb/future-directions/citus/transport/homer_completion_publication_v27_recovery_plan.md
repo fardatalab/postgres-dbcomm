@@ -10247,6 +10247,42 @@ Slice 4F concurrent-validation checkpoint on 2026-06-26:
   full Slice 4F matrix. Remaining 4F work is the explicit semantic `ERROR+EOS`
   runtime case and the small reset/failure fault-injection smoke.
 
+Slice 4F semantic-error validation blocker on 2026-06-26:
+
+- Attempted a targeted Homer pgbench script on `farnet0`:
+
+  ```sql
+  BEGIN;
+  select 1/0;
+  COMMIT;
+  ```
+
+  with remote Homer execution to the `farnet1` service.
+- The first attempt without explicit transaction boundaries was rejected by the
+  pgbench Homer script validator, which is expected:
+
+  ```text
+  --homer currently requires each script to contain explicit BEGIN and
+  COMMIT/END/ROLLBACK commands
+  ```
+
+- With explicit `BEGIN`/`COMMIT`, pgbench printed the expected semantic error:
+
+  ```text
+  pgbench: error: client 0 Homer sql_execute failed: division by zero
+  ```
+
+  but the pgbench process did not exit promptly and had to be interrupted and
+  then killed on `farnet0`. That means semantic error delivery reaches the
+  client-facing error path, but teardown/abort completion for this script shape
+  is still incomplete. This is the current Slice 4F blocker; do not claim full 4F
+  acceptance until the failed SQL script exits without leaving a client process
+  behind.
+- The stuck client was cleaned up. The service logs did not show the tracked
+  RDMA access/CQ failure signatures during this attempt, so this currently looks
+  like an `ERROR+EOS` / transaction-abort completion lifecycle issue rather than
+  a recurrence of the earlier `REM_ACCESS_ERR` path.
+
 Additional Slice 4 instrumentation for the next reproduction:
 
 ```text
