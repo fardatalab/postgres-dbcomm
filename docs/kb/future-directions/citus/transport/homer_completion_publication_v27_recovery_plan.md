@@ -9998,12 +9998,41 @@ Recovery implementation plan:
 	       - service-log signature scan over the validation window found no
 	         `IBV_WC_REM_ACCESS_ERR` / `status=10`, no `status=5`, and no
 	         command-mailbox premature-reset guard trip.
-	     - Remaining follow-up:
-	       - this checkpoint prevents stale-rkey teardown after one failed SQL
-	         command, but it does not yet define a dedicated "backend failed,
-	         explicit TX_ABORT cannot execute" peer response. That remains part of
-	         the later failed-backend abort semantics rather than this MR-lifetime
-	         repair.
+		     - Failed-backend cleanup command semantics:
+		       - The edge case after the MR-lifetime repair is when a peer cleanup
+		         command arrives after the backend loop is already unavailable. A
+		         fresh backend must not be spawned to "abort" the old transaction,
+		         because it does not own the old backend transaction state.
+		       - `TupleSinkServicePeerClientSqlCleanupCommandReady()` now detects a
+		         ready peer command-mailbox record only when the session is a
+		         backend-node peer `CLIENT_SQL_SESSION`, the peer binding is open,
+		         the backend loop is inactive, backend reuse is already poisoned,
+		         and no peer-visible completion publication remains in flight
+		         (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:21034`).
+		       - `TupleSinkServiceConsumePeerClientSqlCleanupCommandWithoutBackend()`
+		         consumes exactly one cleanup record from that mailbox before the
+		         ordinary backend-completion path
+		         (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:17871`
+		         and `:21088`). `TX_ABORT` receives an explicit `FAILED`
+		         completion that says the backend was unavailable and the abort did
+		         not execute. `CLIENT_SQL_SESSION_CLOSE` receives a service-owned
+		         close completion and marks peer command-mailbox writers quiesced.
+		       - The command-machine scheduler facts include this cleanup-ready
+		         condition as an existing `PUBLISH_COMMAND_COMPLETION` action, not a
+		         new broad command-mailbox scan
+		         (`citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34273`).
+		     - Validation after failed-backend cleanup semantics:
+		       - remote c1 smoke completed `1000/1000`, zero failures;
+		       - warmed remote c1 completed `20000/20000`, zero failures, about
+		         `3998 TPS`, p99 about `0.274 ms`;
+		       - remote c4 completed `40000/40000`, zero failures, about
+		         `10.44k TPS`, p99 about `0.593 ms`;
+		       - remote RDMA basebackup completed; the first post-restart run was cold
+		         at `5.85 s`, and the warmed repeat was `4.16 s`;
+		       - service-log signature scan over the validation window found no
+		         `IBV_WC_REM_ACCESS_ERR` / `status=10`, no `status=5`, no
+		         command-mailbox premature-reset guard trip, and no synthetic cleanup
+		         path in normal workloads.
 	6. 4B-R5 - add per-band fairness:
    - Add round-robin cursors for command sessions, remote command senders,
      foreground payload, close/reclaim, bulk payload, and control mailbox.
