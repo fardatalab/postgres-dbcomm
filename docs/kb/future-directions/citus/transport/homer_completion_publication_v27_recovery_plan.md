@@ -10219,6 +10219,34 @@ Slice 4E-R validation checkpoint on 2026-06-26:
   clean for the same tracked RDMA, local-control, protocol, and invariant
   failure signatures used for 4D-R validation.
 
+Slice 4F concurrent-validation checkpoint on 2026-06-26:
+
+- Ran the core concurrent correctness shape after 4D-R and 4E-R:
+
+  ```text
+  foreground:
+      remote Homer pgbench c4, 2500 transactions per client
+  background:
+      remote RDMA basebackup blackhole, slots=8, bytes=8388608
+  ```
+
+- Result:
+
+  ```text
+  pgbench:
+      10000/10000, 0 failed, TPS 9313.129, p99 0.665 ms
+  basebackup:
+      success, real 4.22 s
+  artifacts:
+      /tmp/homer_concurrent_c4_1782453718
+  ```
+
+  Service logs were clean for `status=10`, `status=5`, `REM_ACCESS`,
+  `WR_FLUSH`, async send/recv CQ drain failures, local-control timeout, protocol
+  error, and invariant violation. This is a concurrent smoke checkpoint, not the
+  full Slice 4F matrix. Remaining 4F work is the explicit semantic `ERROR+EOS`
+  runtime case and the small reset/failure fault-injection smoke.
+
 Additional Slice 4 instrumentation for the next reproduction:
 
 ```text
