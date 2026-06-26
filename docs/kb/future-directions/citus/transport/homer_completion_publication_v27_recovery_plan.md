@@ -10074,6 +10074,27 @@ Recovery implementation plan:
 
 4C recovery after 4B-R1 through 4B-R5 pass:
 
+- 4C-R0 tuning experiment after 4B-R5:
+  - Tested the existing environment override
+    `HOMER_MACHINE_BASELINE_MAX_PAYLOAD_GRANTS` at `3` and `4` on the repaired
+    per-band scheduler before changing any default.
+  - Results were correctness-clean but not a stable performance win:
+    - `max_payload=3`: warmed remote c1 was about `3924 TPS`; c4 samples were
+      about `10.34k`-`10.42k TPS`; warmed remote RDMA basebackup was about
+      `4.29 s`.
+    - `max_payload=4`: warmed remote c1 was about `3983`-`4002 TPS`; c4 samples
+      were about `10.28k`-`10.46k TPS`; warmed remote RDMA basebackup was about
+      `4.26 s`.
+    - Restoring the old effective cap with `max_payload=2` produced a c4 sample
+      around `10.36k TPS`, inside the same noise band.
+  - Decision: do not change the default payload grant cap yet.  The c4 bottleneck
+    is not clearly the global payload grant cap after 4B-R5.  Keep using the env
+    override for future A/B runs, and spend the next tuning pass on counters that
+    distinguish command/completion/control cycling from payload work.
+  - Hygiene: rebuilt and reinstalled the no-stats service/client binaries after
+    rejecting the temporary default change so the installed default matches the
+    committed source again.
+
 - Reintroduce budget tuning as quotas, not insertion-order side effects:
 
   ```text
