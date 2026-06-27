@@ -7,7 +7,7 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 ## Subdirectories
 
 <!-- kb-subdirs:start -->
-- (none)
+- [dpu_dma_backend_homer_service_plan_doca_headers](dpu_dma_backend_homer_service_plan_doca_headers/) - Local snapshot of DOCA headers referenced by the DPU DMA backend Homer service plan.
 <!-- kb-subdirs:end -->
 
 ## Documents
@@ -15,6 +15,7 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 <!-- kb-docs:start -->
 - [doca_dma_ordering_visibility_validation_plan.md](doca_dma_ordering_visibility_validation_plan.md) - Standalone host-DPU validation plan for DMA ordering, visibility, sync-event publication, COMCH wakeups, relaxed ordering, and cache-coherency assumptions before Homer integration.
 - [doca_host_dpu_homer_boundary.md](doca_host_dpu_homer_boundary.md) - DOCA-grounded host-DPU boundary plan for moving the current backend-to-Homer process edge onto BlueField, including DMA, PE batching, COMCH/sync-event notifications, and publication caveats.
+- [dpu_dma_backend_homer_service_plan.md](dpu_dma_backend_homer_service_plan.md) - Implementation-facing plan for a DPU-resident Homer backend service that uses DOCA DMA to pull backend-produced host rings, push completions, and preserve grouped publication frontiers.
 - [homer_completion_publication_v27_recovery_plan.md](homer_completion_publication_v27_recovery_plan.md) - Audited recovery plan for peer-client completion publication: one full-slot WRITE_WITH_IMM, receiver CPU publication, descriptor seals, recv-CQ ownership, Stage 6 readiness, and follow-on hot-path cleanup.
 - [homer_continuation_graph_scheduler_plan.md](homer_continuation_graph_scheduler_plan.md) - TODO
 - [homer_frontend_service_separation_plan.md](homer_frontend_service_separation_plan.md) - Mechanical refactor plan for making the PostgreSQL/Citus-facing Homer frontend a separately identifiable component, splitting shared ABI headers from SHM channel details, and preparing the current SHM path for later DPU/DMA replacement.
