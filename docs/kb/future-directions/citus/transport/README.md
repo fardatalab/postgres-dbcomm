@@ -33,6 +33,7 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 ## Related
 
 - `../../../citus/connection-management/connection_management_control_plane.md`: Grounded current behavior that motivates these transport abstractions.
+- `../../../implementations/citus/transport/homer_current_implementation_checkpoint.md`: Current landed Homer implementation map that consolidates the frontend/service refactor, RDMA transport checkpoints, tuple COPY, pgbench, and basebackup paths.
 - `../connection-management/remote_execution_session_control_plane.md`: Chosen higher-level control-plane abstraction that transport designs must serve.
 - `../data-movement/command_dispatch_completion_plane.md`: Typed command dispatch/completion plane that the unification plan keeps semantically separate from payload-stream open.
 - `../intermediate-results/intermediate_results_service_future_directions.md`: Broader tuple-service design space that depends on the transport/control-plane choice.

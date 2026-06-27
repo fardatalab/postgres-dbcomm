@@ -8,7 +8,7 @@ Track the current state of Citus-side prototype code that we are actively landin
 
 <!-- kb-subdirs:start -->
 - `connection-management/`: Ongoing implementation progress for the new session-centric control-plane wrapper layer, service-owned SHM control path, and service-side compatibility session work in Citus.
-- `transport/`: Implementation checkpoints for Homer transport-layer RDMA substrate work.
+- `transport/`: Implementation checkpoints for the landed Homer stack, including the current frontend/service boundary, shared ABI split, RDMA substrate, tuple COPY, pgbench, and basebackup paths.
 - `tuple-route/`: Ongoing implementation progress for the experimental tuple-route service path in Citus.
 <!-- kb-subdirs:end -->
 

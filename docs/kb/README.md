@@ -13,7 +13,7 @@ This is the living knowledge base (KB) for this repo. The directory tree is the 
 <!-- kb-subdirs:start -->
 - `citus/`: Citus design/workflow notes and how they map to timing spots (Citus source: `/data/dbcomm/citus-dbcomm`).
 - `future-directions/`: Forward-looking design notes, open questions, and research directions cross-linked to the grounded KB.
-- `implementations/`: TODO
+- `implementations/`: Implementation-progress notes for landed and in-flight prototypes, including current behavior, validation, caveats, and milestone history.
 - `instrumentation/`: Timing/custom-stats instrumentation spots, call sites, and log aggregation tooling.
 - `postgres/`: PostgreSQL-side workflows and hot paths (query loop, libpq IO, COPY, etc.) with code pointers.
 <!-- kb-subdirs:end -->
