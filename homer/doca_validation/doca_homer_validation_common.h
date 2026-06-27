@@ -19,12 +19,31 @@ enum HdvMode
 	HDV_MODE_SYNC_EVENT_PUBLISH = 4,
 	HDV_MODE_SYNC_EVENT_EARLY_PUBLISH = 5,
 	HDV_MODE_SYNC_EVENT_ASYNC_PULL = 6,
+	HDV_MODE_DPU_SYNC_EVENT_PUBLISH = 7,
+	HDV_MODE_DPU_SYNC_EVENT_EARLY_PUBLISH = 8,
+	HDV_MODE_WRITE_PUBLISH_ASYNC = 9,
+	HDV_MODE_WRITE_PUBLISH_SPLIT_NOWAIT = 10,
+	HDV_MODE_WRITE_PUBLISH_SPLIT_COMPLETION = 11,
 };
 
 enum HdvPayloadMode
 {
 	HDV_PAYLOAD_FULL = 1,
 	HDV_PAYLOAD_HEADER = 2,
+};
+
+enum HdvSizePattern
+{
+	HDV_SIZE_PATTERN_FIXED = 1,
+	HDV_SIZE_PATTERN_MIXED_64_4K = 2,
+	HDV_SIZE_PATTERN_MIXED_64_1K = 3,
+};
+
+enum
+{
+	HDV_MIXED_SMALL_BYTES = 64U,
+	HDV_MIXED_MEDIUM_BYTES = 1024U,
+	HDV_MIXED_LARGE_BYTES = 4096U,
 };
 
 typedef struct HdvControlBlock
@@ -36,6 +55,8 @@ typedef struct HdvControlBlock
 	uint32_t slot_bytes;
 	uint32_t batch_size;
 	uint32_t payload_mode;
+	uint32_t size_pattern;
+	uint32_t reserved32;
 	uint64_t iterations;
 	uint64_t payload_seed;
 
@@ -74,6 +95,46 @@ static inline size_t hdv_payload_bytes(uint32_t slot_bytes)
 	if (slot_bytes <= sizeof(HdvSlotHeader))
 		return 0;
 	return slot_bytes - sizeof(HdvSlotHeader);
+}
+
+static inline size_t hdv_record_bytes(uint32_t slot_bytes, uint64_t epoch, enum HdvSizePattern size_pattern)
+{
+	if (size_pattern == HDV_SIZE_PATTERN_MIXED_64_4K)
+		return (epoch & 1ULL) != 0 ? HDV_MIXED_SMALL_BYTES : HDV_MIXED_LARGE_BYTES;
+	if (size_pattern == HDV_SIZE_PATTERN_MIXED_64_1K)
+		return (epoch & 1ULL) != 0 ? HDV_MIXED_SMALL_BYTES : HDV_MIXED_MEDIUM_BYTES;
+	return slot_bytes;
+}
+
+static inline size_t hdv_record_payload_bytes(uint32_t slot_bytes, uint64_t epoch, enum HdvSizePattern size_pattern)
+{
+	size_t record_bytes = hdv_record_bytes(slot_bytes, epoch, size_pattern);
+
+	if (record_bytes <= sizeof(HdvSlotHeader))
+		return 0;
+	return record_bytes - sizeof(HdvSlotHeader);
+}
+
+static inline uint64_t hdv_total_record_bytes(uint32_t slot_bytes, uint64_t iterations,
+											  enum HdvSizePattern size_pattern)
+{
+	if (size_pattern == HDV_SIZE_PATTERN_MIXED_64_4K)
+	{
+		uint64_t small_count = (iterations + 1) / 2;
+		uint64_t large_count = iterations / 2;
+
+		(void)slot_bytes;
+		return small_count * HDV_MIXED_SMALL_BYTES + large_count * HDV_MIXED_LARGE_BYTES;
+	}
+	if (size_pattern == HDV_SIZE_PATTERN_MIXED_64_1K)
+	{
+		uint64_t small_count = (iterations + 1) / 2;
+		uint64_t medium_count = iterations / 2;
+
+		(void)slot_bytes;
+		return small_count * HDV_MIXED_SMALL_BYTES + medium_count * HDV_MIXED_MEDIUM_BYTES;
+	}
+	return iterations * (uint64_t)slot_bytes;
 }
 
 static inline size_t hdv_slots_offset(void)
@@ -116,11 +177,12 @@ static inline uint64_t hdv_checksum_bytes(const uint8_t *payload, size_t len)
 	return checksum;
 }
 
-static inline void hdv_fill_slot(void *slot, uint32_t slot_bytes, uint64_t seed, uint64_t epoch, uint32_t slot_count)
+static inline void hdv_fill_slot(void *slot, uint32_t slot_bytes, uint64_t seed, uint64_t epoch, uint32_t slot_count,
+								 enum HdvSizePattern size_pattern)
 {
 	HdvSlotHeader *header = (HdvSlotHeader *)slot;
 	uint8_t *payload = (uint8_t *)slot + hdv_payload_offset();
-	size_t payload_len = hdv_payload_bytes(slot_bytes);
+	size_t payload_len = hdv_record_payload_bytes(slot_bytes, epoch, size_pattern);
 
 	header->seq_begin = epoch;
 	header->seq_end = 0;
@@ -138,10 +200,11 @@ static inline void hdv_fill_slot(void *slot, uint32_t slot_bytes, uint64_t seed,
 }
 
 static inline void hdv_fill_slot_header_only(void *slot, uint32_t slot_bytes, uint64_t seed, uint64_t epoch,
-											 uint32_t slot_count)
+											 uint32_t slot_count, enum HdvSizePattern size_pattern)
 {
 	HdvSlotHeader *header = (HdvSlotHeader *)slot;
-	size_t payload_len = hdv_payload_bytes(slot_bytes);
+	size_t record_bytes = hdv_record_bytes(slot_bytes, epoch, size_pattern);
+	size_t payload_len = hdv_record_payload_bytes(slot_bytes, epoch, size_pattern);
 
 	header->seq_begin = epoch;
 	header->seq_end = 0;
@@ -150,7 +213,7 @@ static inline void hdv_fill_slot_header_only(void *slot, uint32_t slot_bytes, ui
 	header->flags = 0;
 	header->poison_before = HDV_POISON_BEFORE;
 	header->poison_after = HDV_POISON_AFTER;
-	header->checksum = seed ^ epoch ^ ((uint64_t)slot_bytes << 32);
+	header->checksum = seed ^ epoch ^ ((uint64_t)record_bytes << 32);
 	header->seq_end = epoch;
 }
 

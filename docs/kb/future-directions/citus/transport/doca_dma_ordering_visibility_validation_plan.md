@@ -19,6 +19,88 @@ The DOCA host-DPU Homer boundary plan in [doca_host_dpu_homer_boundary.md](doca_
 
 The experiment should model Homer's local boundary shape, but it should not depend on Postgres, Citus, or the existing Homer service process. The current Homer structures to keep in mind are [`CitusRemoteExecClientCompletionMailbox`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:485), [`CitusRemoteExecPeerCommandCompletionRing`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_control_protocol.h:515), [`CitusTupleSinkQueueControl`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:186), and [`CitusTupleSinkPayloadRingControl`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:201). Those structures use monotonic head/tail or epoch fields and SPSC ownership, so the validation harness should do the same.
 
+## DOCA DMA Usage Insights For Homer DPU Offload
+
+These are the current design rules from the standalone harness. They are
+Homer-facing conclusions, not a replacement for the detailed dated experiment
+log below.
+
+- Treat a DOCA DMA context as the ordering, completion, and completion-report
+  batching domain. `doca_dma_set_ordered_completions()` applies to one DMA
+  context, and `DOCA_TASK_SUBMIT_FLAG_OPTIMIZE_REPORTS` / non-optimized report
+  sentinels are also reasoned about per context.
+- Treat a DOCA PE as the progress/polling domain. Multiple contexts can be
+  attached to one PE, so "one workload class per DMA ctx" does not require "one
+  PE per workload class" up front. Start with shared PE only when shared progress
+  is simpler; split PEs later if measurements show progress interference or
+  priority isolation needs. A single `doca_pe_progress()` call is not a CQ drain:
+  the local header says it finds the next context with a completed task and
+  invokes its callback, returning `1` if progress was made and `0` otherwise
+  ([`doca_pe_progress()`](/opt/mellanox/doca/include/doca_pe.h:181)). The
+  scheduler should explicitly drain a PE with a loop or bounded budget when it
+  wants to process many completions across sessions.
+- Put payload DMA and the matching publication tail on the same DMA context
+  when the protocol relies on same-context ordering or same-context completion
+  reasoning. If payload and publication are on different contexts, explicitly
+  gate the publication DMA on observed payload completion from the data context.
+  Same-thread submission to two contexts is not a publication-ordering mechanism.
+- For the host-produce / DPU-pull Homer shape, the host should publish a
+  memory-resident frontier or sync-event value only after filling host memory.
+  The DPU should pull with a window of async DMA reads, track completed
+  contiguous records, and publish/consume only that completed frontier. The
+  current no-sync DPU-pull loop is
+  [`run_dpu_host_read_async()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1367);
+  its current one-progress-call loop at
+  [`doca_pe_progress(dma->pe)`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1443)
+  is a harness policy, not the target scheduler policy.
+- For the DPU-produce / host-consume shape, the DPU should similarly keep many
+  payload DMA writes in flight, track the completed contiguous frontier, and
+  publish the frontier only after the data-DMA completions needed for that
+  frontier have been observed.
+- `OPTIMIZE_REPORTS` plus a flushed non-optimized sentinel is useful for
+  streaming small DMA tasks because it coalesces initiator-side completion
+  reporting. It is not useful for a strict one-64B-record command dependency
+  chain where each command has to publish before the next command can proceed.
+  This is distinct from application-level batching: it does not merge records,
+  rings, or publication tails. It only reduces or defers initiator-side
+  completion/callback reporting for DMA tasks already submitted to the same DMA
+  context.
+- Enable ordered completions when using a sentinel completion as the frontier.
+  The harness has seen some variants pass without ordered completions, but the
+  clean protocol should ask DOCA for the same-context completion property it
+  depends on.
+- If the application can make `K > 1` records contiguous in both source and
+  destination and those records have the same publication fate, prefer one larger
+  DMA task over `K` small DMA tasks followed by one tail update. Multiple DMA
+  tasks before one publication still make sense when records live in separate
+  per-session rings, the ring wraps, source/destination ranges are not
+  contiguous, lifetimes/credits differ, or avoiding a staging copy matters.
+- Separate per-session rings imply separate semantic publication tails. Multiple
+  pgbench sessions can share one DMA ctx and one PE for submission/progress, and
+  can benefit from ctx-wide DOCA completion-report coalescing, but they cannot
+  coalesce into one application tail unless Homer adds a new multiplexed queue
+  abstraction. The scheduler must still update per-session completed frontiers
+  and per-session consumed/tail values.
+- Sync-event is best treated as a publish/wakeup object for the protocol value,
+  not as a general-purpose proof that arbitrary unrelated writes are visible. In
+  the current Homer design, use it for cold/control setup and for hot-path
+  wakeup/publication only when the exact data-before-event protocol has been
+  validated. Otherwise, poll a memory frontier and use DMA completions for the
+  DPU's local completion frontier.
+- COMCH should remain control plane for setup, descriptor exchange, and policy
+  messages. Do not put Homer hot-path payload movement on COMCH unless a
+  separate benchmark proves it is competitive with DMA.
+- Current queue-depth evidence suggests `--async-window=32` is a conservative
+  first default for mixed small/medium records. Larger records reach their
+  plateau with lower depths, often `8-16`, so a size-aware or workload-class
+  policy should reduce queue depth for large transfers.
+- The current PCI-export harness could not enable
+  `DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING`; firmware/global
+  `PCI_WR_ORDERING=force_relax` remains the adversarial validation environment.
+  The DOCA protocol should therefore remain correct under relaxed PCI ordering
+  and not depend on per-mmap relaxed-ordering configuration until a supported
+  path is confirmed.
+
 ## Relevant DOCA Starting Points
 
 The existing DOCA samples are good scaffolding, but the validation harness should be its own small program pair so we can keep hot loops, counters, and failure modes under our control.
@@ -814,6 +896,142 @@ Rejected/unsafe report-optimization variants:
   is a proven sentinel/drain pattern that guarantees all reusable task records
   receive observable completion.
 
+June 26 follow-up on the report-sentinel hypothesis:
+
+- Added `--flush-report-sentinel`, implemented in
+  [`async_data_submit_flags()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1172).
+  This is narrower than `--flush=all`: optimized intermediate payload tasks
+  remain aggregateable, while the non-optimized async report sentinel is
+  submitted with `DOCA_TASK_SUBMIT_FLAG_FLUSH`.
+- Mechanism interpretation: `DOCA_TASK_SUBMIT_FLAG_OPTIMIZE_REPORTS` gives us a
+  form of completion-report batching/coalescing. Intermediate payload tasks may
+  defer completion callbacks. A later non-optimized report sentinel is the
+  callback boundary, and `DOCA_TASK_SUBMIT_FLAG_FLUSH` on that sentinel makes the
+  boundary task and previous aggregated tasks reach hardware instead of relying
+  on context-side aggregation. This is not documented as "batching DMA
+  execution"; it is batching/coalescing the initiator-side completion reporting
+  and hardware submission doorbell behavior.
+- Reproduced the old DPU-pull stall with
+  `/tmp/hdv_optreports_baseline_opt_1782521551`: `sync-event-async-pull`,
+  `slot=4 KiB`, `slot-count=8192`, `batch=4096`, `window=256`,
+  `iterations=1048576`, `--optimize-reports`. The DPU timed out at
+  `completed=4094 submitted=4096 published=4096 consumed=4094`; the host timed
+  out producing epoch `8193` because consumed credit never advanced past the
+  first batch.
+- The same run passed with `--optimize-reports --flush-report-sentinel`:
+  `/tmp/hdv_optreports_flush_sentinel_no_order_1782521620`.
+- The same run also passed with ordered completions enabled:
+  `/tmp/hdv_optreports_flush_sentinel_ordered_1782521593`.
+- The no-optimized-report control also passed:
+  `/tmp/hdv_optreports_no_opt_control_1782521631`.
+- Interpretation: a flushed non-optimized report sentinel fixes the reproduced
+  DPU-pull deferred-callback liveness failure. This is a completion-reporting
+  result, not a memory-publication proof. It says the DPU initiator can make its
+  reusable task bookkeeping live; it does not by itself say that a remote host
+  observing a separate frontier has RDMA `WRITE_WITH_IMM`-style visibility
+  semantics.
+- Throughput conclusion: do not treat the sentinel-flush run as a bandwidth win.
+  The DPU-side MiB/s was low in these reruns even for the no-opt control, so this
+  artifact set is liveness evidence only.
+- Performance follow-up on the high-throughput 1 MiB DPU-pull shape:
+  `sync-event-async-pull`, `slot=1 MiB`, `slot-count=1024`, `batch=512`,
+  `window=128`, `iterations=8192`, header validation. With a shorter 1 second
+  host ready delay, DPU-side bandwidth was essentially unchanged:
+  no optimized reports was `35075.59 MiB/s`
+  (`/tmp/hdv_optreports_perf_rdy1s_no_opt_1782523379`),
+  `--optimize-reports --flush-report-sentinel` was `34914.14 MiB/s`
+  (`/tmp/hdv_optreports_perf_rdy1s_opt_flush_1782523382`), and adding
+  `--ordered-completions` was `34616.58 MiB/s`
+  (`/tmp/hdv_optreports_perf_rdy1s_opt_flush_ordered_1782523384`). The PE
+  progress-call counts were also in the same rough band, about `1.39M-1.45M`.
+  Current conclusion: the sentinel-flush pattern fixes the liveness failure but
+  has not shown a meaningful throughput benefit in this harness.
+- Ordered-completion nuance: `doca_dma_set_ordered_completions()` is useful for
+  initiator-side reasoning because it requests DMA completions in submission
+  order for a context. In DPU-pull, however, the host's sync-event publication
+  happens before the DPU issues the DMA reads; observing that host publication
+  only authorizes the DPU to pull. It does not mean the DPU's later payload DMA
+  reads have completed. If the DPU submits a sentinel DMA task after earlier
+  payload DMA tasks, then ordered completions make observing the sentinel
+  completion a sufficient initiator-side indication that earlier submitted DMA
+  completions have also been returned. Without ordered completions, our
+  sentinel-flush tests still passed empirically, and DOCA's `OPTIMIZE_REPORTS`
+  comment says a non-optimized task completion also delivers preceding deferred
+  callbacks; but the cleaner protocol should still enable ordered completions
+  when using a sentinel as a completion frontier.
+- DPU-push contrast: `write-publish-async` did not reproduce the same stall in a
+  matching 1 GiB check. Optimized reports, sentinel flush, sentinel flush plus
+  ordered completions, and no optimized reports all completed
+  (`/tmp/hdv_optreports_push_baseline_opt_1782521662`,
+  `/tmp/hdv_optreports_push_flush_sentinel_1782521672`,
+  `/tmp/hdv_optreports_push_flush_sentinel_ordered_1782521682`,
+  `/tmp/hdv_optreports_push_no_opt_1782521710`), but all showed hundreds of
+  millions of PE progress calls and are diagnostic-only until the DPU-push
+  progress loop is retuned.
+- No-sync-event DPU-pull clarification: if the host publishes only a
+  memory-resident frontier and the DPU polls that frontier with DMA reads, then
+  sync-event is not involved in the hot path. The relevant publication for the
+  DPU's next stage is the DPU's own completed-read frontier. In that shape, a
+  flushed non-optimized sentinel plus ordered completions is a reasonable
+  initiator-side completion frontier: the DPU submits payload DMA reads, then a
+  later sentinel, and observing the sentinel completion means earlier submitted
+  reads have completed when ordered completions are enabled.
+- Added `--size-pattern=mixed-64-1k` to model small control records mixed with
+  small payload records. It alternates 64 B and 1 KiB records in a 1 KiB ring
+  stride.
+- Small-message no-sync-event DPU-pull performance test:
+  `host-write-dpu-read`, `slot-count=4096`, `batch=1024`, `window=128`,
+  `iterations=1000000`, header validation. The DPU polls the memory frontier and
+  drains host slots with async DMA reads. Two passes showed a clear DPU-side
+  elapsed-time benefit from `--optimize-reports --flush-report-sentinel`:
+
+  | Record shape | Variant | DPU MiB/s pass 1 | Artifact pass 1 | DPU MiB/s pass 2 | Artifact pass 2 |
+  | --- | --- | ---: | --- | ---: | --- |
+  | fixed 64 B | no optimized reports | `195.42` | `/tmp/hdv_nosync_opt_64b_no_opt_1782524985` | `197.64` | `/tmp/hdv_nosync_opt_rep2_64b_no_opt_1782525018` |
+  | fixed 64 B | optimized + flushed sentinel | `383.16` | `/tmp/hdv_nosync_opt_64b_opt_flush_1782524987` | `380.61` | `/tmp/hdv_nosync_opt_rep2_64b_opt_flush_1782525020` |
+  | fixed 64 B | optimized + flushed sentinel + ordered | `348.49` | `/tmp/hdv_nosync_opt_64b_opt_flush_ordered_1782524989` | `334.93` | `/tmp/hdv_nosync_opt_rep2_64b_opt_flush_ordered_1782525022` |
+  | fixed 1 KiB | no optimized reports | `3110.48` | `/tmp/hdv_nosync_opt_1k_no_opt_1782524990` | `3172.74` | `/tmp/hdv_nosync_opt_rep2_1k_no_opt_1782525023` |
+  | fixed 1 KiB | optimized + flushed sentinel | `5275.68` | `/tmp/hdv_nosync_opt_1k_opt_flush_1782524992` | `5917.03` | `/tmp/hdv_nosync_opt_rep2_1k_opt_flush_1782525025` |
+  | fixed 1 KiB | optimized + flushed sentinel + ordered | `5989.20` | `/tmp/hdv_nosync_opt_1k_opt_flush_ordered_1782524993` | `5363.48` | `/tmp/hdv_nosync_opt_rep2_1k_opt_flush_ordered_1782525026` |
+  | mixed 64 B / 1 KiB | no optimized reports | `1668.20` | `/tmp/hdv_nosync_opt_mixed64_1k_no_opt_1782524995` | `1686.22` | `/tmp/hdv_nosync_opt_rep2_mixed64_1k_no_opt_1782525028` |
+  | mixed 64 B / 1 KiB | optimized + flushed sentinel | `2928.05` | `/tmp/hdv_nosync_opt_mixed64_1k_opt_flush_1782524996` | `3000.86` | `/tmp/hdv_nosync_opt_rep2_mixed64_1k_opt_flush_1782525030` |
+  | mixed 64 B / 1 KiB | optimized + flushed sentinel + ordered | `3100.34` | `/tmp/hdv_nosync_opt_mixed64_1k_opt_flush_ordered_1782524998` | `2960.70` | `/tmp/hdv_nosync_opt_rep2_mixed64_1k_opt_flush_ordered_1782525031` |
+
+- Interpretation: smaller records are where completion-report coalescing starts
+  to matter. In this no-sync DPU-pull shape, the optimized + flushed sentinel
+  variant roughly doubled fixed-64B DPU-side MiB/s and improved 1 KiB and mixed
+  64B/1KiB by about `1.7-1.9x` in these two passes. Host-side elapsed had more
+  variance because the host can fill the ring and then wait for consumed credit;
+  use the DPU-side elapsed for this completion-overhead question.
+- The improvement did not come from fewer outer `doca_pe_progress()` calls. The
+  optimized variants reported more PE progress calls in this harness. The more
+  plausible explanation is reduced DOCA/HW completion-report pressure or
+  callback-delivery overhead per useful byte, not a simpler polling loop.
+- Homer command-chain caveat: for a single session where command `N+1` depends
+  on completion `N`, the coalescing depth may be only one 64 B command record.
+  We tested this as a strict `K=1` proxy with `host-write-dpu-read`,
+  `slot=64 B`, `batch=1`, `iterations=100000`.
+  With `slot-count=1` and `async-window=1`, the harness uses the synchronous
+  DPU-read path and publishes every consumed command individually; all variants
+  completed, but `OPTIMIZE_REPORTS` cannot apply because each read is already
+  the report boundary:
+  `/tmp/hdv_cmdchain_k1_64b_no_opt_1782526600`,
+  `/tmp/hdv_cmdchain_k1_64b_opt_flush_1782526602`,
+  `/tmp/hdv_cmdchain_k1_64b_opt_flush_ordered_1782526604`.
+  With `slot-count=2` and `async-window=2`, the async path runs and the host can
+  be at most one command ahead. DPU-side MiB/s was effectively flat:
+  no optimized reports `20.46`
+  (`/tmp/hdv_cmdchain_k1_64b_async_no_opt_1782526624`),
+  optimized + flushed sentinel `20.19`
+  (`/tmp/hdv_cmdchain_k1_64b_async_opt_flush_1782526626`), and optimized +
+  flushed sentinel + ordered `20.61`
+  (`/tmp/hdv_cmdchain_k1_64b_async_opt_flush_ordered_1782526627`).
+  Interpretation: for a one-DMA command/completion dependency chain, completion
+  coalescing has no meaningful DPU-side benefit in the current harness. The
+  earlier `1.7-2x` small-record win applies to streaming/pipelined small DMAs or
+  commands with multiple DMA tasks before one command completion, not to a
+  single 64 B DMA that must publish before the next command can proceed.
+
 Interpretation:
 
 - Best stable sync-event-gated DPU-pull result so far is `slot=1 MiB`,
@@ -837,19 +1055,623 @@ Interpretation:
   turn sync-event into a documented general memory fence for unrelated writes;
   it validates this exact protocol on this host/DPU stack.
 
+### June 26, 2026: DPU-Push Sync-Event Publication And Mixed-Size Rings
+
+Current machine state:
+
+- `farnet1` branch during this validation: `homer-dpu-migration`.
+- Both BF3 PFs reported `PCI_WR_ORDERING force_relax(1)`, so these runs were
+  collected under the more adversarial PCI write-ordering setting.
+
+Implemented harness changes:
+
+- Added `dpu-sync-event-publish`, where the host creates a sync-event with
+  remote-PCI publisher and CPU subscriber locations, the DPU DMA-writes host
+  slots, and then the DPU calls `doca_sync_event_update_set(batch_end)`.
+- Added `dpu-sync-event-early-publish`, where the DPU updates the sync-event
+  before writing the matching slot. This is the negative control for DPU-push
+  sync-event publication.
+- Added `--size-pattern=fixed` and `--size-pattern=mixed-64-4k`. The mixed
+  mode uses a 4 KiB ring stride but alternates 64 byte records and 4 KiB records,
+  so one run exercises small control-style DMA records interleaved with larger
+  payload-style DMA records.
+- Throughput reporting now uses actual record bytes moved, not only ring stride
+  bytes, so mixed runs are not overstated.
+
+Important implementation pointers:
+
+- [`HdvSizePattern`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation_common.h:32) defines fixed and mixed-size record modes.
+- [`hdv_record_bytes()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation_common.h:95) computes each epoch's active DMA length.
+- [`run_host()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:613) configures sync-event direction. For DPU-push modes, it uses remote-PCI publisher and CPU subscriber locations.
+- [`run_dpu_write_sync_event()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1911) is the DPU-push sync-event publisher path.
+
+DPU-push sync-event publication results under `force_relax`:
+
+| Mode | Parameters | Result | Artifact |
+| --- | --- | --- | --- |
+| DPU push, fixed small records | `slot=64 B`, `iterations=100000`, `batch=128`, full validation | PASS, DPU `40.64 MiB/s`, host validation `2.66 MiB/s` | `/tmp/hdv_dpu_push_64b_100k_1782509826` |
+| DPU push, fixed 4 KiB records | `slot=4 KiB`, `iterations=100000`, `batch=128`, full validation | PASS, DPU `332.99 MiB/s`, host validation `166.88 MiB/s` | `/tmp/hdv_dpu_push_4k_100k_1782509828` |
+| DPU push, mixed 64 B / 4 KiB records | `slot=4 KiB`, `iterations=100000`, `batch=128`, full validation | PASS, DPU `298.97 MiB/s`, host validation `108.04 MiB/s` | `/tmp/hdv_dpu_push_mixed_100k_1782509831` |
+| DPU push, fixed small records | `slot=64 B`, `iterations=1000000`, `batch=1024`, full validation | PASS, DPU `42.21 MiB/s`, host validation `16.95 MiB/s` | `/tmp/hdv_dpu_push_64b_1m_full_1782509890` |
+| DPU push, fixed 4 KiB records | `slot=4 KiB`, `iterations=1000000`, `batch=1024`, full validation | PASS, DPU `328.90 MiB/s`, host validation `299.37 MiB/s` | `/tmp/hdv_dpu_push_4k_1m_full_1782509893` |
+| DPU push, mixed 64 B / 4 KiB records | `slot=4 KiB`, `iterations=1000000`, `batch=1024`, full validation | PASS, DPU `296.00 MiB/s`, host validation `251.51 MiB/s` | `/tmp/hdv_dpu_push_mixed_1m_full_1782509907` |
+| DPU push, early sync-event negative | `slot=4 KiB`, `iterations=4`, `batch=1`, `early-delay=50000us`, full validation | Expected FAIL: host saw poisoned `seq_begin` for epoch 1 after event value 1 | `/tmp/hdv_dpu_push_early_negative_1782510004` |
+
+Host-produce / DPU-pull mixed-size results under `force_relax`:
+
+| Mode | Parameters | Result | Artifact |
+| --- | --- | --- | --- |
+| sync-event async pull, fixed small records | `slot=64 B`, `iterations=1000000`, `batch=1024`, `window=128`, full validation | PASS, DPU `155.98 MiB/s`, host `33.06 MiB/s` | `/tmp/hdv_host_pull_64b_1m_b1024_1782509852` |
+| sync-event async pull, fixed 4 KiB records | `slot=4 KiB`, `iterations=262144`, `batch=1024`, `window=128`, full validation | PASS, DPU `223.56 MiB/s`, host `177.70 MiB/s` | `/tmp/hdv_host_pull_4k_262k_b1024_1782509854` |
+| sync-event async pull, mixed 64 B / 4 KiB records | `slot=4 KiB`, `iterations=262144`, `batch=1024`, `window=128`, full validation | PASS, DPU `220.63 MiB/s`, host `145.71 MiB/s` | `/tmp/hdv_host_pull_mixed_262k_b1024_1782509860` |
+
+Interpretation:
+
+- This is the missing empirical evidence for the DPU DMA-write / host-consume
+  direction: under `PCI_WR_ORDERING=force_relax`, DPU DMA writes followed by
+  DPU sync-event publication passed full host-side validation for 64 B, 4 KiB,
+  and mixed 64 B / 4 KiB records.
+- The negative mode failed immediately, proving the host validator is actually
+  sensitive to sync-event publication arriving before the matching DMA write.
+- These runs use synchronous per-record DMA writes in the DPU-push path, so the
+  DPU-side MiB/s numbers are correctness evidence, not the final throughput
+  ceiling. The next performance question is async/windowed DPU writes plus
+  sync-event publication after observed data-DMA completions.
+- The evidence is still empirical rather than an official DOCA memory-ordering
+  contract. For Homer, the practical rule should be: data first, wait for or
+  otherwise prove data-DMA completion, then publish the frontier through
+  sync-event. Avoid queued data-DMA plus sync-event notify without explicit
+  validation.
+
 Immediate follow-up implementation work:
 
-1. Add an async DPU-write path with queued data DMA plus queued publish DMA to
-   test DPU-issued publication order without waiting for every data completion.
-2. Add a sync-event variant for DPU-issued DMA writes followed by sync-event
-   notify, because the current sync-event evidence covers host CPU writes
-   followed by host sync-event update.
-3. Replace descriptor files with COMCH setup in the harness and measure cold
+1. Add an intentionally early async DPU-write negative mode that DMA-publishes
+   a frontier before the matching queued data-DMA completions. This would prove
+   the async DPU-write validator catches the same class of bug as the existing
+   synchronous early-publish modes.
+2. Replace descriptor files with COMCH setup in the harness and measure cold
    setup latency.
-4. Add a multi-stream version of async DPU pull to model several DB backends or
+3. Add a multi-stream version of async DPU pull to model several DB backends or
    Homer lanes sharing the DPU DMA engine.
-5. Add relaxed-ordering and CPU cache pre-touch stress variants to make the
-   empirical memory-visibility evidence harsher.
+4. Add CPU cache pre-touch stress variants and investigate whether another DOCA API or newer runtime exposes per-mmap PCI relaxed ordering for this host-DPU DMA path.
+
+### June 26, 2026: No-Sync-Event Publication Contrast Runs
+
+After validating sync-event publication in both directions, we also ran the
+same small, large, and mixed-size shapes without sync-event publication. These
+runs answer a narrower empirical question: whether the existing memory-resident
+frontier schemes happen to work on this machine under the current
+`PCI_WR_ORDERING=force_relax` setting.
+
+Modes under test:
+
+- `write-publish`: DPU DMA-writes host slots, then DPU DMA-writes
+  `HdvControlBlock.published_epoch`. Host polls the host-resident frontier and
+  validates host-resident slots.
+- `write-publish-async`: DPU queues many DMA writes into host slots, observes
+  their data-DMA completions, and only then DMA-writes
+  `HdvControlBlock.published_epoch` for the completed contiguous frontier.
+- `host-write-dpu-read`: host CPU-writes slots and release-stores
+  `HdvControlBlock.published_epoch`; the DPU polls the frontier through DMA
+  reads and drains slots with async DMA reads.
+
+The two modes are intentionally not symmetric. `write-publish` uses DMA for the
+publication word; `host-write-dpu-read` uses a host CPU store for publication
+and DMA only for the DPU consumer. That matches two realistic Homer contrasts:
+DPU-issued completion/result publication versus host backend-owned producer
+rings that the DPU pulls.
+
+No-sync-event DPU-write / host-consume results under `force_relax`:
+
+| Mode | Parameters | Result | Artifact |
+| --- | --- | --- | --- |
+| DPU DMA write + DMA frontier, fixed small records | `slot=64 B`, `iterations=1000000`, `batch=1024`, full validation | PASS, DPU `42.58 MiB/s`, host validation `42.58 MiB/s` | `/tmp/hdv_nosync_dpu_write_64b_1m_1782511160` |
+| DPU DMA write + DMA frontier, fixed 4 KiB records | `slot=4 KiB`, `iterations=1000000`, `batch=1024`, full validation | PASS, DPU `331.79 MiB/s`, host validation `331.69 MiB/s` | `/tmp/hdv_nosync_dpu_write_4k_1m_1782511163` |
+| DPU DMA write + DMA frontier, mixed 64 B / 4 KiB records | `slot=4 KiB`, `iterations=1000000`, `batch=1024`, full validation | PASS, DPU `301.44 MiB/s`, host validation `301.45 MiB/s` | `/tmp/hdv_nosync_dpu_write_mixed_1m_1782511176` |
+
+No-sync-event host-write / DPU-pull results under `force_relax`:
+
+| Mode | Parameters | Result | Artifact |
+| --- | --- | --- | --- |
+| Host CPU write + CPU frontier, fixed small records | `slot=64 B`, `iterations=1000000`, `batch=1024`, `window=128`, full validation | PASS, DPU `174.41 MiB/s`, host `38.12 MiB/s` | `/tmp/hdv_nosync_host_pull_64b_1m_1782511184` |
+| Host CPU write + CPU frontier, fixed 4 KiB records | `slot=4 KiB`, `iterations=262144`, `batch=1024`, `window=128`, full validation | PASS, DPU `224.00 MiB/s`, host `176.52 MiB/s` | `/tmp/hdv_nosync_host_pull_4k_262k_1782511185` |
+| Host CPU write + CPU frontier, mixed 64 B / 4 KiB records | `slot=4 KiB`, `iterations=262144`, `batch=1024`, `window=128`, full validation | PASS, DPU `220.79 MiB/s`, host `145.51 MiB/s` | `/tmp/hdv_nosync_host_pull_mixed_262k_1782511191` |
+
+Interpretation:
+
+- Both no-sync-event directions passed full validation for small, large, and
+  mixed records. This means we did not observe torn or stale slot data after the
+  consumer observed the memory-resident frontier in these runs.
+- This does **not** promote the frontier word to a documented RDMA
+  `WRITE_WITH_IMM`-style publication guarantee. It only says that the exact
+  harness protocol worked empirically on this BF3 setup.
+- For Homer, sync-event remains the stronger candidate for an explicit
+  notification/publish operation because it provides a waitable event value.
+  The no-sync-event memory frontier may still be useful as a low-overhead fast
+  path or fallback if repeated stress keeps passing and we are comfortable with
+  an empirical rather than documented ordering basis.
+- The next useful harshness tests are larger multi-hour mixed runs, an
+  intentionally early async DPU-write negative control, and a separate search
+  for a DOCA API/runtime that actually accepts per-mmap PCI relaxed ordering.
+
+### June 26, 2026: Async No-Sync-Event Publication Stress
+
+We added and validated `write-publish-async` to make the DPU-write no-sync
+direction comparable to the already-windowed `host-write-dpu-read` direction.
+The new mode is implemented by
+[`run_dpu_write_publish_async()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1911):
+the DPU fills reusable local slots, queues async DMA writes into host memory,
+tracks completed epochs, advances only the contiguous completed frontier, and
+then DMA-writes `HdvControlBlock.published_epoch`.
+
+The publication under test is intentionally separate from sync-event:
+
+- Data path: queued async DOCA DMA writes from DPU memory to host ring slots.
+- Completion gate: DPU observes DOCA data-DMA task completions.
+- Publication path: a later small DOCA DMA write of the host-resident
+  `published_epoch` word.
+- Host consumer: host CPU polls `published_epoch` and validates host-resident
+  slots.
+
+Async no-sync-event DPU-write / host-consume results under `force_relax`:
+
+| Mode | Parameters | Result | Artifact |
+| --- | --- | --- | --- |
+| Async DPU DMA write + DMA frontier, fixed small records | `slot=64 B`, `iterations=1000000`, `batch=1024`, `window=128`, full validation | PASS, DPU `212.11 MiB/s`, host validation `212.15 MiB/s` | `/tmp/hdv_async_nosync_dpu_async_write_64b_1m_1782511600` |
+| Async DPU DMA write + DMA frontier, fixed 4 KiB records | `slot=4 KiB`, `iterations=1000000`, `batch=1024`, `window=128`, full validation | PASS, DPU `384.09 MiB/s`, host validation `383.92 MiB/s` | `/tmp/hdv_async_nosync_dpu_async_write_4k_1m_1782511602` |
+| Async DPU DMA write + DMA frontier, mixed 64 B / 4 KiB records | `slot=4 KiB`, `iterations=1000000`, `batch=1024`, `window=128`, full validation | PASS, DPU `375.36 MiB/s`, host validation `375.19 MiB/s` | `/tmp/hdv_async_nosync_dpu_async_write_mixed_1m_1782511613` |
+
+Matched no-sync-event host-write / DPU-async-pull reruns under `force_relax`:
+
+| Mode | Parameters | Result | Artifact |
+| --- | --- | --- | --- |
+| Host CPU write + CPU frontier, async DPU pull, fixed small records | `slot=64 B`, `iterations=1000000`, `batch=1024`, `window=128`, full validation | PASS, DPU `179.83 MiB/s`, host `26.97 MiB/s` | `/tmp/hdv_async_nosync_host_async_pull_64b_1m_1782511620` |
+| Host CPU write + CPU frontier, async DPU pull, fixed 4 KiB records | `slot=4 KiB`, `iterations=262144`, `batch=1024`, `window=128`, full validation | PASS, DPU `223.25 MiB/s`, host `176.02 MiB/s` | `/tmp/hdv_async_nosync_host_async_pull_4k_262k_1782511622` |
+| Host CPU write + CPU frontier, async DPU pull, mixed 64 B / 4 KiB records | `slot=4 KiB`, `iterations=262144`, `batch=1024`, `window=128`, full validation | PASS, DPU `220.67 MiB/s`, host `145.07 MiB/s` | `/tmp/hdv_async_nosync_host_async_pull_mixed_262k_1782511628` |
+
+Interpretation:
+
+- Both directions now have async/windowed no-sync-event validation coverage for
+  fixed 64 B, fixed 4 KiB, and mixed 64 B / 4 KiB records.
+- For DPU-push, the important new evidence is that a DMA frontier write issued
+  after observed data-DMA completions empirically published the earlier queued
+  DMA writes to the host consumer. We did not observe torn or stale slot data.
+- This is still an empirical machine/protocol result, not a documented DOCA
+  replacement for RDMA `WRITE_WITH_IMM`. The protocol remains defensible only
+  if the DPU publication word is issued after the data-DMA completions that it
+  claims to publish.
+- The next stricter correctness test is an async early-publication negative
+  mode that deliberately writes the frontier before data completions and checks
+  that the host validator fails quickly.
+
+### June 26, 2026: Completion-Gated Publication Does Not Imply DMA Depth 1
+
+Question: if the DPU waits for data-DMA completion before publishing a frontier,
+does that collapse the DMA pipeline to a single in-flight payload DMA?
+
+Answer from the harness: no, not if the implementation separates the payload
+frontier from the publication frontier. The completion-gated
+`write-publish-async` mode keeps up to `--async-window` payload DMA writes in
+flight, observes data-DMA completions, advances a contiguous completed frontier,
+and only then posts the small DMA write that publishes
+`HdvControlBlock.published_epoch`. That is different from the synchronous helper
+path in [`hdv_dma_copy()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1092),
+which submits one DMA task and spins in `doca_pe_progress()` until its callback
+marks the task done before returning.
+
+Implementation pointers:
+
+- [`run_dpu_write_publish_async()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1911)
+  is the completion-gated, windowed DPU-write path. It submits new data DMA work
+  while `in_flight < config->async_window`, records completed epochs, and only
+  publishes the completed contiguous prefix.
+- [`hdv_async_submit_host_write()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1307)
+  retargets a reusable DMA task and submits a payload DMA write.
+- [`write_remote_u64()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1158)
+  is still synchronous for the small publication word, so publication itself is
+  completion-waited, but this does not force the preceding payload stream to
+  have window depth 1.
+
+Completion-depth contrast results under `PCI_WR_ORDERING=force_relax`:
+
+| Mode | Parameters | Result | Artifact |
+| --- | --- | --- | --- |
+| Synchronous DPU DMA write + DMA frontier | `slot=4 KiB`, `iterations=262144`, `batch=1024`, header validation | PASS, DPU `2181.99 MiB/s`, host `2188.17 MiB/s` | `/tmp/hdv_completion_depth_1782515810/sync_4k` |
+| Async completion-gated publish, depth 1 | `slot=4 KiB`, `iterations=262144`, `batch=1024`, `window=1`, header validation | PASS, DPU `2075.24 MiB/s`, host `2081.45 MiB/s` | `/tmp/hdv_completion_depth_1782515810/async_w1_4k` |
+| Async completion-gated publish, depth 32 | `slot=4 KiB`, `iterations=262144`, `batch=1024`, `window=32`, header validation | PASS, DPU `15190.02 MiB/s`, host `15232.95 MiB/s` | `/tmp/hdv_completion_depth_1782515810/async_w32_4k` |
+| Async completion-gated publish, depth 128 | `slot=4 KiB`, `iterations=262144`, `batch=1024`, `window=128`, header validation | PASS, DPU `14578.38 MiB/s`, host `14632.40 MiB/s` | `/tmp/hdv_completion_depth_1782515810/async_w128_4k` |
+| Async completion-gated publish, depth 1 | `slot=1 MiB`, `iterations=8192`, `batch=128`, `window=1`, header validation | PASS, DPU `10097.64 MiB/s`, host `10247.25 MiB/s` | `/tmp/hdv_completion_depth_1m_1782515835/async_w1_1m` |
+| Async completion-gated publish, depth 32 | `slot=1 MiB`, `iterations=8192`, `batch=128`, `window=32`, header validation | PASS, DPU `30059.34 MiB/s`, host `29843.69 MiB/s` | `/tmp/hdv_completion_depth_1m_1782515835/async_w32_1m` |
+| Async completion-gated publish, depth 128 | `slot=1 MiB`, `iterations=8192`, `batch=128`, `window=128`, header validation | PASS, DPU `29728.42 MiB/s`, host `30017.14 MiB/s` | `/tmp/hdv_completion_depth_1m_1782515835/async_w128_1m` |
+
+Interpretation:
+
+- Waiting for data-DMA completion before publishing does not inherently serialize
+  the data path. It serializes only the publication frontier behind the completed
+  contiguous prefix. The data path can still have many outstanding payload DMA
+  tasks.
+- A call-site that submits one DMA and immediately waits for that exact task,
+  such as the synchronous `hdv_dma_copy()` helper, behaves like pipeline depth 1.
+  The async mode demonstrates the alternative: multiple payload tasks in flight,
+  completion callbacks retire them, and publication advances independently in
+  batches.
+- This is the DOCA DMA analogue of batching CQ progress in the RDMA transport:
+  do not wait for one work request and publish one object at a time. Poll or
+  process a batch of completions, advance the largest contiguous completed
+  frontier, and publish that frontier once. The publication cadence is therefore
+  decoupled from both individual payload task submission and individual payload
+  task completion, while still refusing to publish bytes whose data-DMA
+  completion has not been observed.
+- In these runs, moving from `window=1` to `window=32` improved 4 KiB DPU-write
+  throughput from about `2.1 GiB/s` to about `14.8 GiB/s`, and 1 MiB throughput
+  from about `9.9 GiB/s` to about `29.4 GiB/s`. Larger `window=128` did not
+  improve over `window=32` in this specific DPU-push test.
+- For Homer, the useful design rule is therefore: do not block the producer loop
+  on every payload DMA; track a separate completed frontier and publish only
+  completed contiguous ranges. That preserves the publication safety property we
+  want to test while keeping the payload DMA stream pipelined.
+
+### June 27, 2026: Split DMA Context Publication Ordering
+
+Question: if one thread submits payload DMA tasks to one DOCA DMA context and
+then submits the tail/publication DMA to another DOCA DMA context, does the
+same-thread submission order empirically provide a usable publication-ordering
+invariant?
+
+Harness changes:
+
+- Added `HDV_MODE_WRITE_PUBLISH_SPLIT_NOWAIT` and
+  `HDV_MODE_WRITE_PUBLISH_SPLIT_COMPLETION` to
+  [`HdvMode`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation_common.h:14).
+- Reused the async DPU-push loop in
+  [`run_dpu_write_publish_async()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1947)
+  with separate `data_dma` and `publish_dma` arguments.
+- For split modes, [`run_dpu()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:2318)
+  initializes a second DMA context with
+  [`hdv_dpu_init()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1076),
+  so payload writes and publication writes are submitted through independent
+  DOCA DMA contexts.
+- `write-publish-split-completion`: data ctx submits payload DMA; the harness
+  waits for the data ctx's completed contiguous frontier; publication ctx then
+  DMA-writes `published_epoch`.
+- `write-publish-split-nowait`: data ctx submits payload DMA; publication ctx
+  immediately DMA-writes the submitted frontier before payload completions are
+  observed. Local task-lane reuse still waits for data completion, so the unsafe
+  variable is specifically cross-context publication ordering.
+
+Results:
+
+| Mode | Parameters | Result | Artifact |
+| --- | --- | --- | --- |
+| single ctx completion-gated, 1 MiB | `write-publish-async`, `slot-count=64`, `slot=1 MiB`, `window=32`, `batch=1`, `iterations=1024`, full validation | PASS, DPU `377.85 MiB/s`, host `381.18 MiB/s`, 34 publish DMA writes | `/tmp/hdv_singlectx_1m_cmp_1782533888` |
+| split completion-gated, 1 MiB | `slot-count=64`, `slot=1 MiB`, `window=32`, `batch=1`, `iterations=1024`, full validation | PASS, DPU `375.74 MiB/s`, host `379.15 MiB/s` | `/tmp/hdv_split_completion_1782533294` |
+| split nowait, 1 MiB | same shape as above | PASS, DPU `381.64 MiB/s`, host `393.40 MiB/s` | `/tmp/hdv_split_nowait_1782533314` |
+| split nowait, harsher 1 MiB | `slot-count=128`, `slot=1 MiB`, `window=128`, `batch=1`, `iterations=4096`, full validation | PASS, DPU `375.61 MiB/s`, host `387.28 MiB/s` | `/tmp/hdv_split_nowait_harsh_1782533337` |
+| split nowait, 64 B | `slot-count=4096`, `slot=64 B`, `window=128`, `batch=1`, `iterations=1000000`, full validation | FAIL at host epoch 96: `seq_begin=11936128518282651045 expected=96`; DPU later saw publish DMA I/O failure after host exited | `/tmp/hdv_split_nowait_64b_1782533374` |
+| split completion-gated, 64 B | same 64 B shape | PASS, DPU `37.19 MiB/s`, host `37.15 MiB/s` | `/tmp/hdv_split_completion_64b_1782533391` |
+| single ctx completion-gated, 64 B | `write-publish-async`, same 64 B shape | PASS, DPU `328.23 MiB/s`, host `327.97 MiB/s`, 15375 publish DMA writes | `/tmp/hdv_singlectx_64b_cmp_1782533867` |
+
+Interpretation:
+
+- Same-thread submission to two DOCA DMA contexts is not a sufficient
+  publication-ordering mechanism. The 64 B nowait split-context run exposed
+  host validation failure quickly.
+- The 1 MiB nowait passes are still informative, but they are not a contract.
+  In the harsher 1 MiB run, the DPU progress log showed host `consumed` moving
+  beyond the DPU's observed completion frontier during the run. That means
+  remote host memory can become visible before the DPU has received the
+  initiator-side completion callback; it does not mean publication from another
+  context is ordered behind data DMA.
+- The positive 64 B result proves that using separate contexts is not inherently
+  broken. It is safe in this harness only when the publication context is gated
+  by the data context's observed completed contiguous frontier.
+- Performance is not neutral. For the 1 MiB full-validation shape, single ctx
+  and split completion-gated ctx were effectively tied at about `376-378 MiB/s`;
+  the host payload scanner dominates that run. For the 64 B shape, single ctx
+  was much faster: `328.23 MiB/s` versus `37.19 MiB/s`. The single-ctx run
+  coalesced the completed frontier into only `15375` publish DMA writes for
+  `1000000` records, while the split completion-gated run published every
+  record and spent far more time in progress/callback bookkeeping. The current
+  split implementation is therefore a correctness validator, not a tuned
+  scheduler design.
+- For Homer, keep command/completion payload records and their tail publication
+  on the same DMA context when possible. If later scheduling wants separate
+  contexts for priority or workload-class isolation, the publication step must
+  be completion-gated across contexts. Do not rely on one thread submitting data
+  to ctx A and tail to ctx B as an RDMA `WRITE_WITH_IMM` analogue.
+
+### June 27, 2026: Coalescing And Progress-Loop Design Corrections
+
+Recent discussion clarified three separate mechanisms that were easy to conflate:
+
+1. **PE progress drain**: one call to `doca_pe_progress()` is one progress
+   attempt, not a full CQ-style drain. The header contract for
+   [`doca_pe_progress()`](/opt/mellanox/doca/include/doca_pe.h:181) says it
+   finds the next context with a completed task and returns `1` when progress
+   was made. A scheduler that wants to amortize polling across many sessions
+   should call it until it returns `0`, or use a bounded budget to avoid
+   starving higher-priority work.
+2. **DOCA completion-report coalescing**: `OPTIMIZE_REPORTS` plus a flushed
+   non-optimized sentinel can coalesce initiator-side completion reporting across
+   many DMA tasks submitted to the same DMA context. If many pgbench sessions
+   share one command-pull DMA context, this can reduce callback/report overhead
+   across sessions. It does not merge per-session rings, per-session DPU-side
+   sinks, or per-session tail publication.
+3. **Application batching**: if one session has multiple contiguous records with
+   the same visibility fate, Homer should prefer one larger DMA task and one tail
+   update over many small DMA tasks plus one tail. If records are in separate
+   session rings, wrap in a ring, or land in separate DPU rings/sinks, the
+   application cannot coalesce them into one semantic tail without a new
+   multiplexed queue abstraction.
+
+The single-ctx DPU-push comparison above also exposed an incidental harness
+effect. In `write-publish-async`, publication uses synchronous
+[`write_remote_u64()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1177),
+which calls [`hdv_dma_copy()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1119).
+While waiting for the tail DMA completion, `hdv_dma_copy()` repeatedly progresses
+the same PE. In the single-ctx DPU-push case, those progress calls also retire
+payload completions on the same ctx/PE, so the next loop may observe a much
+larger completed frontier and issue fewer tail writes. That is real latency
+hiding, but it is accidental and policy-poor: tail-DMA wait time decides how
+much payload completion progress happens.
+
+Cleaner target loop:
+
+```text
+submit payload DMA work within per-class/per-session window
+drain or budget-progress the PE explicitly
+retire task completions into per-session completed frontiers
+submit more payload DMA work when credits allow
+submit async tail/consumed updates when a per-session policy says to publish
+continue progressing payload and tail tasks without blocking the scheduler on
+one synchronous tail write unless correctness or queue capacity requires it
+```
+
+For the likely Homer DPU-pull path, the relevant implementation today is
+[`run_dpu_host_read_async()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1367)
+or the sync-event variant
+[`run_dpu_sync_event_read_async()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1736),
+not the DPU-push `write-publish-async` comparison. In DPU-pull, the DPU pulls
+from host-published per-session rings and then updates per-session consumed
+frontiers. Multiple sessions sharing one DMA ctx can still benefit from
+ctx-wide DOCA completion-report coalescing, but application publication remains
+per session.
+
+Current design implication for Homer:
+
+- Latency-sensitive command/completion rings likely have `K=1` within one
+  session because the next command depends on the previous completion. Here,
+  deep application tail batching is not expected to help; shared ctx
+  report-coalescing across sessions may still reduce DMA completion overhead if
+  the sentinel interval is bounded by latency.
+- Throughput-oriented byte streams, such as basebackup-like payload rings,
+  should use larger contiguous DMA tasks and less frequent per-session tail
+  publication when the byte-ring layout allows it.
+- Separate workload classes may use separate DMA contexts to isolate latency and
+  batching policy. Keep payload and the publication that depends on it in the
+  same ctx when possible; if not, publish only after explicit completion-gating
+  from the payload ctx.
+
+### June 26, 2026: DMA Queue-Depth Sweet Spot By Message Size
+
+We swept the harness's DMA queue-depth knob, `--async-window`, across fixed
+record sizes from 64 B through 1 MiB. These runs used header validation to focus
+on DOCA DMA/task throughput rather than DPU CPU payload scanning.
+
+Common parameters:
+
+- `PCI_WR_ORDERING=force_relax` on both BF3 PFs.
+- `--slot-count=1024`
+- `--batch-size=1024`
+- `--payload-mode=header`
+- `--size-pattern=fixed`
+- windows tested: `1, 2, 4, 8, 16, 32, 64, 128, 256`
+- DPU-push mode: `write-publish-async`, implemented by
+  [`run_dpu_write_publish_async()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1911).
+- DPU-pull mode: `host-write-dpu-read` with `--async-window > 1`, implemented
+  by [`run_dpu_host_read_async()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:1330).
+
+Artifacts:
+
+- DPU-push summary: `/tmp/hdv_qdepth_push_1782517561/summary.tsv`
+- DPU-pull summary: `/tmp/hdv_qdepth_pull_1782517699/summary.tsv`
+- The earlier failed push sweep `/tmp/hdv_qdepth_push_1782517408` is
+  diagnostic-only: rsync copied the x86 host binary over the DPU binary and the
+  DPU failed with `Exec format error`. The rerun rebuilt the DPU binary after
+  source sync and is the valid result set.
+
+Definition used below:
+
+- **Best window**: highest DPU-side MiB/s observed in the one-pass sweep.
+- **95% knee**: smallest window whose DPU-side MiB/s is at least 95% of the best
+  observed value for that size. This is usually the better queue-depth choice
+  than the absolute best because large windows can add bookkeeping pressure and
+  run-to-run noise without material throughput gain.
+
+DPU-push, DPU DMA-write into host memory followed by completion-gated DMA
+frontier publication:
+
+| Record size | Best window | Best DPU MiB/s | 95% knee window | 95% knee MiB/s | Suggested queue depth |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 64 B | 64 | 246.13 | 32 | 235.08 | 32-64 |
+| 1 KiB | 64 | 3976.53 | 32 | 3972.36 | 32-64 |
+| 4 KiB | 64 | 15652.47 | 32 | 15376.78 | 32-64 |
+| 16 KiB | 32 | 29706.55 | 8 | 29526.54 | 8-32 |
+| 64 KiB | 16 | 30276.25 | 8 | 30039.63 | 8-16 |
+| 256 KiB | 256 | 30236.39 | 4 | 30153.79 | 4-16; deeper gave no meaningful gain |
+| 1 MiB | 64 | 30233.45 | 4 | 29621.76 | 4-16; deeper mostly noise |
+
+DPU-pull, DPU DMA-read from host memory after a host CPU frontier:
+
+| Record size | Best window | Best DPU MiB/s | 95% knee window | 95% knee MiB/s | Suggested queue depth |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 64 B | 16 | 222.42 | 16 | 222.42 | 16 |
+| 1 KiB | 16 | 3489.22 | 16 | 3489.22 | 16 |
+| 4 KiB | 64 | 13525.05 | 16 | 13131.63 | 16-64 |
+| 16 KiB | 32 | 34648.36 | 16 | 34041.36 | 16-32 |
+| 64 KiB | 32 | 35427.52 | 16 | 35330.62 | 16-32 |
+| 256 KiB | 64 | 35590.75 | 8 | 34858.54 | 8-16; deeper mostly noise |
+| 1 MiB | 64 | 35632.68 | 8 | 34538.44 | 8-16; deeper mostly noise |
+
+Interpretation:
+
+- Queue depth matters most for small records because each DMA task carries little
+  payload. Depth 1 is not enough even for 1 KiB and 4 KiB records.
+- For DPU-push writes, 64 B through 4 KiB records benefitted up to about
+  `window=32-64`. Larger windows (`128`, `256`) hurt the small-record cases.
+- For DPU-pull reads, 64 B and 1 KiB peaked around `window=16`, while 4 KiB
+  needed a deeper window (`32-64`) to reach the absolute best in this run.
+- For 16 KiB and larger records, the practical knee is much lower: roughly
+  `window=8-16` for push and `window=8-16` for pull, with large records reaching
+  the PCIe-class plateau around 30-35 GiB/s.
+- A single fixed queue depth for an initial Homer DPU prototype should likely be
+  `32` if we want one conservative value across small and medium messages. A
+  size-aware policy can use lower depths for large transfers: around `16` for
+  DPU-pull and `8-16` for DPU-push once record size is at least 16-64 KiB.
+- These are one-pass standalone harness numbers, not a final integrated Homer
+  policy. Before using them as a default, repeat the sweep under the intended
+  CPU placement, sync-event publication shape, and multi-backend load.
+
+### June 26, 2026: DOCA PCI Relaxed-Ordering Flag Probe
+
+We attempted to rerun the async no-sync-event matrix with the harness
+`--relaxed-ordering` switch, which adds
+`DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING` to the host mmap permissions at
+[`doca_mmap_set_permissions()`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_homer_validation.c:676).
+This did not reach the DMA experiments: all six host setup attempts failed
+with `doca_mmap_set_permissions failed: Invalid input`.
+
+Failed matrix setup artifacts:
+
+| Intended mode | Artifact | Failure |
+| --- | --- | --- |
+| `write-publish-async`, 64 B | `/tmp/hdv_async_nosync_relaxed_dpu_async_write_64b_1m_1782511979` | `Invalid input` at mmap permissions |
+| `write-publish-async`, 4 KiB | `/tmp/hdv_async_nosync_relaxed_dpu_async_write_4k_1m_1782511979` | `Invalid input` at mmap permissions |
+| `write-publish-async`, mixed 64 B / 4 KiB | `/tmp/hdv_async_nosync_relaxed_dpu_async_write_mixed_1m_1782511979` | `Invalid input` at mmap permissions |
+| `host-write-dpu-read`, 64 B | `/tmp/hdv_async_nosync_relaxed_host_async_pull_64b_1m_1782511980` | `Invalid input` at mmap permissions |
+| `host-write-dpu-read`, 4 KiB | `/tmp/hdv_async_nosync_relaxed_host_async_pull_4k_262k_1782511980` | `Invalid input` at mmap permissions |
+| `host-write-dpu-read`, mixed 64 B / 4 KiB | `/tmp/hdv_async_nosync_relaxed_host_async_pull_mixed_262k_1782511980` | `Invalid input` at mmap permissions |
+
+To isolate the failure from the harness, we compiled scratch probes under
+`/tmp` against the same DOCA 3.2 headers and libraries:
+
+- `DOCA_ACCESS_FLAG_PCI_READ_ONLY`: `doca_mmap_set_permissions()`,
+  `doca_mmap_start()`, and `doca_mmap_export_pci()` succeeded.
+- `DOCA_ACCESS_FLAG_PCI_READ_WRITE`: `doca_mmap_set_permissions()`,
+  `doca_mmap_start()`, and `doca_mmap_export_pci()` succeeded.
+- `DOCA_ACCESS_FLAG_PCI_READ_ONLY | DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING`:
+  `doca_mmap_set_permissions()` returned `Invalid input`.
+- `DOCA_ACCESS_FLAG_PCI_READ_WRITE | DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING`:
+  `doca_mmap_set_permissions()` returned `Invalid input`.
+- Adding `DOCA_ACCESS_FLAG_LOCAL_READ_WRITE` did not change that result:
+  `LOCAL_READ_WRITE | PCI_READ_ONLY | PCI_RELAXED_ORDERING` and
+  `LOCAL_READ_WRITE | PCI_READ_WRITE | PCI_RELAXED_ORDERING` both returned
+  `Invalid input`.
+- `DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING` alone was accepted by
+  `doca_mmap_set_permissions()` and `doca_mmap_start()`, but
+  `doca_mmap_export_pci()` returned `Operation not permitted`, so it is not a
+  usable permission set for this host-DPU PCI DMA export.
+
+Interpretation:
+
+- On the current farnet1 DOCA 3.2 runtime, the exposed mmap API does not let us
+  combine PCI export permissions with `DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING`.
+  The async ordering experiments therefore cannot currently be rerun with this
+  per-mmap flag.
+- This does not contradict the existing `PCI_WR_ORDERING=force_relax` machine
+  state. The firmware/global PCI policy can still be relaxed even though the
+  DOCA mmap API rejects the per-mmap relaxed-ordering bit for this PCI-export
+  path.
+- Practical next step if we need per-mkey/per-mmap relaxed ordering is to look
+  for a different DOCA API path, a release-note caveat, or a newer DOCA build;
+  the current DMA/export path cannot exercise it.
+
+### June 26, 2026: Small-Message Sync-Event Latency Probe
+
+We ran a forced ping-pong shape to estimate sync-event cost for very small
+message exchanges. The harness used `slot-count=1`, `batch-size=1`,
+`async-window=1`, `slot-bytes=64`, full validation, and a 5 second host
+`ready-delay` so DPU process startup did not contaminate the host-side measured
+loop. In this configuration, every message must be consumed before the producer
+can publish the next one.
+
+Host-produce / DPU-consume results:
+
+| Mode | Iterations | Host measured loop | Approx per message | Artifact |
+| --- | --- | --- | --- | --- |
+| no-sync `host-write-dpu-read` | 100000 | `0.537499 s` | `5.37 us` | `/tmp/hdv_latency_ready_100k_host_to_dpu_nosync_1782513549` |
+| sync-event `sync-event-publish` | 100000 | `0.761142 s` | `7.61 us` | `/tmp/hdv_latency_ready_100k_host_to_dpu_sync_1782513555` |
+
+DPU-produce / host-consume results:
+
+| Mode | Iterations | Host measured loop | Approx per message | Artifact |
+| --- | --- | --- | --- | --- |
+| no-sync `write-publish` | 100000 | `0.481642 s` | `4.82 us` | `/tmp/hdv_latency_ready_100k_dpu_to_host_nosync_1782513561` |
+| sync-event `dpu-sync-event-publish` | 100000 | `0.511707 s` | `5.12 us` | `/tmp/hdv_latency_ready_100k_dpu_to_host_sync_1782513566` |
+
+We also used `strace -c` on 10k sync-event runs:
+
+- DPU-side `sync-event-publish` with 10k `doca_sync_event_wait_gt()` calls
+  made only `561` total syscalls; it did not make a syscall per event wait.
+- Host-side `dpu-sync-event-publish` with 10k host waits made only `595` total
+  syscalls; again, no syscall-per-message behavior was visible.
+
+Interpretation:
+
+- `doca_sync_event_wait_gt()` is a blocking DOCA API call, but in this harness
+  it does not appear to block by yielding to the Linux scheduler per message.
+  The syscall profile is consistent with userspace/DOCA progress or polling
+  around mapped/device state, with setup/control ioctls rather than one syscall
+  per event.
+- For tiny 64 B ping-pong exchanges, sync-event adds measurable latency:
+  roughly `+2.24 us/message` for host-produce / DPU-consume and
+  `+0.30 us/message` for DPU-produce / host-consume in these runs.
+- The benefit of sync-event is therefore not lower hot ping-pong latency. Its
+  value is wakeup/doorbell behavior when avoiding constant frontier polling is
+  more important than shaving microseconds from an always-hot small-message
+  exchange.
+
+### June 26, 2026: Sync-Event CPU-Time Probe
+
+We followed up the syscall probe with `/usr/bin/time -v` on the consumer side
+of the 64 B ping-pong cases. The question was whether `doca_sync_event_wait_gt()`
+actually saves CPU compared with polling the memory frontier, even though it
+does not make one syscall per wait.
+
+Host-produce / DPU-consume, with 5 second host `ready-delay` before publishing:
+
+| Mode | Timed side | User CPU | Wall time | CPU % | Artifact |
+| --- | --- | ---: | ---: | ---: | --- |
+| no-sync `host-write-dpu-read` | DPU consumer | `4.01 s` | `4.18 s` | `96%` | `/tmp/hdv_cpu_idle_host_to_dpu_nosync_1782513724` |
+| sync-event `sync-event-publish` | DPU consumer | `4.48 s` | `4.66 s` | `96%` | `/tmp/hdv_cpu_idle_host_to_dpu_sync_1782513730` |
+
+Host-produce / DPU-consume, no ready delay:
+
+| Mode | Timed side | User CPU | Wall time | CPU % | Artifact |
+| --- | --- | ---: | ---: | ---: | --- |
+| no-sync `host-write-dpu-read` | DPU consumer | `0.53 s` | `0.72 s` | `75%` | `/tmp/hdv_cpu_hot_host_to_dpu_nosync_1782513748` |
+| sync-event `sync-event-publish` | DPU consumer | `0.76 s` | `0.94 s` | `82%` | `/tmp/hdv_cpu_hot_host_to_dpu_sync_1782513750` |
+
+DPU-produce / host-consume, no ready delay:
+
+| Mode | Timed side | User CPU | Wall time | CPU % | Artifact |
+| --- | --- | ---: | ---: | ---: | --- |
+| no-sync `write-publish` | host consumer | `1.74 s` | `1.77 s` | `98%` | `/tmp/hdv_cpu_hot_dpu_to_host_nosync_1782513752` |
+| sync-event `dpu-sync-event-publish` | host consumer | `1.76 s` | `1.80 s` | `98%` | `/tmp/hdv_cpu_hot_dpu_to_host_sync_1782513754` |
+
+Interpretation:
+
+- In these harness modes, sync-event wait does **not** save CPU compared with
+  memory-frontier polling. The timed waiters still consume most of a CPU core.
+- The DPU-side host-produce/DPU-consume idle-delay case is the clearest signal:
+  both no-sync and sync-event consumers spent about `96%` CPU while waiting and
+  draining the 100k tiny messages.
+- This suggests `doca_sync_event_wait_gt()` behaves like a userspace/device
+  polling wait in this configuration, not like a sleep/yield primitive.
+- For Homer, sync-event should not be justified as a CPU-saving idle wait unless
+  a different DOCA wait mode or integration with an OS blocking primitive is
+  found and measured. Its current value is a semantic doorbell/event value, not
+  lower CPU consumption.
 
 ## Decision Matrix For Homer
 

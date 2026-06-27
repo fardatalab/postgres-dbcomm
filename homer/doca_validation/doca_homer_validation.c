@@ -64,8 +64,10 @@ typedef struct HdvConfig
 	bool relaxed_ordering;
 	bool ordered_completions;
 	bool optimize_reports;
+	bool flush_report_sentinel;
 	HdvFlushPolicy flush_policy;
 	enum HdvPayloadMode payload_mode;
+	enum HdvSizePattern size_pattern;
 } HdvConfig;
 
 typedef struct HdvTaskState
@@ -134,19 +136,22 @@ static void usage(const char *prog)
 			"  --pci-addr=ADDR              DOCA PCI address; omitted means first DMA-capable device\n"
 			"  "
 			"--mode=write-publish|early-publish|host-write-dpu-read|sync-event-publish|sync-event-early-publish|sync-"
-			"event-async-pull\n"
+			"event-async-pull|dpu-sync-event-publish|dpu-sync-event-early-publish|write-publish-async|write-publish-"
+			"split-nowait|write-publish-split-completion\n"
 			"  --slot-count=N              power-of-two ring slots, default %u\n"
 			"  --slot-bytes=N              bytes per slot, default %u\n"
 			"  --batch-size=N              publish after N slot writes, default %u\n"
 			"  --async-window=N            in-flight DMA tasks for async DPU-pull, default %u\n"
 			"  --iterations=N              epochs to produce/validate, default %" PRIu64 "\n"
 			"  --payload-mode=full|header  full payload scan or header-only validation\n"
+			"  --size-pattern=fixed|mixed-64-4k|mixed-64-1k  per-epoch DMA record-size pattern\n"
 			"  --timeout-sec=N             host wait timeout, default %u\n"
 			"  --ready-delay-ms=N          host delay after descriptor export, default 0\n"
 			"  --sync-event-path=PATH      sync-event export descriptor for sync-event modes\n"
 			"  --early-publish-delay-us=N  DPU delay after early publish, default 1000\n"
 			"  --flush=none|publish|all    doca_task_submit_ex flush policy\n"
 			"  --optimize-reports          allow deferred data-DMA completion callbacks\n"
+			"  --flush-report-sentinel     flush each non-optimized async report sentinel\n"
 			"  --ordered-completions       request ordered DMA completions on the DPU\n"
 			"  --relaxed-ordering          add PCI relaxed-ordering mmap permission on host\n",
 			prog, HDV_DEFAULT_SLOT_COUNT, HDV_DEFAULT_SLOT_BYTES, HDV_DEFAULT_BATCH_SIZE, HDV_DEFAULT_ASYNC_WINDOW,
@@ -195,6 +200,7 @@ static bool parse_args(int argc, char **argv, HdvConfig *config)
 	config->early_publish_delay_us = 1000;
 	config->flush_policy = HDV_FLUSH_PUBLISH;
 	config->payload_mode = HDV_PAYLOAD_FULL;
+	config->size_pattern = HDV_SIZE_PATTERN_FIXED;
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -210,6 +216,11 @@ static bool parse_args(int argc, char **argv, HdvConfig *config)
 		if (strcmp(arg, "--optimize-reports") == 0)
 		{
 			config->optimize_reports = true;
+			continue;
+		}
+		if (strcmp(arg, "--flush-report-sentinel") == 0)
+		{
+			config->flush_report_sentinel = true;
 			continue;
 		}
 		if (strcmp(arg, "--relaxed-ordering") == 0)
@@ -257,6 +268,16 @@ static bool parse_args(int argc, char **argv, HdvConfig *config)
 				config->mode = HDV_MODE_SYNC_EVENT_EARLY_PUBLISH;
 			else if (strcmp(value, "sync-event-async-pull") == 0)
 				config->mode = HDV_MODE_SYNC_EVENT_ASYNC_PULL;
+			else if (strcmp(value, "dpu-sync-event-publish") == 0)
+				config->mode = HDV_MODE_DPU_SYNC_EVENT_PUBLISH;
+			else if (strcmp(value, "dpu-sync-event-early-publish") == 0)
+				config->mode = HDV_MODE_DPU_SYNC_EVENT_EARLY_PUBLISH;
+			else if (strcmp(value, "write-publish-async") == 0)
+				config->mode = HDV_MODE_WRITE_PUBLISH_ASYNC;
+			else if (strcmp(value, "write-publish-split-nowait") == 0)
+				config->mode = HDV_MODE_WRITE_PUBLISH_SPLIT_NOWAIT;
+			else if (strcmp(value, "write-publish-split-completion") == 0)
+				config->mode = HDV_MODE_WRITE_PUBLISH_SPLIT_COMPLETION;
 			else
 			{
 				fprintf(stderr, "invalid mode: %s\n", value);
@@ -345,6 +366,17 @@ static bool parse_args(int argc, char **argv, HdvConfig *config)
 			else
 				return false;
 		}
+		else if (name_len == strlen("--size-pattern") && strncmp(arg, "--size-pattern", name_len) == 0)
+		{
+			if (strcmp(value, "fixed") == 0)
+				config->size_pattern = HDV_SIZE_PATTERN_FIXED;
+			else if (strcmp(value, "mixed-64-4k") == 0)
+				config->size_pattern = HDV_SIZE_PATTERN_MIXED_64_4K;
+			else if (strcmp(value, "mixed-64-1k") == 0)
+				config->size_pattern = HDV_SIZE_PATTERN_MIXED_64_1K;
+			else
+				return false;
+		}
 		else
 		{
 			fprintf(stderr, "unknown argument: %s\n", arg);
@@ -358,7 +390,8 @@ static bool parse_args(int argc, char **argv, HdvConfig *config)
 		return false;
 	}
 	if ((config->mode == HDV_MODE_SYNC_EVENT_PUBLISH || config->mode == HDV_MODE_SYNC_EVENT_EARLY_PUBLISH ||
-		 config->mode == HDV_MODE_SYNC_EVENT_ASYNC_PULL) &&
+		 config->mode == HDV_MODE_SYNC_EVENT_ASYNC_PULL || config->mode == HDV_MODE_DPU_SYNC_EVENT_PUBLISH ||
+		 config->mode == HDV_MODE_DPU_SYNC_EVENT_EARLY_PUBLISH) &&
 		config->sync_event_path == NULL)
 	{
 		fprintf(stderr, "--sync-event-path is required for sync-event modes\n");
@@ -372,6 +405,16 @@ static bool parse_args(int argc, char **argv, HdvConfig *config)
 	if (config->slot_bytes < sizeof(HdvSlotHeader) + 1U)
 	{
 		fprintf(stderr, "--slot-bytes must be at least %zu\n", sizeof(HdvSlotHeader) + 1U);
+		return false;
+	}
+	if (config->size_pattern == HDV_SIZE_PATTERN_MIXED_64_4K && config->slot_bytes < HDV_MIXED_LARGE_BYTES)
+	{
+		fprintf(stderr, "--size-pattern=mixed-64-4k requires --slot-bytes >= %u\n", HDV_MIXED_LARGE_BYTES);
+		return false;
+	}
+	if (config->size_pattern == HDV_SIZE_PATTERN_MIXED_64_1K && config->slot_bytes < HDV_MIXED_MEDIUM_BYTES)
+	{
+		fprintf(stderr, "--size-pattern=mixed-64-1k requires --slot-bytes >= %u\n", HDV_MIXED_MEDIUM_BYTES);
 		return false;
 	}
 	if (config->batch_size == 0 || config->batch_size > config->slot_count)
@@ -518,16 +561,18 @@ static uint64_t monotonic_ns(void)
 static void fill_slot_for_mode(const HdvConfig *config, void *slot, uint64_t epoch)
 {
 	if (config->payload_mode == HDV_PAYLOAD_HEADER)
-		hdv_fill_slot_header_only(slot, config->slot_bytes, config->seed, epoch, config->slot_count);
+		hdv_fill_slot_header_only(slot, config->slot_bytes, config->seed, epoch, config->slot_count,
+								  config->size_pattern);
 	else
-		hdv_fill_slot(slot, config->slot_bytes, config->seed, epoch, config->slot_count);
+		hdv_fill_slot(slot, config->slot_bytes, config->seed, epoch, config->slot_count, config->size_pattern);
 }
 
 static int validate_slot(const HdvConfig *config, void *slot, uint64_t epoch, char *error, size_t error_len)
 {
 	const HdvSlotHeader *header = (const HdvSlotHeader *)slot;
 	const uint8_t *payload = (const uint8_t *)slot + hdv_payload_offset();
-	size_t payload_len = hdv_payload_bytes(config->slot_bytes);
+	size_t record_bytes = hdv_record_bytes(config->slot_bytes, epoch, config->size_pattern);
+	size_t payload_len = hdv_record_payload_bytes(config->slot_bytes, epoch, config->size_pattern);
 	uint64_t checksum;
 
 	if (header->seq_begin != epoch)
@@ -559,7 +604,7 @@ static int validate_slot(const HdvConfig *config, void *slot, uint64_t epoch, ch
 	}
 	if (config->payload_mode == HDV_PAYLOAD_HEADER)
 	{
-		checksum = config->seed ^ epoch ^ ((uint64_t)config->slot_bytes << 32);
+		checksum = config->seed ^ epoch ^ ((uint64_t)record_bytes << 32);
 		if (header->checksum != checksum)
 		{
 			snprintf(error, error_len, "header_checksum=0x%" PRIx64 " expected=0x%" PRIx64, header->checksum, checksum);
@@ -622,6 +667,7 @@ static int run_host(const HdvConfig *config)
 	control->slot_bytes = config->slot_bytes;
 	control->batch_size = config->batch_size;
 	control->payload_mode = (uint32_t)config->payload_mode;
+	control->size_pattern = (uint32_t)config->size_pattern;
 	control->iterations = config->iterations;
 	control->payload_seed = config->seed;
 	__atomic_store_n(&control->published_epoch, 0, __ATOMIC_RELEASE);
@@ -676,7 +722,8 @@ static int run_host(const HdvConfig *config)
 		goto out_destroy_mmap;
 
 	if (config->mode == HDV_MODE_SYNC_EVENT_PUBLISH || config->mode == HDV_MODE_SYNC_EVENT_EARLY_PUBLISH ||
-		config->mode == HDV_MODE_SYNC_EVENT_ASYNC_PULL)
+		config->mode == HDV_MODE_SYNC_EVENT_ASYNC_PULL || config->mode == HDV_MODE_DPU_SYNC_EVENT_PUBLISH ||
+		config->mode == HDV_MODE_DPU_SYNC_EVENT_EARLY_PUBLISH)
 	{
 		result = doca_sync_event_create(&sync_event);
 		if (result != DOCA_SUCCESS)
@@ -684,16 +731,22 @@ static int run_host(const HdvConfig *config)
 			fprintf(stderr, "doca_sync_event_create failed: %s\n", doca_error_get_descr(result));
 			goto out_destroy_mmap;
 		}
-		result = doca_sync_event_add_publisher_location_cpu(sync_event, dev);
+		if (config->mode == HDV_MODE_DPU_SYNC_EVENT_PUBLISH || config->mode == HDV_MODE_DPU_SYNC_EVENT_EARLY_PUBLISH)
+			result = doca_sync_event_add_publisher_location_remote_pci(sync_event);
+		else
+			result = doca_sync_event_add_publisher_location_cpu(sync_event, dev);
 		if (result != DOCA_SUCCESS)
 		{
-			fprintf(stderr, "sync_event publisher CPU failed: %s\n", doca_error_get_descr(result));
+			fprintf(stderr, "sync_event publisher setup failed: %s\n", doca_error_get_descr(result));
 			goto out_destroy_sync_event;
 		}
-		result = doca_sync_event_add_subscriber_location_remote_pci(sync_event);
+		if (config->mode == HDV_MODE_DPU_SYNC_EVENT_PUBLISH || config->mode == HDV_MODE_DPU_SYNC_EVENT_EARLY_PUBLISH)
+			result = doca_sync_event_add_subscriber_location_cpu(sync_event, dev);
+		else
+			result = doca_sync_event_add_subscriber_location_remote_pci(sync_event);
 		if (result != DOCA_SUCCESS)
 		{
-			fprintf(stderr, "sync_event remote PCI subscriber failed: %s\n", doca_error_get_descr(result));
+			fprintf(stderr, "sync_event subscriber setup failed: %s\n", doca_error_get_descr(result));
 			goto out_destroy_sync_event;
 		}
 		result = doca_sync_event_start(sync_event);
@@ -803,12 +856,74 @@ static int run_host(const HdvConfig *config)
 		{
 			uint64_t elapsed_ns = monotonic_ns() - producer_start_ns;
 			double elapsed_sec = (double)elapsed_ns / 1000000000.0;
-			double mib = ((double)config->iterations * (double)config->slot_bytes) / (1024.0 * 1024.0);
+			double mib = (double)hdv_total_record_bytes(config->slot_bytes, config->iterations, config->size_pattern) /
+						 (1024.0 * 1024.0);
 
 			printf("HDV_HOST_PRODUCER_PASS iterations=%" PRIu64 " dpu_data_dma=%" PRIu64 " dpu_publish_dma=%" PRIu64
 				   " dpu_pe_progress=%" PRIu64 " elapsed_sec=%.6f mib_s=%.2f\n",
 				   config->iterations, control->dpu_data_dma_count, control->dpu_publish_dma_count,
 				   control->dpu_pe_progress_calls, elapsed_sec, elapsed_sec == 0.0 ? 0.0 : mib / elapsed_sec);
+		}
+		rc = 0;
+		goto out_stop_sync_event;
+	}
+
+	if (config->mode == HDV_MODE_DPU_SYNC_EVENT_PUBLISH || config->mode == HDV_MODE_DPU_SYNC_EVENT_EARLY_PUBLISH)
+	{
+		uint64_t published = 0;
+		uint64_t wait_count = 0;
+
+		start_ns = monotonic_ns();
+		while (next_epoch <= config->iterations)
+		{
+			result = doca_sync_event_wait_gt(sync_event, published, UINT64_MAX);
+			if (result != DOCA_SUCCESS)
+			{
+				fprintf(stderr, "host sync_event wait_gt failed: %s\n", doca_error_get_descr(result));
+				goto out_stop_sync_event;
+			}
+			wait_count++;
+			result = doca_sync_event_get(sync_event, &published);
+			if (result != DOCA_SUCCESS)
+			{
+				fprintf(stderr, "host sync_event get failed: %s\n", doca_error_get_descr(result));
+				goto out_stop_sync_event;
+			}
+			if (published > config->iterations)
+				published = config->iterations;
+
+			while (next_epoch <= published && next_epoch <= config->iterations)
+			{
+				char error[256];
+				void *slot = (uint8_t *)region + hdv_slot_offset(next_epoch, config->slot_count, config->slot_bytes);
+
+				if (validate_slot(config, slot, next_epoch, error, sizeof(error)) != 0)
+				{
+					control->error_epoch = next_epoch;
+					control->error_code = 6;
+					fprintf(stderr, "HDV_HOST_SYNC_EVENT_VALIDATION_FAIL epoch=%" PRIu64 " published=%" PRIu64 " %s\n",
+							next_epoch, published, error);
+					goto out_stop_sync_event;
+				}
+				__atomic_store_n(&control->consumed_epoch, next_epoch, __ATOMIC_RELEASE);
+				control->host_validated_epochs = next_epoch;
+				next_epoch++;
+			}
+		}
+
+		control->done_epoch = config->iterations;
+		{
+			uint64_t elapsed_ns = monotonic_ns() - start_ns;
+			double elapsed_sec = (double)elapsed_ns / 1000000000.0;
+			double mib = (double)hdv_total_record_bytes(config->slot_bytes, config->iterations, config->size_pattern) /
+						 (1024.0 * 1024.0);
+
+			printf("HDV_HOST_SYNC_EVENT_PASS iterations=%" PRIu64 " waits=%" PRIu64 " data_dma=%" PRIu64
+				   " sync_event_publishes=%" PRIu64 " consumed_dma_reads=%" PRIu64 " dpu_pe_progress=%" PRIu64
+				   " host_validate_sec=%.6f host_validate_mib_s=%.2f\n",
+				   config->iterations, wait_count, control->dpu_data_dma_count, control->dpu_publish_dma_count,
+				   control->dpu_consumed_dma_read_count, control->dpu_pe_progress_calls, elapsed_sec,
+				   elapsed_sec == 0.0 ? 0.0 : mib / elapsed_sec);
 		}
 		rc = 0;
 		goto out_stop_sync_event;
@@ -862,9 +977,10 @@ static int run_host(const HdvConfig *config)
 	{
 		uint64_t elapsed_ns = first_publish_ns == 0 ? 0 : monotonic_ns() - first_publish_ns;
 		double elapsed_sec = elapsed_ns == 0 ? 0.0 : (double)elapsed_ns / 1000000000.0;
-		double mbps = elapsed_sec == 0.0
-						  ? 0.0
-						  : ((double)config->iterations * (double)config->slot_bytes) / (1024.0 * 1024.0) / elapsed_sec;
+		double mbps = elapsed_sec == 0.0 ? 0.0
+										 : (double)hdv_total_record_bytes(config->slot_bytes, config->iterations,
+																		  config->size_pattern) /
+											   (1024.0 * 1024.0) / elapsed_sec;
 
 		printf("HDV_HOST_PASS iterations=%" PRIu64 " polls=%" PRIu64 " data_dma=%" PRIu64 " publish_dma=%" PRIu64
 			   " consumed_dma_reads=%" PRIu64 " dpu_pe_progress=%" PRIu64
@@ -1065,12 +1181,26 @@ static doca_error_t write_remote_u64(HdvDmaContext *dma, void *remote_base, size
 						sizeof(*local_value), submit_flags);
 }
 
+static uint64_t combined_pe_progress_calls(const HdvDmaContext *first, const HdvDmaContext *second)
+{
+	if (first == second)
+		return first->pe_progress_calls;
+	return first->pe_progress_calls + second->pe_progress_calls;
+}
+
 static uint32_t async_data_submit_flags(const HdvConfig *config, bool force_report)
 {
 	uint32_t flags = 0;
 
 	if (config->optimize_reports && !force_report)
 		flags |= DOCA_TASK_SUBMIT_FLAG_OPTIMIZE_REPORTS;
+	/*
+	 * This is narrower than --flush=all: optimized payload tasks can still be
+	 * aggregated, while the non-optimized boundary task is explicitly flushed
+	 * so it can act as the report sentinel for preceding deferred callbacks.
+	 */
+	if (config->flush_report_sentinel && force_report)
+		flags |= DOCA_TASK_SUBMIT_FLAG_FLUSH;
 	if (config->flush_policy == HDV_FLUSH_ALL)
 		flags |= DOCA_TASK_SUBMIT_FLAG_FLUSH;
 	return flags;
@@ -1138,7 +1268,7 @@ fail:
 }
 
 static doca_error_t hdv_async_submit_host_read(HdvAsyncDmaTask *task, const HdvConfig *config, void *remote_slot,
-											   uint64_t epoch, bool force_report)
+											   size_t record_bytes, uint64_t epoch, bool force_report)
 {
 	struct doca_task *doca_task = doca_dma_task_memcpy_as_task(task->task);
 	doca_error_t result;
@@ -1148,10 +1278,80 @@ static doca_error_t hdv_async_submit_host_read(HdvAsyncDmaTask *task, const HdvC
 	task->in_flight = true;
 	task->epoch = epoch;
 
-	result = doca_buf_inventory_buf_reuse_by_data(task->src, remote_slot, config->slot_bytes);
+	result = doca_buf_inventory_buf_reuse_by_data(task->src, remote_slot, record_bytes);
 	if (result != DOCA_SUCCESS)
 		return result;
-	result = doca_buf_inventory_buf_reuse_by_addr(task->dst, task->local_slot, config->slot_bytes);
+	result = doca_buf_inventory_buf_reuse_by_addr(task->dst, task->local_slot, record_bytes);
+	if (result != DOCA_SUCCESS)
+		return result;
+	doca_dma_task_memcpy_set_src(task->task, task->src);
+	doca_dma_task_memcpy_set_dst(task->task, task->dst);
+	doca_task_set_user_data(doca_task, (union doca_data){.ptr = task});
+	return doca_task_submit_ex(doca_task, async_data_submit_flags(config, force_report));
+}
+
+static doca_error_t hdv_async_write_pool_create(HdvDmaContext *dma, const HdvConfig *config, void *remote_base,
+												void *local_slots, HdvAsyncDmaTask **out_tasks)
+{
+	HdvAsyncDmaTask *tasks = calloc(config->async_window, sizeof(*tasks));
+	doca_error_t result;
+
+	if (tasks == NULL)
+		return DOCA_ERROR_NO_MEMORY;
+
+	for (uint32_t i = 0; i < config->async_window; i++)
+	{
+		union doca_data task_data = {0};
+		void *remote_slot = (uint8_t *)remote_base + hdv_slot_offset(1, config->slot_count, config->slot_bytes);
+		void *local_slot = (uint8_t *)local_slots + (size_t)i * config->slot_bytes;
+
+		tasks[i].local_slot = local_slot;
+		tasks[i].result = DOCA_SUCCESS;
+		task_data.ptr = &tasks[i];
+
+		/*
+		 * The async DPU-push path reuses one local source buffer, one
+		 * remote destination buffer, and one DMA task per in-flight lane.
+		 * The DPU fills the local source slot immediately before submitting
+		 * the DMA write, then retargets the remote destination to the ring
+		 * slot for that epoch.
+		 */
+		result = doca_buf_inventory_buf_get_by_data(dma->buf_inv, dma->local_mmap, local_slot, config->slot_bytes,
+													&tasks[i].src);
+		if (result != DOCA_SUCCESS)
+			goto fail;
+		result = doca_buf_inventory_buf_get_by_addr(dma->buf_inv, dma->remote_mmap, remote_slot, config->slot_bytes,
+													&tasks[i].dst);
+		if (result != DOCA_SUCCESS)
+			goto fail;
+		result = doca_dma_task_memcpy_alloc_init(dma->dma, tasks[i].src, tasks[i].dst, task_data, &tasks[i].task);
+		if (result != DOCA_SUCCESS)
+			goto fail;
+	}
+
+	*out_tasks = tasks;
+	return DOCA_SUCCESS;
+
+fail:
+	hdv_async_pool_destroy(tasks, config->async_window);
+	return result;
+}
+
+static doca_error_t hdv_async_submit_host_write(HdvAsyncDmaTask *task, const HdvConfig *config, void *remote_slot,
+												size_t record_bytes, uint64_t epoch, bool force_report)
+{
+	struct doca_task *doca_task = doca_dma_task_memcpy_as_task(task->task);
+	doca_error_t result;
+
+	task->done = false;
+	task->result = DOCA_SUCCESS;
+	task->in_flight = true;
+	task->epoch = epoch;
+
+	result = doca_buf_inventory_buf_reuse_by_data(task->src, task->local_slot, record_bytes);
+	if (result != DOCA_SUCCESS)
+		return result;
+	result = doca_buf_inventory_buf_reuse_by_addr(task->dst, remote_slot, record_bytes);
 	if (result != DOCA_SUCCESS)
 		return result;
 	doca_dma_task_memcpy_set_src(task->task, task->src);
@@ -1215,6 +1415,7 @@ static int run_dpu_host_read_async(const HdvConfig *config, HdvDmaContext *dma, 
 			HdvAsyncDmaTask *task = &tasks[task_index];
 			void *remote_slot =
 				(uint8_t *)remote_base + hdv_slot_offset(next_submit, config->slot_count, config->slot_bytes);
+			size_t record_bytes = hdv_record_bytes(config->slot_bytes, next_submit, config->size_pattern);
 			bool force_report = (in_flight + 1 == config->async_window) || (next_submit == published) ||
 								(next_submit == config->iterations);
 
@@ -1224,7 +1425,7 @@ static int run_dpu_host_read_async(const HdvConfig *config, HdvDmaContext *dma, 
 						task->epoch);
 				goto out;
 			}
-			result = hdv_async_submit_host_read(task, config, remote_slot, next_submit, force_report);
+			result = hdv_async_submit_host_read(task, config, remote_slot, record_bytes, next_submit, force_report);
 			if (result != DOCA_SUCCESS)
 			{
 				fprintf(stderr, "async slot read submit failed epoch=%" PRIu64 ": %s\n", next_submit,
@@ -1319,7 +1520,8 @@ static int run_dpu_host_read_async(const HdvConfig *config, HdvDmaContext *dma, 
 	{
 		uint64_t elapsed = monotonic_ns() - start;
 		double elapsed_sec = (double)elapsed / 1000000000.0;
-		double mib = ((double)config->iterations * (double)config->slot_bytes) / (1024.0 * 1024.0);
+		double mib = (double)hdv_total_record_bytes(config->slot_bytes, config->iterations, config->size_pattern) /
+					 (1024.0 * 1024.0);
 
 		*scratch_value = read_dma_count;
 		(void)write_remote_u64(dma, remote_base, offsetof(HdvControlBlock, dpu_data_dma_count), scratch_value,
@@ -1402,11 +1604,12 @@ static int run_dpu_sync_event_read(const HdvConfig *config, HdvDmaContext *dma, 
 		while (expected <= published)
 		{
 			char error[256];
+			size_t record_bytes = hdv_record_bytes(config->slot_bytes, expected, config->size_pattern);
 
 			result =
 				hdv_dma_copy(dma, dma->remote_mmap,
 							 (uint8_t *)remote_base + hdv_slot_offset(expected, config->slot_count, config->slot_bytes),
-							 true, dma->local_mmap, slot_buffer, config->slot_bytes, submit_flags_for(config, false));
+							 true, dma->local_mmap, slot_buffer, record_bytes, submit_flags_for(config, false));
 			if (result != DOCA_SUCCESS)
 			{
 				fprintf(stderr, "sync_event slot read failed epoch=%" PRIu64 ": %s\n", expected,
@@ -1454,7 +1657,8 @@ static int run_dpu_sync_event_read(const HdvConfig *config, HdvDmaContext *dma, 
 	{
 		uint64_t elapsed = monotonic_ns() - start;
 		double elapsed_sec = (double)elapsed / 1000000000.0;
-		double mib = ((double)config->iterations * (double)config->slot_bytes) / (1024.0 * 1024.0);
+		double mib = (double)hdv_total_record_bytes(config->slot_bytes, config->iterations, config->size_pattern) /
+					 (1024.0 * 1024.0);
 
 		*scratch_value = read_dma_count;
 		(void)write_remote_u64(dma, remote_base, offsetof(HdvControlBlock, dpu_data_dma_count), scratch_value,
@@ -1577,6 +1781,7 @@ static int run_dpu_sync_event_read_async(const HdvConfig *config, HdvDmaContext 
 			HdvAsyncDmaTask *task = &tasks[task_index];
 			void *remote_slot =
 				(uint8_t *)remote_base + hdv_slot_offset(next_submit, config->slot_count, config->slot_bytes);
+			size_t record_bytes = hdv_record_bytes(config->slot_bytes, next_submit, config->size_pattern);
 			bool force_report = (in_flight + 1 == config->async_window) || (next_submit == published) ||
 								(next_submit == config->iterations);
 
@@ -1586,7 +1791,7 @@ static int run_dpu_sync_event_read_async(const HdvConfig *config, HdvDmaContext 
 						task->epoch);
 				goto out_stop_sync_event;
 			}
-			result = hdv_async_submit_host_read(task, config, remote_slot, next_submit, force_report);
+			result = hdv_async_submit_host_read(task, config, remote_slot, record_bytes, next_submit, force_report);
 			if (result != DOCA_SUCCESS)
 			{
 				fprintf(stderr, "sync-event async slot read submit failed epoch=%" PRIu64 ": %s\n", next_submit,
@@ -1683,7 +1888,8 @@ static int run_dpu_sync_event_read_async(const HdvConfig *config, HdvDmaContext 
 	{
 		uint64_t elapsed = monotonic_ns() - start;
 		double elapsed_sec = (double)elapsed / 1000000000.0;
-		double mib = ((double)config->iterations * (double)config->slot_bytes) / (1024.0 * 1024.0);
+		double mib = (double)hdv_total_record_bytes(config->slot_bytes, config->iterations, config->size_pattern) /
+					 (1024.0 * 1024.0);
 
 		*scratch_value = read_dma_count;
 		(void)write_remote_u64(dma, remote_base, offsetof(HdvControlBlock, dpu_data_dma_count), scratch_value,
@@ -1729,6 +1935,378 @@ out_free_desc:
 	return rc;
 }
 
+/*
+ * Async DPU-producer no-sync-event path. The data DMA context queues many DMA
+ * writes into host ring slots. In the completion-gated mode, the publisher
+ * context writes published_epoch only after the data context reports the
+ * completed contiguous frontier. In the nowait split-context negative mode, the
+ * publisher context writes the submitted frontier before data completions, while
+ * local task reuse still waits for completion so the only intentionally unsafe
+ * assumption is cross-context publication ordering.
+ */
+static int run_dpu_write_publish_async(const HdvConfig *config, HdvDmaContext *data_dma, HdvDmaContext *publish_dma,
+									   void *remote_base, void *local_slots, uint64_t *scratch_value,
+									   bool publish_before_completion)
+{
+	HdvAsyncDmaTask *tasks = NULL;
+	uint64_t *completed_epochs = NULL;
+	uint64_t next_submit = 1;
+	uint64_t completed = 0;
+	uint64_t published_contig = 0;
+	uint64_t last_published = 0;
+	uint64_t consumed = 0;
+	uint64_t data_dma_count = 0;
+	uint64_t publish_dma_count = 0;
+	uint64_t consumed_read_count = 0;
+	uint64_t in_flight = 0;
+	uint64_t start = monotonic_ns();
+	uint64_t last_progress_report = start;
+	bool final_stats_written = false;
+	doca_error_t result;
+	int rc = 1;
+
+	result = hdv_async_write_pool_create(data_dma, config, remote_base, local_slots, &tasks);
+	if (result != DOCA_SUCCESS)
+	{
+		fprintf(stderr, "async write pool create failed: %s\n", doca_error_get_descr(result));
+		return 1;
+	}
+	completed_epochs = calloc(config->slot_count, sizeof(*completed_epochs));
+	if (completed_epochs == NULL)
+	{
+		perror("calloc completed_epochs");
+		goto out;
+	}
+
+	while (completed < config->iterations)
+	{
+		bool submitted_any = false;
+
+		while (next_submit <= config->iterations && in_flight < config->async_window &&
+			   next_submit - consumed <= config->slot_count)
+		{
+			uint32_t task_index = (uint32_t)((next_submit - 1) % config->async_window);
+			HdvAsyncDmaTask *task = &tasks[task_index];
+			void *remote_slot =
+				(uint8_t *)remote_base + hdv_slot_offset(next_submit, config->slot_count, config->slot_bytes);
+			size_t record_bytes = hdv_record_bytes(config->slot_bytes, next_submit, config->size_pattern);
+			bool force_report = (in_flight + 1 == config->async_window) || (next_submit == config->iterations);
+
+			if (task->in_flight)
+			{
+				fprintf(stderr, "async write task reuse while in flight index=%u epoch=%" PRIu64 "\n", task_index,
+						task->epoch);
+				goto out;
+			}
+			fill_slot_for_mode(config, task->local_slot, next_submit);
+			result = hdv_async_submit_host_write(task, config, remote_slot, record_bytes, next_submit, force_report);
+			if (result != DOCA_SUCCESS)
+			{
+				fprintf(stderr, "async slot write submit failed epoch=%" PRIu64 ": %s\n", next_submit,
+						doca_error_get_descr(result));
+				goto out;
+			}
+			next_submit++;
+			data_dma_count++;
+			in_flight++;
+			submitted_any = true;
+		}
+		if (submitted_any && config->flush_policy != HDV_FLUSH_ALL)
+			doca_ctx_flush_tasks(data_dma->ctx);
+
+		if (next_submit <= config->iterations && next_submit - consumed > config->slot_count)
+		{
+			result =
+				read_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, consumed_epoch), scratch_value);
+			if (result != DOCA_SUCCESS)
+			{
+				fprintf(stderr, "async write read consumed_epoch failed: %s\n", doca_error_get_descr(result));
+				goto out;
+			}
+			consumed = *scratch_value;
+			consumed_read_count++;
+		}
+
+		data_dma->pe_progress_calls++;
+		(void)doca_pe_progress(data_dma->pe);
+
+		for (uint32_t i = 0; i < config->async_window; i++)
+		{
+			HdvAsyncDmaTask *task = &tasks[i];
+
+			if (!task->in_flight || !task->done)
+				continue;
+			if (task->result != DOCA_SUCCESS)
+			{
+				fprintf(stderr, "async slot write failed epoch=%" PRIu64 ": %s\n", task->epoch,
+						doca_error_get_descr(task->result));
+				goto out;
+			}
+			completed_epochs[(task->epoch - 1) & (uint64_t)(config->slot_count - 1)] = task->epoch;
+			task->in_flight = false;
+			task->done = false;
+			completed++;
+			in_flight--;
+		}
+
+		while (published_contig < config->iterations &&
+			   completed_epochs[published_contig & (uint64_t)(config->slot_count - 1)] == published_contig + 1)
+		{
+			completed_epochs[published_contig & (uint64_t)(config->slot_count - 1)] = 0;
+			published_contig++;
+		}
+
+		uint64_t publish_frontier = publish_before_completion ? next_submit - 1 : published_contig;
+
+		if ((publish_frontier == config->iterations && last_published != publish_frontier) ||
+			publish_frontier - last_published >= config->batch_size)
+		{
+			if (!publish_before_completion && publish_frontier == config->iterations && !final_stats_written)
+			{
+				/*
+				 * Store counters before the final frontier so the host can
+				 * print useful stats immediately after consuming the last
+				 * published epoch. These diagnostic writes are not part of
+				 * the publication guarantee under test.
+				 */
+				*scratch_value = data_dma_count;
+				(void)write_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, dpu_data_dma_count),
+									   scratch_value, submit_flags_for(config, true));
+				*scratch_value = publish_dma_count + 1;
+				(void)write_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, dpu_publish_dma_count),
+									   scratch_value, submit_flags_for(config, true));
+				*scratch_value = consumed_read_count;
+				(void)write_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, dpu_consumed_dma_read_count),
+									   scratch_value, submit_flags_for(config, true));
+				*scratch_value = combined_pe_progress_calls(data_dma, publish_dma);
+				(void)write_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, dpu_pe_progress_calls),
+									   scratch_value, submit_flags_for(config, true));
+				final_stats_written = true;
+			}
+
+			*scratch_value = publish_frontier;
+			result = write_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, published_epoch),
+									  scratch_value, submit_flags_for(config, true));
+			if (result != DOCA_SUCCESS)
+			{
+				fprintf(stderr, "async write publish DMA failed epoch=%" PRIu64 ": %s\n", publish_frontier,
+						doca_error_get_descr(result));
+				goto out;
+			}
+			last_published = publish_frontier;
+			publish_dma_count++;
+		}
+
+		if ((monotonic_ns() - start) / 1000000000ULL > config->timeout_sec)
+		{
+			fprintf(stderr,
+					"HDV_DPU_WRITE_ASYNC_TIMEOUT completed=%" PRIu64 " submitted=%" PRIu64
+					" completed_frontier=%" PRIu64 " published=%" PRIu64 " consumed=%" PRIu64 "\n",
+					completed, next_submit - 1, published_contig, last_published, consumed);
+			goto out;
+		}
+		if (monotonic_ns() - last_progress_report > 5000000000ULL)
+		{
+			fprintf(stderr,
+					"HDV_DPU_WRITE_ASYNC_PROGRESS completed=%" PRIu64 " submitted=%" PRIu64
+					" completed_frontier=%" PRIu64 " published=%" PRIu64 " consumed=%" PRIu64 "\n",
+					completed, next_submit - 1, published_contig, last_published, consumed);
+			last_progress_report = monotonic_ns();
+		}
+	}
+
+	{
+		uint64_t elapsed = monotonic_ns() - start;
+		double elapsed_sec = (double)elapsed / 1000000000.0;
+		double mib = (double)hdv_total_record_bytes(config->slot_bytes, config->iterations, config->size_pattern) /
+					 (1024.0 * 1024.0);
+
+		if (!final_stats_written)
+		{
+			*scratch_value = data_dma_count;
+			(void)write_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, dpu_data_dma_count),
+								   scratch_value, submit_flags_for(config, true));
+			*scratch_value = publish_dma_count;
+			(void)write_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, dpu_publish_dma_count),
+								   scratch_value, submit_flags_for(config, true));
+			*scratch_value = consumed_read_count;
+			(void)write_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, dpu_consumed_dma_read_count),
+								   scratch_value, submit_flags_for(config, true));
+			*scratch_value = combined_pe_progress_calls(data_dma, publish_dma);
+			(void)write_remote_u64(publish_dma, remote_base, offsetof(HdvControlBlock, dpu_pe_progress_calls),
+								   scratch_value, submit_flags_for(config, true));
+		}
+
+		printf("HDV_DPU_WRITE_ASYNC_DONE iterations=%" PRIu64 " write_dma=%" PRIu64 " publish_dma=%" PRIu64
+			   " consumed_reads=%" PRIu64 " window=%u split_publish=%u nowait_publish=%u pe_progress=%" PRIu64
+			   " elapsed_sec=%.6f mib_s=%.2f\n",
+			   config->iterations, data_dma_count, publish_dma_count, consumed_read_count, config->async_window,
+			   data_dma != publish_dma ? 1U : 0U, publish_before_completion ? 1U : 0U,
+			   combined_pe_progress_calls(data_dma, publish_dma), elapsed_sec,
+			   elapsed_sec == 0.0 ? 0.0 : mib / elapsed_sec);
+	}
+	rc = 0;
+
+out:
+	free(completed_epochs);
+	hdv_async_pool_destroy(tasks, config->async_window);
+	return rc;
+}
+
+/*
+ * DPU-producer sync-event publication path. This is the DPU-push counterpart
+ * to sync-event-async-pull: the DPU writes data into host memory with DOCA DMA,
+ * then publishes the completed frontier through a remote-PCI sync-event value.
+ * Host-side validation waits on the event and then reads the host-resident
+ * slots directly, which is the closest standalone test for sync-event acting as
+ * a WRITE_WITH_IMM-like publication point for DPU DMA writes.
+ */
+static int run_dpu_write_sync_event(const HdvConfig *config, HdvDmaContext *dma, void *remote_base, void *slot_buffer,
+									uint64_t *scratch_value, uint64_t *consumed_snapshot)
+{
+	void *sync_desc = NULL;
+	size_t sync_desc_len = 0;
+	struct doca_sync_event *sync_event = NULL;
+	uint64_t consumed = 0;
+	uint64_t epoch = 1;
+	uint64_t data_dma_count = 0;
+	uint64_t sync_event_publish_count = 0;
+	uint64_t consumed_read_count = 0;
+	uint64_t start_ns;
+	uint64_t elapsed_ns;
+	doca_error_t result;
+	int rc = 1;
+
+	if (read_file_alloc(config->sync_event_path, &sync_desc, &sync_desc_len) != 0)
+		return 1;
+
+	result = doca_sync_event_create_from_export(dma->dev, (const uint8_t *)sync_desc, sync_desc_len, &sync_event);
+	if (result != DOCA_SUCCESS)
+	{
+		fprintf(stderr, "dpu-push sync_event create_from_export failed: %s\n", doca_error_get_descr(result));
+		goto out_free_desc;
+	}
+	result = doca_sync_event_start(sync_event);
+	if (result != DOCA_SUCCESS)
+	{
+		fprintf(stderr, "dpu-push sync_event start failed: %s\n", doca_error_get_descr(result));
+		goto out_destroy_sync_event;
+	}
+
+	start_ns = monotonic_ns();
+	while (epoch <= config->iterations)
+	{
+		uint64_t batch_end = epoch + config->batch_size - 1;
+
+		if (batch_end > config->iterations)
+			batch_end = config->iterations;
+
+		while (epoch <= batch_end)
+		{
+			size_t record_bytes = hdv_record_bytes(config->slot_bytes, epoch, config->size_pattern);
+
+			while (epoch - consumed > config->slot_count)
+			{
+				result =
+					read_remote_u64(dma, remote_base, offsetof(HdvControlBlock, consumed_epoch), consumed_snapshot);
+				if (result != DOCA_SUCCESS)
+				{
+					fprintf(stderr, "dpu-push read consumed_epoch failed: %s\n", doca_error_get_descr(result));
+					goto out_stop_sync_event;
+				}
+				consumed_read_count++;
+				consumed = *consumed_snapshot;
+			}
+
+			fill_slot_for_mode(config, slot_buffer, epoch);
+			if (config->mode == HDV_MODE_DPU_SYNC_EVENT_EARLY_PUBLISH)
+			{
+				result = doca_sync_event_update_set(sync_event, epoch);
+				if (result != DOCA_SUCCESS)
+				{
+					fprintf(stderr, "dpu-push early sync_event update failed epoch=%" PRIu64 ": %s\n", epoch,
+							doca_error_get_descr(result));
+					goto out_stop_sync_event;
+				}
+				sync_event_publish_count++;
+				if (config->early_publish_delay_us != 0)
+					usleep(config->early_publish_delay_us);
+			}
+			result =
+				hdv_dma_copy(dma, dma->local_mmap, slot_buffer, true, dma->remote_mmap,
+							 (uint8_t *)remote_base + hdv_slot_offset(epoch, config->slot_count, config->slot_bytes),
+							 record_bytes, submit_flags_for(config, false));
+			if (result != DOCA_SUCCESS)
+			{
+				fprintf(stderr, "dpu-push slot DMA failed epoch=%" PRIu64 ": %s\n", epoch,
+						doca_error_get_descr(result));
+				goto out_stop_sync_event;
+			}
+			data_dma_count++;
+			epoch++;
+		}
+
+		if (batch_end == config->iterations)
+		{
+			*scratch_value = data_dma_count;
+			(void)write_remote_u64(dma, remote_base, offsetof(HdvControlBlock, dpu_data_dma_count), scratch_value,
+								   submit_flags_for(config, true));
+			*scratch_value = sync_event_publish_count + (config->mode == HDV_MODE_DPU_SYNC_EVENT_PUBLISH ? 1 : 0);
+			(void)write_remote_u64(dma, remote_base, offsetof(HdvControlBlock, dpu_publish_dma_count), scratch_value,
+								   submit_flags_for(config, true));
+			*scratch_value = consumed_read_count;
+			(void)write_remote_u64(dma, remote_base, offsetof(HdvControlBlock, dpu_consumed_dma_read_count),
+								   scratch_value, submit_flags_for(config, true));
+			*scratch_value = dma->pe_progress_calls;
+			(void)write_remote_u64(dma, remote_base, offsetof(HdvControlBlock, dpu_pe_progress_calls), scratch_value,
+								   submit_flags_for(config, true));
+		}
+
+		if (config->mode == HDV_MODE_DPU_SYNC_EVENT_PUBLISH)
+		{
+			result = doca_sync_event_update_set(sync_event, batch_end);
+			if (result != DOCA_SUCCESS)
+			{
+				fprintf(stderr, "dpu-push sync_event update failed epoch=%" PRIu64 ": %s\n", batch_end,
+						doca_error_get_descr(result));
+				goto out_stop_sync_event;
+			}
+			sync_event_publish_count++;
+		}
+	}
+
+	elapsed_ns = monotonic_ns() - start_ns;
+	{
+		double elapsed_sec = (double)elapsed_ns / 1000000000.0;
+		double mib = (double)hdv_total_record_bytes(config->slot_bytes, config->iterations, config->size_pattern) /
+					 (1024.0 * 1024.0);
+
+		printf("HDV_DPU_SYNC_EVENT_WRITE_DONE iterations=%" PRIu64 " data_dma=%" PRIu64 " sync_event_publishes=%" PRIu64
+			   " consumed_dma_reads=%" PRIu64 " pe_progress=%" PRIu64 " elapsed_sec=%.6f mib_s=%.2f\n",
+			   config->iterations, data_dma_count, sync_event_publish_count, consumed_read_count,
+			   dma->pe_progress_calls, elapsed_sec, elapsed_sec == 0.0 ? 0.0 : mib / elapsed_sec);
+	}
+	rc = 0;
+
+out_stop_sync_event:
+	if (sync_event != NULL)
+	{
+		result = doca_sync_event_stop(sync_event);
+		if (result != DOCA_SUCCESS)
+			fprintf(stderr, "dpu-push sync_event stop failed: %s\n", doca_error_get_descr(result));
+	}
+out_destroy_sync_event:
+	if (sync_event != NULL)
+	{
+		result = doca_sync_event_destroy(sync_event);
+		if (result != DOCA_SUCCESS)
+			fprintf(stderr, "dpu-push sync_event destroy failed: %s\n", doca_error_get_descr(result));
+	}
+out_free_desc:
+	free(sync_desc);
+	return rc;
+}
+
 static int run_dpu(const HdvConfig *config)
 {
 	void *export_desc = NULL;
@@ -1742,6 +2320,8 @@ static int run_dpu(const HdvConfig *config)
 	uint64_t *publish_value;
 	uint64_t *consumed_snapshot;
 	HdvDmaContext dma;
+	HdvDmaContext publish_dma = {0};
+	bool publish_dma_initialized = false;
 	uint64_t consumed = 0;
 	uint64_t epoch = 1;
 	uint64_t data_dma_count = 0;
@@ -1776,6 +2356,23 @@ static int run_dpu(const HdvConfig *config)
 		fprintf(stderr, "DPU DOCA init failed: %s\n", doca_error_get_descr(result));
 		goto out_free_local;
 	}
+	if (config->mode == HDV_MODE_WRITE_PUBLISH_SPLIT_NOWAIT || config->mode == HDV_MODE_WRITE_PUBLISH_SPLIT_COMPLETION)
+	{
+		/*
+		 * Split-context modes deliberately submit payload DMA and publication
+		 * DMA through independent DOCA DMA contexts. This lets the harness test
+		 * whether same-thread submission across contexts has any empirical
+		 * ordering property; Homer must not rely on that unless validated and
+		 * backed by an explicit DOCA guarantee.
+		 */
+		result = hdv_dpu_init(config, local_region, local_region_size, export_desc, export_desc_len, &publish_dma);
+		if (result != DOCA_SUCCESS)
+		{
+			fprintf(stderr, "DPU publish DOCA init failed: %s\n", doca_error_get_descr(result));
+			goto out_destroy_dma;
+		}
+		publish_dma_initialized = true;
+	}
 
 	printf("HDV_DPU_START remote=%p bytes=%zu iterations=%" PRIu64 " mode=%u batch=%u\n", remote_base, remote_len,
 		   config->iterations, (uint32_t)config->mode, config->batch_size);
@@ -1800,6 +2397,7 @@ static int run_dpu(const HdvConfig *config)
 		while (expected <= config->iterations)
 		{
 			char error[256];
+			size_t record_bytes = hdv_record_bytes(config->slot_bytes, expected, config->size_pattern);
 
 			while (published < expected)
 			{
@@ -1817,7 +2415,7 @@ static int run_dpu(const HdvConfig *config)
 			result =
 				hdv_dma_copy(&dma, dma.remote_mmap,
 							 (uint8_t *)remote_base + hdv_slot_offset(expected, config->slot_count, config->slot_bytes),
-							 true, dma.local_mmap, slot_buffer, config->slot_bytes, submit_flags_for(config, false));
+							 true, dma.local_mmap, slot_buffer, record_bytes, submit_flags_for(config, false));
 			if (result != DOCA_SUCCESS)
 			{
 				fprintf(stderr, "slot read DMA failed epoch=%" PRIu64 ": %s\n", expected, doca_error_get_descr(result));
@@ -1868,7 +2466,8 @@ static int run_dpu(const HdvConfig *config)
 
 		{
 			double elapsed_sec = (double)elapsed / 1000000000.0;
-			double mib = ((double)config->iterations * (double)config->slot_bytes) / (1024.0 * 1024.0);
+			double mib = (double)hdv_total_record_bytes(config->slot_bytes, config->iterations, config->size_pattern) /
+						 (1024.0 * 1024.0);
 
 			printf("HDV_DPU_READ_DONE iterations=%" PRIu64 " read_dma=%" PRIu64 " frontier_reads=%" PRIu64
 				   " consumed_writes=%" PRIu64 " pe_progress=%" PRIu64 " elapsed_sec=%.6f mib_s=%.2f\n",
@@ -1891,6 +2490,28 @@ static int run_dpu(const HdvConfig *config)
 		goto out_destroy_dma;
 	}
 
+	if (config->mode == HDV_MODE_DPU_SYNC_EVENT_PUBLISH)
+	{
+		rc = run_dpu_write_sync_event(config, &dma, remote_base, slot_buffer, publish_value, consumed_snapshot);
+		goto out_destroy_dma;
+	}
+	if (config->mode == HDV_MODE_DPU_SYNC_EVENT_EARLY_PUBLISH)
+	{
+		rc = run_dpu_write_sync_event(config, &dma, remote_base, slot_buffer, publish_value, consumed_snapshot);
+		goto out_destroy_dma;
+	}
+	if (config->mode == HDV_MODE_WRITE_PUBLISH_ASYNC)
+	{
+		rc = run_dpu_write_publish_async(config, &dma, &dma, remote_base, slot_buffer, publish_value, false);
+		goto out_destroy_dma;
+	}
+	if (config->mode == HDV_MODE_WRITE_PUBLISH_SPLIT_NOWAIT || config->mode == HDV_MODE_WRITE_PUBLISH_SPLIT_COMPLETION)
+	{
+		rc = run_dpu_write_publish_async(config, &dma, &publish_dma, remote_base, slot_buffer, publish_value,
+										 config->mode == HDV_MODE_WRITE_PUBLISH_SPLIT_NOWAIT);
+		goto out_destroy_dma;
+	}
+
 	start_ns = monotonic_ns();
 	while (epoch <= config->iterations)
 	{
@@ -1901,6 +2522,8 @@ static int run_dpu(const HdvConfig *config)
 
 		while (epoch <= batch_end)
 		{
+			size_t record_bytes = hdv_record_bytes(config->slot_bytes, epoch, config->size_pattern);
+
 			while (epoch - consumed > config->slot_count)
 			{
 				result =
@@ -1934,7 +2557,7 @@ static int run_dpu(const HdvConfig *config)
 			result =
 				hdv_dma_copy(&dma, dma.local_mmap, slot_buffer, true, dma.remote_mmap,
 							 (uint8_t *)remote_base + hdv_slot_offset(epoch, config->slot_count, config->slot_bytes),
-							 config->slot_bytes, submit_flags_for(config, false));
+							 record_bytes, submit_flags_for(config, false));
 			if (result != DOCA_SUCCESS)
 			{
 				fprintf(stderr, "slot DMA failed epoch=%" PRIu64 ": %s\n", epoch, doca_error_get_descr(result));
@@ -1975,7 +2598,8 @@ static int run_dpu(const HdvConfig *config)
 
 	{
 		double elapsed_sec = (double)elapsed_ns / 1000000000.0;
-		double mib = ((double)config->iterations * (double)config->slot_bytes) / (1024.0 * 1024.0);
+		double mib = (double)hdv_total_record_bytes(config->slot_bytes, config->iterations, config->size_pattern) /
+					 (1024.0 * 1024.0);
 
 		printf("HDV_DPU_DONE iterations=%" PRIu64 " data_dma=%" PRIu64 " publish_dma=%" PRIu64
 			   " consumed_dma_reads=%" PRIu64 " pe_progress=%" PRIu64 " elapsed_sec=%.6f mib_s=%.2f\n",
@@ -1985,6 +2609,8 @@ static int run_dpu(const HdvConfig *config)
 	rc = 0;
 
 out_destroy_dma:
+	if (publish_dma_initialized)
+		hdv_dpu_destroy(&publish_dma);
 	hdv_dpu_destroy(&dma);
 out_free_local:
 	free(local_region);
