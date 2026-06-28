@@ -274,9 +274,14 @@ Observed result:
 
 ## Next Stage
 
-Stage 5 should implement the grouped-control poll action. The important
-validation gate is a standalone synthetic host/DPU publisher test that proves
-the DPU can submit grouped control-line DMA reads under scheduler grants, retire
-the read completions only through bounded PE-drain grants, validate publication
-epochs/generations/frontiers, and populate DPU-local ready facts without reading
-one tail at a time.
+Stage 5 should implement only the minimal DOCA/COMCH grouped-control lifecycle:
+descriptor exchange/import, local grouped-control buffers, bounded task-slot
+pool allocation, callback installation, and clean teardown behind
+`HOMER_SERVICE_ENABLE_DOCA_DMA=1`. It should not submit real grouped-control DMA
+tasks yet.
+
+The important standalone synthetic host/DPU publisher validation gate moves to
+Stage 6. That gate proves the DPU can submit grouped control-line DMA reads under
+scheduler grants, retire the read completions only through bounded PE-drain
+grants, validate publication epochs/generations/frontiers, and populate
+DPU-local ready facts without reading one tail at a time.

@@ -1007,15 +1007,16 @@ Acceptance:
   `HomerGrantVector` consumption remains a Stage 5+ implementation item once
   the actions submit actual DOCA DMA tasks.
 
-### Stage 5 — Grouped-control poll action
+### Stage 5 — DOCA/COMCH grouped-control lifecycle
 
-Deliverable: scheduled DMA reads of host-publish-line slices.
+Deliverable: real DOCA/COMCH lifecycle objects and grouped-control task-pool
+scaffolding, but no real grouped-control DMA submission yet.
 
 Tasks:
 
 - Enable the minimal real DOCA lifecycle behind `HOMER_SERVICE_ENABLE_DOCA_DMA=1`
-  for grouped-control reads only. Payload pulls, completion pushes, and
-  consumed-head writes remain stubbed.
+  for grouped-control reads only. Payload pulls, completion pushes, consumed-head
+  writes, and real grouped-control task submission remain stubbed.
 - Exchange the host mmap descriptor over COMCH for the real path. A file-based
   descriptor path may be kept only as a standalone debug harness, not as the
   Homer service path.
@@ -1023,46 +1024,64 @@ Tasks:
 - Allocate reusable local buffers for grouped-control slices.
 - Preallocate a bounded pool of `HomerDpuDmaTaskSlot` records with one
   `HomerDpuDmaTaskOwner` per DOCA memcpy task.
-- Submit control-read DMA tasks only under `DPU_DMA_SUBMIT_CONTROL_READS` grants.
-- Drain completions only under `DPU_DMA_DRAIN_PE` grants.
-- Validate task owner identity, publication words, generations, and frontiers in
-  callbacks.
-- Populate DPU-local ready bits/counts for rings with new observed frontiers.
+- Install callback functions and attach task-slot owner metadata to reusable task
+  handles, but keep callbacks unreachable from the scheduler until Stage 6 starts
+  real submissions.
+- Keep `DPU_DMA_SUBMIT_CONTROL_READS` and `DPU_DMA_DRAIN_PE` scheduler actions
+  bounded and nonblocking, but let them report empty/not-ready work until Stage 6
+  connects real submit and PE-drain behavior.
 
 Acceptance:
 
-- Synthetic host publisher can advance frontiers and DPU observes them without
-  reading one tail at a time.
-- Expected lifecycle staleness, such as old ring generation after teardown, is
-  ignored and counted diagnostically.
-- Bug-like validation failures, including task-slot generation mismatch,
-  malformed owner metadata, unexpected generation mismatch, and non-monotonic
-  frontiers, fail the DPU engine fatally instead of being silently ignored.
-- Unchanged publication words are counted as empty/no-new-work, not as errors.
-- No payload DMA reads are submitted in this stage.
-- A standalone host+DPU grouped-control test proves control-read DMA submission
-  and callback retirement are separated: submit action queues reads, PE-drain
-  action observes and validates them.
+- `HOMER_SERVICE_ENABLE_DOCA_DMA=1` can create and destroy the minimal DOCA/COMCH
+  lifecycle on the intended DPU environment without registering real Homer rings
+  or submitting DMA tasks.
+- Host mmap descriptor exchange/import succeeds in a synthetic setup, or fails
+  with an explicit diagnostic before any scheduler action can submit work.
+- Task-pool sizing, local buffer allocation, task-owner initialization, and clean
+  teardown are validated by a lifecycle smoke.
+- No payload DMA reads, completion DMA writes, consumed-head writes, or
+  grouped-control DMA reads are submitted in this stage.
+- The meaningful host/DPU grouped-control correctness test is intentionally
+  deferred to Stage 6, because it requires bounded PE drain plus callback
+  retirement to observe completions safely.
 
-### Stage 6 — PE drain and task-owner retirement
+### Stage 6 — Grouped-control submit, PE drain, and task-owner retirement
 
-Deliverable: bounded PE drain with real callback/frontier accounting.
+Deliverable: scheduled grouped-control DMA reads of host-publish-line slices plus
+bounded PE drain with real callback/frontier accounting.
 
 Tasks:
 
 - Implement task-owner allocation, generation validation, callback retirement,
   and task reuse.
+- Submit control-read DMA tasks only under `DPU_DMA_SUBMIT_CONTROL_READS` grants.
 - Implement bounded `doca_pe_progress()` loops controlled by grant budget.
+- Drain completions only under `DPU_DMA_DRAIN_PE` grants.
+- Validate task owner identity, publication words, generations, and frontiers in
+  callbacks.
+- Populate DPU-local ready bits/counts for rings with new observed frontiers.
 - Report `cqesDrained`, `emptyPolls`, `stillReady`, and `budgetExhausted`.
 - Prohibit nested PE progress from callbacks.
 
 Acceptance:
 
+- Synthetic host publisher can advance frontiers and DPU observes them without
+  reading one tail at a time.
 - Drain action stops on first zero-progress return or budget exhaustion.
 - In-flight tasks remain represented in DPU-local facts for later grants.
+- Expected lifecycle staleness, such as old ring generation after teardown, is
+  ignored and counted diagnostically.
 - Stale generation callbacks do not publish any host-visible state.
+- Bug-like validation failures, including task-slot generation mismatch,
+  malformed owner metadata, unexpected generation mismatch, and non-monotonic
+  frontiers, fail the DPU engine fatally instead of being silently ignored.
+- Unchanged publication words are counted as empty/no-new-work, not as errors.
 - Debug invariant mode proves submit actions do not call `doca_pe_progress()` and
   callbacks do not submit follow-on DMA work.
+- A standalone host+DPU grouped-control test proves control-read DMA submission
+  and callback retirement are separated: submit action queues reads, PE-drain
+  action observes and validates them.
 
 ### Stage 7 — Command/control request pull
 
