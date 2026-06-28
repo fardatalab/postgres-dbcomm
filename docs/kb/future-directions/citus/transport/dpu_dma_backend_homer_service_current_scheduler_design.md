@@ -248,7 +248,7 @@ typedef struct HomerDpuBridgeRingDescriptor
     uint32_t slotCount;
     uint32_t slotBytes;
     uint32_t controlBytes;
-    uint32_t reserved0;
+    uint32_t hostRingOffset;
 
     uint64_t serviceSessionId;
     uint64_t serviceSinkId;
@@ -1364,6 +1364,16 @@ Acceptance:
 
 Deliverable: start-command and poll-completion through DPU-pulled host request
 slots, still using existing semantic request/response structs.
+
+Implementation progress: Stage 7A validates the first command-pull slice in
+`/data/dbcomm/citus-dbcomm`. The DPU DMA engine now consumes a Stage 6B
+discovered-ready command ring, DMA-pulls one full
+`CitusRemoteExecControlSlot` from `hostRingOffset` into DPU-local staging,
+validates slot state, owner pid, request sequence, protocol version, and request
+kind, clears the ready fact after staging, and exposes the staged slot to later
+service adapters. The standalone host-to-DPU COMCH smoke validates this path with
+a synthetic `START_COMMAND` SQL request. Real command execution, response-body
+DMA writes, and response publication remain pending Stage 7B/Stage 8 work.
 
 Tasks:
 

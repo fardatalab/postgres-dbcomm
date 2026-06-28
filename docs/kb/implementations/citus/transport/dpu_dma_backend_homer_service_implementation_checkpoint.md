@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6B.2, the default frontend and service path is still the existing
+As of Stage 7A, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -14,7 +14,8 @@ SHM mapping. A DOCA-enabled frontend build now runs a host-side bridge-memory
 smoke check, exports that bridge as a DOCA PCI mmap, sends the setup bytes with a
 real COMCH client, waits for setup ack with a timeout, tears the smoke bridge
 down, and still fails real Homer API calls with a deliberate not-implemented
-error because Stage 7 command pulling has not landed. The service-side DPU DMA
+error because Stage 7 has not yet wired staged requests into the existing command
+handlers or response publication. The service-side DPU DMA
 scheduler path is opt-in behind
 `HOMER_SERVICE_ENABLE_DPU_DMA=1`; it reads maintained facts and wires bounded
 DPU actions through `machine-baseline`. The engine now has Stage 5
@@ -39,8 +40,7 @@ the existing mmap-import handler. Stage 6A.6 wires that server object into the
 production service startup path when `HOMER_SERVICE_ENABLE_DPU_DMA=1` and
 `HOMER_SERVICE_ENABLE_DOCA_DMA=1`, adds COMCH server env overrides, progresses
 the COMCH PE through the bounded DPU `PE_DRAIN` scheduler action, and destroys
-the server before the DMA engine. Production frontend startup still does not
-call a real DOCA COMCH client. Stage 6A.7 replaces the earlier singleton
+the server before the DMA engine. Stage 6A.7 replaces the earlier singleton
 imported-host-mmap slot with a bounded import table keyed by bridge generation
 plus client instance ID. This lets the DPU service accept multiple future
 backend/frontend setup imports without conflating their mmap descriptors; duplicate
@@ -57,10 +57,12 @@ scheduler adapter now calls these engine APIs for
 host-publish-line snapshots into maintained DPU-local ready-ring facts by
 validating publication epoch, generation, ring identity, entry state, and
 monotonic frontier before incrementing
-`HomerDpuDmaSchedulerFacts.totalDiscoveredReadyRingCount`. This still stops
-before Stage 7 command pulling: the service can discover that a command ring has
-a new accepted host frontier, but it does not yet DMA-pull the command request
-slot.
+`HomerDpuDmaSchedulerFacts.totalDiscoveredReadyRingCount`. Stage 7A consumes
+that ready fact for one fixed control slot: the DMA engine can submit a bounded
+command-slot pull, stage a complete `CitusRemoteExecControlSlot`, validate slot
+state, owner pid, request sequence, request protocol, and request kind, and clear
+the discovered-ready fact after the accepted frontier is staged. This still stops
+before real command execution and response DMA publication.
 
 ## Stage 1: Bridge ABI Header
 
@@ -1324,14 +1326,144 @@ Observed result:
   if the new ready-fact assertion had not observed exactly one discovered ready
   ring.
 
+## Stage 7A: Synthetic Fixed Command-Slot Pull
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_bridge_abi.h:174`
+  gives each descriptor a `hostRingOffset` separate from `hostControlOffset`.
+  This lets one host mmap carry grouped-control lines and command/control slots
+  without assuming the slot area begins at the same offset as the publication
+  line.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:118`
+  exposes `HomerDpuDmaSubmitCommandPulls()`, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:126`
+  exposes `HomerDpuDmaCopyStagedCommandSlot()` for the Stage 7 service adapter.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:508`
+  implements the bounded command-pull submit action. It consumes only accepted
+  Stage 6B ready facts, submits DMA tasks without calling `doca_pe_progress()`,
+  and treats already-consumed ready facts as stale scheduler state to clear, not
+  as action failures.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1366`
+  implements `HomerDpuDmaSubmitOneCommandPull()`. It validates command
+  descriptor identity, generation, direction, slot geometry, and
+  `hostRingOffset`, then DMA-reads one full `CitusRemoteExecControlSlot` into a
+  preallocated DPU-local command staging buffer.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1656`
+  implements `HomerDpuDmaAcceptCommandPullSlot()`. It validates task owner
+  identity, accepted frontier epoch, slot state, owner pid, request sequence,
+  request protocol version, and known request kind before marking one staged
+  command request visible in DPU-local facts.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35985`
+  wires `HOMER_PROGRESS_ACTION_DPU_COMMAND_PULL` to
+  `HomerDpuDmaSubmitCommandPulls()` through the current scheduler adapter.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:452`
+  builds a setup descriptor whose `hostRingOffset` points past the three bridge
+  control cache lines to a synthetic fixed control slot.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:798`
+  validates the staged command slot after the DPU command-pull DMA completes:
+  state `REQUEST_READY`, owner pid `4242`, request sequence `42`,
+  `START_COMMAND`, command kind `CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE`, and SQL
+  bytes `select 1`.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:877`
+  submits the command pull only after the grouped-control DMA read has completed
+  and produced an accepted ready fact.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_abi_check.c:93`
+  now exercises `hostRingOffset` and the full fixed-control-slot size in the
+  host-only COMCH ABI check.
+
+Important implementation details and decisions:
+
+- Stage 7A deliberately pulls a complete `CitusRemoteExecControlSlot`, not only
+  `CitusRemoteExecControlRequestUnion`. This is heavier than the eventual
+  minimum request bytes, but it keeps the first migration slice faithful to the
+  current fixed-slot semantic boundary: state, owner pid, request sequence,
+  request body, and response storage stay together until the service adapter is
+  refactored.
+- The command staging buffers are separate from task slots. A completed command
+  pull keeps its staging buffer reserved while
+  `HomerDpuDmaCopyStagedCommandSlot()` can copy it for the later service adapter;
+  task-slot retirement and staged-command consumption are separate lifetimes.
+- A stale ready fact whose accepted frontier has already been consumed is cleared
+  and counted as empty scheduler state. It is not a DMA error and not a fatal
+  protocol condition.
+
+Stage 7A was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make dpu-comch-abi-check dpu-comch-transport-smoke-bin \
+  service-dpu-dma-smoke service-dpu-dma-doca-smoke service-bin client-bin
+
+DPU_DIR=/tmp/homer_dpu_comch_stage7_command_pull
+ssh dpu "rm -rf $DPU_DIR && mkdir -p \
+  $DPU_DIR/src/bin \
+  $DPU_DIR/src/backend/distributed/utils/homer \
+  $DPU_DIR/src/include/distributed/homer"
+rsync -az src/bin/homer_dpu_comch_transport_smoke.c \
+  dpu:$DPU_DIR/src/bin/
+rsync -az src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/homer_service_dpu_comch.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_comch.h \
+  dpu:$DPU_DIR/src/backend/distributed/utils/homer/
+rsync -az src/include/distributed/homer/*.h \
+  dpu:$DPU_DIR/src/include/distributed/homer/
+ssh dpu "cd $DPU_DIR && gcc -std=gnu99 -Wall -Wextra \
+  -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers \
+  -Wno-deprecated-declarations -DHOMER_DPU_DMA_WITH_DOCA \
+  -DALLOW_EXPERIMENTAL_API -I/opt/mellanox/doca/include \
+  -I/usr/include/libnl3 -Isrc/include \
+  -Isrc/backend/distributed/utils/homer \
+  -o homer_dpu_comch_transport_smoke \
+  src/bin/homer_dpu_comch_transport_smoke.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_comch.c \
+  -L/opt/mellanox/doca/lib/aarch64-linux-gnu \
+  -ldoca_comch -ldoca_dma -ldoca_common"
+
+ssh dpu "cd /tmp/homer_dpu_comch_stage7_command_pull && \
+  LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu \
+  ./homer_dpu_comch_transport_smoke --server --import-dma \
+  --submit-control-read --submit-command-pull \
+  --name homer-dpu-comch-stage7-command \
+  --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0 \
+  --timeout-ms 20000 \
+  > /tmp/homer-dpu-comch-stage7-command-server.log 2>&1" &
+
+LD_LIBRARY_PATH=/opt/mellanox/doca/lib/x86_64-linux-gnu \
+  ./build/homer/homer_dpu_comch_transport_smoke --client --real-mmap \
+  --name homer-dpu-comch-stage7-command --dev-pci 0000:21:00.0 \
+  --timeout-ms 20000
+
+ssh dpu "cat /tmp/homer-dpu-comch-stage7-command-server.log"
+```
+
+Observed result:
+
+- `homer_dpu_comch_abi_check: ok`
+- `homer_service_dpu_dma_smoke: ok`
+- `homer_service_dpu_dma_smoke: ok` for the DOCA-enabled build, with only the
+  known DOCA experimental/deprecation warnings.
+- `dpu-comch-transport-smoke-bin`, `service-bin`, and `client-bin` built.
+- Host client printed `client exported real PCI mmap bytes=279
+  buffer_bytes=68056`, `client received setup ack generation=1 rings=1
+  imported_bytes=279`, and exited `ok`.
+- The DPU server log contained
+  `server DMA grouped-control read complete epoch=1 tail=1 cookie=65261`,
+  `server DMA command-pull submitted after accepted grouped-control frontier`,
+  `server DMA command-pull complete owner=4242 seq=42 command=6 sql="select 1"`,
+  and `homer_dpu_comch_transport_smoke: ok`.
+
 ## Next Stage
 
-Stage 7 should consume the Stage 6B.2 ready-ring facts by adding a DPU command
-request-pull API. That API should read accepted ring/frontier state, DMA-pull the
-corresponding host request slots into DPU-local staging, and only then clear or
-advance the ready bit for the command ring. The selected DPU command
-`not implemented` guard can then be replaced with DPU-pulled command request
-slots.
+Stage 7B should turn staged command slots into real service command handling.
+The next implementation slice should refactor the existing local-control service
+handler behind an adapter that accepts a staged `CitusRemoteExecControlSlot`,
+runs the existing request semantics, and then prepares the response for Stage 8
+DPU-to-host response-body plus publication-word DMA writes. The selected DPU
+command `not implemented` guard should remain until command execution and
+response publication both exist; Stage 7A only proves request discovery and pull.
 
 Decisions recorded for Stage 6:
 
