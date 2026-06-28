@@ -1524,8 +1524,13 @@ DPU response staging/publication path. Once that exists, staged DPU command
 slots can run through the same semantic handler and Stage 8 can DMA-write the
 response body plus publication word back to host memory. The selected DPU command
 `not implemented` guard should remain until command execution and response
-publication both exist; Stage 7A only proves request discovery and pull, and
-Stage 7B.1 only proves the first dispatch-boundary refactor.
+publication both exist.
+
+This is also the next Stage 7 promotion item, not a separate promotion cleanup:
+the response owner must stop async command handling from assuming an SHM slot
+once the selected-DPU path uses staged request slots. Stage 7A only proves
+request discovery and pull, and Stage 7B.1 only proves the first
+dispatch-boundary refactor.
 
 Decisions recorded for Stage 6:
 
@@ -1560,12 +1565,6 @@ Decisions recorded for Stage 6:
   exported mmap blob, `HomerDpuBridgeControlBlockHeader`,
   `HomerDpuBridgeRingDescriptor[]`, and an ack/error result. This ABI is now
   implemented and validated by Stage 6A.1.
-
-Promotion to non-experimental DPU mode is tracked directly in the staged TODOs
-and acceptance gates of
-`docs/kb/future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md`.
-The old host-process SHM path can remain buildable during migration as a DPU-off
-comparison path, but selected DPU mode must not use it as a runtime fallback.
 
 After Stage 6B.2, grouped-control discovery can produce maintained DPU-local
 ready facts. Close/close-ack and reclaim remain folded into Stage 10 teardown

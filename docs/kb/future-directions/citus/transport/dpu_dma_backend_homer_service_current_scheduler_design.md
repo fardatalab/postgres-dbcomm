@@ -926,13 +926,14 @@ bring-up correctness, not performance.
 
 ## Implementation sequence
 
-Promotion is intentionally embedded in the stage work below. Each stage owns the
-selected-DPU behavior it first makes meaningful: setup in Stage 6, command pull
-in Stage 7, completion publication in Stage 8, payload/basebackup pull in Stage
-9, lifecycle/reconnect in Stage 10, and only the user-facing selector promotion
-in Stage 11. Do not carry a selected-DPU placeholder or host-process SHM escape
-path forward as "later promotion cleanup" once the corresponding stage is
-accepted.
+Promotion is not a separate cleanup track. The stage tasks and acceptance gates
+below are the source of truth for moving selected DPU mode from experimental
+scaffolding to the production path. Each stage owns the selected-DPU behavior it
+first makes meaningful: setup in Stage 6, command pull in Stage 7, completion
+publication in Stage 8, payload/basebackup pull in Stage 9, lifecycle/reconnect
+in Stage 10, and only the user-facing selector flip in Stage 11. Once a stage is
+accepted, its selected-DPU path must not retain the old host-process SHM path as
+an escape hatch for that behavior.
 
 ### Stage 0 — Freeze the migration contract
 
@@ -1393,12 +1394,19 @@ Tasks:
 - DMA-read ready request slots into DPU-local staging.
 - Refactor service local-control handling behind an adapter that accepts staged
   request/response objects.
+- Add a response-owner abstraction before enabling async staged commands. SHM
+  slots are one owner kind for DPU-off mode; selected DPU mode must use a
+  DPU-response owner that carries enough bridge/ring/generation information for
+  Stage 8 DMA publication.
 - Submit response-body DMA writes followed immediately by the response-ready
   publication-word DMA write on the same ordered context.
 - Preserve request sequence and owner validation.
 - Keep the old SHM host-process APIs buildable only as DPU-off migration
   coexistence; do not add fallback branches from selected DPU command handling to
   SHM command handling.
+- Add a stage-local diagnostic or counter that proves a selected-DPU command API
+  call entered through COMCH setup, grouped-control discovery, command-slot DMA
+  pull, and staged local-control dispatch rather than the old SHM command ring.
 - Replace the Stage 6 terminal `not implemented` guard for command APIs with the
   staged request-slot pull path. After this stage, a selected DPU command session
   should fail only for DPU setup/protocol/runtime errors, not because command
@@ -1427,6 +1435,8 @@ Acceptance:
 - Stage 7 is not accepted if selected-DPU command execution can still reach the
   old host-process SHM command ring, even as a convenience fallback after a DPU
   setup or command-pull error.
+- Stage 7 is not accepted if response-owner plumbing still assumes an SHM slot
+  for any selected-DPU command request that can become asynchronous.
 - Early response publication negative test fails as expected.
 - Before real backend command execution, a synthetic request-slot pull test DMA
   reads one fixed request slot into DPU-local staging, validates owner/generation,
@@ -1455,6 +1465,9 @@ Tasks:
 - Remove the selected-DPU completion dependency on host-process SHM completion
   mailboxes. The old mailbox code may remain for DPU-off mode, but DPU-mode
   command completion must be driven by DPU-published lines.
+- Add a selected-DPU completion-path diagnostic or counter that proves command
+  completion became visible through DPU-written publication lines, not through
+  the SHM completion mailbox.
 - Treat Stage 8 promotion work as the completion replacement gate: selected-DPU
   completion polling must consume DPU-written completion/credit publication
   lines and must not use host-process SHM completion mailboxes after selection.
@@ -1470,6 +1483,9 @@ Acceptance:
 - In DPU mode, completion polling consumes only DPU-published completion/credit
   lines. A missing or invalid DPU completion path must return a DPU-path error,
   not poll the old SHM completion mailbox as a fallback.
+- Stage 8 acceptance must include one command path where the request arrives via
+  DPU-pulled staging and completion becomes visible via the DPU publication
+  line. A SHM-only command smoke is insufficient for this stage.
 - Stage 8 is not accepted if a selected-DPU session can report command completion
   from the old host-process mailbox when the DPU completion path is absent,
   stale, or invalid.
@@ -1497,6 +1513,10 @@ Tasks:
   host-process SHM queues with host-published byte rings and DPU DMA pulls. The
   SHM byte-stream path remains useful only for DPU-off comparison during
   migration.
+- Add payload/basebackup path counters that distinguish host-published byte-ring
+  frontiers, payload DMA pulls, contiguous completed frontiers, and consumed-head
+  DMA writes. These counters are part of the Stage 9 promotion evidence, not just
+  performance instrumentation.
 - Treat Stage 9 promotion work as the payload/basebackup replacement gate:
   selected-DPU byte streams must publish host byte-ring frontiers for DPU pull and
   must not use host-process SHM queues as an escape path for large transfers.
@@ -1520,6 +1540,9 @@ Acceptance:
 - Mixed command plus basebackup validation runs with both workloads on the DPU
   boundary so foreground/background interference measurements are meaningful for
   the migrated design.
+- Stage 9 acceptance must include path evidence for both foreground command
+  traffic and background byte-stream traffic. It is not enough for one workload
+  class to be DPU-backed while the other remains on host-process SHM.
 
 ### Stage 10 — Teardown, failure, and generation reset
 
@@ -1541,6 +1564,9 @@ Tasks:
 - Convert setup/teardown/reconnect behavior from experimental smoke semantics
   into the lifecycle contract for selected DPU mode: selected DPU sessions either
   reconnect through COMCH with a new generation or fail boundedly.
+- Add lifecycle diagnostics that record selected-DPU close, generation reset,
+  reconnect setup, and fatal DMA-error shutdown paths separately from DPU-off SHM
+  teardown.
 - Treat Stage 10 promotion work as the lifecycle replacement gate: selected-DPU
   teardown, reconnect, and service-restart handling must use generation reset and
   fresh COMCH setup, not SHM continuation.
@@ -1556,6 +1582,9 @@ Acceptance:
 - DPU service restart while host backends are alive causes bounded DPU-mode
   failures and generation rejection; surviving host sessions must not continue on
   SHM as an implicit recovery path.
+- Stage 10 acceptance must exercise reconnect/re-setup on an already-running DPU
+  service and a DPU-service restart failure case. Both outcomes must be visible
+  as DPU lifecycle behavior, not as host-process SHM recovery.
 - Stage 10 is not accepted if teardown, backend reconnect, or DPU service
   restart can recover a selected-DPU session by switching that session to the
   host-process SHM transport.
@@ -1585,6 +1614,9 @@ Tasks:
   selected-DPU command, completion, payload, and lifecycle paths should already
   be real DPU paths from Stages 6 through 10. Stage 11 should not contain a bulk
   fallback-removal cleanup.
+- Keep DPU-off SHM/RDMA runs as comparison baselines, but remove any code path
+  where normal DPU mode can silently demote a selected session back to
+  host-process SHM after setup or runtime failure.
 
 Acceptance:
 
