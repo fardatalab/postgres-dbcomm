@@ -50,6 +50,10 @@ Stage 8B.3 adds the scheduler scaffold for the production backend-mailbox path:
 `DPU_BACKEND_COMPLETION_PULL` now exist as distinct bounded DPU scheduler
 actions with maintained zero-valued facts. They are intentionally inert until
 the backend-mailbox DMA queues and submission APIs land.
+Stage 8B.4 adds explicit bridge descriptor roles so setup/import can
+distinguish frontend control slots, backend command mailboxes, backend
+completion mailboxes, and payload byte rings without inferring role from only
+workload class, direction, and geometry.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -2173,16 +2177,114 @@ unless a later engine slice populates them. The selected-DPU frontend guard must
 remain in place until the host lifecycle shim and backend-mailbox DMA publish
 and pull APIs are implemented and validated.
 
+## Stage 8B.4: Descriptor Roles and Role-Aware Setup Import
+
+Implemented in `/data/dbcomm/citus-dbcomm` as commit `2cac3e457`:
+
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_bridge_abi.h:75`
+  adds `HomerDpuBridgeDescriptorRole` with roles for frontend control slots,
+  backend command mailboxes, backend completion mailboxes, and payload byte
+  rings.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_bridge_abi.h:163`
+  extends `HomerDpuBridgeRingDescriptor` with `descriptorRole` and `reserved0`;
+  the descriptor size is now pinned at 120 bytes at
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_bridge_abi.h:210`.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_bridge_abi.h:213`
+  adds `HomerDpuBridgeKnownDescriptorRole()`, and
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_bridge_abi.h:221`
+  adds `HomerDpuBridgeDescriptorRoleMatchesShape()`. The shape check rejects
+  role/workload/direction/geometry/flag mismatches before a descriptor can
+  become a DMA target.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_comch_abi.h:321`
+  now applies the role/shape check during setup-message validation.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1177`
+  adds `HomerDpuDmaValidateDescriptorForImport()`, which validates descriptor
+  identity, role shape, control range, slot range, and role-specific minimum
+  slot sizes before the DOCA mmap import is accepted.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1321`
+  calls that validator for every descriptor in the setup import path.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:2026`
+  makes command-pull require the frontend-control role, and the response
+  publication path now also requires that role before DMA-writing the frontend
+  response slot.
+- The grouped-control submit loop skips backend command/completion mailbox
+  descriptors for now. This prevents the current host-publish-line parser from
+  treating a backend mailbox header as `HomerDpuBridgeHostPublishLine`; the
+  backend mailbox-specific parser remains a later Stage 8B slice.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c`
+  and the standalone TCP/legacy-COMCH transport smokes now mark their existing
+  one-ring descriptor as `FRONTEND_CONTROL_SLOT`.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:165`
+  expands the synthetic exported mmap layout, and
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:310`
+  builds a three-descriptor setup payload: frontend control slot, backend
+  command mailbox, and backend completion mailbox. When DOCA lifecycle is
+  available, the smoke expects one import to add three rings and two imports to
+  add six rings.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_bridge_abi_check.c` now validates
+  descriptor role/shape helpers, and
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_abi_check.c` now rejects a
+  setup descriptor whose role does not match its shape.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git diff --cached --check
+sudo -n -u dbcomm make dpu-bridge-abi-check dpu-comch-abi-check \
+  service-dpu-dma-smoke frontend-dma-smoke
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm make -C src/backend/distributed all
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+```
+
+Observed result:
+
+- `homer_dpu_bridge_abi_check: ok`;
+- `homer_dpu_comch_abi_check: ok`;
+- `homer_service_dpu_dma_smoke: ok`;
+- `homer_frontend_dma_smoke: ok`;
+- the normal service/client build completed successfully;
+- the extension build completed successfully;
+- the forced DOCA-enabled service/client build completed successfully, with
+  only the known DOCA experimental/deprecated warnings from NVIDIA headers,
+  `doca_task_submit_ex()`, and `doca_dma_set_ordered_completions()`;
+- a final forced normal service/client rebuild completed successfully so the
+  local service binary was not left in the forced DOCA macro build state.
+
+Validation note:
+
+- Running `make -B service-dpu-dma-smoke
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'` is not currently a valid
+  target invocation because `service-dpu-dma-smoke` does not add the DOCA include
+  and link flags that `service-bin` adds. The DOCA-enabled compile coverage for
+  this slice therefore comes from the forced `service-bin client-bin` build, not
+  from a DOCA-enabled standalone smoke run.
+- A validation-command mistake briefly ran two configure-triggering builds in
+  parallel, which left `src/include/citus_version.h` with undefined version
+  macros. Running `./config.status --recheck && ./config.status` serially as
+  `dbcomm` regenerated the header, and the subsequent serial extension build
+  passed. This was a build-system race from the validation command ordering, not
+  a source-code defect in the descriptor-role slice.
+
+This substage still does not implement backend command publication or backend
+completion pulling. It makes those next engine APIs safe to target by role:
+backend-command DMA must use `BACKEND_COMMAND_MAILBOX`, backend-completion DMA
+must use `BACKEND_COMPLETION_MAILBOX`, and frontend response publication must
+continue using `FRONTEND_CONTROL_SLOT`.
+
 ## Next Stage
 
 The next implementation slice should keep the selected-DPU `not implemented`
 guard in place and add the first real backend-mailbox queues behind the Stage
-8B.3 scheduler scaffold. The immediate target is not end-to-end SQL yet; it is
-to populate maintained facts and implement bounded engine APIs for backend
-command publication and backend completion pull so the new scheduler actions can
-become productive without changing scheduler taxonomy again. Candidate building
-must continue to read only maintained facts and must not call DOCA or inspect
-host memory.
+8B.3 scheduler scaffold and Stage 8B.4 descriptor roles. The immediate target is
+not end-to-end SQL yet; it is to populate maintained facts and implement bounded
+engine APIs for backend command publication and backend completion pull so the
+new scheduler actions can become productive without changing scheduler taxonomy
+or descriptor identity again. Candidate building must continue to read only
+maintained facts and must not call DOCA or inspect host memory.
 
 Current Stage 6 setup decisions:
 
