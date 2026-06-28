@@ -287,6 +287,14 @@ Responsibilities:
 7. Keep `OpenRemoteExecutionSession()`, `StartRemoteExecutionCommand()`, and
    `PollRemoteExecutionCommandCompletion()` stable for ordinary callers.
 
+Decision: the host-side COMCH client belongs in `homer_frontend_dma.c` for this
+phase. It is part of the DMA channel setup path: it registers/exports host mmap
+state, sends descriptor bytes to the DPU service, waits for the setup ack, and
+then lets the hot path publish frontiers through DMA-visible memory. Because this
+is cold-path setup, it may block while waiting for COMCH connection/setup
+completion, but it must use a timeout and emit explicit diagnostics rather than
+spinning indefinitely.
+
 The first command-plane implementation may preserve the current fixed control
 slot request/response union as the command record body. That is less invasive
 than inventing a new semantic command ring immediately. The bridge then uses a
@@ -301,10 +309,22 @@ Add:
 ```text
 src/backend/distributed/utils/homer/homer_service_dpu_dma.c
 src/backend/distributed/utils/homer/homer_service_dpu_dma.h
+src/backend/distributed/utils/homer/homer_service_dpu_comch.c
+src/backend/distributed/utils/homer/homer_service_dpu_comch.h
 ```
 
 The engine owns DOCA objects and physical movement state. It exposes facts and
 bounded actions to the existing scheduler.
+
+Decision: keep new DPU implementation work out of
+`tuple_sink_service_process.c` where the current scheduler-local type boundary
+allows it. The large file should remain a thin scheduler adapter: it owns current
+`HomerGrantVector`, `HomerProgressResult`, collector/action enums, and dispatch
+from `HomerServiceExecuteDpuDmaAction()`. Real COMCH server lifecycle and message
+handling should live in `homer_service_dpu_comch.c/.h`; real DMA lifecycle,
+descriptor import, buffer/task ownership, PE drain, and callbacks should stay in
+`homer_service_dpu_dma.c/.h`. Do not extract the scheduler-local types only to
+move code out; do that later if the adapter boundary becomes the limiting factor.
 
 ### Minimum state
 
@@ -690,6 +710,51 @@ COMCH is cold/control-plane setup for this phase, not a hot-path publication
 primitive. It should carry descriptors and lifecycle acks; data movement and
 frontier publication stay in DMA-visible memory.
 
+The DPU Homer service is the COMCH server. The host/frontend DMA channel is the
+COMCH client. This matches the deployment shape where the DPU service is the
+long-lived endpoint and host backends/frontends initiate bridge setup for their
+exported memory.
+
+Initial setup may block because it is outside the workload hot path. Blocking is
+allowed only in explicit setup/teardown routines; ready-set construction,
+scheduled DMA submit actions, PE-drain actions, and callbacks must stay bounded
+and nonblocking.
+
+Minimal setup message ABI:
+
+```text
+struct HomerDpuComchSetupHeader {
+    uint32_t protocolVersion;
+    uint32_t messageKind;        // SETUP, SETUP_ACK, CLOSE, CLOSE_ACK
+    uint32_t headerBytes;
+    uint32_t flags;
+    uint64_t bridgeGeneration;
+    uint32_t featureFlags;
+    uint32_t ringCount;
+    uint32_t descriptorBytes;
+    uint32_t mmapExportBytes;
+    uint32_t reserved0;
+};
+
+payload for SETUP:
+    mmap export blob bytes
+    HomerDpuBridgeControlBlockHeader
+    HomerDpuBridgeRingDescriptor[ringCount]
+
+payload for SETUP_ACK:
+    accepted bridgeGeneration
+    accepted featureFlags
+    status/error code
+    rejected ring index or HOMER_DPU_BRIDGE_INVALID_RING_INDEX
+```
+
+The exact C struct can be adjusted while implementing, but the required content
+is fixed: protocol/versioning, message kind, bridge generation, feature flags,
+ring count, descriptor size, mmap export length, exported mmap blob, bridge
+header, descriptor table, and an ack/error result. The DPU COMCH server should
+pass the received export blob to `HomerDpuDmaImportHostMmapDescriptor()` and
+validate the bridge header/descriptors before accepting rings.
+
 Initial setup sequence:
 
 ```text
@@ -1070,10 +1135,27 @@ Acceptance:
 Deliverable: scheduled grouped-control DMA reads of host-publish-line slices plus
 bounded PE drain with real callback/frontier accounting.
 
+Stage 6 is split into two ordered sub-stages:
+
+1. **Stage 6A — COMCH setup path**: implement minimal host/frontend COMCH client
+   and DPU-service COMCH server. The host sends the setup message and waits for
+   ack with a timeout. The DPU receives descriptor bytes, calls
+   `HomerDpuDmaImportHostMmapDescriptor()`, validates bridge header/descriptors,
+   and marks accepted rings setup-ready. No grouped-control DMA reads are
+   submitted yet.
+2. **Stage 6B — grouped-control DMA submit/drain**: allocate or arm concrete
+   `doca_dma_task_memcpy` tasks after descriptor import provides remote source
+   buffers and local staging destination buffers. Submit grouped-control reads
+   under scheduler grants and retire completions through bounded PE-drain grants.
+
 Tasks:
 
+- Implement the minimal COMCH setup message ABI and close/ack shell.
+- Implement the host COMCH client in `homer_frontend_dma.c`.
+- Implement the DPU COMCH server in `homer_service_dpu_comch.c/.h`, keeping
+  `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter.
 - Implement task-owner allocation, generation validation, callback retirement,
-  and task reuse.
+  and task reuse for grouped-control DMA tasks after descriptor import.
 - Submit control-read DMA tasks only under `DPU_DMA_SUBMIT_CONTROL_READS` grants.
 - Implement bounded `doca_pe_progress()` loops controlled by grant budget.
 - Drain completions only under `DPU_DMA_DRAIN_PE` grants.
@@ -1085,6 +1167,12 @@ Tasks:
 
 Acceptance:
 
+- Host/frontend COMCH setup can send a real mmap export blob, bridge header, and
+  ring descriptors to the DPU service and receive a setup ack before any hot-path
+  frontier publication is used.
+- DPU COMCH setup imports the host mmap via `HomerDpuDmaImportHostMmapDescriptor()`
+  and rejects malformed protocol version, descriptor size, generation, or ring
+  geometry with an explicit setup error.
 - Synthetic host publisher can advance frontiers and DPU observes them without
   reading one tail at a time.
 - Drain action stops on first zero-progress return or budget exhaustion.

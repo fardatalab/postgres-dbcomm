@@ -351,11 +351,41 @@ Observed result:
 
 ## Next Stage
 
-Stage 6 should implement real grouped-control submit and bounded PE drain.
-Control-read DMA tasks should be submitted only under
-`DPU_DMA_SUBMIT_CONTROL_READS` grants, completions should be retired only under
-`DPU_DMA_DRAIN_PE` grants, and callbacks should validate task-owner identity,
-publication epochs, generations, and monotonic frontiers.
+Stage 6 should start with the real COMCH setup path, then implement grouped-control
+DMA submit/drain.
+
+Decisions recorded for Stage 6:
+
+- Keep new DPU implementation code out of
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  where sensible. That file remains the current-scheduler adapter for
+  `HomerGrantVector`, `HomerProgressResult`, collector/action enums, and
+  `HomerServiceExecuteDpuDmaAction()`.
+- Put the host COMCH client in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c`,
+  because it is part of DMA-channel setup.
+- Add a service-side `homer_service_dpu_comch.c/.h` for the DPU COMCH server and
+  setup-message handling. It should deliver mmap export bytes to
+  `HomerDpuDmaImportHostMmapDescriptor()` rather than embedding COMCH receive
+  state inside the DMA engine.
+- The DPU Homer service is the COMCH server; the host/frontend DMA channel is
+  the COMCH client.
+- COMCH setup is cold path. It may block while waiting for connection/setup ack,
+  but must use a timeout and explicit diagnostics. Scheduler ready-set building,
+  DMA submit actions, PE-drain actions, and callbacks remain bounded and
+  nonblocking.
+- The setup message should include protocol/versioning, message kind, bridge
+  generation, feature flags, ring count, descriptor size, mmap export length,
+  exported mmap blob, `HomerDpuBridgeControlBlockHeader`,
+  `HomerDpuBridgeRingDescriptor[]`, and an ack/error result.
+
+Stage 6A should implement minimal COMCH setup/ack and descriptor import without
+submitting grouped-control DMA reads. Stage 6B should allocate or arm concrete
+`doca_dma_task_memcpy` tasks after descriptor import provides remote source
+buffers and local staging destination buffers. Control-read DMA tasks should be
+submitted only under `DPU_DMA_SUBMIT_CONTROL_READS` grants, completions should be
+retired only under `DPU_DMA_DRAIN_PE` grants, and callbacks should validate
+task-owner identity, publication epochs, generations, and monotonic frontiers.
 
 The important standalone synthetic host/DPU publisher validation gate moves to
 Stage 6. That gate proves the DPU can submit grouped control-line DMA reads under
