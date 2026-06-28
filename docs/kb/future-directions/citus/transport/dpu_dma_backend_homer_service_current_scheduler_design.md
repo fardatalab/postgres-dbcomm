@@ -1141,8 +1141,9 @@ Stage 6 is split into two ordered sub-stages:
    and DPU-service COMCH server. The host sends the setup message and waits for
    ack with a timeout. The DPU receives descriptor bytes, calls
    `HomerDpuDmaImportHostMmapDescriptor()`, validates bridge header/descriptors,
-   and marks accepted rings setup-ready. No grouped-control DMA reads are
-   submitted yet.
+   and marks accepted rings setup-ready. The DPU service starts independently and
+   listens for host setup; host DB backends connect later when they initialize the
+   DPU frontend path. No grouped-control DMA reads are submitted yet.
 2. **Stage 6B — grouped-control DMA submit/drain**: allocate or arm concrete
    `doca_dma_task_memcpy` tasks after descriptor import provides remote source
    buffers and local staging destination buffers. Submit grouped-control reads
@@ -1168,9 +1169,14 @@ Tasks:
 
 - Implement the minimal COMCH setup message ABI and close/ack shell. The setup
   ABI and setup-ack struct are landed; the close/close-ack shell remains.
+- Integrate the DPU COMCH server so service startup creates the listener and then
+  returns to normal service pumping. Startup must not wait indefinitely for a host
+  DB backend to connect.
 - Implement the host COMCH client in `homer_frontend_dma.c`. The setup-payload
   builder is landed; the standalone transport smoke validates real COMCH
-  connect/send/wait, but production frontend integration remains.
+  connect/send/wait, but production frontend integration remains. Host-side
+  setup is allowed to block because it is cold path, but it must have a timeout
+  and explicit diagnostics.
 - Implement the DPU COMCH server in `homer_service_dpu_comch.c/.h`, keeping
   `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter. The
   setup-payload handler is landed; the standalone transport smoke validates real
@@ -1192,6 +1198,8 @@ Acceptance:
 - Host/frontend COMCH setup can send a real mmap export blob, bridge header, and
   ring descriptors to the DPU service and receive a setup ack before any hot-path
   frontier publication is used.
+- DPU service startup succeeds and starts normal service pumping even when no host
+  backend has connected yet.
 - DPU COMCH setup imports the host mmap via `HomerDpuDmaImportHostMmapDescriptor()`
   and rejects malformed protocol version, descriptor size, generation, or ring
   geometry with an explicit setup error.
@@ -1211,6 +1219,34 @@ Acceptance:
 - A standalone host+DPU grouped-control test proves control-read DMA submission
   and callback retirement are separated: submit action queues reads, PE-drain
   action observes and validates them.
+
+### Promotion Path To Non-Experimental DPU Mode
+
+The implementation should move from hidden experimental guard to normal DPU mode
+only after the DPU path is a complete Homer channel:
+
+1. **Experimental setup path**: replace the current frontend smoke-and-error path
+   with real host setup against an independently running DPU service. The host
+   exports bridge memory, sends setup over COMCH, and waits for ack with a finite
+   timeout.
+2. **Experimental functional DPU channel**: implement grouped-control DMA reads,
+   PE drain, command pull, completion push, payload/basebackup pulls, and
+   consumed-head publication. A session that selects DPU mode must use DPU DMA or
+   fail explicitly; it must not silently fall back to the old SHM host-process
+   boundary.
+3. **Validation mode**: keep DPU mode opt-in while repeated correctness and
+   lifecycle gates run: setup/teardown, backend connect/disconnect, single-client
+   and multi-client pgbench, payload/basebackup paths as they land, DPU service
+   restart/timeout behavior, and service log scans.
+4. **Non-experimental DPU mode**: replace
+   `citus.enable_experimental_homer_dpu_frontend` with a normal DPU transport or
+   mode selector only after semantics and validation are solid. This selector is
+   for choosing the DPU implementation during migration, not for falling back from
+   DPU to SHM inside one session.
+5. **Default DPU path**: make DPU the normal Homer boundary once correctness,
+   lifecycle stability, and performance are acceptable. At that point SHM should
+   be removed or retained only as separate legacy/development code, not as a
+   runtime fallback for DPU operation.
 
 ### Stage 7 — Command/control request pull
 

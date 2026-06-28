@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6A.3, the default frontend and service path is still the existing
+As of Stage 6A.4, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the frontend runs a host-side bridge-memory smoke check and still
@@ -674,10 +674,11 @@ sudo -n -u dbcomm make dpu-comch-transport-smoke-bin dpu-comch-abi-check dpu-bri
 Stage 6A should next integrate the real DOCA COMCH endpoint lifecycle into the
 host frontend setup path and DPU service startup path, using the validated
 farnet1 COMCH defaults DPU server `dev=0000:03:00.0` and `rep=0000:21:00.0`
-unless the deployment is explicitly configured otherwise. The DPU DMA engine now
-separately defaults its local DMA device to `0000:03:00.0` and accepts
-`HOMER_SERVICE_DOCA_DEV_PCI` as an override. Stage 6B should then implement
-grouped-control DMA submit/drain.
+unless the deployment is explicitly configured otherwise. The DPU service should
+start independently and listen for host setup; it must not block service startup
+waiting for a DB backend. The DPU DMA engine now separately defaults its local
+DMA device to `0000:03:00.0` and accepts `HOMER_SERVICE_DOCA_DEV_PCI` as an
+override. Stage 6B should then implement grouped-control DMA submit/drain.
 
 Decisions recorded for Stage 6:
 
@@ -699,11 +700,48 @@ Decisions recorded for Stage 6:
   but must use a timeout and explicit diagnostics. Scheduler ready-set building,
   DMA submit actions, PE-drain actions, and callbacks remain bounded and
   nonblocking.
+- The independent service-startup rule is: service startup creates the DPU DMA
+  engine and COMCH listener, then returns to normal service pumping. Host DB
+  backends connect later from the DPU frontend setup path, export bridge memory,
+  send setup over COMCH, and wait for ack with a finite timeout.
 - The setup message includes protocol/versioning, message kind, bridge
   generation, feature flags, ring count, descriptor size, mmap export length,
   exported mmap blob, `HomerDpuBridgeControlBlockHeader`,
   `HomerDpuBridgeRingDescriptor[]`, and an ack/error result. This ABI is now
   implemented and validated by Stage 6A.1.
+
+## Promotion Path Toward Non-Experimental DPU Mode
+
+The DPU path should not become "production" merely by renaming
+`citus.enable_experimental_homer_dpu_frontend`. Promotion is gated by functional
+coverage and validation. The intended path is:
+
+1. **Experimental setup path**: replace the current frontend bridge-memory
+   smoke-and-error with real host setup. The host frontend allocates/registers
+   bridge memory, exports the mmap, builds the COMCH setup payload, connects to
+   the independently running DPU service, sends setup, and waits for ack with a
+   timeout. This remains guarded because no real command/completion execution is
+   complete yet.
+2. **Experimental functional DPU channel**: implement grouped-control DMA reads,
+   bounded PE drain, command pull, completion push, payload/basebackup byte-stream
+   pull, and consumed-head publication. A DPU-mode session must either complete
+   setup and use the DPU path or fail explicitly; it must not silently fall back
+   to SHM.
+3. **Validation mode**: keep DPU mode opt-in while running repeated
+   correctness/lifecycle gates: setup/teardown, backend connect/disconnect,
+   single-client pgbench, multi-client pgbench, payload/basebackup cases as they
+   land, DPU service restart behavior, timeout/error diagnostics, and service log
+   scans. Failures in DPU mode should be treated as DPU path bugs unless a
+   specific recoverable policy is designed.
+4. **Non-experimental DPU mode**: once the DPU path preserves Homer semantics and
+   passes the validation gates, replace the hidden experimental guard with a
+   normal DPU transport/mode selector. This is not a fallback selector: SHM remains
+   the old host-process implementation during migration, while a selected DPU
+   session uses the host-DPU boundary exclusively.
+5. **Default DPU path**: make DPU mode the normal Homer path after performance and
+   stability are acceptable for the target workloads. At that point SHM should be
+   removed or left only as intentionally separate legacy/development code, not as
+   a runtime fallback inside DPU operation.
 
 Remaining Stage 6A work should move the validated standalone COMCH lifecycle
 into production setup: service-side server creation during DPU service startup,
