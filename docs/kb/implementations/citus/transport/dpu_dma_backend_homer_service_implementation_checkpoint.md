@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6A.1, the default frontend and service path is still the existing
+As of Stage 6A.2, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the frontend runs a host-side bridge-memory smoke check and still
@@ -21,7 +21,10 @@ staging buffers, one PE plus per-class DMA contexts, and an imported-host-mmap
 descriptor API. Stage 6A.1 adds a shared COMCH setup-message ABI and
 service-side setup handler that validates received setup bytes and routes mmap
 descriptor import through `HomerDpuDmaImportHostMmapDescriptor()`. It still does
-not create real COMCH endpoints, submit DOCA DMA tasks, or drain a DOCA PE.
+not submit DOCA DMA tasks or drain a DOCA PE. Stage 6A.2 adds a standalone real
+DOCA COMCH transport smoke for the setup bytes and validates the farnet1 host to
+farnet1 DPU control-channel path. The service and frontend do not yet call that
+transport lifecycle directly.
 
 ## Stage 1: Bridge ABI Header
 
@@ -431,11 +434,93 @@ Observed result:
   deprecated experimental reuse APIs. These warnings remain from DOCA headers,
   not from Homer calling those helpers.
 
+## Stage 6A.2: Standalone DOCA COMCH Transport Smoke
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c` adds a
+  standalone server/client smoke for the real DOCA COMCH endpoint lifecycle. The
+  DPU-side server opens a DOCA device and representor, creates a COMCH server,
+  validates one received `HomerDpuComchSetupHeader` payload, and replies with a
+  `HomerDpuComchSetupAck`. The host-side client creates a COMCH client, sends a
+  synthetic setup payload using the shared ABI, waits for the ack, and validates
+  the ack status.
+- `/data/dbcomm/citus-dbcomm/Makefile` adds `DOCA_COMCH_CFLAGS`,
+  `DOCA_COMCH_LIBS`, and `dpu-comch-transport-smoke-bin`.
+
+Scope boundary:
+
+- This stage proves the real DOCA COMCH control channel can carry the Homer
+  setup bytes between host and DPU. It still uses a synthetic mmap export blob,
+  so it does not replace the Stage 6A.1 DMA-engine import smoke.
+- The new smoke does not link into `citus.so`, `homer_frontend_dma.c`, or the
+  production `citus_tuple_sink_service` startup path yet. That integration is
+  the next Stage 6A step.
+- DPU source is not checked out under `/data/dbcomm/citus-dbcomm` on the DPU, so
+  validation copied only the smoke source and ABI headers into
+  `/tmp/homer_dpu_comch_smoke` and compiled there with the DPU aarch64 DOCA
+  libraries.
+
+Representor finding:
+
+- The initial assumption that the DPU-side SF representor
+  `0000:03:00.0` / `en3f0pf0sf0` should be used as the COMCH server representor
+  did **not** work for the host-DPU setup channel. With DPU server
+  `--dev-pci 0000:03:00.0 --rep-pci 0000:03:00.0`, the server started and
+  timed out after 15 seconds, while the host client using `--dev-pci
+  0000:21:00.0` failed with `Connection aborted`.
+- The working DPU-side representor for the farnet1 host-to-DPU COMCH smoke is
+  the host PF representor `0000:21:00.0` under DPU local device
+  `0000:03:00.0`. With DPU server `--dev-pci 0000:03:00.0 --rep-pci
+  0000:21:00.0` and host client `--dev-pci 0000:21:00.0`, the host received a
+  valid setup ack and both processes exited successfully.
+
+## Validation
+
+Stage 6A.2 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make dpu-comch-transport-smoke-bin dpu-comch-abi-check dpu-bridge-abi-check
+
+ssh dpu "rm -rf /tmp/homer_dpu_comch_smoke && mkdir -p /tmp/homer_dpu_comch_smoke/src/bin /tmp/homer_dpu_comch_smoke/src/include/distributed/homer"
+rsync -az src/bin/homer_dpu_comch_transport_smoke.c dpu:/tmp/homer_dpu_comch_smoke/src/bin/
+rsync -az src/include/distributed/homer/homer_abi_version.h src/include/distributed/homer/homer_dpu_bridge_abi.h src/include/distributed/homer/homer_dpu_comch_abi.h dpu:/tmp/homer_dpu_comch_smoke/src/include/distributed/homer/
+ssh dpu 'cd /tmp/homer_dpu_comch_smoke && gcc -std=gnu99 -Wall -Wextra -Werror=vla -I src/include $(pkg-config --cflags doca-comch doca-common) -o homer_dpu_comch_transport_smoke src/bin/homer_dpu_comch_transport_smoke.c $(pkg-config --libs doca-comch doca-common)'
+
+ssh dpu 'cd /tmp/homer_dpu_comch_smoke && ./homer_dpu_comch_transport_smoke --server --name homer-dpu-comch-default-test --timeout-ms 15000'
+./build/homer/homer_dpu_comch_transport_smoke --client --name homer-dpu-comch-default-test --timeout-ms 15000
+```
+
+Observed result:
+
+- Host build of `homer_dpu_comch_transport_smoke` completed successfully.
+- DPU aarch64 build under `/tmp/homer_dpu_comch_smoke` completed successfully.
+- Failed representor attempt:
+  - Host client: `homer_dpu_comch_transport_smoke: failed: Connection aborted`
+  - DPU server with `--rep-pci 0000:03:00.0`: `COMCH smoke timed out after
+    15000 ms`
+- Working default attempt:
+  - Host client printed `client received setup ack generation=1 rings=1
+    imported_bytes=16` and `homer_dpu_comch_transport_smoke: ok`.
+  - DPU server printed `server ready name=homer-dpu-comch-default-test
+    dev=0000:03:00.0 rep=0000:21:00.0 timeout_ms=15000` and
+    `homer_dpu_comch_transport_smoke: ok`.
+- Existing source validation still passed:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make dpu-comch-transport-smoke-bin dpu-comch-abi-check dpu-bridge-abi-check frontend-dma-smoke service-dpu-dma-smoke service-dpu-dma-doca-smoke service-bin client-bin
+sudo -n -u dbcomm make -j8
+```
+
 ## Next Stage
 
-Stage 6A should next add the real DOCA COMCH endpoint lifecycle around the
-validated setup bytes, then Stage 6B should implement grouped-control DMA
-submit/drain.
+Stage 6A should next integrate the real DOCA COMCH endpoint lifecycle into the
+host frontend setup path and DPU service startup path, using the validated
+farnet1 DPU default `dev=0000:03:00.0` and `rep=0000:21:00.0` unless the
+deployment is explicitly configured otherwise. Stage 6B should then implement
+grouped-control DMA submit/drain.
 
 Decisions recorded for Stage 6:
 
@@ -463,16 +548,16 @@ Decisions recorded for Stage 6:
   `HomerDpuBridgeRingDescriptor[]`, and an ack/error result. This ABI is now
   implemented and validated by Stage 6A.1.
 
-Remaining Stage 6A work should wrap the validated bytes in real DOCA COMCH
-client/server lifecycle: service-side server creation, DPU representor/device
-selection, host-side client connect, blocking cold-path send/wait with timeout,
-ack receive, close/close-ack shell, and diagnostics. Stage 6B should allocate or
-arm concrete `doca_dma_task_memcpy` tasks after descriptor import provides
-remote source buffers and local staging destination buffers. Control-read DMA
-tasks should be submitted only under `DPU_DMA_SUBMIT_CONTROL_READS` grants,
-completions should be retired only under `DPU_DMA_DRAIN_PE` grants, and
-callbacks should validate task-owner identity, publication epochs, generations,
-and monotonic frontiers.
+Remaining Stage 6A work should move the validated standalone COMCH lifecycle
+into production setup: service-side server creation during DPU service startup,
+host-side client connect from the frontend DMA setup path, blocking cold-path
+send/wait with timeout, ack receive, close/close-ack shell, and diagnostics.
+Stage 6B should allocate or arm concrete `doca_dma_task_memcpy` tasks after
+descriptor import provides remote source buffers and local staging destination
+buffers. Control-read DMA tasks should be submitted only under
+`DPU_DMA_SUBMIT_CONTROL_READS` grants, completions should be retired only under
+`DPU_DMA_DRAIN_PE` grants, and callbacks should validate task-owner identity,
+publication epochs, generations, and monotonic frontiers.
 
 The important standalone synthetic host/DPU publisher validation gate moves to
 Stage 6. That gate proves the DPU can submit grouped control-line DMA reads under

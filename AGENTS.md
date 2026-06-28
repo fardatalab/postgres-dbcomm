@@ -51,6 +51,19 @@ June 28, 2026:
 - `farnet1` DPU: from `farnet1`, run `ssh dpu`; `enp3s0f0s0` is
   `10.10.1.201/24`.
 
+For DOCA COMCH host-to-DPU setup on farnet1, the DPU-side COMCH server should
+open local DOCA device `0000:03:00.0` with host PF representor `0000:21:00.0`.
+The SF representor `0000:03:00.0` / `en3f0pf0sf0` was tested as the server
+representor on June 28, 2026 and did not establish the host-DPU COMCH control
+channel: the DPU server timed out and the host client reported `Connection
+aborted`. The working smoke used the DPU command shape:
+
+```sh
+./homer_dpu_comch_transport_smoke --server --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0
+```
+
+and the farnet1 host client default device `0000:21:00.0`.
+
 The second host fast-link addresses were also configured on June 17, 2026:
 
 - `farnet0` host: `10.10.2.100`
