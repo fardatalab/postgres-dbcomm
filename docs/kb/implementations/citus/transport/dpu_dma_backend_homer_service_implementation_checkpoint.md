@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6A.8, the default frontend and service path is still the existing
+As of Stage 6B.1, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -46,7 +46,15 @@ plus client instance ID. This lets the DPU service accept multiple future
 backend/frontend setup imports without conflating their mmap descriptors; duplicate
 setup identity is rejected explicitly. Stage 6A.8 adds the production frontend
 COMCH setup client code path in `homer_frontend_dma.c` and opt-in DOCA extension
-linkage. No grouped-control DMA read is submitted yet.
+linkage. Stage 6B.1 adds the first real grouped-control DMA read path: the DPU
+DMA engine stores copied bridge headers/descriptors in the import table, submits
+cache-line reads of host-published control lines only through a bounded submit
+API, drains completions only through a bounded PE-drain API, and exposes copied
+snapshots only after the completion callback retires the task. The current
+scheduler adapter now calls these engine APIs for
+`HOMER_PROGRESS_ACTION_DPU_GROUPED_CONTROL_READ` and
+`HOMER_PROGRESS_ACTION_DPU_PE_DRAIN`. This still stops before Stage 7 command
+pulling and does not populate semantic ready-ring facts yet.
 
 ## Stage 1: Bridge ABI Header
 
@@ -1090,17 +1098,137 @@ Observed result:
   DOCA dependency, and PostgreSQL was restarted back into that default runtime
   shape.
 
+## Stage 6B.1: Grouped-Control DMA Submit And PE Drain
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:82`
+  defines `HomerDpuDmaProgressResult`, the scheduler-facing result summary for
+  submitted tasks, completed tasks, failed tasks, PE progress calls, empty polls,
+  budget exhaustion, and fatal errors.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:101`
+  extends `HomerDpuDmaImportHostMmapDescriptorForSetup()` so COMCH setup passes
+  the parsed `HomerDpuBridgeControlBlockHeader` and
+  `HomerDpuBridgeRingDescriptor[]` into the DMA engine import table.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:315`
+  now forwards those parsed bridge metadata pointers from
+  `HomerServiceDpuComchHandleSetupPayload()` into the DMA engine instead of
+  importing only raw mmap export bytes.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:109`
+  exposes `HomerDpuDmaSubmitGroupedControlReads()`,
+  `HomerDpuDmaDrainPe()`, and `HomerDpuDmaCopyGroupedControlSnapshot()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:376`
+  implements the bounded submit API. It walks active imported host mmaps, skips
+  rings with an in-flight control read, submits at most the granted task budget,
+  and does not call `doca_pe_progress()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:462`
+  implements the bounded PE-drain API. It calls `doca_pe_progress()` at most the
+  requested poll budget and stops on the first zero-progress return.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:530`
+  copies a completed grouped-control snapshot only after the callback has marked
+  that ring snapshot valid.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1015`
+  builds the source and destination `doca_buf` objects for one host-publish-line
+  read. The source buffer must call `doca_buf_set_data()` at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1023`;
+  without this, the real DPU read task submitted but completed with
+  `Input/Output Operation Failed`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1064`
+  submits grouped-control discovery reads with `doca_task_submit_ex(...,
+  DOCA_TASK_SUBMIT_FLAG_FLUSH)`. Discovery reads are boundary tasks, not
+  optimized-report payload tasks, because there may be no later sentinel to flush
+  them.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1487`
+  and `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1513`
+  retire successful/error DMA callbacks. Callback code validates the task slot
+  identity/generation, does not call PE progress, frees task/buffer ownership,
+  marks successful snapshots visible, and treats DMA task failure as fatal.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35870`
+  now lets `HOMER_PROGRESS_ACTION_DPU_PE_DRAIN` drain both the COMCH server PE
+  and the DMA engine PE under the same granted poll budget.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35929`
+  now lets `HOMER_PROGRESS_ACTION_DPU_GROUPED_CONTROL_READ` submit bounded
+  grouped-control reads through the DMA engine.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:58`
+  adds `--submit-control-read` to the host/DPU COMCH transport smoke. The host
+  client writes a synthetic host-publish line into the exported mmap, and the DPU
+  server imports the mmap, submits one grouped-control DMA read, drains it, checks
+  the copied epoch/tail/cookie, and only then sends setup ack.
+
+Important implementation details and decisions:
+
+- Stage 6B.1 explicitly defers close/close-ack to Stage 10 teardown. The current
+  slice needed the real grouped-control DMA submit/drain path before command
+  pulling can start; adding close now would not validate the hot discovery
+  invariant.
+- The production engine stores copied bridge metadata in
+  `HomerDpuDmaHostMmapImport`. A later task must not rely on transient COMCH
+  receive buffers after the callback returns.
+- The submit action and drain action are intentionally separate. Submit queues
+  DMA tasks and returns; only PE drain invokes callbacks and makes snapshots
+  visible.
+- The host-local DOCA DMA smoke keeps the grouped-control DMA read behind
+  `HOMER_DPU_DMA_SMOKE_RUN_GROUPED_CONTROL_READ`, because a same-host
+  create-from-export path produced a DMA `Input/Output Operation Failed` and is
+  not the target host-DPU mapping. The meaningful validation is the
+  host-to-DPU transport smoke below.
+
+Stage 6B.1 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make service-dpu-dma-smoke service-dpu-dma-doca-smoke \
+  dpu-comch-transport-smoke-bin service-bin client-bin
+
+# DPU-side AArch64 build from the same changed sources.
+DPU_DIR=/tmp/homer_dpu_comch_stage6b_control_read
+ssh dpu "cd $DPU_DIR && gcc -std=gnu99 -Wall -Wextra \
+  -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers \
+  -Wno-deprecated-declarations -DHOMER_DPU_DMA_WITH_DOCA \
+  -DALLOW_EXPERIMENTAL_API -I/opt/mellanox/doca/include \
+  -I/usr/include/libnl3 -Isrc/include \
+  -Isrc/backend/distributed/utils/homer \
+  -o homer_dpu_comch_transport_smoke \
+  src/bin/homer_dpu_comch_transport_smoke.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_comch.c \
+  -L/opt/mellanox/doca/lib/aarch64-linux-gnu \
+  -ldoca_comch -ldoca_dma -ldoca_common"
+
+ssh dpu "cd /tmp/homer_dpu_comch_stage6b_control_read && \
+  LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu \
+  ./homer_dpu_comch_transport_smoke --server --import-dma \
+  --submit-control-read --name homer-dpu-comch-stage6b-data \
+  --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0 \
+  --timeout-ms 20000 \
+  > /tmp/homer-dpu-comch-stage6b-data-server.log 2>&1" &
+
+LD_LIBRARY_PATH=/opt/mellanox/doca/lib/x86_64-linux-gnu \
+  ./build/homer/homer_dpu_comch_transport_smoke --client --real-mmap \
+  --name homer-dpu-comch-stage6b-data --dev-pci 0000:21:00.0 \
+  --timeout-ms 20000
+```
+
+Observed result:
+
+- `homer_service_dpu_dma_smoke: ok`
+- `homer_service_dpu_dma_smoke: ok` for the DOCA-enabled build, with only DOCA
+  experimental/deprecation header warnings.
+- `service-bin` and `client-bin` built.
+- The first real host-to-DPU grouped-control DMA read attempt failed until the
+  source `doca_buf_set_data()` call was added. After that fix, the host client
+  printed `client received setup ack generation=1 rings=1 imported_bytes=280` and
+  exited `ok`.
+- The DPU server log contained
+  `server DMA grouped-control read complete epoch=1 tail=17 cookie=65261` and
+  `homer_dpu_comch_transport_smoke: ok`.
+
 ## Next Stage
 
-Stage 6A should next add the close/close-ack shell, or explicitly defer close to
-Stage 10 teardown and move into Stage 6B grouped-control DMA submit/drain. The
-service side now owns the COMCH listener and progresses it through bounded
-scheduler actions, the DMA engine can retain multiple imported host mmaps keyed
-by setup identity, the frontend has the opt-in DOCA COMCH setup client, and the
-actual PostgreSQL backend/frontend setup call path has been validated against an
-import-enabled DPU COMCH peer. Stage 6B should allocate/arm concrete
-grouped-control DMA tasks after descriptor import and retire them only through
-bounded `DPU_DMA_DRAIN_PE` grants.
+Stage 6B should next turn the completed grouped-control snapshots into DPU-local
+ready-ring facts by validating publication epochs, generations, and monotonic
+frontiers for host-published lines. After that, Stage 7 can replace the selected
+DPU command `not implemented` guard with DPU-pulled command request slots.
 
 Decisions recorded for Stage 6:
 
@@ -1136,44 +1264,15 @@ Decisions recorded for Stage 6:
   `HomerDpuBridgeRingDescriptor[]`, and an ack/error result. This ABI is now
   implemented and validated by Stage 6A.1.
 
-## Promotion Gates Are Stage Work
-
-Promotion to non-experimental DPU mode is not tracked as a separate late cleanup.
-The current-scheduler design note now folds that work into the relevant stage
-tasks and acceptance gates:
-
-- Stage 6 must turn a selected DPU frontend setup into a real COMCH/mmap setup
-  attempt, or a bounded DPU setup failure, before any SHM mapping can occur.
-- Stage 7 must replace the selected-DPU command `not implemented` guard with
-  DPU-pulled command request slots. SHM command success remains only a DPU-off
-  regression check.
-- Stage 8 must make selected-DPU completion polling consume DPU-published
-  completion/credit lines, not host-process SHM completion mailboxes.
-- Stage 9 must make selected-DPU payload and basebackup streams use host-published
-  byte rings plus DPU DMA pulls, not local SHM queues as an escape path.
-- Stage 10 must define reconnect, teardown, generation reset, and service-restart
-  behavior for selected DPU sessions without SHM continuation.
-- Stage 11 must replace the hidden experimental selector with the normal DPU
-  transport/mode selector only after the functional, lifecycle, and measurement
-  gates pass.
-
+Promotion to non-experimental DPU mode is tracked directly in the staged TODOs
+and acceptance gates of
+`docs/kb/future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md`.
 The old host-process SHM path can remain buildable during migration as a DPU-off
-comparison path, but it is not acceptance evidence for selected DPU mode and must
-not be used as a runtime fallback inside DPU operation.
+comparison path, but selected DPU mode must not use it as a runtime fallback.
 
-Remaining Stage 6A work should move the validated standalone COMCH lifecycle
-into production setup: service-side server creation during DPU service startup,
-host-side client connect from the frontend DMA setup path, blocking cold-path
-send/wait with timeout, ack receive, close/close-ack shell, and diagnostics.
-Stage 6B should allocate or arm concrete `doca_dma_task_memcpy` tasks after
-descriptor import provides remote source buffers and local staging destination
-buffers. Control-read DMA tasks should be submitted only under
-`DPU_DMA_SUBMIT_CONTROL_READS` grants, completions should be retired only under
-`DPU_DMA_DRAIN_PE` grants, and callbacks should validate task-owner identity,
-publication epochs, generations, and monotonic frontiers.
-
-The important standalone synthetic host/DPU publisher validation gate moves to
-Stage 6. That gate proves the DPU can submit grouped control-line DMA reads under
-scheduler grants, retire the read completions only through bounded PE-drain
-grants, validate publication epochs/generations/frontiers, and populate
-DPU-local ready facts without reading one tail at a time.
+After Stage 6B.1, the remaining grouped-control work is not task submission
+itself but semantic interpretation of completed snapshots: validate host
+publication epochs, generations, and monotonic frontiers, then populate
+DPU-local ready facts without reading one tail at a time. Close/close-ack and
+reclaim remain folded into Stage 10 teardown rather than blocking Stage 7
+command-pull work.

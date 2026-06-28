@@ -938,18 +938,18 @@ Tasks:
   collectors/actions.
 - Keep SHM as the default DPU-off runtime path only while no selected DPU path is
   runnable.
-- Record that promotion to normal DPU mode is not a separate late cleanup: later
-  stages must replace each selected DPU-mode fallback with a real DPU DMA/COMCH
-  path or an explicit bounded DPU error.
+- Record the promotion rule that later stages carry directly: every selected
+  DPU-mode guard, placeholder, or old host-process dependency must be replaced
+  in the stage that first needs that behavior, not saved for a final cleanup
+  pass.
 
 Acceptance:
 
 - No behavior change.
 - The plan explicitly distinguishes current-scheduler migration from future
   scheduler cleanup.
-- The implementation sequence below carries the promotion work in the relevant
-  stage tasks and acceptance gates, rather than leaving it as a standalone
-  paragraph.
+- Stages 6 through 11 each name the selected-DPU fallback or placeholder they
+  must eliminate before that stage can be considered complete.
 
 ### Stage 1 — Bridge ABI header
 
@@ -1208,6 +1208,17 @@ Stage 7 command-pull `not implemented` guard. The exact PostgreSQL backend
 runtime invocation of that helper has been validated against the standalone
 import-enabled DPU COMCH smoke server. Full DPU-resident
 `citus_tuple_sink_service` runtime validation remains a later deployment gate.
+Stage 6B.1 then added the first real grouped-control DMA submit/drain slice:
+COMCH setup now copies the bridge header and descriptor table into the DPU DMA
+import table, `HomerDpuDmaSubmitGroupedControlReads()` submits cache-line reads
+under bounded scheduler grants, `HomerDpuDmaDrainPe()` runs bounded PE progress
+and retires callbacks, and `HomerDpuDmaCopyGroupedControlSnapshot()` exposes a
+snapshot only after the callback marks it valid. The current scheduler adapter
+now calls those APIs for `HOMER_PROGRESS_ACTION_DPU_GROUPED_CONTROL_READ` and
+`HOMER_PROGRESS_ACTION_DPU_PE_DRAIN`. A real farnet1 host-to-DPU validation
+passed with the standalone COMCH transport smoke after adding
+`doca_buf_set_data()` for the source `doca_buf`; without that call the DPU DMA
+task submitted but completed with `Input/Output Operation Failed`.
 
 Tasks:
 
@@ -1233,6 +1244,9 @@ Tasks:
   frontend setup must attempt the real COMCH/mmap setup against the independently
   running DPU service and then either mark the DPU bridge setup-ready or return a
   bounded DPU setup error. It must not reopen the SHM frontend path.
+- Treat Stage 6 promotion work as the setup replacement gate: the selected-DPU
+  setup path may still end at the Stage 7 command guard, but it must already use
+  real COMCH/mmap setup or fail with a bounded DPU setup error.
 - Keep the DPU selector experimental in Stage 6, but make the selected path real
   enough to validate setup: the old bridge-memory smoke may remain as a local
   preflight check, but it must no longer be the terminal behavior for a selected
@@ -1254,15 +1268,25 @@ Tasks:
   backend/frontend bridge setup and resolve grouped-control buffers through that
   entry.
 - Implement task-owner allocation, generation validation, callback retirement,
-  and task reuse for grouped-control DMA tasks after descriptor import.
+  and task reuse for grouped-control DMA tasks after descriptor import. Done for
+  the physical task/snapshot lifecycle in Stage 6B.1; semantic ready-frontier
+  validation remains next.
 - Submit control-read DMA tasks only under `DPU_DMA_SUBMIT_CONTROL_READS` grants.
-- Implement bounded `doca_pe_progress()` loops controlled by grant budget.
-- Drain completions only under `DPU_DMA_DRAIN_PE` grants.
-- Validate task owner identity, publication words, generations, and frontiers in
-  callbacks.
+  Done in Stage 6B.1 via `HOMER_PROGRESS_ACTION_DPU_GROUPED_CONTROL_READ`.
+- Implement bounded `doca_pe_progress()` loops controlled by grant budget. Done
+  for DMA engine PE drain in Stage 6B.1.
+- Drain completions only under `DPU_DMA_DRAIN_PE` grants. Done for grouped
+  control reads in Stage 6B.1.
+- Validate task owner identity in callbacks. Done in Stage 6B.1. Publication
+  words, generations, and monotonic frontiers must be validated when completed
+  snapshots are converted into ready-ring facts.
 - Populate DPU-local ready bits/counts for rings with new observed frontiers.
 - Report `cqesDrained`, `emptyPolls`, `stillReady`, and `budgetExhausted`.
-- Prohibit nested PE progress from callbacks.
+  Stage 6B.1 reports submitted/completed/empty work through the adapter; richer
+  `stillReady`/`budgetExhausted` feedback should be preserved when ready facts
+  are added.
+- Prohibit nested PE progress from callbacks. Done for grouped-control DMA
+  callbacks in Stage 6B.1.
 
 Acceptance:
 
@@ -1278,6 +1302,9 @@ Acceptance:
 - The selected DPU setup path has no SHM fallback branch. In non-DOCA builds it
   may fail with a compile-time capability error; in DOCA-enabled builds it must
   attempt COMCH/mmap setup or return a bounded DPU setup error.
+- Stage 6 is not accepted if selecting DPU mode can still complete frontend
+  initialization by remapping the host-process SHM channel after the DPU setup
+  guard has accepted the mode.
 - Before Stage 6A is closed, the production PostgreSQL backend/frontend path must
   be exercised against an independently running DPU COMCH service, not only
   compiled or validated through the standalone host client. Done against the
@@ -1290,9 +1317,12 @@ Acceptance:
   duplicate bridge generation plus client instance ID is rejected before later
   DMA task ownership can become ambiguous.
 - Synthetic host publisher can advance frontiers and DPU observes them without
-  reading one tail at a time.
-- Drain action stops on first zero-progress return or budget exhaustion.
-- In-flight tasks remain represented in DPU-local facts for later grants.
+  reading one tail at a time. Done for one host-published line in the Stage 6B.1
+  host-to-DPU COMCH transport smoke.
+- Drain action stops on first zero-progress return or budget exhaustion. Done for
+  `HomerDpuDmaDrainPe()` in Stage 6B.1.
+- In-flight tasks remain represented in DPU-local facts for later grants. Done
+  for grouped-control in-flight counts in Stage 6B.1.
 - Expected lifecycle staleness, such as old ring generation after teardown, is
   ignored and counted diagnostically.
 - Stale generation callbacks do not publish any host-visible state.
@@ -1301,10 +1331,13 @@ Acceptance:
   frontiers, fail the DPU engine fatally instead of being silently ignored.
 - Unchanged publication words are counted as empty/no-new-work, not as errors.
 - Debug invariant mode proves submit actions do not call `doca_pe_progress()` and
-  callbacks do not submit follow-on DMA work.
+  callbacks do not submit follow-on DMA work. Stage 6B.1 implements this shape
+  for grouped-control reads; a debug invariant mode can still make it explicit.
 - A standalone host+DPU grouped-control test proves control-read DMA submission
   and callback retirement are separated: submit action queues reads, PE-drain
-  action observes and validates them.
+  action observes and validates them. Done in Stage 6B.1 with
+  `homer_dpu_comch_transport_smoke --server --import-dma
+  --submit-control-read` on the DPU and `--client --real-mmap` on the host.
 
 ### Stage 7 — Command/control request pull
 
@@ -1332,6 +1365,10 @@ Tasks:
   staged request-slot pull path. After this stage, a selected DPU command session
   should fail only for DPU setup/protocol/runtime errors, not because command
   execution is still deliberately blocked.
+- Treat Stage 7 promotion work as the command replacement gate: selected-DPU
+  command APIs must publish host request slots for DPU pull, and any remaining
+  command failure must be a DPU setup/protocol/runtime failure rather than a
+  deliberate migration placeholder.
 
 Acceptance:
 
@@ -1349,6 +1386,9 @@ Acceptance:
 - The hidden experimental selector remains required, but command API acceptance
   evidence must be collected through the selected DPU path. SHM command success
   is only a DPU-off regression check.
+- Stage 7 is not accepted if selected-DPU command execution can still reach the
+  old host-process SHM command ring, even as a convenience fallback after a DPU
+  setup or command-pull error.
 - Early response publication negative test fails as expected.
 - Before real backend command execution, a synthetic request-slot pull test DMA
   reads one fixed request slot into DPU-local staging, validates owner/generation,
@@ -1373,6 +1413,9 @@ Tasks:
 - Remove the selected-DPU completion dependency on host-process SHM completion
   mailboxes. The old mailbox code may remain for DPU-off mode, but DPU-mode
   command completion must be driven by DPU-published lines.
+- Treat Stage 8 promotion work as the completion replacement gate: selected-DPU
+  completion polling must consume DPU-written completion/credit publication
+  lines and must not use host-process SHM completion mailboxes after selection.
 
 Acceptance:
 
@@ -1385,6 +1428,9 @@ Acceptance:
 - In DPU mode, completion polling consumes only DPU-published completion/credit
   lines. A missing or invalid DPU completion path must return a DPU-path error,
   not poll the old SHM completion mailbox as a fallback.
+- Stage 8 is not accepted if a selected-DPU session can report command completion
+  from the old host-process mailbox when the DPU completion path is absent,
+  stale, or invalid.
 
 ### Stage 9 — Payload and basebackup byte-stream pull
 
@@ -1409,6 +1455,9 @@ Tasks:
   host-process SHM queues with host-published byte rings and DPU DMA pulls. The
   SHM byte-stream path remains useful only for DPU-off comparison during
   migration.
+- Treat Stage 9 promotion work as the payload/basebackup replacement gate:
+  selected-DPU byte streams must publish host byte-ring frontiers for DPU pull and
+  must not use host-process SHM queues as an escape path for large transfers.
 
 Acceptance:
 
@@ -1423,6 +1472,9 @@ Acceptance:
 - A DPU-mode payload/basebackup stream whose DPU setup is missing, stale, or
   generation-mismatched fails explicitly before payload publication; it must not
   switch the stream back to local SHM queues.
+- Stage 9 is not accepted if foreground commands use the selected-DPU boundary
+  while background payload/basebackup traffic silently remains on local
+  host-process SHM queues.
 - Mixed command plus basebackup validation runs with both workloads on the DPU
   boundary so foreground/background interference measurements are meaningful for
   the migrated design.
@@ -1447,6 +1499,9 @@ Tasks:
 - Convert setup/teardown/reconnect behavior from experimental smoke semantics
   into the lifecycle contract for selected DPU mode: selected DPU sessions either
   reconnect through COMCH with a new generation or fail boundedly.
+- Treat Stage 10 promotion work as the lifecycle replacement gate: selected-DPU
+  teardown, reconnect, and service-restart handling must use generation reset and
+  fresh COMCH setup, not SHM continuation.
 
 Acceptance:
 
@@ -1459,6 +1514,9 @@ Acceptance:
 - DPU service restart while host backends are alive causes bounded DPU-mode
   failures and generation rejection; surviving host sessions must not continue on
   SHM as an implicit recovery path.
+- Stage 10 is not accepted if teardown, backend reconnect, or DPU service
+  restart can recover a selected-DPU session by switching that session to the
+  host-process SHM transport.
 
 ### Stage 11 — Measurement and tuning
 
@@ -1481,6 +1539,10 @@ Tasks:
   experimental selector with the normal DPU transport/mode selector. This
   promotion is a Stage 11 deliverable because the final decision depends on both
   correctness gates and workload measurements.
+- Treat Stage 11 promotion work as selector promotion only: by this point the
+  selected-DPU command, completion, payload, and lifecycle paths should already
+  be real DPU paths from Stages 6 through 10. Stage 11 should not contain a bulk
+  fallback-removal cleanup.
 
 Acceptance:
 
@@ -1497,6 +1559,9 @@ Acceptance:
   gates pass should the hidden/experimental DPU selector be promoted to the
   normal DPU runtime mode. At that point SHM remains only a DPU-off comparison
   path, not a fallback inside DPU mode.
+- Stage 11 is not accepted if measurements cannot prove that command,
+  completion, payload, and basebackup records crossed the DPU DMA/COMCH boundary
+  during the selected-DPU run.
 
 ## Invariants to assert early
 
