@@ -1148,12 +1148,25 @@ Stage 6 is split into two ordered sub-stages:
    buffers and local staging destination buffers. Submit grouped-control reads
    under scheduler grants and retire completions through bounded PE-drain grants.
 
+Implementation progress: Stage 6A.1 has landed the setup-message ABI,
+host-side setup-payload builder, service-side setup-payload validation/ack
+handler, and DMA-engine mmap-import handoff in `/data/dbcomm/citus-dbcomm`.
+This validates the byte protocol and import handoff, but does not yet create
+real DOCA COMCH endpoints or send messages over COMCH. The next Stage 6A slice
+must add `doca_comch_server_create()`/`doca_comch_client_create()` lifecycle,
+DPU representor/device selection, cold-path connect/send/wait timeout handling,
+ack receive, and close/close-ack plumbing around the already validated setup
+bytes.
+
 Tasks:
 
-- Implement the minimal COMCH setup message ABI and close/ack shell.
-- Implement the host COMCH client in `homer_frontend_dma.c`.
+- Implement the minimal COMCH setup message ABI and close/ack shell. The setup
+  ABI and setup-ack struct are landed; the close/close-ack shell remains.
+- Implement the host COMCH client in `homer_frontend_dma.c`. The setup-payload
+  builder is landed; real DOCA COMCH client connect/send/wait remains.
 - Implement the DPU COMCH server in `homer_service_dpu_comch.c/.h`, keeping
-  `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter.
+  `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter. The
+  setup-payload handler is landed; real DOCA COMCH server lifecycle remains.
 - Implement task-owner allocation, generation validation, callback retirement,
   and task reuse for grouped-control DMA tasks after descriptor import.
 - Submit control-read DMA tasks only under `DPU_DMA_SUBMIT_CONTROL_READS` grants.

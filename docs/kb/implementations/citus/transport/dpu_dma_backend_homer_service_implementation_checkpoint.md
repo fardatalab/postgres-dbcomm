@@ -6,18 +6,22 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 5, the default frontend and service path is still the existing
+As of Stage 6A.1, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
-GUC is enabled, the frontend runs a host-side bridge-memory smoke check and then
+GUC is enabled, the frontend runs a host-side bridge-memory smoke check and still
 fails real Homer API calls with a deliberate not-implemented error. The
-service-side DPU DMA scheduler path is opt-in behind
+frontend now also has a COMCH setup-payload builder, but no DOCA COMCH client
+transport yet. The service-side DPU DMA scheduler path is opt-in behind
 `HOMER_SERVICE_ENABLE_DPU_DMA=1`; it reads maintained zero-work facts and wires
 no-op bounded DPU actions through `machine-baseline`. The engine now has Stage 5
 service-side DOCA lifecycle scaffolding behind a compile-time
 `HOMER_DPU_DMA_WITH_DOCA` gate: task-slot/owner arrays, local grouped-control
 staging buffers, one PE plus per-class DMA contexts, and an imported-host-mmap
-descriptor API. It still does not submit DOCA DMA tasks or drain a DOCA PE.
+descriptor API. Stage 6A.1 adds a shared COMCH setup-message ABI and
+service-side setup handler that validates received setup bytes and routes mmap
+descriptor import through `HomerDpuDmaImportHostMmapDescriptor()`. It still does
+not create real COMCH endpoints, submit DOCA DMA tasks, or drain a DOCA PE.
 
 ## Stage 1: Bridge ABI Header
 
@@ -309,7 +313,8 @@ Implemented in `/data/dbcomm/citus-dbcomm`:
 - `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:30`
   keeps the default no-DOCA smoke deterministic and adds a
   `HOMER_DPU_DMA_WITH_DOCA` path that creates the lifecycle, exports a synthetic
-  PCI mmap descriptor, imports it through the engine API, and tears down cleanly.
+  PCI mmap descriptor, imports it through the Stage 6A COMCH setup handler, and
+  tears down cleanly.
 - `/data/dbcomm/citus-dbcomm/Makefile:20` adds `DOCA_CFLAGS`/`DOCA_LIBS`, and
   `/data/dbcomm/citus-dbcomm/Makefile:47` adds the opt-in
   `service-dpu-dma-doca-smoke` target.
@@ -321,7 +326,8 @@ Current limitation:
   separating the DMA engine from control-plane message transport: the validated
   engine consumes descriptor bytes through `HomerDpuDmaImportHostMmapDescriptor()`,
   while the future COMCH endpoint should only deliver those bytes and connection
-  lifecycle events.
+  lifecycle events. Stage 6A.1 implements that byte-level boundary and service
+  setup handler, but not the actual DOCA COMCH client/server endpoint lifecycle.
 
 ## Validation
 
@@ -342,17 +348,94 @@ Observed result:
 - `service-bin` and `client-bin` completed successfully.
 - `service-dpu-dma-doca-smoke` created three DOCA DMA contexts, observed DOCA
   context state transitions `0 -> 2` and `2 -> 0`, exported a synthetic PCI mmap
-  descriptor, imported it through the engine API, and printed
+  descriptor, imported it through the Stage 6A COMCH setup handler, and printed
   `homer_service_dpu_dma_smoke: ok`.
 - The DOCA-enabled compile emitted warnings from the installed
   `/opt/mellanox/doca/include/doca_buf_inventory.h` inline helpers about
   deprecated experimental reuse APIs; the warnings come from the header include,
   not from Homer calling those helpers.
 
+## Stage 6A.1: COMCH Setup ABI And Service Handoff
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_comch_abi.h`
+  defines the fixed COMCH setup protocol, message kinds, setup status codes,
+  one-cache-line setup ack, setup message sizing helper, setup-header builder,
+  and receiver-side validation helper.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_comch_abi.h`
+  validates that a setup payload contains one `HomerDpuBridgeControlBlockHeader`,
+  a descriptor table of `HomerDpuBridgeRingDescriptor[]`, and a nonempty mmap
+  export blob; it rejects malformed COMCH protocol version, message kind, total
+  byte count, descriptor size, bridge generation, descriptor generation, ring
+  index, workload class, direction, and record geometry.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c`
+  adds `HomerFrontendDmaSetupPayloadBytes()` and
+  `HomerFrontendDmaBuildSetupPayload()`. These are byte-buffer builders for the
+  future host COMCH client. They do not register a DOCA mmap or send on COMCH
+  yet.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c`
+  adds `HomerServiceDpuComchHandleSetupPayload()`. It validates received setup
+  bytes, fills a setup ack, reports explicit setup status, treats a missing DMA
+  engine as an internal setup bug, and calls
+  `HomerDpuDmaImportHostMmapDescriptor()` for the mmap export bytes.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_abi_check.c` adds a
+  standalone host-only setup ABI checker covering accepted setup payloads,
+  rejected short payloads, rejected protocol mismatch, rejected descriptor
+  mismatch, rejected total-size mismatch, and ack initialization.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c` now routes
+  the DOCA synthetic mmap export through `HomerServiceDpuComchHandleSetupPayload()`
+  instead of importing it directly. The no-DOCA path also checks that a valid
+  setup payload returns `HOMER_DPU_COMCH_SETUP_IMPORT_FAILED` rather than being
+  silently accepted by an engine that cannot import host mmap descriptors.
+- `/data/dbcomm/citus-dbcomm/Makefile` compiles `homer_service_dpu_comch.c`
+  into `citus_tuple_sink_service`, adds `dpu-comch-abi-check`, and links the
+  COMCH receiver module into the DPU DMA smoke binaries.
+
+Scope boundary:
+
+- This is **not** the full Stage 6A real COMCH transport. No code calls
+  `doca_comch_server_create()`, `doca_comch_client_create()`, or a COMCH send
+  task yet. The new code defines and validates the message bytes that the real
+  COMCH callbacks should exchange.
+- This stage deliberately leaves `tuple_sink_service_process.c` unchanged. The
+  current scheduler still sees no new DPU DMA work, because grouped-control DMA
+  submission starts in Stage 6B after real setup imports a host mmap descriptor.
+
+## Validation
+
+Stage 6A.1 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make dpu-bridge-abi-check dpu-comch-abi-check frontend-dma-smoke service-dpu-dma-smoke service-dpu-dma-doca-smoke service-bin client-bin
+sudo -n -u dbcomm make -j8
+```
+
+Observed result:
+
+- `homer_dpu_bridge_abi_check: ok`
+- `homer_dpu_comch_abi_check: ok`
+- `homer_frontend_dma_smoke: ok`
+- `homer_service_dpu_dma_smoke: ok`
+- `service-dpu-dma-doca-smoke` created three DOCA DMA contexts, exported a
+  synthetic PCI mmap descriptor, imported it through
+  `HomerServiceDpuComchHandleSetupPayload()`, and printed
+  `homer_service_dpu_dma_smoke: ok`.
+- `service-bin` and `client-bin` completed successfully.
+- The full Citus build completed and compiled
+  `utils/homer/homer_frontend_dma.o` and `utils/homer/homer_service_dpu_comch.o`
+  into `citus.so`.
+- The DOCA-enabled compile still emits warnings from the installed
+  `/opt/mellanox/doca/include/doca_buf_inventory.h` inline helpers about
+  deprecated experimental reuse APIs. These warnings remain from DOCA headers,
+  not from Homer calling those helpers.
+
 ## Next Stage
 
-Stage 6 should start with the real COMCH setup path, then implement grouped-control
-DMA submit/drain.
+Stage 6A should next add the real DOCA COMCH endpoint lifecycle around the
+validated setup bytes, then Stage 6B should implement grouped-control DMA
+submit/drain.
 
 Decisions recorded for Stage 6:
 
@@ -374,18 +457,22 @@ Decisions recorded for Stage 6:
   but must use a timeout and explicit diagnostics. Scheduler ready-set building,
   DMA submit actions, PE-drain actions, and callbacks remain bounded and
   nonblocking.
-- The setup message should include protocol/versioning, message kind, bridge
+- The setup message includes protocol/versioning, message kind, bridge
   generation, feature flags, ring count, descriptor size, mmap export length,
   exported mmap blob, `HomerDpuBridgeControlBlockHeader`,
-  `HomerDpuBridgeRingDescriptor[]`, and an ack/error result.
+  `HomerDpuBridgeRingDescriptor[]`, and an ack/error result. This ABI is now
+  implemented and validated by Stage 6A.1.
 
-Stage 6A should implement minimal COMCH setup/ack and descriptor import without
-submitting grouped-control DMA reads. Stage 6B should allocate or arm concrete
-`doca_dma_task_memcpy` tasks after descriptor import provides remote source
-buffers and local staging destination buffers. Control-read DMA tasks should be
-submitted only under `DPU_DMA_SUBMIT_CONTROL_READS` grants, completions should be
-retired only under `DPU_DMA_DRAIN_PE` grants, and callbacks should validate
-task-owner identity, publication epochs, generations, and monotonic frontiers.
+Remaining Stage 6A work should wrap the validated bytes in real DOCA COMCH
+client/server lifecycle: service-side server creation, DPU representor/device
+selection, host-side client connect, blocking cold-path send/wait with timeout,
+ack receive, close/close-ack shell, and diagnostics. Stage 6B should allocate or
+arm concrete `doca_dma_task_memcpy` tasks after descriptor import provides
+remote source buffers and local staging destination buffers. Control-read DMA
+tasks should be submitted only under `DPU_DMA_SUBMIT_CONTROL_READS` grants,
+completions should be retired only under `DPU_DMA_DRAIN_PE` grants, and
+callbacks should validate task-owner identity, publication epochs, generations,
+and monotonic frontiers.
 
 The important standalone synthetic host/DPU publisher validation gate moves to
 Stage 6. That gate proves the DPU can submit grouped control-line DMA reads under
