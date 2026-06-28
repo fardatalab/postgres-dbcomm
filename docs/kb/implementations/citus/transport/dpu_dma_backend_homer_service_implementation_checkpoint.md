@@ -6,15 +6,18 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 4, the default frontend and service path is still the existing
+As of Stage 5, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the frontend runs a host-side bridge-memory smoke check and then
 fails real Homer API calls with a deliberate not-implemented error. The
 service-side DPU DMA scheduler path is opt-in behind
-`HOMER_SERVICE_ENABLE_DPU_DMA=1`; it creates the Stage 3 no-DOCA engine, reads
-zero-work facts, and wires no-op bounded DPU actions through `machine-baseline`.
-It still does not submit DOCA DMA tasks or drain a DOCA PE.
+`HOMER_SERVICE_ENABLE_DPU_DMA=1`; it reads maintained zero-work facts and wires
+no-op bounded DPU actions through `machine-baseline`. The engine now has Stage 5
+service-side DOCA lifecycle scaffolding behind a compile-time
+`HOMER_DPU_DMA_WITH_DOCA` gate: task-slot/owner arrays, local grouped-control
+staging buffers, one PE plus per-class DMA contexts, and an imported-host-mmap
+descriptor API. It still does not submit DOCA DMA tasks or drain a DOCA PE.
 
 ## Stage 1: Bridge ABI Header
 
@@ -272,13 +275,87 @@ Observed result:
 - `homer_frontend_dma_smoke: ok`
 - `git diff --check` reported no whitespace errors.
 
+## Stage 5: DOCA Lifecycle And Descriptor Import Boundary
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:31`
+  adds Stage 5 sizing fields for grouped-control staging buffers.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:67`
+  exposes scheduler facts for task-slot count, free slot count, grouped-control
+  buffer bytes, and whether a host mmap descriptor has been imported.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:80`
+  declares `HomerDpuDmaImportHostMmapDescriptor()`, the scheduler-neutral entry
+  point that future COMCH receive code should call after receiving host mmap
+  export bytes.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:33`
+  defines the bounded task-slot state, grouped-control owner metadata, and
+  future task owner identity fields.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:163`
+  sets default Stage 5 local-buffer geometry to 1024 cache-line buffers.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:421`
+  allocates the Stage 5 task-slot/owner pool and aligned local grouped-control
+  buffers. It deliberately does not allocate `doca_dma_task_memcpy` handles yet:
+  DOCA requires real source and destination `doca_buf` objects at
+  `doca_dma_task_memcpy_alloc_init()` time, and the remote source buffers cannot
+  exist before host mmap descriptor import.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:324`
+  imports a host PCI mmap export descriptor into the DPU engine after the DOCA
+  lifecycle is enabled.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:520`
+  creates the opt-in DOCA lifecycle: first available DMA-capable device, PE,
+  buffer inventory, local mmap for grouped-control staging, and one DMA context
+  per workload class.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:30`
+  keeps the default no-DOCA smoke deterministic and adds a
+  `HOMER_DPU_DMA_WITH_DOCA` path that creates the lifecycle, exports a synthetic
+  PCI mmap descriptor, imports it through the engine API, and tears down cleanly.
+- `/data/dbcomm/citus-dbcomm/Makefile:20` adds `DOCA_CFLAGS`/`DOCA_LIBS`, and
+  `/data/dbcomm/citus-dbcomm/Makefile:47` adds the opt-in
+  `service-dpu-dma-doca-smoke` target.
+
+Current limitation:
+
+- The production COMCH peer that carries descriptor bytes from the host/frontend
+  to the DPU service is not implemented in Stage 5. This is intentional after
+  separating the DMA engine from control-plane message transport: the validated
+  engine consumes descriptor bytes through `HomerDpuDmaImportHostMmapDescriptor()`,
+  while the future COMCH endpoint should only deliver those bytes and connection
+  lifecycle events.
+
+## Validation
+
+Stage 5 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make service-dpu-dma-smoke dpu-bridge-abi-check frontend-dma-smoke
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm make service-dpu-dma-doca-smoke
+```
+
+Observed result:
+
+- `homer_service_dpu_dma_smoke: ok`
+- `homer_dpu_bridge_abi_check: ok`
+- `homer_frontend_dma_smoke: ok`
+- `service-bin` and `client-bin` completed successfully.
+- `service-dpu-dma-doca-smoke` created three DOCA DMA contexts, observed DOCA
+  context state transitions `0 -> 2` and `2 -> 0`, exported a synthetic PCI mmap
+  descriptor, imported it through the engine API, and printed
+  `homer_service_dpu_dma_smoke: ok`.
+- The DOCA-enabled compile emitted warnings from the installed
+  `/opt/mellanox/doca/include/doca_buf_inventory.h` inline helpers about
+  deprecated experimental reuse APIs; the warnings come from the header include,
+  not from Homer calling those helpers.
+
 ## Next Stage
 
-Stage 5 should implement only the minimal DOCA/COMCH grouped-control lifecycle:
-descriptor exchange/import, local grouped-control buffers, bounded task-slot
-pool allocation, callback installation, and clean teardown behind
-`HOMER_SERVICE_ENABLE_DOCA_DMA=1`. It should not submit real grouped-control DMA
-tasks yet.
+Stage 6 should implement real grouped-control submit and bounded PE drain.
+Control-read DMA tasks should be submitted only under
+`DPU_DMA_SUBMIT_CONTROL_READS` grants, completions should be retired only under
+`DPU_DMA_DRAIN_PE` grants, and callbacks should validate task-owner identity,
+publication epochs, generations, and monotonic frontiers.
 
 The important standalone synthetic host/DPU publisher validation gate moves to
 Stage 6. That gate proves the DPU can submit grouped control-line DMA reads under

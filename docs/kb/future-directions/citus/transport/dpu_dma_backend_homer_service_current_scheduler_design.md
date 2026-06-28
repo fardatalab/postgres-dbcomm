@@ -1012,6 +1012,25 @@ Acceptance:
 Deliverable: real DOCA/COMCH lifecycle objects and grouped-control task-pool
 scaffolding, but no real grouped-control DMA submission yet.
 
+Status: completed for the service-side DOCA lifecycle and descriptor-import
+boundary in `/data/dbcomm/citus-dbcomm`. The implementation creates bounded
+task-slot/owner arrays and local grouped-control staging buffers, can compile an
+opt-in DOCA lifecycle smoke with `HOMER_DPU_DMA_WITH_DOCA`, creates one PE plus
+per-class DMA contexts, and imports PCI mmap export descriptors through
+`HomerDpuDmaImportHostMmapDescriptor()`. The production COMCH peer that carries
+those descriptor bytes from the host/frontend into the DPU service is not wired
+yet; Stage 5 treats COMCH as the required control-plane transport boundary, while
+the validated code consumes descriptor bytes through a scheduler-neutral import
+API.
+
+Implementation correction from the DOCA headers: preallocating
+`doca_dma_task_memcpy` handles before descriptor import is not valid, because
+`doca_dma_task_memcpy_alloc_init()` requires real source and destination
+`doca_buf` objects. Stage 5 therefore preallocates bounded `HomerDpuDmaTaskSlot`
+and `HomerDpuDmaTaskOwner` records plus local buffers. Stage 6 allocates or
+arms concrete memcpy tasks once the imported host mmap can produce source
+buffers and the local staging mmap can produce destination buffers.
+
 Tasks:
 
 - Enable the minimal real DOCA lifecycle behind `HOMER_SERVICE_ENABLE_DOCA_DMA=1`
@@ -1023,10 +1042,10 @@ Tasks:
 - Import host mmap descriptor on the DPU side.
 - Allocate reusable local buffers for grouped-control slices.
 - Preallocate a bounded pool of `HomerDpuDmaTaskSlot` records with one
-  `HomerDpuDmaTaskOwner` per DOCA memcpy task.
-- Install callback functions and attach task-slot owner metadata to reusable task
-  handles, but keep callbacks unreachable from the scheduler until Stage 6 starts
-  real submissions.
+  `HomerDpuDmaTaskOwner` per future DOCA memcpy task.
+- Install callback functions, but keep callbacks unreachable from the scheduler
+  until Stage 6 starts real submissions. Concrete memcpy task handles are created
+  only after descriptor import provides remote source buffers.
 - Keep `DPU_DMA_SUBMIT_CONTROL_READS` and `DPU_DMA_DRAIN_PE` scheduler actions
   bounded and nonblocking, but let them report empty/not-ready work until Stage 6
   connects real submit and PE-drain behavior.
