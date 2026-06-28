@@ -1382,9 +1382,10 @@ slot index, and the SHM async pump rejects non-SHM owners as a service bug.
 Stage 7B.3 adds the DPU command-staging handoff lifetime API: the service can
 copy a staged command together with bridge/ring/ordinal metadata and explicitly
 release the DMA staging buffer after making its own local copy. Real DPU
-response-owner metadata, command execution from staged DPU slots, response-body
-DMA writes, and response publication remain pending later Stage 7 and Stage 8
-work.
+response-owner metadata was added in Stage 7B.4, along with an explicit guard
+that rejects async DPU-staged local-control continuations until Stage 8 response
+publication exists. Command execution from staged DPU slots, response-body DMA
+writes, and response publication remain pending later Stage 7 and Stage 8 work.
 
 Tasks:
 

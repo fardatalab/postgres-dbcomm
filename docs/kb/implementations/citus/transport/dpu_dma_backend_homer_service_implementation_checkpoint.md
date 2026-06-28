@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 7B.3, the default frontend and service path is still the existing
+As of Stage 7B.4, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -76,7 +76,9 @@ lifetime API: the DMA engine can copy a staged command together with
 bridge/ring/ordinal owner metadata, and the service must explicitly release that
 staged command after it has made its own local copy. The release path validates
 owner metadata and drops `totalStagedCommandRequestCount` back to zero; it does
-not publish a response to host memory.
+not publish a response to host memory. Stage 7B.4 adds the DPU staged-command
+response-owner metadata shape to the local-control dispatcher and makes async
+registration explicitly SHM-only until Stage 8 response publication exists.
 
 ## Stage 1: Bridge ABI Header
 
@@ -1713,14 +1715,63 @@ Observed result:
 
 - The wrapper reported `client_rc=0 server_rc=0`.
 
+## Stage 7B.4: DPU Response-Owner Async Guard
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31399`
+  adds `TUPLE_SINK_SERVICE_LOCAL_CONTROL_RESPONSE_OWNER_DPU_STAGED_COMMAND`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31407`
+  adds `TupleSinkServiceLocalControlDpuStagedCommandResponseOwner`, carrying the
+  import index, ring index, bridge generation, ring generation, command ordinal,
+  request sequence, and accepted publication epoch that Stage 8 will need for
+  response DMA body+publish work.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31424`
+  adds that DPU owner to the `TupleSinkServiceLocalControlResponseOwner` union.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31499`
+  adds `TupleSinkServiceLocalControlResponseOwnerCanRegisterAsync()`. It returns
+  true only for SHM-slot owners because only the SHM async pump can currently
+  resume and publish an async response.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34257`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34298`,
+  and `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34329`
+  make async OPEN_SESSION, START_COMMAND, and POLL_COMMAND_COMPLETION return
+  explicit Stage 8-style errors if a non-SHM owner tries to register an async
+  continuation.
+
+Important implementation details and decisions:
+
+- DPU response-owner metadata now has a concrete service-local shape, but there
+  is still no DPU async continuation queue and no DMA response publication path.
+  Therefore the dispatcher refuses to register async work for DPU-staged owners
+  instead of creating an op that the SHM async pump cannot safely publish.
+- This slice prepares the next staged-command dispatch adapter: synchronous
+  local-control requests can carry a DPU owner through the shared dispatcher, and
+  async-shaped requests fail explicitly until Stage 8 adds response publication.
+
+Stage 7B.4 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c
+sudo -n -u dbcomm make service-bin client-bin
+git diff --check
+```
+
+Observed result:
+
+- `service-bin` rebuilt successfully.
+- `client-bin` was up to date.
+- `git diff --check` reported no whitespace errors.
+
 ## Next Stage
 
 The next Stage 7 slice should add a service-local staged-command dispatch record
-and DPU response-owner shape that use `HomerDpuDmaCopyStagedCommand()` before
-`HomerDpuDmaReleaseStagedCommandSlot()`. The selected DPU command
-`not implemented` guard should remain until command execution and response
-publication both exist: Stage 7B.3 only proves the DMA staging-buffer handoff
-lifetime and release transition.
+that uses `HomerDpuDmaCopyStagedCommand()`, fills the DPU response owner, and
+then calls `HomerDpuDmaReleaseStagedCommandSlot()` after the request and owner
+metadata have been copied locally. The selected DPU command `not implemented`
+guard should remain until command execution and response publication both exist:
+Stage 7B.4 only proves the response-owner metadata shape and the async guard.
 
 Decisions recorded for Stage 6:
 
