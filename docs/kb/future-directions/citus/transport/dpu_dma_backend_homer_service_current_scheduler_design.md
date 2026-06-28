@@ -1378,10 +1378,13 @@ local-control semantic dispatcher from SHM slot response publication, while
 keeping async continuations explicitly SHM-slot-owned until a response-owner
 abstraction exists. Stage 7B.2 adds the first response-owner abstraction for the
 current SHM slot path: async state now carries a response owner instead of a raw
-slot index, and the SHM async pump rejects non-SHM owners as a service bug. Real
-DPU response-owner metadata, command execution from staged DPU slots,
-response-body DMA writes, and response publication remain pending Stage 7B.3 and
-Stage 8 work.
+slot index, and the SHM async pump rejects non-SHM owners as a service bug.
+Stage 7B.3 adds the DPU command-staging handoff lifetime API: the service can
+copy a staged command together with bridge/ring/ordinal metadata and explicitly
+release the DMA staging buffer after making its own local copy. Real DPU
+response-owner metadata, command execution from staged DPU slots, response-body
+DMA writes, and response publication remain pending later Stage 7 and Stage 8
+work.
 
 Tasks:
 

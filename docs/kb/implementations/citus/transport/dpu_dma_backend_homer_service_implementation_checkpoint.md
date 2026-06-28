@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 7B.2, the default frontend and service path is still the existing
+As of Stage 7B.3, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -71,7 +71,12 @@ continuations. Stage 7B.2 then replaces the raw async `slotIndex` owner with a
 SHM response-owner object. Current SHM async continuations resolve through that
 owner before touching the SHM control slot, and an accidental non-SHM owner in
 the SHM async pump fails as a service bug. DPU response owners and DMA response
-publication are still pending.
+publication are still pending. Stage 7B.3 adds the DPU command-staging handoff
+lifetime API: the DMA engine can copy a staged command together with
+bridge/ring/ordinal owner metadata, and the service must explicitly release that
+staged command after it has made its own local copy. The release path validates
+owner metadata and drops `totalStagedCommandRequestCount` back to zero; it does
+not publish a response to host memory.
 
 ## Stage 1: Bridge ABI Header
 
@@ -1585,14 +1590,137 @@ Observed result:
 - `client-bin` was up to date.
 - `git diff --check` reported no whitespace errors.
 
+## Stage 7B.3: Staged Command Handoff Lifetime
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:101`
+  adds `HomerDpuDmaStagedCommandSlot`, the service-side handoff record for a
+  pulled command slot plus import, ring, bridge generation, ring generation,
+  command ordinal, request sequence, and accepted publication epoch.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:144`
+  declares `HomerDpuDmaCopyStagedCommand()`, which returns the copied command
+  slot plus owner metadata.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:150`
+  declares `HomerDpuDmaReleaseStagedCommandSlot()`, which releases the
+  engine-owned command-pull staging buffer after the service has copied the
+  request and owner metadata into its own dispatch state.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:723`
+  implements `HomerDpuDmaCopyStagedCommand()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:803`
+  implements `HomerDpuDmaReleaseStagedCommandSlot()`. It validates import/ring
+  identity, bridge/ring generation, command ordinal, accepted publication epoch,
+  request sequence, and request kind before releasing the staging buffer.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1023`
+  adds `HomerDpuDmaClearStagedCommandSlot()` and reuses it from teardown so
+  explicit release and import clearing maintain the same staged-count and buffer
+  state.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:798`
+  changes the command-pull smoke to copy the rich staged-command record.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:838`
+  releases the staged command after validation and checks that scheduler facts
+  report `totalStagedCommandRequestCount == 0`.
+
+Important implementation details and decisions:
+
+- The staging buffer is DMA-engine-owned until the service has copied both the
+  protocol slot and owner metadata into service-local dispatch state. Releasing
+  it earlier would lose the owner metadata needed for Stage 8 response
+  publication; keeping it forever would block additional command pulls for that
+  ring.
+- Stage 7B.3 deliberately does not execute the staged command or publish a
+  response. It only defines and validates the handoff lifetime needed before a
+  service adapter can safely consume staged commands.
+- The older `HomerDpuDmaCopyStagedCommandSlot()` remains as a compatibility
+  helper for tests that only need the copied protocol slot. New service adapter
+  code should use `HomerDpuDmaCopyStagedCommand()`.
+
+Stage 7B.3 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/bin/homer_dpu_comch_transport_smoke.c
+sudo -n -u dbcomm make dpu-comch-transport-smoke-bin service-bin client-bin
+git diff --check
+
+DPU_DIR=/tmp/homer_dpu_comch_stage7b3_release
+ssh dpu "rm -rf $DPU_DIR && mkdir -p \
+  $DPU_DIR/src/bin \
+  $DPU_DIR/src/backend/distributed/utils/homer \
+  $DPU_DIR/src/include/distributed/homer"
+rsync -az src/bin/homer_dpu_comch_transport_smoke.c \
+  dpu:$DPU_DIR/src/bin/
+rsync -az src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/homer_service_dpu_comch.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_comch.h \
+  dpu:$DPU_DIR/src/backend/distributed/utils/homer/
+rsync -az src/include/distributed/homer/*.h \
+  dpu:$DPU_DIR/src/include/distributed/homer/
+ssh dpu "cd $DPU_DIR && gcc -std=gnu99 -Wall -Wextra \
+  -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers \
+  -Wno-deprecated-declarations -DHOMER_DPU_DMA_WITH_DOCA \
+  -DALLOW_EXPERIMENTAL_API -I/opt/mellanox/doca/include \
+  -I/usr/include/libnl3 -Isrc/include \
+  -Isrc/backend/distributed/utils/homer \
+  -o homer_dpu_comch_transport_smoke \
+  src/bin/homer_dpu_comch_transport_smoke.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_comch.c \
+  -L/opt/mellanox/doca/lib/aarch64-linux-gnu \
+  -ldoca_comch -ldoca_dma -ldoca_common"
+```
+
+The final host-to-DPU smoke used:
+
+```sh
+ssh dpu "cd /tmp/homer_dpu_comch_stage7b3_release && \
+  LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu \
+  ./homer_dpu_comch_transport_smoke --server --import-dma \
+  --submit-control-read --submit-command-pull \
+  --name homer-dpu-comch-stage7b3-release \
+  --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0 \
+  --timeout-ms 20000 \
+  > /tmp/homer-dpu-comch-stage7b3-release-server.log 2>&1" &
+
+LD_LIBRARY_PATH=/opt/mellanox/doca/lib/x86_64-linux-gnu \
+  ./build/homer/homer_dpu_comch_transport_smoke --client --real-mmap \
+  --name homer-dpu-comch-stage7b3-release \
+  --dev-pci 0000:21:00.0 \
+  --timeout-ms 20000
+```
+
+Observed result:
+
+- The local `dpu-comch-transport-smoke-bin`, `service-bin`, and `client-bin`
+  build passed. DOCA headers emitted only the known experimental/deprecation
+  warnings.
+- `git diff --check` reported no whitespace errors.
+- The DPU-side aarch64 smoke binary built under
+  `/tmp/homer_dpu_comch_stage7b3_release`.
+- The host client printed `homer_dpu_comch_transport_smoke: ok`.
+- The DPU server log contained:
+
+  ```text
+  server DMA grouped-control read complete epoch=1 tail=1 cookie=65261
+  server DMA command-pull submitted after accepted grouped-control frontier
+  server DMA command-pull complete owner=4242 seq=42 ordinal=0 command=6 sql="select 1"
+  homer_dpu_comch_transport_smoke: ok
+  ```
+
+- The wrapper reported `client_rc=0 server_rc=0`.
+
 ## Next Stage
 
-The next Stage 7 slice should add the DPU response-owner shape and a staged
-command dispatch path that can run through the shared local-control dispatcher
-without publishing into SHM. The selected DPU command `not implemented` guard
-should remain until command execution and response publication both exist: Stage
-7B.2 only proves that async continuation ownership is no longer hard-coded as a
-raw SHM slot index.
+The next Stage 7 slice should add a service-local staged-command dispatch record
+and DPU response-owner shape that use `HomerDpuDmaCopyStagedCommand()` before
+`HomerDpuDmaReleaseStagedCommandSlot()`. The selected DPU command
+`not implemented` guard should remain until command execution and response
+publication both exist: Stage 7B.3 only proves the DMA staging-buffer handoff
+lifetime and release transition.
 
 Decisions recorded for Stage 6:
 
