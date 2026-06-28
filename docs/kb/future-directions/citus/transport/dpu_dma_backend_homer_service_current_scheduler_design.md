@@ -7,6 +7,9 @@ current host-process service to a DPU-resident service while keeping the schedul
 model that exists today. It is a companion to
 [`dpu_dma_backend_homer_service_plan.md`](dpu_dma_backend_homer_service_plan.md).
 
+Implementation progress is tracked in
+[`../../../implementations/citus/transport/dpu_dma_backend_homer_service_implementation_checkpoint.md`](../../../implementations/citus/transport/dpu_dma_backend_homer_service_implementation_checkpoint.md).
+
 The important constraint is:
 
 > Do not introduce the future async-continuation/workflow scheduler as part of
@@ -819,6 +822,11 @@ Acceptance:
 ### Stage 1 — Bridge ABI header
 
 Deliverable: `homer_dpu_bridge_abi.h`.
+
+Status: completed in `/data/dbcomm/citus-dbcomm` with
+`src/include/distributed/homer/homer_dpu_bridge_abi.h`,
+`src/bin/homer_dpu_bridge_abi_check.c`, and the `dpu-bridge-abi-check` Makefile
+target. See the implementation checkpoint for validation evidence.
 
 Tasks:
 
