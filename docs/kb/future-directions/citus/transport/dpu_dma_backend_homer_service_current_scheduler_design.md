@@ -980,7 +980,8 @@ Deliverable: `homer_frontend_dma.c/.h` behind a build/runtime switch.
 Status: completed in `/data/dbcomm/citus-dbcomm` with the hidden
 `citus.enable_experimental_homer_dpu_frontend` switch, bridge-memory skeleton,
 and `frontend-dma-smoke` validation target. Real DPU command execution remains
-intentionally not implemented and fails before SHM fallback when selected.
+intentionally not implemented and fails explicitly instead of falling back to SHM
+when selected.
 
 Tasks:
 
@@ -1268,7 +1269,14 @@ Acceptance:
 - `StartRemoteExecutionCommandThroughLocalService()` and
   `PollRemoteExecutionCommandCompletionThroughLocalService()` work through the DPU
   channel in a single-session test.
-- The same APIs still work through SHM when DPU mode is off.
+- The same APIs still work through the old SHM host-process implementation when
+  DPU mode is off during migration, but this is mode selection, not fallback from
+  a selected DPU session.
+- A DPU-mode command session that has not completed COMCH/mmap setup fails with
+  an explicit DPU setup error before publishing a request, and does not remap or
+  call the SHM frontend path.
+- A DPU-mode command session whose DPU service is absent or times out fails with
+  an explicit bounded setup/connection error.
 - Early response publication negative test fails as expected.
 - Before real backend command execution, a synthetic request-slot pull test DMA
   reads one fixed request slot into DPU-local staging, validates owner/generation,
@@ -1295,6 +1303,9 @@ Acceptance:
 - Same-context body+publish test submits completion-body DMA tasks followed
   immediately by one publication-word DMA task, with no PE drain in the submit
   action; the host observes only the final publication word.
+- In DPU mode, completion polling consumes only DPU-published completion/credit
+  lines. A missing or invalid DPU completion path must return a DPU-path error,
+  not poll the old SHM completion mailbox as a fallback.
 
 ### Stage 9 — Payload and basebackup byte-stream pull
 
@@ -1321,6 +1332,12 @@ Acceptance:
   generated records, DPU pulls only bytes at or below the accepted frontier,
   callbacks advance the completed contiguous frontier, and consumed-head
   publication happens only after semantic release.
+- A DPU-mode payload/basebackup stream whose DPU setup is missing, stale, or
+  generation-mismatched fails explicitly before payload publication; it must not
+  switch the stream back to local SHM queues.
+- Mixed command plus basebackup validation runs with both workloads on the DPU
+  boundary so foreground/background interference measurements are meaningful for
+  the migrated design.
 
 ### Stage 10 — Teardown, failure, and generation reset
 
@@ -1341,6 +1358,12 @@ Acceptance:
 - Forced backend exit does not allow stale DPU writes into reused memory.
 - DPU DMA error callbacks record diagnostics and request fatal service shutdown.
 - Service restart increments generation and rejects old task owners.
+- Host backend disconnect/teardown followed by reconnect performs a new
+  host-initiated setup against an already-running DPU service, with a new bridge
+  generation and no reuse of stale imported mmap descriptors.
+- DPU service restart while host backends are alive causes bounded DPU-mode
+  failures and generation rejection; surviving host sessions must not continue on
+  SHM as an implicit recovery path.
 
 ### Stage 11 — Measurement and tuning
 
@@ -1361,6 +1384,12 @@ Acceptance:
 - Command latency does not regress unacceptably under background basebackup.
 - Basebackup throughput remains stable under mixed foreground command load.
 - Scheduler feedback shows bounded empty-poll behavior, not hot spinning.
+- Performance measurements used for DPU-mode promotion must verify that command,
+  completion, payload, and basebackup traffic all traverse the DPU DMA/COMCH
+  boundary. Runs that fall back to the old host-process SHM path are invalid for
+  DPU acceptance.
+- Include cold-path setup latency and reconnect latency as separate measurements
+  from steady-state hot-path command/basebackup throughput.
 
 ## Invariants to assert early
 

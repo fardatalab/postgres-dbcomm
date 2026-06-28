@@ -169,7 +169,8 @@ of those backend allocation helpers because it currently allocates with
 - Stage 2 does not register DOCA mmap objects, connect COMCH, or submit DMA
   tasks.
 - The experimental DPU frontend channel is not runnable for real Homer commands
-  yet. It intentionally fails before SHM fallback when selected.
+  yet. When selected, it intentionally fails before any SHM mapping rather than
+  falling back to the old host-process path.
 - Stage 4 kept DPU engine APIs independent of `HomerGrantVector` and
   `HomerProgressResult`. The current adapter lives inside
   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
@@ -742,6 +743,13 @@ coverage and validation. The intended path is:
    stability are acceptable for the target workloads. At that point SHM should be
    removed or left only as intentionally separate legacy/development code, not as
    a runtime fallback inside DPU operation.
+
+This promotion rule also changes later acceptance gates: Stage 7 command pull,
+Stage 8 completion/result push, Stage 9 payload/basebackup pull, Stage 10
+teardown/reconnect, and Stage 11 measurement must all validate the selected DPU
+mode directly. Passing a workload through the old SHM host-process implementation
+is still useful as migration coexistence or comparison, but it is not acceptance
+evidence for DPU mode.
 
 Remaining Stage 6A work should move the validated standalone COMCH lifecycle
 into production setup: service-side server creation during DPU service startup,
