@@ -27,7 +27,7 @@ choice: backend processes should remain CPU producers into host memory, and the
 DPU-side Homer service should pull records with DOCA DMA. Host backends should
 not submit hot-path DMA tasks.
 
-However, the plan needs four corrections before implementation:
+However, the plan needs five corrections before implementation:
 
 1. **The grouped control block is new ABI.** Today's host-process Homer has SHM
    control slots, ready bitmaps, completion mailboxes, SPSC queues, and byte
@@ -50,6 +50,14 @@ However, the plan needs four corrections before implementation:
    validation still passes in both host-produce/DPU-pull and DPU-push
    directions. Use a regular TCP setup socket for the same cold-path bytes and
    keep all hot-path movement and publication in DOCA DMA-visible memory.
+5. **PostgreSQL-local lifecycle needs a host shim, not a hot-path fallback.**
+   A DPU-resident service cannot directly `shm_open()` host mailbox objects,
+   signal the host postmaster, or run PostgreSQL postmaster-local backend-spawn
+   hooks. Selected-DPU mode therefore needs a small host lifecycle shim in or
+   beside the host DMA frontend. That shim creates/exports host memory, performs
+   TCP setup, submits backend spawn requests locally, and then leaves the hot
+   command/completion/payload path to DPU DMA. It must not forward every command
+   through the old host Homer service.
 
 ## Current code shape to preserve
 
@@ -73,6 +81,20 @@ The current branch already has the split we need:
 
 Therefore, the first DPU migration should replace the host-service IPC boundary,
 not the service's high-level command/session/payload semantics.
+
+The exception is PostgreSQL-local lifecycle setup. The current host service owns
+mailbox creation in `TupleSinkServiceEnsureSessionMailboxes()` at
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18033`
+and backend spawn in `TupleSinkServiceSubmitBackendSpawnRequest()` at
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18188`.
+The postmaster side creates the spawn region and launches backends in
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1638`
+and
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2792`.
+Those operations must move to a selected-DPU host lifecycle shim because the DPU
+cannot perform them through DMA. The resulting backend command/completion
+mailboxes, grouped control block, and frontend request/response slots are still
+exported to the DPU and used by the DPU DMA hot path.
 
 ## Non-goals for this phase
 
@@ -944,9 +966,10 @@ corresponding experimental guard, placeholder, or old host-process SHM
 dependency and must add acceptance evidence for the replacement. Later stages
 should not inherit a vague "remove fallback before production" TODO. Instead,
 any remaining promotion work belongs directly in the stage that owns the
-behavior: setup in Stage 6, command pull in Stage 7, completion publication in
-Stage 8, payload/basebackup pull in Stage 9, lifecycle/reconnect in Stage 10,
-and only the user-facing selector flip in Stage 11.
+behavior: setup in Stage 6, command-pull mechanism in Stage 7, response
+publication mechanism in Stage 8A, selected-DPU command-path promotion in Stage
+8B, payload/basebackup pull in Stage 9, lifecycle/reconnect in Stage 10, and
+only the user-facing selector flip in Stage 11.
 
 ### Stage 0 — Freeze the migration contract
 
@@ -1395,10 +1418,13 @@ Acceptance:
   Stage 7 command guard, but it must prove that setup did not remap the
   host-process SHM frontend channel.
 
-### Stage 7 — Command/control request pull
+### Stage 8B — Selected-DPU command path promotion
 
-Deliverable: start-command and poll-completion through DPU-pulled host request
-slots, still using existing semantic request/response structs.
+Deliverable: promote the frontend command APIs from setup-only smoke to a real
+selected-DPU command path. Command requests must be published into DPU-visible
+host slots, pulled by DPU DMA, executed through the service scheduler, and
+answered by DPU DMA response publication. The path still uses existing
+`CitusRemoteExecControlSlot` request/response structs.
 
 Implementation progress: Stage 7A validates the first command-pull slice in
 `/data/dbcomm/citus-dbcomm`. The DPU DMA engine now consumes a Stage 6B
@@ -1433,12 +1459,26 @@ action consumes service-owned dispatch entries only when pending-response
 capacity exists, runs `TupleSinkServiceDispatchLocalControlSlot()` with a DPU
 response owner, and stores the completed response plus bridge/ring/generation
 metadata for Stage 8. This separation is intentional: dispatch is the physical
-DMA-staging handoff, execute is the semantic state mutation, and Stage 8 remains
-the only host-visible response publication point. Response-body DMA writes and
-response-ready publication remain pending Stage 8 work.
+DMA-staging handoff, execute is the semantic state mutation, and response
+publication is the only host-visible completion point. Stage 8A adds the
+same-context response-body DMA plus response-ready publication-word DMA
+mechanism; Stage 8B wires the real selected-DPU frontend command path to it and
+adds the no-fallback acceptance evidence.
 
 Tasks:
 
+- Add a host lifecycle shim in or beside `homer_frontend_dma.c/.h` for selected
+  DPU command sessions. It owns host-local mailbox creation, mmap
+  registration/export, TCP setup, DPU session identity exchange, postmaster
+  spawn request submission, and bounded setup/spawn/teardown errors.
+- Do not treat `TupleSinkServiceDispatchLocalControlSlot()` as a drop-in
+  production dispatcher for selected-DPU command-session open if it would require
+  the DPU service to perform host-local backend spawn work. Use it only for
+  DPU-owned or already-lifecycle-prepared command/control records, or refactor
+  the host-local lifecycle pieces behind the shim first.
+- Establish the selected-DPU setup ordering: DPU session identity, host mailbox
+  creation, host mmap export, DPU import ack, host postmaster spawn, then
+  hot-path request publication.
 - Make host frontend publish request-ready state through bridge lines.
 - Require completed DPU TCP/mmap setup before publishing any command request in
   DPU mode.
@@ -1482,21 +1522,29 @@ Tasks:
   staged request-slot pull path. After this stage, a selected DPU command session
   should fail only for DPU setup/protocol/runtime errors, not because command
   execution is still deliberately blocked.
-- Treat Stage 7 promotion work as the command replacement gate: selected-DPU
+- Treat Stage 8B promotion work as the command replacement gate: selected-DPU
   command APIs must publish host request slots for DPU pull, and any remaining
   command failure must be a DPU setup/protocol/runtime failure rather than a
   deliberate migration placeholder.
-- Add Stage 7 promotion evidence to command-path diagnostics: one accepted
+- Add Stage 8B promotion evidence to command-path diagnostics: one accepted
   command must be traceable through host request publication, grouped-control
   discovery, command-slot DMA pull, DPU-local staged dispatch, and response-owner
   selection. SHM command-ring evidence is valid only as a DPU-off regression
   check.
+- Add lifecycle-shim evidence to Stage 8B diagnostics: selected-DPU open must show
+  host mailbox creation, DPU TCP/mmap import ack, host postmaster spawn request,
+  and then DPU-pulled request publication. The old host service may remain
+  buildable for DPU-off mode, but it must not be the selected-DPU hot-path
+  command transport.
 
 Acceptance:
 
 - `StartRemoteExecutionCommandThroughLocalService()` and
   `PollRemoteExecutionCommandCompletionThroughLocalService()` work through the DPU
   channel in a single-session test.
+- Selected-DPU command-session open does not require the DPU service to open host
+  `/dev/shm` objects or signal the host postmaster. Those operations are carried
+  by the host lifecycle shim before hot-path DMA publication begins.
 - The same APIs still work through the old SHM host-process implementation when
   DPU mode is off during migration, but this is mode selection, not fallback from
   a selected DPU session.
@@ -1508,12 +1556,16 @@ Acceptance:
 - The hidden experimental selector remains required, but command API acceptance
   evidence must be collected through the selected DPU path. SHM command success
   is only a DPU-off regression check.
-- Stage 7 is not accepted if selected-DPU command execution can still reach the
+- Stage 8B is not accepted if selected-DPU command execution can still reach the
   old host-process SHM command ring, even as a convenience fallback after a DPU
   setup or command-pull error.
-- Stage 7 is not accepted if response-owner plumbing still assumes an SHM slot
+- Stage 8B is not accepted if selected-DPU command-session open is implemented by
+  forwarding every semantic command back to a host service. Host-local lifecycle
+  setup may use TCP and postmaster SHM, but steady-state command/completion
+  movement must be through exported memory and DPU DMA.
+- Stage 8B is not accepted if response-owner plumbing still assumes an SHM slot
   for any selected-DPU command request that can become asynchronous.
-- Stage 7 is not accepted if semantic execution of a DPU-staged command can
+- Stage 8B is not accepted if semantic execution of a DPU-staged command can
   mutate service state before the completed response is either DMA-published to
   the host or durably staged in a bounded service-owned pending-publication queue.
 - Stage 7B.6 compile validation is not a substitute for Stage 7 acceptance. It
@@ -1528,12 +1580,12 @@ Acceptance:
   command ring eligible once, command-pull work consumes or advances that ready
   fact, and the scheduler no longer sees `totalDiscoveredReadyRingCount > 0`
   after all accepted command slots have been staged.
-- Stage 7 promotion evidence must include the command-path diagnostic/counter
+- Stage 8B promotion evidence must include the command-path diagnostic/counter
   proving selected-DPU command work entered through the DPU pull path. A command
   smoke that succeeds only through the host-process SHM command ring does not
-  satisfy Stage 7.
+  satisfy Stage 8B.
 
-### Stage 8 — Completion/result push
+### Stage 8A — Completion/result push mechanism
 
 Deliverable: DPU DMA writes to host completion/result mailboxes.
 
@@ -1555,15 +1607,15 @@ Tasks:
 - Add a selected-DPU completion-path diagnostic or counter that proves command
   completion became visible through DPU-written publication lines, not through
   the SHM completion mailbox.
-- If Stage 7 introduced an "executed response pending DPU publication" queue,
-  Stage 8 owns draining that queue with same-context response-body DMA writes
-  followed by the response-ready publication-word DMA write. Stage 8 must also
-  own bounded queue retirement and failure handling; the queue is not a
+- The Stage 7B/8A "executed response pending DPU publication" queue is drained
+  with same-context response-body DMA writes followed by the response-ready
+  publication-word DMA write. Stage 8A must also own bounded queue retirement and
+  failure handling; the queue is not a
   substitute for host-visible response publication.
-- Treat Stage 8 promotion work as the completion replacement gate: selected-DPU
+- Treat Stage 8B promotion work as the completion replacement gate: selected-DPU
   completion polling must consume DPU-written completion/credit publication
   lines and must not use host-process SHM completion mailboxes after selection.
-- Add Stage 8 promotion evidence to completion-path diagnostics: for at least
+- Add Stage 8B promotion evidence to completion-path diagnostics: for at least
   one selected-DPU command, the request must arrive through DPU-pulled staging
   and the response must become visible through DPU-written body-plus-publication
   DMA, not through the host-process SHM completion mailbox.
@@ -1579,13 +1631,13 @@ Acceptance:
 - In DPU mode, completion polling consumes only DPU-published completion/credit
   lines. A missing or invalid DPU completion path must return a DPU-path error,
   not poll the old SHM completion mailbox as a fallback.
-- Stage 8 acceptance must include one command path where the request arrives via
+- Stage 8B acceptance must include one command path where the request arrives via
   DPU-pulled staging and completion becomes visible via the DPU publication
   line. A SHM-only command smoke is insufficient for this stage.
-- Stage 8 is not accepted if a selected-DPU session can report command completion
+- Stage 8B is not accepted if a selected-DPU session can report command completion
   from the old host-process mailbox when the DPU completion path is absent,
   stale, or invalid.
-- Stage 8 promotion evidence must include both a positive DPU completion
+- Stage 8B promotion evidence must include both a positive DPU completion
   publication run and a negative run where an absent/stale DPU completion path
   fails boundedly instead of falling back to SHM.
 
@@ -1718,7 +1770,7 @@ Tasks:
   payload, and basebackup records used DPU DMA with TCP setup during a DPU-mode run.
 - Measure cold TCP/mmap setup latency and reconnect latency separately from
   steady-state hot-path throughput.
-- After Stage 7 through Stage 10 functional gates pass, replace the hidden
+- After Stage 8B through Stage 10 functional gates pass, replace the hidden
   experimental selector with the normal DPU transport/mode selector. This
   promotion is a Stage 11 deliverable because the final decision depends on both
   correctness gates and workload measurements.
@@ -1745,7 +1797,7 @@ Acceptance:
   invalid for DPU acceptance.
 - Include cold-path setup latency and reconnect latency as separate measurements
   from steady-state hot-path command/basebackup throughput.
-- Only after the Stage 7 through Stage 11 functional, lifecycle, and measurement
+- Only after the Stage 8B through Stage 11 functional, lifecycle, and measurement
   gates pass should the hidden/experimental DPU selector be promoted to the
   normal DPU runtime mode. At that point SHM remains only a DPU-off comparison
   path, not a fallback inside DPU mode.

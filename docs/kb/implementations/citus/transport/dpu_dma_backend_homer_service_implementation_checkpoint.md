@@ -45,6 +45,21 @@ response publication observed by host memory polling. Full selected-DPU SQL
 frontend execution is still pending and must not be claimed until the frontend
 guard is removed and the negative no-fallback completion gate is validated.
 
+The next production selected-DPU command milestone must also add a host
+lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
+directly create host `/dev/shm` mailbox objects or signal the host postmaster.
+Those operations are currently performed by `TupleSinkServiceEnsureSessionMailboxes()`
+and `TupleSinkServiceSubmitBackendSpawnRequest()` in
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`,
+with postmaster-side handling in
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c`.
+Selected-DPU mode should move that PostgreSQL-local lifecycle work into a small
+host-side shim in or beside `homer_frontend_dma.c/.h`: create/register/export
+mailboxes and bridge memory, complete TCP setup/import with the DPU, submit the
+backend spawn request locally, and only then publish hot-path DMA frontiers.
+This is a setup/lifecycle path, not a fallback that forwards every command to
+the old host Homer service.
+
 ## Stage 1: Bridge ABI Header
 
 Implemented in `/data/dbcomm/citus-dbcomm`:

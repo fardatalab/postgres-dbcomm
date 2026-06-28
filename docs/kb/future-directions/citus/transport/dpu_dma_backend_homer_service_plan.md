@@ -365,6 +365,75 @@ TCP setup messages should carry:
 
 The copied DOCA COMCH headers remain in the header snapshot as historical/reference material for the abandoned setup path. They are not on the immediate implementation path.
 
+### Host Lifecycle Shim For PostgreSQL-Local Work
+
+The DPU service cannot directly perform host-local PostgreSQL lifecycle work. It
+cannot `shm_open()` host `/dev/shm` objects, map socketless backend mailboxes,
+or signal the host postmaster. That does not mean the old host Homer service
+stays on the hot path. It means selected-DPU mode needs a small host lifecycle
+shim, owned by the host frontend DMA channel, to establish the resources that
+DMA will later use.
+
+The host lifecycle shim should live in or beside `homer_frontend_dma.c/.h`.
+Split it into a separate private source file if that keeps the frontend channel
+readable, but keep it conceptually under the host DMA frontend, not under the
+DPU service engine.
+
+Responsibilities:
+
+- create host-local SHM/mailbox objects that PostgreSQL backends must open by
+  name, including command and completion mailboxes;
+- allocate/register/export the host memory regions that the DPU will DMA;
+- connect to the DPU TCP setup listener and exchange mmap export descriptors,
+  ring descriptors, feature bits, setup generation, and ack/error status;
+- obtain or confirm DPU-owned Homer session identity such as service session id,
+  service session index, generation, and bridge generation;
+- submit the backend spawn request to the host postmaster after the mailboxes
+  and DPU-visible descriptors are established;
+- report bounded setup, spawn, and teardown errors before any selected-DPU
+  frontend path would otherwise be tempted to fall back to the old SHM channel.
+
+Current host-local code that motivates this split:
+
+- `TupleSinkServiceEnsureSessionMailboxes()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18033`
+  creates and maps the backend command/completion mailboxes today.
+- `TupleSinkServiceSubmitBackendSpawnRequest()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18188`
+  opens the postmaster-owned spawn region, fills
+  `CitusRemoteExecBackendSpawnRequest`, signals postmaster, and waits for the
+  response.
+- `CitusRemoteExecInitializeBackendSpawnRegion()` and
+  `ProcessSpawnRequestSlot()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1638`
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2792`
+  are host/PostgreSQL-local operations.
+- `ExecuteRemoteExecBackendCommand()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2456`
+  later maps the command/completion mailboxes by name and runs the socketless
+  backend command loop.
+
+The selected-DPU setup order for a command-capable session should be:
+
+1. Host frontend asks the DPU service over TCP setup for a DPU session allocation
+   or validates a host-proposed identity.
+2. Host lifecycle shim creates the command/completion mailboxes using the agreed
+   service session id and the existing naming rule.
+3. Host lifecycle shim registers/exports the grouped control block, request
+   slots, backend mailboxes, and completion/credit memory that the DPU must DMA.
+4. DPU service imports those descriptors and acknowledges the exact generation,
+   ring geometry, and session identity.
+5. Host lifecycle shim submits `CitusRemoteExecBackendSpawnRequest` locally to
+   postmaster with the same session identity and backend startup metadata.
+6. Only after setup/import/spawn succeeds may the host publish hot-path DMA
+   frontiers for DPU pull.
+
+The hot path after this setup remains DPU DMA: the host produces records and
+frontiers in exported memory; the DPU pulls commands/payloads and writes
+completion/credit state. The lifecycle shim is not a transport fallback and must
+not forward every command back to the old host Homer service.
+
 ### Sync-Event Optional Path
 
 Do not put sync-event on the default hot path. If we later add idle wakeup:
