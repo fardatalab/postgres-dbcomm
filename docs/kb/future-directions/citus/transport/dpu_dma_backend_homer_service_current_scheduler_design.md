@@ -1585,6 +1585,116 @@ Acceptance:
   smoke that succeeds only through the host-process SHM command ring does not
   satisfy Stage 8B.
 
+#### Stage 8B scheduler-action contract for backend-mailbox DMA
+
+The selected-DPU command path needs one additional scheduler-level distinction
+before implementation continues: Stage 7B's DPU staged-command dispatch/execute
+path is a useful control-slot mechanism, but it is not the final
+`CLIENT_SQL_SESSION` hot path. Real SQL command execution still happens in the
+host socketless backend loop at
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2456`.
+Therefore Stage 8B must schedule DMA operations that bridge between the
+host-exported frontend command slot and the host-exported backend command and
+completion mailboxes.
+
+Keep these operations inside the existing `machine-baseline` DPU collector/action
+framework. The current registry already creates DPU collectors in
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14519`
+through
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14547`,
+and all DPU work is executed through
+`HomerServiceExecuteDpuDmaAction()` at
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:36420`.
+Do not add a private DPU loop and do not block inside PE drain; PE progress
+remains bounded by the granted poll budget.
+
+The Stage 8B command scheduler should become:
+
+1. **Grouped-control read**: keep the existing
+   `HOMER_PROGRESS_ACTION_DPU_GROUPED_CONTROL_READ` action. It DMA-reads
+   frontend host-publish lines and accepts command-slot frontiers only after
+   generation, ring identity, and monotonic frontier checks.
+2. **Frontend command pull**: keep the existing
+   `HOMER_PROGRESS_ACTION_DPU_COMMAND_PULL` action for the frontend request
+   descriptor role. It DMA-reads a ready `CitusRemoteExecControlSlot` into
+   DPU-local staging and records bridge/ring/request-sequence ownership.
+3. **Frontend-to-backend command translation**: add a bounded service-side
+   action that consumes one staged frontend command only when backend-command
+   DMA task capacity exists. This action materializes the corresponding
+   `CitusRemoteExecLocalCommandRecord` and command-slot publication word for the
+   host backend mailbox, but does not submit host-visible frontend completion.
+4. **Backend command mailbox DMA write**: add a DPU DMA submit action that writes
+   the backend command record body into the exported backend command mailbox,
+   then writes the matching `readySeq` publication word on the same ordered DOCA
+   DMA context. This is the selected-DPU replacement for the host service's
+   direct mailbox publication before the backend consumes commands at
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2456`.
+   The submit action may enqueue body and publish tasks immediately; task
+   completion retirement is left to the bounded PE-drain action.
+5. **Backend completion mailbox DMA read**: add a scheduled DMA-read action that
+   reads the backend completion mailbox publication frontier and then pulls the
+   next completion slot body from the exported backend completion mailbox. The
+   action must validate the expected command sequence and mailbox epoch before
+   converting the backend completion into a frontend response. It is the
+   selected-DPU replacement for service-side completion consumption in
+   `TupleSinkServiceConsumeCompletionMailbox()` at
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18371`.
+6. **Frontend response publication**: reuse the Stage 8A
+   `HOMER_PROGRESS_ACTION_DPU_COMPLETION_PUSH` shape for frontend-visible
+   response publication: response body DMA write first, then the response-ready
+   publication word on the same ordered DOCA DMA context. This publishes back to
+   the frontend bridge/control-slot role, not to the backend completion mailbox.
+7. **PE drain and task retirement**: keep
+   `HOMER_PROGRESS_ACTION_DPU_PE_DRAIN` as the only place that retires DOCA task
+   completions. Submission actions must not spin waiting for completion; they
+   set enough owner metadata for callbacks to update contiguous physical
+   frontiers and recycle task slots later.
+
+The DPU DMA engine therefore needs new task-owner kinds for backend-command
+write and backend-completion read, in addition to the existing grouped-control,
+frontend command-pull, and frontend response-publish owners in
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:80`.
+Each owner must carry import index, descriptor role, ring index, bridge
+generation, serviceSessionId, command sequence, slot index or mailbox epoch, and
+local staging-buffer identity. A stale owner due to teardown or generation
+change may be counted and recycled, but a role mismatch, impossible command
+sequence, or publication-order violation is a fatal service bug.
+
+These actions imply a small descriptor-role ABI extension. The existing
+`HomerDpuBridgeRingDescriptor` at
+`/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_bridge_abi.h:154`
+already has `workloadClass`, `direction`, `recordGeometry`,
+`serviceSessionId`, and `serviceSinkId`, but role must not be inferred only from
+that tuple. Add an explicit descriptor role for at least:
+
+- frontend control slot: host frontend request slot and DPU response target;
+- backend command mailbox: DPU writes `CitusRemoteExecLocalCommandRecord` bodies
+  and `readySeq` publication words;
+- backend completion mailbox: DPU reads backend-published completions;
+- payload byte ring: host-published byte stream for Stage 9 DPU pull.
+
+`serviceSessionId` identifies the selected-DPU SQL session. `serviceSinkId`
+remains meaningful for tuple/basebackup byte streams and should be zero or an
+invalid sentinel for per-session command/completion mailbox descriptors unless
+the implementation later needs multiple command-like sinks per session.
+
+Implementation substeps for this scheduler contract:
+
+1. Add descriptor roles and multi-export setup parsing, while keeping the
+   existing frontend-control descriptor working.
+2. Add host lifecycle shim setup that creates/maps/exports the backend command
+   and completion mailboxes and sends their descriptors with the frontend bridge
+   descriptor.
+3. Add DPU DMA engine descriptor lookup by role plus task-owner structs for
+   backend command writes and backend completion reads.
+4. Add collectors/action kinds for backend-command publish and backend-completion
+   pull, or reuse existing DPU collector families only if the action kind remains
+   explicit and diagnostics distinguish them.
+5. Validate with a synthetic backend-mailbox DMA smoke before removing the
+   selected-DPU frontend `not implemented` guard: DPU writes one backend command
+   record+readySeq, the host backend consumes it, DPU reads one backend
+   completion, and DPU publishes the frontend response.
+
 ### Stage 8A — Completion/result push mechanism
 
 Deliverable: DPU DMA writes to host completion/result mailboxes.

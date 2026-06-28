@@ -2092,7 +2092,13 @@ synthetic command can still be useful as a service-side mechanism smoke, but it
 is not sufficient for production SQL frontend promotion because DPU-local
 dispatch does not execute work in the host PostgreSQL backend. The selected-DPU
 `not implemented` guard should remain until the real lifecycle/mailbox path has
-both positive DPU publication evidence and negative no-fallback evidence.
+both positive DPU publication evidence and negative no-fallback evidence. The
+concrete scheduler contract for that next slice is now recorded in
+[`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md):
+host frontend control-slot pull, backend command-mailbox DMA write, backend
+completion-mailbox DMA read, and frontend response publication must be separate
+bounded DPU actions integrated through `machine-baseline`, with PE drain as the
+only DOCA completion-retirement point.
 
 Current Stage 6 setup decisions:
 
