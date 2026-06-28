@@ -1973,6 +1973,55 @@ Current limitation:
   the negative acceptance run where absent/stale DPU completion publication fails
   boundedly instead of falling back to SHM.
 
+## Stage 8B.1: Frontend Bridge Control Slot Layout
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.h`
+  extends `HomerFrontendDmaBridgeState` with command-slot count, offset, size,
+  and a `CitusRemoteExecControlSlot *` pointer.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c`
+  now allocates one fixed control slot after the bridge header, host publish
+  line, and DPU credit line. This makes the real frontend bridge layout match
+  the host-DPU TCP transport smoke shape instead of depending on smoke-only
+  manual allocation.
+- `HomerFrontendDmaBuildSyntheticDescriptor()` now advertises
+  `slotBytes = sizeof(CitusRemoteExecControlSlot)` and `hostRingOffset` equal to
+  the bridge-owned command slot offset. The DPU command-pull engine already
+  validates `slotBytes >= sizeof(CitusRemoteExecControlSlot)`, so this change
+  turns the setup-smoke descriptor into the same layout expected by the command
+  pull path.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_frontend_dma_smoke.c` checks that the
+  exported layout includes the command slot and that it starts in the free
+  state.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make frontend-dma-smoke dpu-bridge-abi-check
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm make -C src/backend/distributed all
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+git diff --check
+```
+
+Observed result:
+
+- `homer_frontend_dma_smoke: ok`
+- `homer_dpu_bridge_abi_check: ok`
+- the extension build recompiled `homer_frontend_control.o` and
+  `homer_frontend_dma.o`, then relinked `citus.so`;
+- the forced DOCA-enabled service/client build linked successfully with
+  `libdoca_dma`/`libdoca_common`;
+- `git diff --check` reported no whitespace errors.
+
+This is a layout and descriptor correctness substep, not full Stage 8B
+promotion. Real selected-DPU command execution still needs the persistent
+frontend channel, host lifecycle shim, backend-mailbox DMA path, and positive
+plus negative no-fallback validation.
+
 ## Next Stage
 
 The next implementation slice should promote the frontend command API from
