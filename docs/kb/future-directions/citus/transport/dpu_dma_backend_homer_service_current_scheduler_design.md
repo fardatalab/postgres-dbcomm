@@ -1157,9 +1157,12 @@ PF representor `0000:21:00.0`; the SF representor `0000:03:00.0` /
 `en3f0pf0sf0` timed out and the host client aborted. Stage 6A.3 made the DPU
 DMA engine open an explicitly configured local DOCA device instead of the first
 DMA-capable device; the DPU default is `0000:03:00.0`, with
-`HOMER_SERVICE_DOCA_DEV_PCI` as the service override. The next Stage 6A slice
-should integrate the validated COMCH lifecycle into service/frontend setup
-rather than using the standalone smoke binary.
+`HOMER_SERVICE_DOCA_DEV_PCI` as the service override. Stage 6A.4 then validated
+the full standalone cold setup composition: the host exported a real PCI mmap
+descriptor, sent it over COMCH, and the DPU server imported it through the
+service DMA engine. The next Stage 6A slice should integrate this validated
+COMCH lifecycle into service/frontend setup rather than using the standalone
+smoke binary.
 
 Tasks:
 

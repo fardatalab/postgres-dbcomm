@@ -70,6 +70,21 @@ to COMCH server setup. The Homer DPU DMA engine defaults to `0000:03:00.0` and
 can be overridden with `HOMER_SERVICE_DOCA_DEV_PCI` if the DPU device numbering
 changes.
 
+The standalone COMCH transport smoke can also validate the real cold setup
+composition: host PCI mmap export over COMCH and DPU-side import into the DMA
+engine. Run the DPU server with `--import-dma` and the host client with
+`--real-mmap`:
+
+```sh
+# On the DPU, after compiling/copying the smoke there:
+./homer_dpu_comch_transport_smoke --server --import-dma \
+  --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0
+
+# On farnet1 host:
+./build/homer/homer_dpu_comch_transport_smoke --client --real-mmap \
+  --dev-pci 0000:21:00.0
+```
+
 The second host fast-link addresses were also configured on June 17, 2026:
 
 - `farnet0` host: `10.10.2.100`

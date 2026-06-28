@@ -27,7 +27,10 @@ farnet1 DPU control-channel path. The service and frontend do not yet call that
 transport lifecycle directly. Stage 6A.3 replaces first-capable-device DMA
 selection with an explicit local DOCA device PCI: the service defaults to the
 DPU-local `0000:03:00.0` and can be overridden with
-`HOMER_SERVICE_DOCA_DEV_PCI`.
+`HOMER_SERVICE_DOCA_DEV_PCI`. Stage 6A.4 extends the standalone COMCH smoke so a
+host client can export a real PCI mmap descriptor and the DPU server can import
+it through the service DMA engine. Production service/frontend startup still
+does not call the COMCH lifecycle directly.
 
 ## Stage 1: Bridge ABI Header
 
@@ -590,6 +593,81 @@ Observed result:
 - The DOCA-enabled host and DPU compiles still emit warnings from installed
   `doca_buf_inventory.h` inline helpers about deprecated experimental reuse APIs.
   Homer does not call those helpers directly.
+
+## Stage 6A.4: Real Mmap COMCH Transport Into DMA Import
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:55`
+  extends the standalone COMCH smoke options with `--import-dma` for the
+  DPU-side server and `--real-mmap` for the host-side client. The flags are
+  deliberately role-specific so the original transport-only smoke remains
+  available.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:551`
+  creates a real service-side `HomerDpuDmaEngine` for the server import smoke,
+  using the same `HOMER_SERVICE_DOCA_DEV_PCI` override as production service
+  startup.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:578`
+  allocates a cache-line-aligned host buffer, registers it with `doca_mmap`,
+  grants `DOCA_ACCESS_FLAG_PCI_READ_WRITE`, starts the mmap, and exports a PCI
+  descriptor with `doca_mmap_export_pci()`.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:905`
+  routes a received setup payload through
+  `HomerServiceDpuComchHandleSetupPayload()` when `--import-dma` is set. That
+  means the DPU server validates setup bytes, imports the host mmap descriptor
+  through `HomerDpuDmaImportHostMmapDescriptor()`, and replies with the normal
+  `HomerDpuComchSetupAck`.
+- `/data/dbcomm/citus-dbcomm/Makefile:120` links the COMCH transport smoke with
+  `homer_service_dpu_dma.c`, `homer_service_dpu_comch.c`, `doca-comch`, and
+  `doca-dma` so the standalone binary exercises the same service import helper
+  as the eventual production setup path.
+
+Scope boundary:
+
+- Stage 6A.4 is still a standalone validation binary, not production startup
+  integration. It proves that the cold-path pieces compose correctly across the
+  actual host-DPU boundary: host mmap export, COMCH setup send, DPU COMCH
+  receive, DPU DMA engine init, and DPU mmap import.
+- The next production integration step still needs to decide the exact lifetime
+  of the server/client COMCH objects inside `citus_tuple_sink_service` and
+  `homer_frontend_dma.c`, including whether the cold setup blocks before normal
+  service pumping or is exposed as an explicit experimental setup operation.
+
+Stage 6A.4 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make -B dpu-comch-transport-smoke-bin
+
+ssh dpu 'rm -rf /tmp/homer_dpu_comch_smoke && mkdir -p /tmp/homer_dpu_comch_smoke'
+rsync -azR src/bin/homer_dpu_comch_transport_smoke.c src/backend/distributed/utils/homer/homer_service_dpu_dma.c src/backend/distributed/utils/homer/homer_service_dpu_dma.h src/backend/distributed/utils/homer/homer_service_dpu_comch.c src/backend/distributed/utils/homer/homer_service_dpu_comch.h src/include/distributed/homer/homer_abi_version.h src/include/distributed/homer/homer_dpu_bridge_abi.h src/include/distributed/homer/homer_dpu_comch_abi.h dpu:/tmp/homer_dpu_comch_smoke/
+ssh dpu 'cd /tmp/homer_dpu_comch_smoke && gcc -std=gnu99 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Werror=vla -Werror=implicit-int -Werror=implicit-function-declaration -Werror=return-type -DHOMER_DPU_DMA_WITH_DOCA -I src/include -I src/backend/distributed/utils/homer -I/opt/mellanox/doca/include -I/usr/include/libnl3 -DALLOW_EXPERIMENTAL_API -o homer_dpu_comch_transport_smoke src/bin/homer_dpu_comch_transport_smoke.c src/backend/distributed/utils/homer/homer_service_dpu_dma.c src/backend/distributed/utils/homer/homer_service_dpu_comch.c -L/opt/mellanox/doca/lib/aarch64-linux-gnu -ldoca_comch -ldoca_dma -ldoca_common'
+
+# Regression: transport-only synthetic setup still passes.
+ssh dpu 'cd /tmp/homer_dpu_comch_smoke && LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu ./homer_dpu_comch_transport_smoke --server --name homer-dpu-comch-regression --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0 --timeout-ms 15000'
+./build/homer/homer_dpu_comch_transport_smoke --client --name homer-dpu-comch-regression --dev-pci 0000:21:00.0 --timeout-ms 15000
+
+# Real setup: host exports a real mmap descriptor; DPU imports it into DMA.
+ssh dpu 'cd /tmp/homer_dpu_comch_smoke && LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu ./homer_dpu_comch_transport_smoke --server --import-dma --name homer-dpu-comch-dma-import --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0 --timeout-ms 15000'
+./build/homer/homer_dpu_comch_transport_smoke --client --real-mmap --name homer-dpu-comch-dma-import --dev-pci 0000:21:00.0 --timeout-ms 15000
+```
+
+Observed result:
+
+- The regression transport-only path still printed `client received setup ack
+  generation=1 rings=1 imported_bytes=16` and both host and DPU processes exited
+  with `homer_dpu_comch_transport_smoke: ok`.
+- The real mmap path printed `client exported real PCI mmap bytes=277
+  buffer_bytes=192` on the host, and the host ack reported `imported_bytes=277`.
+- The DPU server printed `server DMA import enabled dma_dev=0000:03:00.0`,
+  observed three DOCA DMA context start/stop transitions, and exited with
+  `homer_dpu_comch_transport_smoke: ok`.
+- The follow-up affected-target build passed:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make dpu-comch-transport-smoke-bin dpu-comch-abi-check dpu-bridge-abi-check frontend-dma-smoke service-dpu-dma-smoke service-dpu-dma-doca-smoke service-bin client-bin
+```
 
 ## Next Stage
 
