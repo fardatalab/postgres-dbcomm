@@ -926,14 +926,15 @@ bring-up correctness, not performance.
 
 ## Implementation sequence
 
-Promotion is not a separate cleanup track. The stage tasks and acceptance gates
-below are the source of truth for moving selected DPU mode from experimental
-scaffolding to the production path. Each stage owns the selected-DPU behavior it
-first makes meaningful: setup in Stage 6, command pull in Stage 7, completion
-publication in Stage 8, payload/basebackup pull in Stage 9, lifecycle/reconnect
-in Stage 10, and only the user-facing selector flip in Stage 11. Once a stage is
-accepted, its selected-DPU path must not retain the old host-process SHM path as
-an escape hatch for that behavior.
+Promotion is stage-scoped, not a separate cleanup track. When a stage first makes
+a selected-DPU behavior meaningful, that same stage must replace the
+corresponding experimental guard, placeholder, or old host-process SHM
+dependency and must add acceptance evidence for the replacement. Later stages
+should not inherit a vague "remove fallback before production" TODO. Instead,
+any remaining promotion work belongs directly in the stage that owns the
+behavior: setup in Stage 6, command pull in Stage 7, completion publication in
+Stage 8, payload/basebackup pull in Stage 9, lifecycle/reconnect in Stage 10,
+and only the user-facing selector flip in Stage 11.
 
 ### Stage 0 — Freeze the migration contract
 
@@ -959,6 +960,8 @@ Acceptance:
   scheduler cleanup.
 - Stages 6 through 11 each name the selected-DPU fallback or placeholder they
   must eliminate before that stage can be considered complete.
+- Stages 6 through 11 each include acceptance evidence that distinguishes a real
+  selected-DPU path from a DPU-off SHM comparison path.
 
 ### Stage 1 — Bridge ABI header
 
@@ -1123,6 +1126,9 @@ Tasks:
 - Enable the minimal real DOCA lifecycle behind `HOMER_SERVICE_ENABLE_DOCA_DMA=1`
   for grouped-control reads only. Payload pulls, completion pushes, consumed-head
   writes, and real grouped-control task submission remain stubbed.
+- Keep Stage 5 as infrastructure only: it may introduce DOCA/COMCH objects,
+  task-slot pools, and debug harnesses, but it must not claim any selected-DPU
+  runtime behavior has been promoted yet.
 - Exchange the host mmap descriptor over COMCH for the real path. A file-based
   descriptor path may be kept only as a standalone debug harness, not as the
   Homer service path.
@@ -1151,6 +1157,9 @@ Acceptance:
 - The meaningful host/DPU grouped-control correctness test is intentionally
   deferred to Stage 6, because it requires bounded PE drain plus callback
   retirement to observe completions safely.
+- Stage 5 acceptance is not promotion evidence for user-facing DPU mode. It only
+  proves that the later stage-owned replacements have the DOCA/COMCH lifecycle
+  substrate they need.
 
 ### Stage 6 — Grouped-control submit, PE drain, and task-owner retirement
 
@@ -1265,6 +1274,10 @@ Tasks:
   enough to validate setup: the old bridge-memory smoke may remain as a local
   preflight check, but it must no longer be the terminal behavior for a selected
   DPU frontend build that has DOCA enabled.
+- Add Stage 6 promotion evidence to the smoke/runtime output: selected DPU setup
+  must report COMCH connection, mmap export/import, bridge generation, accepted
+  descriptor count, and the expected Stage 7 command guard. A run that reaches
+  the guard through SHM setup is invalid.
 - Implement the DPU COMCH server in `homer_service_dpu_comch.c/.h`, keeping
   `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter. The
   setup-payload handler and reusable server lifecycle are landed; the standalone
@@ -1360,6 +1373,10 @@ Acceptance:
   action observes and validates them. Done in Stage 6B.1 with
   `homer_dpu_comch_transport_smoke --server --import-dma
   --submit-control-read` on the DPU and `--client --real-mmap` on the host.
+- Stage 6 promotion evidence must include a selected-DPU setup trace from the
+  host/frontend path through COMCH/mmap import. The trace may still stop at the
+  Stage 7 command guard, but it must prove that setup did not remap the
+  host-process SHM frontend channel.
 
 ### Stage 7 — Command/control request pull
 
@@ -1423,6 +1440,11 @@ Tasks:
   command APIs must publish host request slots for DPU pull, and any remaining
   command failure must be a DPU setup/protocol/runtime failure rather than a
   deliberate migration placeholder.
+- Add Stage 7 promotion evidence to command-path diagnostics: one accepted
+  command must be traceable through host request publication, grouped-control
+  discovery, command-slot DMA pull, DPU-local staged dispatch, and response-owner
+  selection. SHM command-ring evidence is valid only as a DPU-off regression
+  check.
 
 Acceptance:
 
@@ -1453,6 +1475,10 @@ Acceptance:
   command ring eligible once, command-pull work consumes or advances that ready
   fact, and the scheduler no longer sees `totalDiscoveredReadyRingCount > 0`
   after all accepted command slots have been staged.
+- Stage 7 promotion evidence must include the command-path diagnostic/counter
+  proving selected-DPU command work entered through the DPU pull path. A command
+  smoke that succeeds only through the host-process SHM command ring does not
+  satisfy Stage 7.
 
 ### Stage 8 — Completion/result push
 
@@ -1479,6 +1505,10 @@ Tasks:
 - Treat Stage 8 promotion work as the completion replacement gate: selected-DPU
   completion polling must consume DPU-written completion/credit publication
   lines and must not use host-process SHM completion mailboxes after selection.
+- Add Stage 8 promotion evidence to completion-path diagnostics: for at least
+  one selected-DPU command, the request must arrive through DPU-pulled staging
+  and the response must become visible through DPU-written body-plus-publication
+  DMA, not through the host-process SHM completion mailbox.
 
 Acceptance:
 
@@ -1497,6 +1527,9 @@ Acceptance:
 - Stage 8 is not accepted if a selected-DPU session can report command completion
   from the old host-process mailbox when the DPU completion path is absent,
   stale, or invalid.
+- Stage 8 promotion evidence must include both a positive DPU completion
+  publication run and a negative run where an absent/stale DPU completion path
+  fails boundedly instead of falling back to SHM.
 
 ### Stage 9 — Payload and basebackup byte-stream pull
 
@@ -1528,6 +1561,10 @@ Tasks:
 - Treat Stage 9 promotion work as the payload/basebackup replacement gate:
   selected-DPU byte streams must publish host byte-ring frontiers for DPU pull and
   must not use host-process SHM queues as an escape path for large transfers.
+- Add Stage 9 promotion evidence to stream diagnostics: selected-DPU runs must
+  report host byte-ring frontier publication, payload/basebackup DMA pulls,
+  contiguous completion-frontier advancement, and consumed-head DMA publication.
+  DPU-off SHM/RDMA stream counters remain comparison evidence only.
 
 Acceptance:
 
@@ -1551,6 +1588,9 @@ Acceptance:
 - Stage 9 acceptance must include path evidence for both foreground command
   traffic and background byte-stream traffic. It is not enough for one workload
   class to be DPU-backed while the other remains on host-process SHM.
+- Stage 9 promotion evidence must be collected under the mixed foreground
+  command plus background basebackup shape, because this is where a silent
+  host-process SHM stream fallback would invalidate the migration measurement.
 
 ### Stage 10 — Teardown, failure, and generation reset
 
@@ -1578,6 +1618,9 @@ Tasks:
 - Treat Stage 10 promotion work as the lifecycle replacement gate: selected-DPU
   teardown, reconnect, and service-restart handling must use generation reset and
   fresh COMCH setup, not SHM continuation.
+- Add Stage 10 promotion evidence to lifecycle diagnostics: selected-DPU close,
+  reconnect, DPU service restart, stale-generation rejection, and fatal DMA-error
+  shutdown must be distinguishable from DPU-off SHM teardown/recovery.
 
 Acceptance:
 
@@ -1596,6 +1639,9 @@ Acceptance:
 - Stage 10 is not accepted if teardown, backend reconnect, or DPU service
   restart can recover a selected-DPU session by switching that session to the
   host-process SHM transport.
+- Stage 10 promotion evidence must include one successful reconnect/re-setup
+  case and one bounded failure case after DPU service restart. Neither case may
+  use SHM continuation for the selected session.
 
 ### Stage 11 — Measurement and tuning
 
@@ -1625,6 +1671,10 @@ Tasks:
 - Keep DPU-off SHM/RDMA runs as comparison baselines, but remove any code path
   where normal DPU mode can silently demote a selected session back to
   host-process SHM after setup or runtime failure.
+- Add Stage 11 promotion evidence as a measurement preflight requirement:
+  workload runs used to justify the selector flip must first assert that the
+  Stage 6 through Stage 10 path counters are present and nonzero for the selected
+  workload classes.
 
 Acceptance:
 
@@ -1644,6 +1694,9 @@ Acceptance:
 - Stage 11 is not accepted if measurements cannot prove that command,
   completion, payload, and basebackup records crossed the DPU DMA/COMCH boundary
   during the selected-DPU run.
+- Stage 11 is not accepted if it discovers deferred fallback-removal work that
+  should have belonged to Stages 6 through 10; in that case, reopen the owning
+  stage gate rather than promoting the selector.
 
 ## Invariants to assert early
 
