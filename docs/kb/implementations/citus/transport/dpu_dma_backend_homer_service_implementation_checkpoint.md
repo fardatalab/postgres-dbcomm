@@ -6,83 +6,44 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 7B.5, the default frontend and service path is still the existing
+As of Stage 8A/TCP, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
-SHM mapping. A DOCA-enabled frontend build now runs a host-side bridge-memory
-smoke check, exports that bridge as a DOCA PCI mmap, sends the setup bytes with a
-real COMCH client, waits for setup ack with a timeout, tears the smoke bridge
-down, and still fails real Homer API calls with a deliberate not-implemented
-error because Stage 7 has not yet wired staged requests into the existing command
-handlers or response publication. The service-side DPU DMA
-scheduler path is opt-in behind
+SHM mapping. A DOCA-enabled frontend build exports a synthetic bridge as a DOCA
+PCI mmap and now sends the setup bytes over a regular TCP setup socket, not
+DOCA COMCH. It still fails real Homer API calls with a deliberate
+not-implemented error because the SQL frontend has not yet been promoted from
+the setup smoke into a runnable selected-DPU command path.
+
+The service-side DPU DMA scheduler path is opt-in behind
 `HOMER_SERVICE_ENABLE_DPU_DMA=1`; it reads maintained facts and wires bounded
-DPU actions through `machine-baseline`. The engine now has Stage 5
-service-side DOCA lifecycle scaffolding behind a compile-time
-`HOMER_DPU_DMA_WITH_DOCA` gate: task-slot/owner arrays, local grouped-control
-staging buffers, one PE plus per-class DMA contexts, and an imported-host-mmap
-descriptor API. Stage 6A.1 adds a shared COMCH setup-message ABI and
-service-side setup handler that validates received setup bytes and routes mmap
-descriptor import through `HomerDpuDmaImportHostMmapDescriptor()`. It still does
-not submit DOCA DMA tasks or drain a DOCA PE. Stage 6A.2 adds a standalone real
-DOCA COMCH transport smoke for the setup bytes and validates the farnet1 host to
-farnet1 DPU control-channel path. The service and frontend do not yet call that
-transport lifecycle directly. Stage 6A.3 replaces first-capable-device DMA
-selection with an explicit local DOCA device PCI: the service defaults to the
-DPU-local `0000:03:00.0` and can be overridden with
-`HOMER_SERVICE_DOCA_DEV_PCI`. Stage 6A.4 extends the standalone COMCH smoke so a
-host client can export a real PCI mmap descriptor and the DPU server can import
-it through the service DMA engine. Stage 6A.5 adds a reusable service-side
-`HomerServiceDpuComchServer` lifecycle API that creates a real DPU COMCH
-listener, exposes bounded PE progress, and delivers received setup messages to
-the existing mmap-import handler. Stage 6A.6 wires that server object into the
-production service startup path when `HOMER_SERVICE_ENABLE_DPU_DMA=1` and
-`HOMER_SERVICE_ENABLE_DOCA_DMA=1`, adds COMCH server env overrides, progresses
-the COMCH PE through the bounded DPU `PE_DRAIN` scheduler action, and destroys
-the server before the DMA engine. Stage 6A.7 replaces the earlier singleton
-imported-host-mmap slot with a bounded import table keyed by bridge generation
-plus client instance ID. This lets the DPU service accept multiple future
-backend/frontend setup imports without conflating their mmap descriptors; duplicate
-setup identity is rejected explicitly. Stage 6A.8 adds the production frontend
-COMCH setup client code path in `homer_frontend_dma.c` and opt-in DOCA extension
-linkage. Stage 6B.1 adds the first real grouped-control DMA read path: the DPU
-DMA engine stores copied bridge headers/descriptors in the import table, submits
-cache-line reads of host-published control lines only through a bounded submit
-API, drains completions only through a bounded PE-drain API, and exposes copied
-snapshots only after the completion callback retires the task. The current
-scheduler adapter now calls these engine APIs for
-`HOMER_PROGRESS_ACTION_DPU_GROUPED_CONTROL_READ` and
-`HOMER_PROGRESS_ACTION_DPU_PE_DRAIN`. Stage 6B.2 turns those completed
-host-publish-line snapshots into maintained DPU-local ready-ring facts by
-validating publication epoch, generation, ring identity, entry state, and
-monotonic frontier before incrementing
-`HomerDpuDmaSchedulerFacts.totalDiscoveredReadyRingCount`. Stage 7A consumes
-that ready fact for one fixed control slot: the DMA engine can submit a bounded
-command-slot pull, stage a complete `CitusRemoteExecControlSlot`, validate slot
-state, owner pid, request sequence, request protocol, and request kind, and clear
-the discovered-ready fact after the accepted frontier is staged. This still stops
-before real command execution and response DMA publication. Stage 7B.1 begins
-the service adapter refactor by extracting the SHM local-control semantic
-dispatcher from the SHM slot response-publication step; the existing SHM path
-still owns slot-state publication, while future DPU callers get an explicit
-"response owner required" error for requests that need slot-indexed async
-continuations. Stage 7B.2 then replaces the raw async `slotIndex` owner with a
-SHM response-owner object. Current SHM async continuations resolve through that
-owner before touching the SHM control slot, and an accidental non-SHM owner in
-the SHM async pump fails as a service bug. DPU response owners and DMA response
-publication are still pending. Stage 7B.3 adds the DPU command-staging handoff
-lifetime API: the DMA engine can copy a staged command together with
-bridge/ring/ordinal owner metadata, and the service must explicitly release that
-staged command after it has made its own local copy. The release path validates
-owner metadata and drops `totalStagedCommandRequestCount` back to zero; it does
-not publish a response to host memory. Stage 7B.4 adds the DPU staged-command
-response-owner metadata shape to the local-control dispatcher and makes async
-registration explicitly SHM-only until Stage 8 response publication exists.
-Stage 7B.5 adds a bounded service-owned staged-command dispatch queue plus a
-current-scheduler collector/action that copies engine-staged commands into that
-queue and releases the engine DMA staging buffer. It still does not run command
-semantics or publish a DPU response.
+DPU actions through `machine-baseline`. The engine now has service-side DOCA
+lifecycle scaffolding behind `HOMER_DPU_DMA_WITH_DOCA`: task-slot/owner arrays,
+local grouped-control staging buffers, one PE plus per-class DMA contexts, and a
+bounded imported-host-mmap table keyed by bridge generation plus client instance
+ID. The setup ABI still uses the existing `HomerDpuComch*` struct names, but the
+active transport is TCP. `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c`
+owns the nonblocking DPU listener and delivers received setup payloads to
+`HomerDpuDmaImportHostMmapDescriptorForSetup()`. The production service creates
+that listener when both `HOMER_SERVICE_ENABLE_DPU_DMA=1` and
+`HOMER_SERVICE_ENABLE_DOCA_DMA=1`, progresses it through the bounded
+`HOMER_PROGRESS_ACTION_DPU_PE_DRAIN` action, and destroys it before the DMA
+engine.
+
+Stages 6B and 7 remain the physical DPU-pull command path: grouped-control DMA
+reads produce maintained ready-ring facts, command-slot pulls stage complete
+`CitusRemoteExecControlSlot` records, and service-owned dispatch entries preserve
+the DMA owner metadata needed for response publication. Stage 8A adds a bounded
+pending-response queue and `HOMER_PROGRESS_ACTION_DPU_COMPLETION_PUSH`, which
+submits same-context response-body DMA writes followed immediately by the
+response-ready publication-word DMA write through
+`HomerDpuDmaSubmitCommandResponsePublication()`. The standalone TCP transport
+smoke validates the host-DPU composition end to end: real host mmap export over
+TCP setup, DPU mmap import, grouped-control read, command pull, and DPU-written
+response publication observed by host memory polling. Full selected-DPU SQL
+frontend execution is still pending and must not be claimed until the frontend
+guard is removed and the negative no-fallback completion gate is validated.
 
 ## Stage 1: Bridge ABI Header
 
@@ -1874,55 +1835,173 @@ Observed result:
   ordinal=0 command=6 sql="select 1"`, and
   `homer_dpu_comch_transport_smoke: ok`.
 
+## Stage 6/8 Transport Pivot: TCP Setup Replaces COMCH
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c`
+  adds a reusable service-side setup listener. It accepts one nonblocking TCP
+  client at a time, reads exactly one existing setup ABI payload, validates and
+  imports the host mmap descriptor through the DPU DMA engine, writes one setup
+  ack, and closes the client. The module intentionally performs no hot-path
+  data movement.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c`
+  keeps ownership of host-side DOCA mmap export but replaces the COMCH client
+  with a bounded TCP connect/write/read setup exchange. The active overrides are
+  `HOMER_FRONTEND_DPU_SETUP_HOST`, `HOMER_FRONTEND_DPU_SETUP_PORT`,
+  `HOMER_FRONTEND_DOCA_DEV_PCI`, and `HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  now creates `HomerServiceDpuSetupTcpServer` when DPU DMA and DOCA are enabled,
+  progresses it from `HOMER_PROGRESS_ACTION_DPU_PE_DRAIN`, and treats an active
+  setup connection as known scheduler work. An idle listener remains blind
+  polling under scheduler feedback.
+- `/data/dbcomm/citus-dbcomm/Makefile` links production
+  `citus_tuple_sink_service` against `homer_service_dpu_setup_tcp.c` plus
+  `doca-dma`/`doca-common` only. The active production path no longer links
+  `doca-comch`.
+
+Important decision:
+
+- COMCH is no longer a required Homer setup dependency. It was only a cold-path
+  descriptor transport, and it failed below Homer during later farnet1
+  validation even after driver/firmware resets. TCP is sufficient for this phase
+  because all performance-critical publication and data movement still happen
+  through DOCA DMA-visible host memory. The old `HomerDpuComch*` ABI names are a
+  temporary compatibility artifact and should be renamed only after the migration
+  stabilizes.
+
+## Stage 8A: DPU DMA Response Publication
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c`
+  implements `HomerDpuDmaSubmitCommandResponsePublication()`. It DMA-writes the
+  completed control response body and then submits the response-ready publication
+  word on the same ordered command DMA context. The body task uses optimized
+  completion reporting, while the publication task is the explicit flush/report
+  boundary.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  adds the pending-response slots, the
+  `HOMER_PROGRESS_ACTION_DPU_STAGED_COMMAND_EXECUTE` action that copies executed
+  semantic responses into service-owned pending state, and the
+  `HOMER_PROGRESS_ACTION_DPU_COMPLETION_PUSH` action that submits the DMA
+  response publication work. Completion retirement still happens through the
+  bounded PE-drain action; submit actions do not spin waiting for their own DMA
+  completions.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_tcp_transport_smoke.c` validates
+  the current end-to-end DPU pipeline without requiring the SQL frontend path to
+  be runnable yet. The server side uses the production TCP setup listener, then
+  directly drives grouped-control read, command pull, and response publication.
+  The host side exports a real DOCA mmap, sends setup over TCP, and polls the
+  command slot until the DPU-written response-ready state is visible.
+
+Validation on June 28, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make -j8 -C src/backend/distributed \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make dpu-tcp-transport-smoke-bin CPPFLAGS='-D_GNU_SOURCE'
+git diff --check
+```
+
+DPU-side smoke compile/run:
+
+```sh
+# DPU native compile used copied source/header files under /tmp/homer_dpu_tcp_smoke.
+gcc -std=gnu99 -Wall -Wextra -Werror=vla \
+  -Wno-unused-parameter -Wno-sign-compare \
+  -Wno-missing-field-initializers -Wno-declaration-after-statement \
+  -DHOMER_DPU_DMA_WITH_DOCA \
+  -I src/include -I src/backend/distributed/utils/homer \
+  $(pkg-config --cflags doca-dma doca-common) \
+  -o homer_dpu_tcp_transport_smoke \
+  src/bin/homer_dpu_tcp_transport_smoke.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c \
+  $(pkg-config --libs doca-dma doca-common)
+
+# DPU
+./homer_dpu_tcp_transport_smoke --server \
+  --port 9727 --timeout-ms 15000
+
+# Host
+./build/homer/homer_dpu_tcp_transport_smoke --client \
+  --host 10.10.1.201 --port 9727 --timeout-ms 15000 \
+  --expect-response-publish
+```
+
+Observed result:
+
+- `service-bin`, `client-bin`, extension build, and
+  `dpu-tcp-transport-smoke-bin` built successfully. `ldd` on
+  `build/homer/citus_tuple_sink_service` and `src/backend/distributed/citus.so`
+  showed `libdoca_common.so.2` and `libdoca_dma.so.2`, with no
+  `libdoca_comch`.
+- `git diff --check` reported no whitespace errors.
+- The cross host-DPU TCP smoke returned `client_rc=0 server_rc=0`.
+- The DPU server printed `server TCP setup listening host=0.0.0.0 port=9727
+  dma_dev=0000:03:00.0` and `server DMA response publication complete tasks=2`.
+- The host client printed `client received TCP setup ack generation=1 rings=1
+  imported_bytes=282`, then `client observed DMA response publication state=4
+  command_seq=7001`.
+
+Current limitation:
+
+- This is strong Stage 8 mechanism evidence, but not final Stage 8 promotion
+  evidence. The SQL frontend still calls `HomerFrontendDmaRaiseNotImplemented()`
+  after setup smoke, so there is not yet a selected-DPU pgbench command path that
+  proves completion polling has abandoned the old SHM mailbox. The next
+  promotion slice must wire real frontend commands to the DPU bridge and include
+  the negative acceptance run where absent/stale DPU completion publication fails
+  boundedly instead of falling back to SHM.
+
 ## Next Stage
 
-The next Stage 7 slice should consume service-owned staged-command dispatch
-entries into the local-control semantic dispatcher with a DPU response owner for
-synchronous-only requests, while keeping async DPU-staged requests explicitly
-blocked until Stage 8 response publication exists. The selected DPU command
-`not implemented` guard should remain until command execution and response
-publication both exist.
+The next implementation slice should promote the frontend command API from
+setup-only smoke to a real selected-DPU command path. It should submit/publish a
+host command slot through the DPU bridge, let the service scheduler run grouped
+control read, command pull, staged-command dispatch, staged-command execution,
+and completion push, and make the host frontend consume only the DPU-published
+response-ready state. The selected-DPU `not implemented` guard should remain
+until that path has both positive DPU publication evidence and negative
+no-fallback evidence.
 
-Important handoff rule: semantic execution of a DPU-staged command must not
-mutate service state unless its response is either DMA-published to host memory
-or copied into a bounded service-owned "executed response pending DPU
-publication" queue that preserves the response body and DPU response-owner
-metadata. The latter is only an intermediate state for a Stage 8 bounded
-response-publish action; it is not host-visible completion.
-
-Decisions recorded for Stage 6:
+Current Stage 6 setup decisions:
 
 - Keep new DPU implementation code out of
   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
   where sensible. That file remains the current-scheduler adapter for
   `HomerGrantVector`, `HomerProgressResult`, collector/action enums, and
   `HomerServiceExecuteDpuDmaAction()`.
-- Put the host COMCH client in
+- Put the host TCP setup client in
   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c`,
   because it is part of DMA-channel setup.
-- Add a service-side `homer_service_dpu_comch.c/.h` for the DPU COMCH server and
-  setup-message handling. It should deliver mmap export bytes to
-  `HomerDpuDmaImportHostMmapDescriptor()` rather than embedding COMCH receive
+- Add a service-side `homer_service_dpu_setup_tcp.c/.h` for the DPU TCP setup
+  listener and setup-message handling. It should deliver mmap export bytes to
+  `HomerDpuDmaImportHostMmapDescriptor()` rather than embedding setup receive
   state inside the DMA engine.
-- The DPU Homer service is the COMCH server; the host/frontend DMA channel is
-  the COMCH client.
-- COMCH setup is cold path. It may block while waiting for connection/setup ack,
+- The DPU Homer service is the TCP listener; the host/frontend DMA channel is
+  the TCP client.
+- TCP setup is cold path. It may block while waiting for connection/setup ack,
   but must use a timeout and explicit diagnostics. Scheduler ready-set building,
   DMA submit actions, PE-drain actions, and callbacks remain bounded and
   nonblocking.
 - The independent service-startup rule is: service startup creates the DPU DMA
-  engine and COMCH listener, then returns to normal service pumping. Host DB
+  engine and TCP setup listener, then returns to normal service pumping. Host DB
   backends connect later from the DPU frontend setup path, export bridge memory,
-  send setup over COMCH, and wait for ack with a finite timeout.
-- COMCH ack sends are asynchronous. Any server callback that sends an ack must
-  keep ack bytes alive until the send completion/error callback runs. Stage 6A.5
-  uses one heap `HomerDpuComchSetupAck` copy per send task and frees it from
-  DOCA task user data.
+  send setup over TCP, and wait for ack with a finite timeout.
+- TCP setup uses explicit message framing and short-read/short-write handling.
+  It does not require COMCH send-completion ownership, but receive payloads and
+  ack bytes must remain owned until the bounded setup exchange completes or
+  fails.
 - The setup message includes protocol/versioning, message kind, bridge
   generation, feature flags, ring count, descriptor size, mmap export length,
   exported mmap blob, `HomerDpuBridgeControlBlockHeader`,
-  `HomerDpuBridgeRingDescriptor[]`, and an ack/error result. This ABI is now
-  implemented and validated by Stage 6A.1.
+  `HomerDpuBridgeRingDescriptor[]`, and an ack/error result. The struct names
+  still say `Comch` for now, but the active transport is TCP.
 
 After Stage 6B.2, grouped-control discovery can produce maintained DPU-local
 ready facts. Close/close-ack and reclaim remain folded into Stage 10 teardown

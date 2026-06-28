@@ -27,7 +27,7 @@ choice: backend processes should remain CPU producers into host memory, and the
 DPU-side Homer service should pull records with DOCA DMA. Host backends should
 not submit hot-path DMA tasks.
 
-However, the plan needs three corrections before implementation:
+However, the plan needs four corrections before implementation:
 
 1. **The grouped control block is new ABI.** Today's host-process Homer has SHM
    control slots, ready bitmaps, completion mailboxes, SPSC queues, and byte
@@ -43,6 +43,13 @@ However, the plan needs three corrections before implementation:
    payload grant may issue many DMA tasks. Those task owners are below the
    scheduler's semantic layer. Publication, command completion, close/reclaim,
    and teardown still need explicit existing-machine state and generation checks.
+4. **The setup transport is TCP, not DOCA COMCH.** COMCH was only intended to
+   carry cold setup bytes: mmap export descriptors, bridge descriptors, feature
+   bits, and acks. It is no longer an implementation dependency because stock
+   DOCA COMCH currently fails on farnet1 below Homer, while standalone DOCA DMA
+   validation still passes in both host-produce/DPU-pull and DPU-push
+   directions. Use a regular TCP setup socket for the same cold-path bytes and
+   keep all hot-path movement and publication in DOCA DMA-visible memory.
 
 ## Current code shape to preserve
 
@@ -280,18 +287,18 @@ Responsibilities:
 2. Register those host regions with DOCA mmap and export descriptors for DPU PCI
    access.
 3. Exchange mmap exports, bridge descriptors, generations, and optional wakeup
-   handles with the DPU service over COMCH during setup.
+   handles with the DPU service over the TCP setup socket during setup.
 4. Write backend-produced request records and payload bytes into host memory.
 5. Publish host-owned frontiers through `HomerDpuBridgeHostPublishLine`.
 6. Read DPU-owned credit/completion lines with acquire-side validation.
 7. Keep `OpenRemoteExecutionSession()`, `StartRemoteExecutionCommand()`, and
    `PollRemoteExecutionCommandCompletion()` stable for ordinary callers.
 
-Decision: the host-side COMCH client belongs in `homer_frontend_dma.c` for this
-phase. It is part of the DMA channel setup path: it registers/exports host mmap
-state, sends descriptor bytes to the DPU service, waits for the setup ack, and
-then lets the hot path publish frontiers through DMA-visible memory. Because this
-is cold-path setup, it may block while waiting for COMCH connection/setup
+Decision: the host-side TCP setup client belongs in `homer_frontend_dma.c` for
+this phase. It is part of the DMA channel setup path: it registers/exports host
+mmap state, sends descriptor bytes to the DPU service, waits for the setup ack,
+and then lets the hot path publish frontiers through DMA-visible memory. Because
+this is cold-path setup, it may block while waiting for TCP connection/setup
 completion, but it must use a timeout and emit explicit diagnostics rather than
 spinning indefinitely.
 
@@ -309,8 +316,8 @@ Add:
 ```text
 src/backend/distributed/utils/homer/homer_service_dpu_dma.c
 src/backend/distributed/utils/homer/homer_service_dpu_dma.h
-src/backend/distributed/utils/homer/homer_service_dpu_comch.c
-src/backend/distributed/utils/homer/homer_service_dpu_comch.h
+src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c
+src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.h
 ```
 
 The engine owns DOCA objects and physical movement state. It exposes facts and
@@ -320,11 +327,12 @@ Decision: keep new DPU implementation work out of
 `tuple_sink_service_process.c` where the current scheduler-local type boundary
 allows it. The large file should remain a thin scheduler adapter: it owns current
 `HomerGrantVector`, `HomerProgressResult`, collector/action enums, and dispatch
-from `HomerServiceExecuteDpuDmaAction()`. Real COMCH server lifecycle and message
-handling should live in `homer_service_dpu_comch.c/.h`; real DMA lifecycle,
-descriptor import, buffer/task ownership, PE drain, and callbacks should stay in
-`homer_service_dpu_dma.c/.h`. Do not extract the scheduler-local types only to
-move code out; do that later if the adapter boundary becomes the limiting factor.
+from `HomerServiceExecuteDpuDmaAction()`. Real TCP setup listener lifecycle and
+message handling should live in `homer_service_dpu_setup_tcp.c/.h`; real DMA
+lifecycle, descriptor import, buffer/task ownership, PE drain, and callbacks
+should stay in `homer_service_dpu_dma.c/.h`. Do not extract the scheduler-local
+types only to move code out; do that later if the adapter boundary becomes the
+limiting factor.
 
 ### Minimum state
 
@@ -546,7 +554,7 @@ Use callbacks for only these operations:
 ```
 
 Callbacks should not dispatch semantic command handlers, submit new DMA work,
-run COMCH setup, call scheduler planning code, or spin on other completions. If a
+run TCP setup, call scheduler planning code, or spin on other completions. If a
 callback discovers follow-on work, it records maintained facts such as
 `discoveredReadyRingCount`, `completionPushQueueDepth`,
 `consumedHeadPublishPendingCount`, or failure bits. The next bounded scheduler
@@ -704,14 +712,16 @@ Every DPU action must return when its grant is exhausted, when it observes no
 progress, or when it cannot submit because a real dependency is blocked. It must
 not spin waiting for a particular DMA task or frontier.
 
-### COMCH and mmap setup lifecycle
+### TCP setup and mmap import lifecycle
 
-COMCH is cold/control-plane setup for this phase, not a hot-path publication
-primitive. It should carry descriptors and lifecycle acks; data movement and
-frontier publication stay in DMA-visible memory.
+The TCP setup socket is cold/control-plane setup for this phase, not a hot-path
+publication primitive. It should carry descriptors and lifecycle acks; data
+movement and frontier publication stay in DMA-visible memory. This replaces the
+earlier COMCH plan because COMCH currently fails at the stock DOCA sample level
+on farnet1, while DOCA DMA itself still validates independently.
 
-The DPU Homer service is the COMCH server. The host/frontend DMA channel is the
-COMCH client. This matches the deployment shape where the DPU service is the
+The DPU Homer service is the TCP listener. The host/frontend DMA channel is the
+TCP client. This matches the deployment shape where the DPU service is the
 long-lived endpoint and host backends/frontends initiate bridge setup for their
 exported memory.
 
@@ -748,12 +758,14 @@ payload for SETUP_ACK:
     rejected ring index or HOMER_DPU_BRIDGE_INVALID_RING_INDEX
 ```
 
-The exact C struct can be adjusted while implementing, but the required content
-is fixed: protocol/versioning, message kind, bridge generation, feature flags,
-ring count, descriptor size, mmap export length, exported mmap blob, bridge
-header, descriptor table, and an ack/error result. The DPU COMCH server should
-pass the received export blob to `HomerDpuDmaImportHostMmapDescriptor()` and
-validate the bridge header/descriptors before accepting rings.
+The exact C struct can be adjusted while implementing, and the current
+`Comch`-named setup structs may be preserved temporarily to avoid churn. The
+transport, however, is TCP. The required content is fixed:
+protocol/versioning, message kind, bridge generation, feature flags, ring count,
+descriptor size, mmap export length, exported mmap blob, bridge header,
+descriptor table, and an ack/error result. The DPU TCP setup handler should pass
+the received export blob to `HomerDpuDmaImportHostMmapDescriptor()` and validate
+the bridge header/descriptors before accepting rings.
 
 Initial setup sequence:
 
@@ -763,16 +775,16 @@ Initial setup sequence:
 2. Host creates a doca_mmap, sets the memory range and PCI read/write
    permissions, adds the local device, starts the mmap, and exports it with
    doca_mmap_export_pci().
-3. Host opens/attaches the COMCH client connection to the DPU service and sends:
+3. Host opens the TCP setup connection to the DPU service and sends:
    protocol version, feature flags, exported mmap blob, descriptor table,
    initial generation, ring count, and optional idle-wakeup handles.
-4. DPU service receives the COMCH setup message, imports the mmap with
+4. DPU service receives the TCP setup message, imports the mmap with
    doca_mmap_create_from_export(), validates protocol/descriptor geometry, and
    creates DPU-local ring/class state in SETUP.
 5. DPU creates or reuses class DMA contexts, attaches them to the PE, configures
    task pools/callbacks, starts contexts, and marks descriptors ACTIVE only after
    all buffers/task-owner pools needed for the accepted rings exist.
-6. DPU sends a COMCH setup ack containing accepted generation, feature bits,
+6. DPU sends a TCP setup ack containing accepted generation, feature bits,
    negotiated class windows, and any rejected ring descriptors.
 7. Host publishes ring frontiers only after setup ack. Until then the DPU must
    ignore hot-path lines for that generation.
@@ -781,16 +793,16 @@ Initial setup sequence:
 Teardown sequence:
 
 ```text
-1. Host publishes DRAINING/CLOSED in the owner line and sends a COMCH close if
+1. Host publishes DRAINING/CLOSED in the owner line and sends a TCP close if
    the connection is still alive.
 2. DPU stops submitting new DMA tasks for that generation, drains or invalidates
    in-flight tasks through scheduled PE-drain grants, and prevents stale
    callbacks from publishing host-visible state.
 3. DPU publishes final consumed/error state if the host memory is still valid and
-   sends a COMCH close ack.
+   sends a TCP close ack.
 4. Host waits for close ack or whole-service generation reset before unmapping,
    stopping the mmap, or reusing the address range for a new generation.
-5. If COMCH dies, both sides advance service/ring generation and rely on stale
+5. If the TCP setup connection dies, both sides advance service/ring generation and rely on stale
    task-owner generation checks to prevent old DMA callbacks from publishing into
    a reused semantic object.
 ```
@@ -1009,7 +1021,7 @@ Tasks:
 - Allocate aligned bridge memory and placeholder command/completion/payload
   regions.
 - Implement publication-word publish/read helpers.
-- Add placeholder COMCH setup hooks or explicit `not implemented` errors behind
+- Add placeholder TCP setup hooks or explicit `not implemented` errors behind
   the DPU channel switch.
 - Do not submit DMA tasks from backend processes.
 - Treat the hidden experimental selector as temporary scaffolding: selecting DPU
@@ -1097,9 +1109,9 @@ Acceptance:
   `HomerGrantVector` consumption remains a Stage 5+ implementation item once
   the actions submit actual DOCA DMA tasks.
 
-### Stage 5 — DOCA/COMCH grouped-control lifecycle
+### Stage 5 — DOCA/TCP grouped-control lifecycle
 
-Deliverable: real DOCA/COMCH lifecycle objects and grouped-control task-pool
+Deliverable: real DOCA DMA lifecycle objects, TCP setup lifecycle objects, and grouped-control task-pool
 scaffolding, but no real grouped-control DMA submission yet.
 
 Status: completed for the service-side DOCA lifecycle and descriptor-import
@@ -1107,11 +1119,10 @@ boundary in `/data/dbcomm/citus-dbcomm`. The implementation creates bounded
 task-slot/owner arrays and local grouped-control staging buffers, can compile an
 opt-in DOCA lifecycle smoke with `HOMER_DPU_DMA_WITH_DOCA`, creates one PE plus
 per-class DMA contexts, and imports PCI mmap export descriptors through
-`HomerDpuDmaImportHostMmapDescriptor()`. The production COMCH peer that carries
-those descriptor bytes from the host/frontend into the DPU service is not wired
-yet; Stage 5 treats COMCH as the required control-plane transport boundary, while
-the validated code consumes descriptor bytes through a scheduler-neutral import
-API.
+`HomerDpuDmaImportHostMmapDescriptor()`. The production setup peer that carries
+those descriptor bytes from the host/frontend into the DPU service is being
+pivoted from COMCH to TCP; the validated code already consumes descriptor bytes
+through a scheduler-neutral import API.
 
 Implementation correction from the DOCA headers: preallocating
 `doca_dma_task_memcpy` handles before descriptor import is not valid, because
@@ -1126,10 +1137,10 @@ Tasks:
 - Enable the minimal real DOCA lifecycle behind `HOMER_SERVICE_ENABLE_DOCA_DMA=1`
   for grouped-control reads only. Payload pulls, completion pushes, consumed-head
   writes, and real grouped-control task submission remain stubbed.
-- Keep Stage 5 as infrastructure only: it may introduce DOCA/COMCH objects,
+- Keep Stage 5 as infrastructure only: it may introduce DOCA DMA and TCP setup objects,
   task-slot pools, and debug harnesses, but it must not claim any selected-DPU
   runtime behavior has been promoted yet.
-- Exchange the host mmap descriptor over COMCH for the real path. A file-based
+- Exchange the host mmap descriptor over TCP for the real path. A file-based
   descriptor path may be kept only as a standalone debug harness, not as the
   Homer service path.
 - Import host mmap descriptor on the DPU side.
@@ -1145,7 +1156,7 @@ Tasks:
 
 Acceptance:
 
-- `HOMER_SERVICE_ENABLE_DOCA_DMA=1` can create and destroy the minimal DOCA/COMCH
+- `HOMER_SERVICE_ENABLE_DOCA_DMA=1` can create and destroy the minimal DOCA DMA and TCP setup
   lifecycle on the intended DPU environment without registering real Homer rings
   or submitting DMA tasks.
 - Host mmap descriptor exchange/import succeeds in a synthetic setup, or fails
@@ -1158,7 +1169,7 @@ Acceptance:
   deferred to Stage 6, because it requires bounded PE drain plus callback
   retirement to observe completions safely.
 - Stage 5 acceptance is not promotion evidence for user-facing DPU mode. It only
-  proves that the later stage-owned replacements have the DOCA/COMCH lifecycle
+  proves that the later stage-owned replacements have the DOCA DMA/TCP setup lifecycle
   substrate they need.
 
 ### Stage 6 — Grouped-control submit, PE drain, and task-owner retirement
@@ -1168,9 +1179,9 @@ bounded PE drain with real callback/frontier accounting.
 
 Stage 6 is split into two ordered sub-stages:
 
-1. **Stage 6A — COMCH setup path**: implement minimal host/frontend COMCH client
-   and DPU-service COMCH server. The host sends the setup message and waits for
-   ack with a timeout. The DPU receives descriptor bytes, calls
+1. **Stage 6A — TCP setup path**: implement minimal host/frontend TCP setup client
+   and DPU-service TCP setup listener. The host sends the setup message and waits
+   for ack with a timeout. The DPU receives descriptor bytes, calls
    `HomerDpuDmaImportHostMmapDescriptor()`, validates bridge header/descriptors,
    and marks accepted rings setup-ready. The DPU service starts independently and
    listens for host setup; host DB backends connect later when they initialize the
@@ -1243,52 +1254,59 @@ advanced epoch as the semantic gate, validates generation/ring identity and
 monotonic `publishedTail`, and increments maintained ready-ring facts only for
 rings with new accepted frontier.
 
+Stage 6A COMCH work is now historical prototype evidence, not the production
+setup direction. On June 28, 2026, stock DOCA COMCH failed on farnet1 below
+Homer even after driver restart, DPU reset, machine power cycle, and BlueField
+system reset, while the standalone DOCA DMA validation harness still passed both
+host-produce/DPU-pull and DPU-push directions. The immediate Stage 6A repair is
+therefore to replace the COMCH transport lifecycle with a regular TCP setup
+socket carrying the same setup payload and ack bytes. Keep the setup-payload
+builder/parser and DPU DMA import path; remove COMCH as an acceptance
+requirement for future stages.
+
 Tasks:
 
-- Implement the minimal COMCH setup message ABI and close/ack shell. The setup
-  ABI and setup-ack struct are landed; the close/close-ack shell remains.
-- Integrate the DPU COMCH server so service startup creates the listener and then
+- Implement the minimal TCP setup message ABI and close/ack shell. The existing
+  setup ABI and setup-ack struct may be reused initially even if their C names
+  still contain `Comch`; later rename them to neutral setup names after the TCP
+  path is stable.
+- Integrate the DPU TCP setup listener so service startup creates the listener and then
   returns to normal service pumping. Done for service ownership and bounded
-  scheduler PE progress in Stage 6A.6; runtime validation of the exact production
-  service binary on the DPU remains a later deployment gate. Startup must not
+  scheduler PE progress in Stage 6A.6 for the COMCH prototype; the TCP listener
+  is the immediate replacement and must be validated on the exact production
+  service binary on the DPU. Startup must not
   wait indefinitely for a host DB backend to connect.
-- Implement the host COMCH client in `homer_frontend_dma.c`. Done in Stage 6A.8
-  for compile/link integration: the helper exports bridge memory as a PCI mmap,
-  sends setup over COMCH, waits for ack with a timeout, and rejects selected DPU
-  mode explicitly in non-DOCA builds. Runtime validation through the exact
-  PostgreSQL backend frontend path passed against the standalone import-enabled
-  DPU COMCH smoke server.
+- Implement the host TCP setup client in `homer_frontend_dma.c`. It should export
+  bridge memory as a PCI mmap, send setup over TCP, wait for ack with a timeout,
+  and reject selected DPU mode explicitly in non-DOCA builds.
 - Replace the current frontend smoke-and-error guard with a real DPU setup
-  operation that either completes COMCH/mmap setup or fails before any SHM mapping
+  operation that either completes TCP/mmap setup or fails before any SHM mapping
   is attempted in a selected DPU session. Stage 6A.8 wires this operation before
-  the Stage 7 command-pull `not implemented` error; the backend/runtime
-  validation reached that expected guard after DPU setup completed.
+  the Stage 7 command-pull `not implemented` error for the COMCH prototype; the
+  TCP path should preserve the same selected-DPU guard behavior.
 - Start the runtime promotion path here: after the DPU channel is selected, host
-  frontend setup must attempt the real COMCH/mmap setup against the independently
+  frontend setup must attempt the real TCP/mmap setup against the independently
   running DPU service and then either mark the DPU bridge setup-ready or return a
   bounded DPU setup error. It must not reopen the SHM frontend path.
 - Treat Stage 6 promotion work as the setup replacement gate: the selected-DPU
   setup path may still end at the Stage 7 command guard, but it must already use
-  real COMCH/mmap setup or fail with a bounded DPU setup error.
+  real TCP/mmap setup or fail with a bounded DPU setup error.
 - Keep the DPU selector experimental in Stage 6, but make the selected path real
   enough to validate setup: the old bridge-memory smoke may remain as a local
   preflight check, but it must no longer be the terminal behavior for a selected
   DPU frontend build that has DOCA enabled.
 - Add Stage 6 promotion evidence to the smoke/runtime output: selected DPU setup
-  must report COMCH connection, mmap export/import, bridge generation, accepted
+  must report TCP connection, mmap export/import, bridge generation, accepted
   descriptor count, and the expected Stage 7 command guard. A run that reaches
   the guard through SHM setup is invalid.
-- Implement the DPU COMCH server in `homer_service_dpu_comch.c/.h`, keeping
-  `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter. The
-  setup-payload handler and reusable server lifecycle are landed; the standalone
-  transport smoke validates real server lifecycle and the current farnet1
-  representor choice, and Stage 6A.6 wires service startup/teardown plus bounded
-  `DPU_PE_DRAIN` progress.
-- Keep COMCH ack buffers alive until the send completion/error callback. DOCA
-  COMCH sends are asynchronous, so callbacks must not pass a stack ack or a
-  shared scratch ack to `doca_comch_server_task_send_alloc_init()`. Stage 6A.5
-  uses one heap `HomerDpuComchSetupAck` copy per send task and frees it from
-  task user data in the send callback.
+- Implement the DPU TCP setup listener in `homer_service_dpu_setup_tcp.c/.h`,
+  keeping `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter.
+  The old COMCH server code may remain temporarily as a prototype/reference, but
+  it is not the production setup path.
+- For the TCP setup path, keep receive buffers, parsed setup payload, and ack
+  buffers owned until the blocking setup exchange returns or the bounded timeout
+  fails. Unlike COMCH sends, this does not require DOCA send-completion callback
+  ownership; it does require explicit message framing and short-read handling.
 - Store imported host mmaps in a bounded engine table keyed by setup identity,
   not in a singleton. Done in Stage 6A.7 for bridge generation plus client
   instance ID. Later host/frontend setup should allocate one table entry per
@@ -1320,36 +1338,35 @@ Tasks:
 
 Acceptance:
 
-- Host/frontend COMCH setup can send a real mmap export blob, bridge header, and
+- Host/frontend TCP setup can send a real mmap export blob, bridge header, and
   ring descriptors to the DPU service and receive a setup ack before any hot-path
   frontier publication is used.
 - DPU service startup succeeds and starts normal service pumping even when no host
   backend has connected yet.
-- A selected DPU frontend path reaches a real COMCH setup attempt, not the old
-  smoke-only guard. Missing service, malformed setup, representor/device mismatch,
+- A selected DPU frontend path reaches a real TCP setup attempt, not the old
+  smoke-only guard. Missing service, malformed setup, address/device mismatch,
   and timeout are reported as DPU setup failures before any SHM mapping or
   local-service SHM call.
 - The selected DPU setup path has no SHM fallback branch. In non-DOCA builds it
   may fail with a compile-time capability error; in DOCA-enabled builds it must
-  attempt COMCH/mmap setup or return a bounded DPU setup error.
+  attempt TCP/mmap setup or return a bounded DPU setup error.
 - Stage 6 is not accepted if selecting DPU mode can still complete frontend
   initialization by remapping the host-process SHM channel after the DPU setup
   guard has accepted the mode.
 - Before Stage 6A is closed, the production PostgreSQL backend/frontend path must
-  be exercised against an independently running DPU COMCH service, not only
-  compiled or validated through the standalone host client. Done against the
-  import-enabled DPU COMCH smoke server; full DPU-resident
-  `citus_tuple_sink_service` runtime validation is still separate.
-- DPU COMCH setup imports the host mmap via `HomerDpuDmaImportHostMmapDescriptor()`
+  be exercised against an independently running DPU TCP setup listener, not only
+  compiled or validated through the standalone host client. Full DPU-resident
+  `citus_tuple_sink_service` runtime validation is required for acceptance.
+- DPU TCP setup imports the host mmap via `HomerDpuDmaImportHostMmapDescriptor()`
   and rejects malformed protocol version, descriptor size, generation, or ring
   geometry with an explicit setup error.
 - Multiple host/frontend setup imports can coexist in the DPU DMA engine. A
   duplicate bridge generation plus client instance ID is rejected before later
   DMA task ownership can become ambiguous.
 - Synthetic host publisher can advance frontiers and DPU observes them without
-  reading one tail at a time. Done for one host-published line in the Stage 6B.1
-  host-to-DPU COMCH transport smoke; Stage 6B.2 extends that smoke to assert the
-  scheduler-visible ready-ring fact after semantic acceptance.
+  reading one tail at a time. This was proven in the Stage 6B COMCH smoke, but
+  Stage 6A must revalidate the same grouped-control observation through the TCP
+  setup path before accepting the production setup replacement.
 - Drain action stops on first zero-progress return or budget exhaustion. Done for
   `HomerDpuDmaDrainPe()` in Stage 6B.1.
 - In-flight tasks remain represented in DPU-local facts for later grants. Done
@@ -1370,11 +1387,11 @@ Acceptance:
   for grouped-control reads; a debug invariant mode can still make it explicit.
 - A standalone host+DPU grouped-control test proves control-read DMA submission
   and callback retirement are separated: submit action queues reads, PE-drain
-  action observes and validates them. Done in Stage 6B.1 with
-  `homer_dpu_comch_transport_smoke --server --import-dma
-  --submit-control-read` on the DPU and `--client --real-mmap` on the host.
+  action observes and validates them. The existing COMCH smoke is historical
+  evidence; the accepted production path should use the TCP setup smoke or exact
+  service/frontend path with the same DMA assertions.
 - Stage 6 promotion evidence must include a selected-DPU setup trace from the
-  host/frontend path through COMCH/mmap import. The trace may still stop at the
+  host/frontend path through TCP/mmap import. The trace may still stop at the
   Stage 7 command guard, but it must prove that setup did not remap the
   host-process SHM frontend channel.
 
@@ -1389,8 +1406,10 @@ discovered-ready command ring, DMA-pulls one full
 `CitusRemoteExecControlSlot` from `hostRingOffset` into DPU-local staging,
 validates slot state, owner pid, request sequence, protocol version, and request
 kind, clears the ready fact after staging, and exposes the staged slot to later
-service adapters. The standalone host-to-DPU COMCH smoke validates this path with
-a synthetic `START_COMMAND` SQL request. Stage 7B.1 then extracts the
+service adapters. The standalone host-to-DPU COMCH smoke historically validated
+this path with a synthetic `START_COMMAND` SQL request; the TCP setup path must
+revalidate the same command-pull slice before the production setup replacement is
+accepted. Stage 7B.1 then extracts the
 local-control semantic dispatcher from SHM slot response publication, while
 keeping async continuations explicitly SHM-slot-owned until a response-owner
 abstraction exists. Stage 7B.2 adds the first response-owner abstraction for the
@@ -1421,7 +1440,7 @@ response-ready publication remain pending Stage 8 work.
 Tasks:
 
 - Make host frontend publish request-ready state through bridge lines.
-- Require completed DPU COMCH/mmap setup before publishing any command request in
+- Require completed DPU TCP/mmap setup before publishing any command request in
   DPU mode.
 - Consume Stage 6B.2 discovered-ready ring facts through a command-pull engine
   API. The API should expose accepted ring identity/frontier, DMA-pull request
@@ -1457,7 +1476,7 @@ Tasks:
   coexistence; do not add fallback branches from selected DPU command handling to
   SHM command handling.
 - Add a stage-local diagnostic or counter that proves a selected-DPU command API
-  call entered through COMCH setup, grouped-control discovery, command-slot DMA
+  call entered through TCP setup, grouped-control discovery, command-slot DMA
   pull, and staged local-control dispatch rather than the old SHM command ring.
 - Replace the Stage 6 terminal `not implemented` guard for command APIs with the
   staged request-slot pull path. After this stage, a selected DPU command session
@@ -1481,7 +1500,7 @@ Acceptance:
 - The same APIs still work through the old SHM host-process implementation when
   DPU mode is off during migration, but this is mode selection, not fallback from
   a selected DPU session.
-- A DPU-mode command session that has not completed COMCH/mmap setup fails with
+- A DPU-mode command session that has not completed TCP/mmap setup fails with
   an explicit DPU setup error before publishing a request, and does not remap or
   call the SHM frontend path.
 - A DPU-mode command session whose DPU service is absent or times out fails with
@@ -1578,7 +1597,7 @@ service payload transport logic.
 Tasks:
 
 - Register/import byte-ring host memory.
-- Require each DPU-mode payload/basebackup stream to be represented in the COMCH
+- Require each DPU-mode payload/basebackup stream to be represented in the TCP
   setup descriptors and imported mmap state before the host publishes stream
   payload readiness.
 - Discover byte-ring `publishedTail` via grouped-control polling.
@@ -1644,19 +1663,19 @@ Tasks:
 - DPU drains or invalidates in-flight tasks before acknowledging teardown.
 - Host does not unmap registered memory until DPU ack or whole-service generation
   reset.
-- Implement host backend reconnect as a fresh host-initiated COMCH setup with a
+- Implement host backend reconnect as a fresh host-initiated TCP setup with a
   new bridge generation against the already-running DPU service.
 - Treat DPU service restart as a DPU-mode generation failure for existing host
   sessions; the recovery path is reconnect/re-setup, not SHM continuation.
 - Convert setup/teardown/reconnect behavior from experimental smoke semantics
   into the lifecycle contract for selected DPU mode: selected DPU sessions either
-  reconnect through COMCH with a new generation or fail boundedly.
+  reconnect through TCP setup with a new generation or fail boundedly.
 - Add lifecycle diagnostics that record selected-DPU close, generation reset,
   reconnect setup, and fatal DMA-error shutdown paths separately from DPU-off SHM
   teardown.
 - Treat Stage 10 promotion work as the lifecycle replacement gate: selected-DPU
   teardown, reconnect, and service-restart handling must use generation reset and
-  fresh COMCH setup, not SHM continuation.
+  fresh TCP setup, not SHM continuation.
 - Add Stage 10 promotion evidence to lifecycle diagnostics: selected-DPU close,
   reconnect, DPU service restart, stale-generation rejection, and fatal DMA-error
   shutdown must be distinguishable from DPU-off SHM teardown/recovery.
@@ -1696,8 +1715,8 @@ Tasks:
 - Tune grouped-control poll cadence: command class frequent/small; byte-stream
   class less frequent/larger; idle wakeup optional.
 - Add measurement preflight checks or counters that prove command, completion,
-  payload, and basebackup records used DPU DMA/COMCH during a DPU-mode run.
-- Measure cold COMCH/mmap setup latency and reconnect latency separately from
+  payload, and basebackup records used DPU DMA with TCP setup during a DPU-mode run.
+- Measure cold TCP/mmap setup latency and reconnect latency separately from
   steady-state hot-path throughput.
 - After Stage 7 through Stage 10 functional gates pass, replace the hidden
   experimental selector with the normal DPU transport/mode selector. This
@@ -1721,9 +1740,9 @@ Acceptance:
 - Basebackup throughput remains stable under mixed foreground command load.
 - Scheduler feedback shows bounded empty-poll behavior, not hot spinning.
 - Performance measurements used for DPU-mode promotion must verify that command,
-  completion, payload, and basebackup traffic all traverse the DPU DMA/COMCH
-  boundary. Runs that fall back to the old host-process SHM path are invalid for
-  DPU acceptance.
+  completion, payload, and basebackup traffic all traverse the DPU DMA boundary
+  after TCP setup. Runs that fall back to the old host-process SHM path are
+  invalid for DPU acceptance.
 - Include cold-path setup latency and reconnect latency as separate measurements
   from steady-state hot-path command/basebackup throughput.
 - Only after the Stage 7 through Stage 11 functional, lifecycle, and measurement
@@ -1731,8 +1750,8 @@ Acceptance:
   normal DPU runtime mode. At that point SHM remains only a DPU-off comparison
   path, not a fallback inside DPU mode.
 - Stage 11 is not accepted if measurements cannot prove that command,
-  completion, payload, and basebackup records crossed the DPU DMA/COMCH boundary
-  during the selected-DPU run.
+  completion, payload, and basebackup records crossed the DPU DMA boundary after
+  TCP setup during the selected-DPU run.
 - Stage 11 is not accepted if it discovers deferred fallback-removal work that
   should have belonged to Stages 6 through 10; in that case, reopen the owning
   stage gate rather than promoting the selector.

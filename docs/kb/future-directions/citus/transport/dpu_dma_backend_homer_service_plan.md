@@ -5,7 +5,7 @@
 - **What this doc explains**: the implementation-facing plan for replacing the current host-side standalone Homer service boundary with a DPU-resident Homer service that pulls backend-produced records from host memory using DOCA DMA.
 - **What this doc does not cover**: a final committed implementation, a DPA-kernel port, peer-service RDMA redesign, or a new SQL/session semantic model.
 - **Header snapshot**: DOCA API headers referenced below are copied under [`dpu_dma_backend_homer_service_plan_doca_headers/`](dpu_dma_backend_homer_service_plan_doca_headers/).
-- **Current-scheduler companion**: [`dpu_dma_backend_homer_service_current_scheduler_design.md`](dpu_dma_backend_homer_service_current_scheduler_design.md) tightens this plan for today's `machine-baseline` scheduler, including callback retirement, grouped-control ABI details, grant wiring, COMCH/mmap setup, and staged implementation constraints.
+- **Current-scheduler companion**: [`dpu_dma_backend_homer_service_current_scheduler_design.md`](dpu_dma_backend_homer_service_current_scheduler_design.md) tightens this plan for today's `machine-baseline` scheduler, including callback retirement, grouped-control ABI details, grant wiring, TCP/mmap setup, and staged implementation constraints.
 - **Doc type**: `future-direction`
 
 ## Current Decision
@@ -15,6 +15,8 @@ The target hot path is DPU pull from host memory, not host push through backend-
 The PostgreSQL/Citus backend remains a CPU producer into host memory. It writes command records, payload descriptors, and byte-stream chunks into SPSC rings or byte rings, then release-publishes a grouped frontier. The DPU Homer service is the DOCA DMA initiator: it discovers published host frontiers, posts async DMA reads, tracks completed contiguous records, executes or forwards the work, and writes consumed head/credit updates back to host memory.
 
 Sync-event is not required for the hot path. The current empirical decision is to use memory-resident grouped control blocks/frontiers as the authoritative publication mechanism. Sync-event can remain an optional cold/idle wakeup experiment, but the default hot path should work by polling grouped control blocks with DMA and by explicit DMA completion tracking.
+
+COMCH is no longer the planned setup transport. It was only meant to carry cold descriptor/setup bytes, and stock DOCA COMCH currently fails on farnet1 below Homer while standalone DOCA DMA still validates in both directions. Use a regular TCP setup socket for host frontend to DPU service setup; keep all hot-path data movement and publication on DOCA DMA-visible memory.
 
 The implementation should keep three layers separate:
 
@@ -80,7 +82,7 @@ Responsibilities:
 - allocate or attach long-lived host memory regions for control blocks, command rings, completion rings, and byte-stream rings
 - register those regions with DOCA mmap
 - export mmap descriptors for DPU PCI access
-- exchange descriptors and ring metadata with the DPU service over COMCH during setup
+- exchange descriptors and ring metadata with the DPU service over TCP during setup
 - write backend-produced command/payload records into host rings
 - release-publish grouped frontier entries after records are complete
 - read DPU-written consumed heads/completion frontiers with acquire semantics
@@ -169,7 +171,7 @@ These source kinds should map to the existing CPU-class vocabulary:
 
 - control poll and command pull: `HOMER_PROGRESS_CPU_CLASS_HOT_CONTROL` or a new latency-sensitive class if the current enum becomes too coarse
 - payload pull and completion push: `HOMER_PROGRESS_CPU_CLASS_HOT_DATA`
-- COMCH setup/import/export: `HOMER_PROGRESS_CPU_CLASS_COLD_SETUP_MAINTENANCE`
+- TCP setup/import/export: `HOMER_PROGRESS_CPU_CLASS_COLD_SETUP_MAINTENANCE`
 - teardown/failure cleanup: `HOMER_PROGRESS_CPU_CLASS_CLOSE_LIFETIME`
 
 The ready-set phase must stay cheap. [`HomerServiceBuildCoarseProgressReadySet()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12238)
@@ -344,22 +346,24 @@ Permissions:
 - drain explicitly when needed; the header comment at [`doca_pe.h:283`](dpu_dma_backend_homer_service_plan_doca_headers/doca_pe.h:283) describes calling `doca_pe_progress()` until it returns `0`, but in Homer this loop must also obey the scheduler grant budget and must not wait for a specific completion after a zero-progress return
 - never call `doca_pe_progress()` from inside a task completion callback; the callback comment in [`doca_pe.h`](dpu_dma_backend_homer_service_plan_doca_headers/doca_pe.h:121) warns against nested progress
 
-### COMCH Setup
+### TCP Setup Channel
 
-Use COMCH for cold setup, not hot payload movement:
+Use a regular TCP socket for cold setup, not hot payload movement:
 
-- service side creates a server with [`doca_comch_server_create()`](dpu_dma_backend_homer_service_plan_doca_headers/doca_comch.h:198)
-- host side creates a client with [`doca_comch_client_create()`](dpu_dma_backend_homer_service_plan_doca_headers/doca_comch.h:396)
-- exchange setup messages with [`doca_comch_server_task_send_alloc_init()`](dpu_dma_backend_homer_service_plan_doca_headers/doca_comch.h:652), [`doca_comch_client_task_send_alloc_init()`](dpu_dma_backend_homer_service_plan_doca_headers/doca_comch.h:679), [`doca_comch_server_event_msg_recv_register()`](dpu_dma_backend_homer_service_plan_doca_headers/doca_comch.h:738), and [`doca_comch_client_event_msg_recv_register()`](dpu_dma_backend_homer_service_plan_doca_headers/doca_comch.h:756)
+- DPU service side creates a normal TCP listener on the DPU fast-link control/data interface, initially `enp3s0f0s0`.
+- host frontend side connects to that listener during DPU channel setup.
+- exchange the same setup payload bytes the COMCH prototype used: mmap export blob, bridge header, ring descriptors, generation, feature bits, and ack/error status.
 
-COMCH messages should carry:
+TCP setup messages should carry:
 
 - protocol version and feature flags
 - mmap export blobs
 - ring descriptors
 - grouped control block descriptor
-- optional sync-event export if idle wakeup mode is enabled
+- optional sync-event export if idle wakeup mode is enabled later
 - service/session/sink ids
+
+The copied DOCA COMCH headers remain in the header snapshot as historical/reference material for the abandoned setup path. They are not on the immediate implementation path.
 
 ### Sync-Event Optional Path
 
@@ -456,14 +460,14 @@ Polling cadence should be scheduler-controlled:
 
 - latency class: frequent small grouped-control reads, bounded payload window
 - throughput class: less frequent discovery, larger byte/task budget
-- idle class: optional sync-event or COMCH wakeup to restart polling after quiescence
+- idle class: optional sync-event or a future TCP-side wakeup to restart polling after quiescence
 
 ## Lifecycle And Ownership
 
 Setup:
 
 1. Host frontend creates/registers host memory and grouped control block.
-2. Host frontend starts COMCH and sends descriptors to the DPU service.
+2. Host frontend starts TCP setup and sends descriptors to the DPU service.
 3. DPU imports mmap descriptors and creates local `doca_buf` views.
 4. DPU registers ring descriptors with `HomerDpuDmaEngine`.
 5. Host publishes a generation-valid control entry only after DPU acknowledges setup.
@@ -492,7 +496,7 @@ Failure handling:
 
 1. **Bridge ABI only**: add `homer_dpu_bridge_abi.h` with grouped control block and descriptor structs; no behavior change.
 2. **Host frontend DMA skeleton**: add `homer_frontend_dma.c/.h` with setup/teardown scaffolding and a build-time switch, but keep SHM as default.
-3. **COMCH descriptor exchange prototype**: exchange one mmap descriptor and one grouped control block with the DPU process; no payload movement.
+3. **TCP descriptor exchange prototype**: exchange one mmap descriptor and one grouped control block with the DPU process; no payload movement.
 4. **DPU DMA engine skeleton**: create DMA ctx/PE/task pools and import mmap descriptors; add explicit PE drain API.
 5. **Grouped control polling**: DPU DMA-reads grouped control entries and reports observed frontiers without pulling payload.
 6. **Scheduler source skeleton**: add DPU DMA source kinds, ready-set counters, action kinds, and no-op bounded executors so the scheduler can choose DPU work before real payload movement exists.

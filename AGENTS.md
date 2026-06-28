@@ -51,38 +51,51 @@ June 28, 2026:
 - `farnet1` DPU: from `farnet1`, run `ssh dpu`; `enp3s0f0s0` is
   `10.10.1.201/24`.
 
-For DOCA COMCH host-to-DPU setup on farnet1, the DPU-side COMCH server should
-open local DOCA device `0000:03:00.0` with host PF representor `0000:21:00.0`.
-The SF representor `0000:03:00.0` / `en3f0pf0sf0` was tested as the server
-representor on June 28, 2026 and did not establish the host-DPU COMCH control
-channel: the DPU server timed out and the host client reported `Connection
-aborted`. The working smoke used the DPU command shape:
+For Homer DPU DMA setup on farnet1, use the TCP setup socket rather than DOCA
+COMCH. DOCA COMCH repeatedly failed below Homer after firmware/driver resets,
+while DOCA DMA still validated. The TCP setup socket carries the same cold-path
+bytes: host PCI mmap export descriptor, bridge header, ring descriptors, and a
+setup ack. Hot command/completion/payload movement remains DOCA DMA.
 
-```sh
-./homer_dpu_comch_transport_smoke --server --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0
-```
+Current defaults:
 
-and the farnet1 host client default device `0000:21:00.0`.
+- DPU service TCP setup listener: bind `0.0.0.0`, port `9727`.
+- Host/frontend TCP setup target: farnet1 DPU `10.10.1.201:9727`.
+- DPU DOCA DMA device: `0000:03:00.0`.
+- Host DOCA mmap-export device: `0000:21:00.0`.
+
+Useful overrides:
+
+- DPU service: `HOMER_SERVICE_DPU_SETUP_BIND_HOST`,
+  `HOMER_SERVICE_DPU_SETUP_PORT`, and `HOMER_SERVICE_DOCA_DEV_PCI`.
+- Host/frontend: `HOMER_FRONTEND_DPU_SETUP_HOST`,
+  `HOMER_FRONTEND_DPU_SETUP_PORT`, `HOMER_FRONTEND_DOCA_DEV_PCI`, and
+  `HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS`.
 
 For the DPU-side DOCA DMA engine, use the local DOCA device `0000:03:00.0`.
-DMA does not take a representor; the representor distinction above is specific
-to COMCH server setup. The Homer DPU DMA engine defaults to `0000:03:00.0` and
-can be overridden with `HOMER_SERVICE_DOCA_DEV_PCI` if the DPU device numbering
-changes.
+DMA does not take a representor. The Homer DPU DMA engine defaults to
+`0000:03:00.0` and can be overridden with `HOMER_SERVICE_DOCA_DEV_PCI` if the
+DPU device numbering changes.
 
-The standalone COMCH transport smoke can also validate the real cold setup
-composition: host PCI mmap export over COMCH and DPU-side import into the DMA
-engine. Run the DPU server with `--import-dma` and the host client with
-`--real-mmap`:
+The standalone TCP transport smoke validates the current cold setup plus Stage 8
+response-publication composition: host PCI mmap export over TCP setup, DPU-side
+import into the DMA engine, DPU grouped-control read, DPU command pull, and DPU
+DMA response-body plus response-ready publication back into host memory.
 
 ```sh
-# On the DPU, after compiling/copying the smoke there:
-./homer_dpu_comch_transport_smoke --server --import-dma \
-  --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0
+# On the DPU, after compiling/copying the smoke there.
+./homer_dpu_tcp_transport_smoke --server \
+  --dev-pci 0000:03:00.0 \
+  --port 9727 \
+  --timeout-ms 15000
 
 # On farnet1 host:
-./build/homer/homer_dpu_comch_transport_smoke --client --real-mmap \
-  --dev-pci 0000:21:00.0
+./build/homer/homer_dpu_tcp_transport_smoke --client \
+  --host 10.10.1.201 \
+  --dev-pci 0000:21:00.0 \
+  --port 9727 \
+  --timeout-ms 15000 \
+  --expect-response-publish
 ```
 
 The second host fast-link addresses were also configured on June 17, 2026:
