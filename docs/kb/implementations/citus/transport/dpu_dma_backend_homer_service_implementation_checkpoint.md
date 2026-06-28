@@ -2095,10 +2095,14 @@ dispatch does not execute work in the host PostgreSQL backend. The selected-DPU
 both positive DPU publication evidence and negative no-fallback evidence. The
 concrete scheduler contract for that next slice is now recorded in
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md):
-host frontend control-slot pull, backend command-mailbox DMA write, backend
-completion-mailbox DMA read, and frontend response publication must be separate
-bounded DPU actions integrated through `machine-baseline`, with PE drain as the
-only DOCA completion-retirement point.
+host frontend control-slot pull, backend command staging, backend
+command-mailbox DMA publication, backend completion-mailbox DMA pull/credit, and
+frontend response publication must be separate bounded DPU actions integrated
+through `machine-baseline`, with PE drain as the only DOCA
+completion-retirement point. The next implementation substage should start with
+the scheduler enum/registry scaffold and maintained-fact counters before adding
+real backend-mailbox DMA submits, because candidate building must continue to
+read only maintained facts and must not call DOCA or inspect host memory.
 
 Current Stage 6 setup decisions:
 
