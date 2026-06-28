@@ -6,15 +6,16 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 8A/TCP, the default frontend and service path is still the existing
+As of Stage 8B.2, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
 SHM mapping. A DOCA-enabled frontend build exports a synthetic bridge as a DOCA
 PCI mmap and now sends the setup bytes over a regular TCP setup socket, not
-DOCA COMCH. It still fails real Homer API calls with a deliberate
-not-implemented error because the SQL frontend has not yet been promoted from
-the setup smoke into a runnable selected-DPU command path.
+DOCA COMCH. The setup path has been refactored into a persistent opaque
+frontend control channel, but real Homer API calls still fail with a deliberate
+not-implemented error because the SQL frontend has not yet been promoted into a
+runnable selected-DPU command path.
 
 The service-side DPU DMA scheduler path is opt-in behind
 `HOMER_SERVICE_ENABLE_DPU_DMA=1`; it reads maintained facts and wires bounded
@@ -2022,16 +2023,76 @@ promotion. Real selected-DPU command execution still needs the persistent
 frontend channel, host lifecycle shim, backend-mailbox DMA path, and positive
 plus negative no-fallback validation.
 
+## Stage 8B.2: Persistent Frontend Control Channel Setup
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.h:40`
+  declares `HomerFrontendDmaControlChannel` as an opaque frontend-owned handle.
+  The handle deliberately hides the current DOCA mmap/export state so later
+  frontend command code does not couple directly to setup internals.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.h:77`
+  exposes `HomerFrontendDmaOpenControlChannel()`, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.h:78`
+  exposes `HomerFrontendDmaCloseControlChannel()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:393`
+  implements `HomerFrontendDmaOpenControlChannel()`. In non-DOCA builds it keeps
+  the previous explicit error behavior. In DOCA-enabled builds it loads the
+  TCP/DOCA setup configuration and calls the persistent DOCA setup opener.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:422`
+  implements `HomerFrontendDmaCloseControlChannel()`. It is intentionally safe
+  on `NULL` and centralizes teardown through `HomerFrontendDmaCleanupDocaSetup()`
+  before freeing the opaque channel.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:500`
+  keeps `HomerFrontendDmaRunDpuSetupSmoke()` as a compatibility validation path,
+  but it now opens the real persistent channel and immediately closes it. This
+  prevents the smoke from becoming a separate setup implementation that can
+  drift from the production selected-DPU path.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:688`
+  replaces the old stack-owned setup smoke with
+  `HomerFrontendDmaOpenDocaControlChannel()`. That function allocates the
+  channel, initializes the bridge layout, opens the DOCA device, exports the PCI
+  mmap, builds and validates the TCP setup payload, waits for the DPU setup ack,
+  frees only the transient setup payload, and leaves the bridge/mmap/device
+  state alive until channel close.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git diff --check
+sudo -n -u dbcomm make frontend-dma-smoke dpu-bridge-abi-check
+sudo -n -u dbcomm make -C src/backend/distributed all
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+```
+
+Observed result:
+
+- `homer_frontend_dma_smoke: ok`
+- `homer_dpu_bridge_abi_check: ok`
+- the extension build completed successfully;
+- the forced DOCA-enabled service/client build completed successfully, with
+  only the known experimental/deprecated DOCA warnings from DOCA headers,
+  `doca_task_submit_ex()`, and `doca_dma_set_ordered_completions()`;
+- `git diff --check` reported no whitespace errors.
+
+This is still not full selected-DPU SQL execution. It only turns setup from a
+one-shot smoke into an owned lifecycle object. The next promotion step must be
+careful not to wire the SQL API directly to DPU-local staged command dispatch:
+for real `CLIENT_SQL_SESSION`, the DPU still needs a host lifecycle/backend
+mailbox path so it can DMA-write commands into the host socketless backend
+mailbox and DMA-read backend completions before publishing frontend responses.
+
 ## Next Stage
 
-The next implementation slice should promote the frontend command API from
-setup-only smoke to a real selected-DPU command path. It should submit/publish a
-host command slot through the DPU bridge, let the service scheduler run grouped
-control read, command pull, staged-command dispatch, staged-command execution,
-and completion push, and make the host frontend consume only the DPU-published
-response-ready state. The selected-DPU `not implemented` guard should remain
-until that path has both positive DPU publication evidence and negative
-no-fallback evidence.
+The next implementation slice should introduce the selected-DPU lifecycle and
+backend-mailbox bridge needed by real frontend commands. A minimal direct
+synthetic command can still be useful as a service-side mechanism smoke, but it
+is not sufficient for production SQL frontend promotion because DPU-local
+dispatch does not execute work in the host PostgreSQL backend. The selected-DPU
+`not implemented` guard should remain until the real lifecycle/mailbox path has
+both positive DPU publication evidence and negative no-fallback evidence.
 
 Current Stage 6 setup decisions:
 
