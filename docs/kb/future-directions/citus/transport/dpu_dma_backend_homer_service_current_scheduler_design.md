@@ -1372,8 +1372,11 @@ discovered-ready command ring, DMA-pulls one full
 validates slot state, owner pid, request sequence, protocol version, and request
 kind, clears the ready fact after staging, and exposes the staged slot to later
 service adapters. The standalone host-to-DPU COMCH smoke validates this path with
-a synthetic `START_COMMAND` SQL request. Real command execution, response-body
-DMA writes, and response publication remain pending Stage 7B/Stage 8 work.
+a synthetic `START_COMMAND` SQL request. Stage 7B.1 then extracts the
+local-control semantic dispatcher from SHM slot response publication, while
+keeping async continuations explicitly SHM-slot-owned until a response-owner
+abstraction exists. Real command execution from staged DPU slots, response-body
+DMA writes, and response publication remain pending Stage 7B.2/Stage 8 work.
 
 Tasks:
 

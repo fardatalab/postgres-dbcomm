@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 7A, the default frontend and service path is still the existing
+As of Stage 7B.1, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -62,7 +62,12 @@ that ready fact for one fixed control slot: the DMA engine can submit a bounded
 command-slot pull, stage a complete `CitusRemoteExecControlSlot`, validate slot
 state, owner pid, request sequence, request protocol, and request kind, and clear
 the discovered-ready fact after the accepted frontier is staged. This still stops
-before real command execution and response DMA publication.
+before real command execution and response DMA publication. Stage 7B.1 begins
+the service adapter refactor by extracting the SHM local-control semantic
+dispatcher from the SHM slot response-publication step; the existing SHM path
+still owns slot-state publication, while future DPU callers get an explicit
+"response owner required" error for requests that need slot-indexed async
+continuations.
 
 ## Stage 1: Bridge ABI Header
 
@@ -1455,15 +1460,72 @@ Observed result:
   `server DMA command-pull complete owner=4242 seq=42 command=6 sql="select 1"`,
   and `homer_dpu_comch_transport_smoke: ok`.
 
+## Stage 7B.1: Local-Control Dispatch Boundary
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31389`
+  adds `TupleSinkServiceLocalControlDispatchResult`, which distinguishes a
+  request that completed synchronously from one whose slot is owned by an async
+  local-control continuation.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34147`
+  adds `TupleSinkServiceDispatchLocalControlSlot()`. It runs the existing
+  local-control semantic request dispatch for open, close,
+  report-post-command-state, start-command, poll-completion, and unknown request
+  errors without publishing the transport-specific response-visible state.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34155`
+  makes async continuations explicit through `allowAsyncSlotContinuation`.
+  Existing SHM slot callers pass `true`; a future DPU-staged caller must provide
+  an equivalent response owner before enabling async continuations. If it passes
+  `false`, async-shaped requests get an explicit response-owner error instead of
+  accidentally registering an async op against an unrelated SHM slot index.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34349`
+  changes `TupleSinkServicePumpControlSlots()` to call the shared dispatcher and
+  keep only the SHM-specific publication step: store
+  `CITUS_REMOTE_EXEC_CONTROL_SLOT_RESPONSE_READY`, publish heartbeat, and update
+  local-control feedback.
+
+Important implementation details and decisions:
+
+- This slice intentionally does not make DPU-staged commands executable yet. It
+  removes the first coupling between semantic dispatch and SHM response
+  publication, but async continuations still recover their response slot through
+  `slotIndex` from the SHM control region.
+- The next DPU command-execution slice needs a response-owner abstraction for
+  staged commands. That owner must tell an async continuation where to publish
+  the eventual response: SHM slot today, DPU DMA response body plus publication
+  word later. Without that owner, enabling async DPU commands would risk writing
+  a response into the wrong SHM slot.
+- Synchronous requests can now be driven through the same helper once the DPU
+  path has a response-publish action, but selected-DPU command API success should
+  still wait for response DMA publication rather than returning a host-local
+  result.
+
+Stage 7B.1 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c
+sudo -n -u dbcomm make service-bin client-bin
+git diff --check
+```
+
+Observed result:
+
+- `service-bin` rebuilt successfully.
+- `client-bin` was up to date.
+- `git diff --check` reported no whitespace errors.
+
 ## Next Stage
 
-Stage 7B should turn staged command slots into real service command handling.
-The next implementation slice should refactor the existing local-control service
-handler behind an adapter that accepts a staged `CitusRemoteExecControlSlot`,
-runs the existing request semantics, and then prepares the response for Stage 8
-DPU-to-host response-body plus publication-word DMA writes. The selected DPU
-command `not implemented` guard should remain until command execution and
-response publication both exist; Stage 7A only proves request discovery and pull.
+Stage 7B.2 should add the response-owner abstraction that lets the shared
+local-control dispatcher publish results either to the current SHM slot or to a
+DPU response staging/publication path. Once that exists, staged DPU command
+slots can run through the same semantic handler and Stage 8 can DMA-write the
+response body plus publication word back to host memory. The selected DPU command
+`not implemented` guard should remain until command execution and response
+publication both exist; Stage 7A only proves request discovery and pull, and
+Stage 7B.1 only proves the first dispatch-boundary refactor.
 
 Decisions recorded for Stage 6:
 
