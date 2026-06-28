@@ -995,10 +995,11 @@ Stage 6A.8 design notes:
   That is valid only because Stage 7 command DMA reads are not submitted yet.
   The first Stage 7 functional path must retain the frontend bridge allocation
   and DOCA mmap for the session lifetime.
-- This sub-stage validates compile/link integration of the production frontend
-  helper. The exact PostgreSQL backend runtime path invoking this helper against
-  a running DPU service still needs a dedicated validation gate before Stage 6A
-  can be considered fully closed.
+- This sub-stage now validates both compile/link integration and the exact
+  PostgreSQL backend/frontend call path that invokes the setup helper. The DPU
+  peer used for this validation is the standalone import-enabled COMCH smoke
+  server; a full DPU-resident `citus_tuple_sink_service` runtime remains a later
+  deployment gate.
 
 Stage 6A.8 was validated with:
 
@@ -1016,6 +1017,39 @@ sudo -n -u dbcomm make -B -C src/backend/distributed \
   utils/homer/homer_frontend_dma.o \
   CPPFLAGS='-D_GNU_SOURCE'
 git diff --cached --check
+
+# Runtime validation of the exact PostgreSQL backend/frontend path. This
+# temporarily installed a DOCA-enabled citus.so, restarted PostgreSQL, and then
+# restored the default non-DOCA install afterward.
+sudo -n -u dbcomm make -B -C src/backend/distributed install \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_ctl \
+  -D /data/dbcomm/pg-citus/data \
+  -l /data/dbcomm/pg-citus/data/postgres.log \
+  restart -w
+ssh dpu "cd /tmp/homer_dpu_comch_stage6a5_final && \
+  LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu \
+  ./homer_dpu_comch_transport_smoke \
+    --server --import-dma \
+    --name homer-dpu-comch \
+    --dev-pci 0000:03:00.0 \
+    --rep-pci 0000:21:00.0 \
+    --timeout-ms 20000 \
+    > /tmp/homer_backend_setup_server.log 2>&1" &
+DPU_SERVER_PID=$!
+sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql \
+  -h /tmp -p 5432 -U dbcomm -X postgres \
+  -v ON_ERROR_STOP=0 \
+  -c "SET citus.enable_experimental_homer_dpu_frontend = on;
+      SELECT pg_catalog.citus_remote_exec_pgbench_transaction(1, 1, 1, 1, 1);"
+wait "$DPU_SERVER_PID"
+ssh dpu "cat /tmp/homer_backend_setup_server.log"
+sudo -n -u dbcomm make -B -C src/backend/distributed install \
+  CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_ctl \
+  -D /data/dbcomm/pg-citus/data \
+  -l /data/dbcomm/pg-citus/data/postgres.log \
+  restart -w
 ```
 
 Observed result:
@@ -1036,16 +1070,35 @@ Observed result:
 - After the DOCA-enabled compile/link check, `homer_frontend_dma.o` was rebuilt
   again with default `CPPFLAGS='-D_GNU_SOURCE'` so local build artifacts were not
   left in a DOCA-forced shape.
+- The runtime validation installed a DOCA-enabled `citus.so`; `ldd` showed
+  `libdoca_comch.so.2` and `libdoca_common.so.2` while the validation build was
+  installed, proving PostgreSQL would load the frontend COMCH client code.
+- The SQL call through
+  `citus_remote_exec_pgbench_transaction(1, 1, 1, 1, 1)` with
+  `citus.enable_experimental_homer_dpu_frontend=on` returned the expected Stage 7
+  error:
+  `experimental Homer DPU frontend channel is not implemented yet`,
+  `operation=OpenRemoteExecutionCommandSession`.
+  It did not fail with `Homer DPU COMCH setup failed`, which means the frontend
+  setup helper completed before the command-pull guard fired.
+- The DPU peer log printed
+  `server DMA import enabled dma_dev=0000:03:00.0`,
+  `server ready name=homer-dpu-comch dev=0000:03:00.0 rep=0000:21:00.0
+  timeout_ms=20000`, and `homer_dpu_comch_transport_smoke: ok`.
+- After runtime validation, the default non-DOCA extension was reinstalled,
+  `ldd /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so` showed no
+  DOCA dependency, and PostgreSQL was restarted back into that default runtime
+  shape.
 
 ## Next Stage
 
-Stage 6A should next validate the exact PostgreSQL backend/runtime setup path
-against the independently running DPU service, then add the close/close-ack shell
-or move into Stage 6B grouped-control DMA submit/drain if close is intentionally
-deferred to Stage 10 teardown. The service side now owns the COMCH listener and
-progresses it through bounded scheduler actions, the DMA engine can retain
-multiple imported host mmaps keyed by setup identity, and the frontend has the
-opt-in DOCA COMCH setup client. Stage 6B should allocate/arm concrete
+Stage 6A should next add the close/close-ack shell, or explicitly defer close to
+Stage 10 teardown and move into Stage 6B grouped-control DMA submit/drain. The
+service side now owns the COMCH listener and progresses it through bounded
+scheduler actions, the DMA engine can retain multiple imported host mmaps keyed
+by setup identity, the frontend has the opt-in DOCA COMCH setup client, and the
+actual PostgreSQL backend/frontend setup call path has been validated against an
+import-enabled DPU COMCH peer. Stage 6B should allocate/arm concrete
 grouped-control DMA tasks after descriptor import and retire them only through
 bounded `DPU_DMA_DRAIN_PE` grants.
 
