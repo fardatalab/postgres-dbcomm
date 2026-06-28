@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6A.6, the default frontend and service path is still the existing
+As of Stage 6A.7, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the frontend runs a host-side bridge-memory smoke check and still
@@ -37,7 +37,12 @@ production service startup path when `HOMER_SERVICE_ENABLE_DPU_DMA=1` and
 `HOMER_SERVICE_ENABLE_DOCA_DMA=1`, adds COMCH server env overrides, progresses
 the COMCH PE through the bounded DPU `PE_DRAIN` scheduler action, and destroys
 the server before the DMA engine. Production frontend startup still does not
-call a real DOCA COMCH client.
+call a real DOCA COMCH client. Stage 6A.7 replaces the earlier singleton
+imported-host-mmap slot with a bounded import table keyed by bridge generation
+plus client instance ID. This lets the DPU service accept multiple future
+backend/frontend setup imports without conflating their mmap descriptors; duplicate
+setup identity is rejected explicitly. No grouped-control DMA read is submitted
+yet.
 
 ## Stage 1: Bridge ABI Header
 
@@ -837,15 +842,106 @@ Observed result:
 - The only compile warnings in the forced DOCA build were the known NVIDIA DOCA
   header deprecation warnings for `doca_buf_inventory_buf_reuse_by_args`.
 
+## Stage 6A.7: Bounded Host Mmap Import Table
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:42`
+  adds `hostMmapImportCapacity` to `HomerDpuDmaEngineConfig`; the default is
+  `1024` imports in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:185`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:72`
+  exposes `hostMmapImportCapacity`, `hostMmapImportCount`, and
+  `importedRingCount` through scheduler facts so ready-set construction can see
+  setup state without calling DOCA.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:97`
+  defines `HomerDpuDmaHostMmapImport`, the per-import metadata table entry. It
+  records active state, ring count, descriptor size, bridge generation, client
+  instance ID, export-descriptor byte count, and the imported `doca_mmap *` in
+  DOCA builds.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:367`
+  implements `HomerDpuDmaImportHostMmapDescriptorForSetup()`. It validates setup
+  identity, rejects duplicate `(bridgeGeneration, clientInstanceId)` imports,
+  imports the descriptor with `doca_mmap_create_from_export()`, stores metadata
+  in a free table slot, and updates import/ring counters.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:355`
+  keeps the older `HomerDpuDmaImportHostMmapDescriptor()` entry point as a
+  compatibility wrapper for tests that do not yet carry full setup identity.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:315`
+  routes COMCH setup imports through the setup-aware import API, passing the
+  bridge generation, client instance ID, ring count, and descriptor size from the
+  setup header.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:778`
+  destroys every active imported mmap during DOCA lifecycle teardown before DMA
+  contexts and the device are destroyed.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:162`
+  now exports two synthetic host mmaps, imports both through the COMCH setup
+  handler, verifies import/ring counts reach two, and verifies re-sending the
+  first setup fails with `HOMER_DPU_COMCH_SETUP_IMPORT_FAILED`.
+- `/data/dbcomm/citus-dbcomm/Makefile:170` links the DOCA DMA smoke with
+  `DOCA_COMCH_CFLAGS` and `DOCA_COMCH_LIBS`, because the smoke now compiles the
+  COMCH setup handler in DOCA mode.
+
+Scope boundary:
+
+- Stage 6A.7 removes a setup-time singleton bottleneck before the production
+  host/frontend COMCH client exists. It does not yet add host-side COMCH client
+  code, per-session ring descriptors beyond the current setup payload, imported
+  mmap reclaim by close message, or grouped-control DMA submission.
+- The table key is deliberately setup identity, not ring identity. Future
+  grouped-control and payload task owners still need ring/session identifiers
+  when they resolve source buffers inside an imported mmap.
+- Duplicate setup identity is treated as an explicit setup error. Later teardown
+  work can make a new generation legal after close/reclaim; this stage only
+  supports monotonically distinct setup imports during one engine lifecycle.
+
+Stage 6A.7 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make service-dpu-dma-smoke dpu-comch-abi-check service-bin client-bin service-dpu-comch-smoke-bin dpu-comch-transport-smoke-bin
+sudo -n -u dbcomm make service-dpu-dma-doca-smoke
+
+# DPU-side DOCA DMA smoke, cross-compiled on the DPU from a copied source subset.
+LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu \
+HOMER_DPU_DMA_SMOKE_DOCA_DEV_PCI=0000:03:00.0 \
+./homer_service_dpu_dma_smoke
+
+# Real host-to-DPU COMCH regression after the import-table change.
+LD_LIBRARY_PATH=/opt/mellanox/doca/lib/x86_64-linux-gnu \
+build/homer/homer_dpu_comch_transport_smoke \
+  --client --real-mmap \
+  --name homer-dpu-comch-multi-import-regression-1782625310 \
+  --dev-pci 0000:21:00.0 \
+  --timeout-ms 20000
+```
+
+Observed result:
+
+- The default host build/smoke passed, including `service-bin`, `client-bin`, the
+  COMCH ABI check, the service-side COMCH smoke binary, and the transport smoke
+  binary.
+- `service-dpu-dma-doca-smoke` passed on the host and printed
+  `homer_service_dpu_dma_smoke: ok`.
+- The DPU-side DOCA DMA smoke passed on `ssh dpu` with
+  `HOMER_DPU_DMA_SMOKE_DOCA_DEV_PCI=0000:03:00.0` and printed
+  `homer_service_dpu_dma_smoke: ok`.
+- The real host-to-DPU COMCH regression passed with both processes returning
+  zero. The host log printed `client received setup ack generation=1 rings=1
+  imported_bytes=284`; the DPU server log printed
+  `homer_dpu_comch_transport_smoke: ok`.
+- The only compile warnings were known DOCA header deprecation warnings for
+  `doca_buf_inventory_buf_reuse_by_args`.
+
 ## Next Stage
 
 Stage 6A should next implement the host/frontend COMCH client in
 `homer_frontend_dma.c` and replace the experimental smoke-and-error guard with a
 real setup operation that sends the bridge mmap descriptor to the independently
 running DPU service. The service side now owns the COMCH listener and progresses
-it through bounded scheduler actions, using validated farnet1 defaults unless
-the deployment is explicitly configured otherwise. Stage 6B should then
-implement grouped-control DMA submit/drain.
+it through bounded scheduler actions, and the DMA engine can retain multiple
+imported host mmaps keyed by setup identity. Stage 6B should then implement
+grouped-control DMA submit/drain.
 
 Decisions recorded for Stage 6:
 

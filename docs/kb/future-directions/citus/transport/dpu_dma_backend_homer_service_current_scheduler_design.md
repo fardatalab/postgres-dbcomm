@@ -1193,7 +1193,13 @@ the service-side COMCH env overrides `HOMER_SERVICE_DPU_COMCH_NAME`,
 service binary with `doca-comch`, and progressed COMCH events only through the
 bounded DPU `PE_DRAIN` scheduler action. Full production service runtime on the
 DPU is still pending; the Stage 6A.6 validation is compile/link coverage plus
-the Stage 6A.5 DPU lifecycle and real mmap transport runtime smokes.
+the Stage 6A.5 DPU lifecycle and real mmap transport runtime smokes. Stage
+6A.7 removes the singleton imported-host-mmap assumption in the DPU DMA engine:
+COMCH setup now records each imported mmap in a bounded table keyed by bridge
+generation plus client instance ID, exposes import counts through scheduler
+facts, rejects duplicate setup identity, and destroys every active imported mmap
+during engine teardown. This is still setup/lifecycle work; it does not submit
+grouped-control DMA reads.
 
 Tasks:
 
@@ -1227,6 +1233,11 @@ Tasks:
   shared scratch ack to `doca_comch_server_task_send_alloc_init()`. Stage 6A.5
   uses one heap `HomerDpuComchSetupAck` copy per send task and frees it from
   task user data in the send callback.
+- Store imported host mmaps in a bounded engine table keyed by setup identity,
+  not in a singleton. Done in Stage 6A.7 for bridge generation plus client
+  instance ID. Later host/frontend setup should allocate one table entry per
+  backend/frontend bridge setup and resolve grouped-control buffers through that
+  entry.
 - Implement task-owner allocation, generation validation, callback retirement,
   and task reuse for grouped-control DMA tasks after descriptor import.
 - Submit control-read DMA tasks only under `DPU_DMA_SUBMIT_CONTROL_READS` grants.
@@ -1252,6 +1263,9 @@ Acceptance:
 - DPU COMCH setup imports the host mmap via `HomerDpuDmaImportHostMmapDescriptor()`
   and rejects malformed protocol version, descriptor size, generation, or ring
   geometry with an explicit setup error.
+- Multiple host/frontend setup imports can coexist in the DPU DMA engine. A
+  duplicate bridge generation plus client instance ID is rejected before later
+  DMA task ownership can become ambiguous.
 - Synthetic host publisher can advance frontiers and DPU observes them without
   reading one tail at a time.
 - Drain action stops on first zero-progress return or budget exhaustion.
