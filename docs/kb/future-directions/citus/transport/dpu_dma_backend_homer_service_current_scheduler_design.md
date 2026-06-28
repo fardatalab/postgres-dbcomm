@@ -936,13 +936,20 @@ Tasks:
 - Record that the async-continuation scheduler is deferred.
 - Record that the DPU DMA integration target is today's `machine-baseline`
   collectors/actions.
-- Keep SHM as the default runtime path.
+- Keep SHM as the default DPU-off runtime path only while no selected DPU path is
+  runnable.
+- Record that promotion to normal DPU mode is not a separate late cleanup: later
+  stages must replace each selected DPU-mode fallback with a real DPU DMA/COMCH
+  path or an explicit bounded DPU error.
 
 Acceptance:
 
 - No behavior change.
 - The plan explicitly distinguishes current-scheduler migration from future
   scheduler cleanup.
+- The implementation sequence below carries the promotion work in the relevant
+  stage tasks and acceptance gates, rather than leaving it as a standalone
+  paragraph.
 
 ### Stage 1 — Bridge ABI header
 
@@ -985,13 +992,16 @@ when selected.
 
 Tasks:
 
-- Add channel-selection plumbing while keeping SHM default.
+- Add channel-selection plumbing while keeping SHM as the DPU-off path during
+  migration.
 - Allocate aligned bridge memory and placeholder command/completion/payload
   regions.
 - Implement publication-word publish/read helpers.
 - Add placeholder COMCH setup hooks or explicit `not implemented` errors behind
   the DPU channel switch.
 - Do not submit DMA tasks from backend processes.
+- Treat the hidden experimental selector as temporary scaffolding: selecting DPU
+  mode must never silently fall through to SHM after the guard accepts the mode.
 
 Acceptance:
 
@@ -1002,6 +1012,8 @@ Acceptance:
 - Host-only experimental-mode smoke can publish synthetic request/credit
   frontiers in bridge memory and verify that ordinary frontend API callers still
   fail with explicit `not implemented` errors before the DPU service is present.
+- The selected DPU path fails before any SHM frontend mapping or local-service
+  SHM call. Keeping SHM buildable here is mode coexistence, not DPU fallback.
 
 ### Stage 3 — DPU DMA engine skeleton
 
@@ -1200,6 +1212,10 @@ Tasks:
 - Replace the current frontend smoke-and-error guard with a real DPU setup
   operation that either completes COMCH/mmap setup or fails before any SHM mapping
   is attempted in a selected DPU session.
+- Start the runtime promotion path here: after the DPU channel is selected, host
+  frontend setup must attempt the real COMCH/mmap setup against the independently
+  running DPU service and then either mark the DPU bridge setup-ready or return a
+  bounded DPU setup error. It must not reopen the SHM frontend path.
 - Implement the DPU COMCH server in `homer_service_dpu_comch.c/.h`, keeping
   `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter. The
   setup-payload handler and reusable server lifecycle are landed; the standalone
@@ -1229,6 +1245,10 @@ Acceptance:
   frontier publication is used.
 - DPU service startup succeeds and starts normal service pumping even when no host
   backend has connected yet.
+- A selected DPU frontend path reaches a real COMCH setup attempt, not the old
+  smoke-only guard. Missing service, malformed setup, representor/device mismatch,
+  and timeout are reported as DPU setup failures before any SHM mapping or
+  local-service SHM call.
 - DPU COMCH setup imports the host mmap via `HomerDpuDmaImportHostMmapDescriptor()`
   and rejects malformed protocol version, descriptor size, generation, or ring
   geometry with an explicit setup error.
@@ -1248,19 +1268,6 @@ Acceptance:
 - A standalone host+DPU grouped-control test proves control-read DMA submission
   and callback retirement are separated: submit action queues reads, PE-drain
   action observes and validates them.
-
-### Cross-Stage Promotion Rule
-
-Promotion from hidden experimental guard to normal DPU mode is implemented by the
-stage tasks below, not by a separate late cleanup. The rule is:
-
-- DPU service starts independently and host backends initiate bounded setup.
-- A selected DPU session either uses the DPU DMA/COMCH path or fails explicitly;
-  it must not silently fall back to the old SHM host-process boundary.
-- SHM remains useful during migration as the DPU-off implementation and as a
-  comparison baseline, not as recovery inside DPU mode.
-- The DPU selector becomes non-experimental only after the Stage 7 through Stage
-  11 functional, lifecycle, and measurement gates pass on the DPU path.
 
 ### Stage 7 — Command/control request pull
 
@@ -1428,6 +1435,10 @@ Acceptance:
   DPU acceptance.
 - Include cold-path setup latency and reconnect latency as separate measurements
   from steady-state hot-path command/basebackup throughput.
+- Only after the Stage 7 through Stage 11 functional, lifecycle, and measurement
+  gates pass should the hidden/experimental DPU selector be promoted to the
+  normal DPU runtime mode. At that point SHM remains only a DPU-off comparison
+  path, not a fallback inside DPU mode.
 
 ## Invariants to assert early
 
