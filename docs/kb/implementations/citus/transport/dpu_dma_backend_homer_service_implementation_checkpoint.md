@@ -6,10 +6,11 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 1, no runtime Homer behavior has changed. The default frontend and
-service path is still the existing host-process SHM/RDMA implementation. The
-landed code only introduces the host-DPU bridge ABI and a host-only protocol
-checker.
+As of Stage 2, the default frontend and service path is still the existing
+host-process SHM/RDMA implementation. The DPU frontend path exists only behind
+the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
+GUC is enabled, the frontend runs a host-side bridge-memory smoke check and then
+fails real Homer API calls with a deliberate not-implemented error.
 
 ## Stage 1: Bridge ABI Header
 
@@ -79,12 +80,76 @@ denied` because `build/homer` is owned by `dbcomm`. The successful validation
 used the runbook-required `sudo -n -u dbcomm` build style and did not change
 ownership.
 
+## Stage 2: Host Frontend DMA Skeleton
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:24`
+  defines the hidden GUC backing variable `EnableExperimentalHomerDpuFrontend`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/shared_library_init.c:2593`
+  registers `citus.enable_experimental_homer_dpu_frontend`, defaulting false.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:58`
+  allocates an aligned in-process bridge block with one control header, host
+  publish lines, and DPU credit lines. This is not DOCA mmap registration yet.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:150`
+  publishes a host-owned line by writing body fields first and release-storing
+  the `publishedEpoch` word last.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:174`
+  reads a DPU-owned credit line only after the publication epoch and generation
+  match the expected values.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:208`
+  runs the Stage 2 bridge-memory smoke path used by the experimental frontend
+  guard.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:639`
+  is the current channel-selection guard. With the GUC disabled it returns and
+  the existing SHM path continues. With the GUC enabled it runs the smoke and
+  raises an explicit DPU-not-implemented error before any SHM mapping.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:714`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:794`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:861`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:922`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:992`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:1073`,
+  and `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:1213`
+  call that guard from the current local-service frontend operations.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_frontend_dma_smoke.c:32` is the
+  standalone host-only bridge-memory smoke. `/data/dbcomm/citus-dbcomm/Makefile:37`
+  adds the `frontend-dma-smoke` target.
+
+Stage 2 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make frontend-dma-smoke
+sudo -n -u dbcomm make -C src/backend/distributed utils/homer/homer_frontend_dma.o
+sudo -n -u dbcomm make -j8
+sudo -n -u dbcomm make -j8 service-bin client-bin frontend-dma-smoke dpu-bridge-abi-check
+git diff --check
+```
+
+Observed result:
+
+- `homer_frontend_dma_smoke: ok`
+- `homer_dpu_bridge_abi_check: ok`
+- `utils/homer/homer_frontend_dma.o` compiled cleanly.
+- The broader Citus build completed and linked `utils/homer/homer_frontend_dma.o`
+  into `citus.so`.
+- `service-bin` and `client-bin` remained buildable/up to date.
+- `git diff --check` reported no whitespace errors.
+
+During validation, the first backend-object compile failed because
+`mul_size()` was not visible from `homer_frontend_dma.c`; replacing it with
+explicit `Size` arithmetic then exposed that a separate `MaxAllocSize` check was
+also not visible in this context. The final code keeps the skeleton independent
+of those backend allocation helpers because it currently allocates with
+`posix_memalign()` and only needs to guard `Size` addition overflow.
+
 ## Current Caveats
 
-- Stage 1 does not allocate bridge memory, register DOCA mmap objects, connect
-  COMCH, or submit DMA tasks.
-- The new ABI is not yet included by the existing SHM frontend/service runtime
-  paths; Stage 2 will introduce the experimental host-side DMA channel skeleton.
+- Stage 2 does not register DOCA mmap objects, connect COMCH, or submit DMA
+  tasks.
+- The experimental DPU frontend channel is not runnable for real Homer commands
+  yet. It intentionally fails before SHM fallback when selected.
 - The one-word publication offset is pinned at offset zero for both hot lines.
   This is a protocol choice for efficient polling and separate one-word DMA
   publication; if a future multi-word sealed snapshot is needed, it should be a
@@ -92,7 +157,6 @@ ownership.
 
 ## Next Stage
 
-Stage 2 should add `homer_frontend_dma.c/.h` behind an explicit experimental
-channel switch. The SHM path must remain the default, and the experimental mode
-should only initialize/tear down aligned bridge memory plus synthetic
-publication/credit checks before any DPU service exists.
+Stage 3 should add `homer_service_dpu_dma.c/.h` with DPU-side engine lifecycle
+state and zero-work scheduler facts. The first version should compile without
+DOCA when DPU mode is off and should not add a private progress loop.

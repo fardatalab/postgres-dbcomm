@@ -852,6 +852,11 @@ Acceptance:
 
 Deliverable: `homer_frontend_dma.c/.h` behind a build/runtime switch.
 
+Status: completed in `/data/dbcomm/citus-dbcomm` with the hidden
+`citus.enable_experimental_homer_dpu_frontend` switch, bridge-memory skeleton,
+and `frontend-dma-smoke` validation target. Real DPU command execution remains
+intentionally not implemented and fails before SHM fallback when selected.
+
 Tasks:
 
 - Add channel-selection plumbing while keeping SHM default.
