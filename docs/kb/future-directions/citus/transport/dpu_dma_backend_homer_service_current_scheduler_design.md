@@ -1222,6 +1222,10 @@ Tasks:
   frontend setup must attempt the real COMCH/mmap setup against the independently
   running DPU service and then either mark the DPU bridge setup-ready or return a
   bounded DPU setup error. It must not reopen the SHM frontend path.
+- Keep the DPU selector experimental in Stage 6, but make the selected path real
+  enough to validate setup: the old bridge-memory smoke may remain as a local
+  preflight check, but it must no longer be the terminal behavior for a selected
+  DPU frontend build that has DOCA enabled.
 - Implement the DPU COMCH server in `homer_service_dpu_comch.c/.h`, keeping
   `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter. The
   setup-payload handler and reusable server lifecycle are landed; the standalone
@@ -1260,6 +1264,9 @@ Acceptance:
   smoke-only guard. Missing service, malformed setup, representor/device mismatch,
   and timeout are reported as DPU setup failures before any SHM mapping or
   local-service SHM call.
+- The selected DPU setup path has no SHM fallback branch. In non-DOCA builds it
+  may fail with a compile-time capability error; in DOCA-enabled builds it must
+  attempt COMCH/mmap setup or return a bounded DPU setup error.
 - DPU COMCH setup imports the host mmap via `HomerDpuDmaImportHostMmapDescriptor()`
   and rejects malformed protocol version, descriptor size, generation, or ring
   geometry with an explicit setup error.
@@ -1305,6 +1312,10 @@ Tasks:
 - Keep the old SHM host-process APIs buildable only as DPU-off migration
   coexistence; do not add fallback branches from selected DPU command handling to
   SHM command handling.
+- Replace the Stage 6 terminal `not implemented` guard for command APIs with the
+  staged request-slot pull path. After this stage, a selected DPU command session
+  should fail only for DPU setup/protocol/runtime errors, not because command
+  execution is still deliberately blocked.
 
 Acceptance:
 
@@ -1319,6 +1330,9 @@ Acceptance:
   call the SHM frontend path.
 - A DPU-mode command session whose DPU service is absent or times out fails with
   an explicit bounded setup/connection error.
+- The hidden experimental selector remains required, but command API acceptance
+  evidence must be collected through the selected DPU path. SHM command success
+  is only a DPU-off regression check.
 - Early response publication negative test fails as expected.
 - Before real backend command execution, a synthetic request-slot pull test DMA
   reads one fixed request slot into DPU-local staging, validates owner/generation,
@@ -1340,6 +1354,9 @@ Tasks:
 - Submit completion-body DMA writes followed immediately by ready
   epoch/frontier publication-word DMA writes on the same ordered context.
 - Update host frontend polling to validate DPU-owned credit/completion lines.
+- Remove the selected-DPU completion dependency on host-process SHM completion
+  mailboxes. The old mailbox code may remain for DPU-off mode, but DPU-mode
+  command completion must be driven by DPU-published lines.
 
 Acceptance:
 
@@ -1372,6 +1389,10 @@ Tasks:
 - Publish consumed head to host only after safe release.
 - Keep mixed foreground/background workload validation on the DPU boundary; do not
   use local SHM queues as the background-stream escape path in DPU mode.
+- Replace any selected-DPU byte-stream placeholder that still routes through
+  host-process SHM queues with host-published byte rings and DPU DMA pulls. The
+  SHM byte-stream path remains useful only for DPU-off comparison during
+  migration.
 
 Acceptance:
 
@@ -1407,6 +1428,9 @@ Tasks:
   new bridge generation against the already-running DPU service.
 - Treat DPU service restart as a DPU-mode generation failure for existing host
   sessions; the recovery path is reconnect/re-setup, not SHM continuation.
+- Convert setup/teardown/reconnect behavior from experimental smoke semantics
+  into the lifecycle contract for selected DPU mode: selected DPU sessions either
+  reconnect through COMCH with a new generation or fail boundedly.
 
 Acceptance:
 
@@ -1437,6 +1461,10 @@ Tasks:
   payload, and basebackup records used DPU DMA/COMCH during a DPU-mode run.
 - Measure cold COMCH/mmap setup latency and reconnect latency separately from
   steady-state hot-path throughput.
+- After Stage 7 through Stage 10 functional gates pass, replace the hidden
+  experimental selector with the normal DPU transport/mode selector. This
+  promotion is a Stage 11 deliverable because the final decision depends on both
+  correctness gates and workload measurements.
 
 Acceptance:
 
