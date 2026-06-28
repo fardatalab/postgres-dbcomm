@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6A.2, the default frontend and service path is still the existing
+As of Stage 6A.3, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the frontend runs a host-side bridge-memory smoke check and still
@@ -24,7 +24,10 @@ descriptor import through `HomerDpuDmaImportHostMmapDescriptor()`. It still does
 not submit DOCA DMA tasks or drain a DOCA PE. Stage 6A.2 adds a standalone real
 DOCA COMCH transport smoke for the setup bytes and validates the farnet1 host to
 farnet1 DPU control-channel path. The service and frontend do not yet call that
-transport lifecycle directly.
+transport lifecycle directly. Stage 6A.3 replaces first-capable-device DMA
+selection with an explicit local DOCA device PCI: the service defaults to the
+DPU-local `0000:03:00.0` and can be overridden with
+`HOMER_SERVICE_DOCA_DEV_PCI`.
 
 ## Stage 1: Bridge ABI Header
 
@@ -298,9 +301,13 @@ Implemented in `/data/dbcomm/citus-dbcomm`:
 - `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:33`
   defines the bounded task-slot state, grouped-control owner metadata, and
   future task owner identity fields.
-- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:163`
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:166`
   sets default Stage 5 local-buffer geometry to 1024 cache-line buffers.
-- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:421`
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:28`
+  defines `HOMER_DPU_DMA_DEFAULT_DOCA_DEVICE_PCI` as `0000:03:00.0`, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:169`
+  installs that value in `HomerDpuDmaDefaultConfig()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:423`
   allocates the Stage 5 task-slot/owner pool and aligned local grouped-control
   buffers. It deliberately does not allocate `doca_dma_task_memcpy` handles yet:
   DOCA requires real source and destination `doca_buf` objects at
@@ -309,15 +316,26 @@ Implemented in `/data/dbcomm/citus-dbcomm`:
 - `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:324`
   imports a host PCI mmap export descriptor into the DPU engine after the DOCA
   lifecycle is enabled.
-- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:520`
-  creates the opt-in DOCA lifecycle: first available DMA-capable device, PE,
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:522`
+  creates the opt-in DOCA lifecycle: configured local DMA-capable device, PE,
   buffer inventory, local mmap for grouped-control staging, and one DMA context
   per workload class.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:725`
+  opens the exact configured local DOCA device with
+  `doca_devinfo_is_equal_pci_addr()`, verifies DMA memcpy support, and fails
+  explicitly if the configured PCI is absent, unsupported, or cannot be opened.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:36681`
+  reads `HOMER_SERVICE_DOCA_DEV_PCI` during service startup, after
+  `HomerDpuDmaDefaultConfig()` has installed the DPU default.
 - `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:30`
   keeps the default no-DOCA smoke deterministic and adds a
   `HOMER_DPU_DMA_WITH_DOCA` path that creates the lifecycle, exports a synthetic
   PCI mmap descriptor, imports it through the Stage 6A COMCH setup handler, and
   tears down cleanly.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:343`
+  selects a smoke-specific DOCA device. Host-side validation defaults to
+  `0000:21:00.0`; DPU-side validation sets
+  `HOMER_DPU_DMA_SMOKE_DOCA_DEV_PCI=0000:03:00.0`.
 - `/data/dbcomm/citus-dbcomm/Makefile:20` adds `DOCA_CFLAGS`/`DOCA_LIBS`, and
   `/data/dbcomm/citus-dbcomm/Makefile:47` adds the opt-in
   `service-dpu-dma-doca-smoke` target.
@@ -514,12 +532,73 @@ sudo -n -u dbcomm make dpu-comch-transport-smoke-bin dpu-comch-abi-check dpu-bri
 sudo -n -u dbcomm make -j8
 ```
 
+## Stage 6A.3: Explicit DOCA DMA Device Selection
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:28`
+  adds `HOMER_DPU_DMA_DEVICE_PCI_BYTES` and
+  `HOMER_DPU_DMA_DEFAULT_DOCA_DEVICE_PCI`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:43`
+  adds `HomerDpuDmaEngineConfig.docaDevicePci`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:169`
+  defaults that field to the farnet1 DPU-local DOCA device `0000:03:00.0`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:725`
+  replaces the previous first-capable-device scan with
+  `HomerDpuDmaOpenConfiguredDevice()`. The function uses
+  `doca_devinfo_is_equal_pci_addr()` to match the configured PCI, requires
+  `doca_dma_cap_task_memcpy_is_supported()`, and reports separate errors for
+  missing, unsupported, or unopenable configured devices.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:36681`
+  adds `HOMER_SERVICE_DOCA_DEV_PCI` as the service startup override. The startup
+  log now prints the selected `doca_dev_pci` so a failed DPU deployment does not
+  hide which device was attempted.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:343`
+  adds `HOMER_DPU_DMA_SMOKE_DOCA_DEV_PCI`, defaulting the host smoke to
+  `0000:21:00.0` while allowing the same smoke source to validate the DPU-local
+  `0000:03:00.0`.
+
+Design note:
+
+- DMA still uses only a local `doca_dev`; there is no representor in the DMA
+  engine. The representor remains COMCH-specific, where the working farnet1
+  setup channel uses DPU server `dev=0000:03:00.0` and `rep=0000:21:00.0`.
+
+Stage 6A.3 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make service-dpu-dma-smoke service-dpu-dma-doca-smoke dpu-comch-transport-smoke-bin dpu-comch-abi-check dpu-bridge-abi-check service-bin client-bin
+git diff --check --cached
+
+ssh dpu 'rm -rf /tmp/homer_dpu_dma_smoke && mkdir -p /tmp/homer_dpu_dma_smoke'
+rsync -azR src/bin/homer_service_dpu_dma_smoke.c src/backend/distributed/utils/homer/homer_service_dpu_dma.c src/backend/distributed/utils/homer/homer_service_dpu_dma.h src/backend/distributed/utils/homer/homer_service_dpu_comch.c src/backend/distributed/utils/homer/homer_service_dpu_comch.h src/include/distributed/homer/homer_abi_version.h src/include/distributed/homer/homer_dpu_bridge_abi.h src/include/distributed/homer/homer_dpu_comch_abi.h dpu:/tmp/homer_dpu_dma_smoke/
+ssh dpu 'cd /tmp/homer_dpu_dma_smoke && gcc -std=gnu99 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Werror=vla -Werror=implicit-int -Werror=implicit-function-declaration -Werror=return-type -DHOMER_DPU_DMA_WITH_DOCA -I src/include -I src/backend/distributed/utils/homer -I/opt/mellanox/doca/include -I/usr/include/libnl3 -DALLOW_EXPERIMENTAL_API -o homer_service_dpu_dma_smoke src/bin/homer_service_dpu_dma_smoke.c src/backend/distributed/utils/homer/homer_service_dpu_dma.c src/backend/distributed/utils/homer/homer_service_dpu_comch.c -L/opt/mellanox/doca/lib/aarch64-linux-gnu -ldoca_dma -ldoca_common && LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu HOMER_DPU_DMA_SMOKE_DOCA_DEV_PCI=0000:03:00.0 ./homer_service_dpu_dma_smoke'
+```
+
+Observed result:
+
+- Host no-DOCA smoke printed `homer_service_dpu_dma_smoke: ok`.
+- Host DOCA smoke printed `using DOCA DMA device PCI 0000:21:00.0`, observed
+  three DMA context start/stop transitions, and printed
+  `homer_service_dpu_dma_smoke: ok`.
+- DPU aarch64 smoke printed `using DOCA DMA device PCI 0000:03:00.0`, observed
+  three DMA context start/stop transitions, and printed
+  `homer_service_dpu_dma_smoke: ok`.
+- `dpu-comch-abi-check`, `dpu-bridge-abi-check`, `service-bin`, and `client-bin`
+  completed successfully.
+- The DOCA-enabled host and DPU compiles still emit warnings from installed
+  `doca_buf_inventory.h` inline helpers about deprecated experimental reuse APIs.
+  Homer does not call those helpers directly.
+
 ## Next Stage
 
 Stage 6A should next integrate the real DOCA COMCH endpoint lifecycle into the
 host frontend setup path and DPU service startup path, using the validated
-farnet1 DPU default `dev=0000:03:00.0` and `rep=0000:21:00.0` unless the
-deployment is explicitly configured otherwise. Stage 6B should then implement
+farnet1 COMCH defaults DPU server `dev=0000:03:00.0` and `rep=0000:21:00.0`
+unless the deployment is explicitly configured otherwise. The DPU DMA engine now
+separately defaults its local DMA device to `0000:03:00.0` and accepts
+`HOMER_SERVICE_DOCA_DEV_PCI` as an override. Stage 6B should then implement
 grouped-control DMA submit/drain.
 
 Decisions recorded for Stage 6:

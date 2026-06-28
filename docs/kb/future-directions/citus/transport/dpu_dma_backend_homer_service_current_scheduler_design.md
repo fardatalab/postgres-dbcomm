@@ -1154,9 +1154,12 @@ DMA-engine mmap-import handoff in `/data/dbcomm/citus-dbcomm`. Stage 6A.2 added
 a standalone real DOCA COMCH transport smoke for those setup bytes. On farnet1,
 the working DPU server endpoint was local DOCA device `0000:03:00.0` with host
 PF representor `0000:21:00.0`; the SF representor `0000:03:00.0` /
-`en3f0pf0sf0` timed out and the host client aborted. The next Stage 6A slice
-should integrate the validated lifecycle into service/frontend setup rather
-than using the standalone smoke binary.
+`en3f0pf0sf0` timed out and the host client aborted. Stage 6A.3 made the DPU
+DMA engine open an explicitly configured local DOCA device instead of the first
+DMA-capable device; the DPU default is `0000:03:00.0`, with
+`HOMER_SERVICE_DOCA_DEV_PCI` as the service override. The next Stage 6A slice
+should integrate the validated COMCH lifecycle into service/frontend setup
+rather than using the standalone smoke binary.
 
 Tasks:
 

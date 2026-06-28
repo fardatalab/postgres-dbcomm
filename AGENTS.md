@@ -64,6 +64,12 @@ aborted`. The working smoke used the DPU command shape:
 
 and the farnet1 host client default device `0000:21:00.0`.
 
+For the DPU-side DOCA DMA engine, use the local DOCA device `0000:03:00.0`.
+DMA does not take a representor; the representor distinction above is specific
+to COMCH server setup. The Homer DPU DMA engine defaults to `0000:03:00.0` and
+can be overridden with `HOMER_SERVICE_DOCA_DEV_PCI` if the DPU device numbering
+changes.
+
 The second host fast-link addresses were also configured on June 17, 2026:
 
 - `farnet0` host: `10.10.2.100`
