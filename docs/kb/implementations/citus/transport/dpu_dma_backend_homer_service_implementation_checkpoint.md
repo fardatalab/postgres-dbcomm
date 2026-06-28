@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 7B.1, the default frontend and service path is still the existing
+As of Stage 7B.2, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -67,7 +67,11 @@ the service adapter refactor by extracting the SHM local-control semantic
 dispatcher from the SHM slot response-publication step; the existing SHM path
 still owns slot-state publication, while future DPU callers get an explicit
 "response owner required" error for requests that need slot-indexed async
-continuations.
+continuations. Stage 7B.2 then replaces the raw async `slotIndex` owner with a
+SHM response-owner object. Current SHM async continuations resolve through that
+owner before touching the SHM control slot, and an accidental non-SHM owner in
+the SHM async pump fails as a service bug. DPU response owners and DMA response
+publication are still pending.
 
 ## Stage 1: Bridge ABI Header
 
@@ -1468,18 +1472,16 @@ Implemented in `/data/dbcomm/citus-dbcomm`:
   adds `TupleSinkServiceLocalControlDispatchResult`, which distinguishes a
   request that completed synchronously from one whose slot is owned by an async
   local-control continuation.
-- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34147`
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34217`
   adds `TupleSinkServiceDispatchLocalControlSlot()`. It runs the existing
   local-control semantic request dispatch for open, close,
   report-post-command-state, start-command, poll-completion, and unknown request
   errors without publishing the transport-specific response-visible state.
-- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34155`
-  makes async continuations explicit through `allowAsyncSlotContinuation`.
-  Existing SHM slot callers pass `true`; a future DPU-staged caller must provide
-  an equivalent response owner before enabling async continuations. If it passes
-  `false`, async-shaped requests get an explicit response-owner error instead of
-  accidentally registering an async op against an unrelated SHM slot index.
-- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34349`
+- Stage 7B.1 originally made async continuations explicit through an
+  `allowAsyncSlotContinuation` guard. Stage 7B.2 replaces that guard with an
+  explicit response-owner argument, so the current code no longer carries the
+  boolean form.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34330`
   changes `TupleSinkServicePumpControlSlots()` to call the shared dispatcher and
   keep only the SHM-specific publication step: store
   `CITUS_REMOTE_EXEC_CONTROL_SLOT_RESPONSE_READY`, publish heartbeat, and update
@@ -1489,8 +1491,9 @@ Important implementation details and decisions:
 
 - This slice intentionally does not make DPU-staged commands executable yet. It
   removes the first coupling between semantic dispatch and SHM response
-  publication, but async continuations still recover their response slot through
-  `slotIndex` from the SHM control region.
+  publication. Stage 7B.2 removes the remaining raw `slotIndex` ownership from
+  async continuation state, but selected-DPU commands still need a DPU response
+  owner and DMA publication path before they can run.
 - The next DPU command-execution slice needs a response-owner abstraction for
   staged commands. That owner must tell an async continuation where to publish
   the eventual response: SHM slot today, DPU DMA response body plus publication
@@ -1516,21 +1519,80 @@ Observed result:
 - `client-bin` was up to date.
 - `git diff --check` reported no whitespace errors.
 
+## Stage 7B.2: SHM Local-Control Response Owner
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31395`
+  adds `TupleSinkServiceLocalControlResponseOwnerKind`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31406`
+  adds `TupleSinkServiceLocalControlResponseOwner`, which currently has one
+  implemented owner kind: an SHM control slot.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31418`
+  changes `TupleSinkServiceLocalControlAsyncOp` to store `responseOwner` instead
+  of a raw `slotIndex`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31447`
+  adds `TupleSinkServiceMakeShmLocalControlResponseOwner()` for the current SHM
+  control-slot caller.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31463`
+  adds `TupleSinkServiceLocalControlResponseOwnerShmSlotIndex()`. It deliberately
+  accepts only SHM-slot owners so a future DPU owner cannot be silently coerced
+  into a host-process control slot.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:31593`
+  updates `TupleSinkServiceLocalControlAsyncSlotMatches()` to require that the
+  active async op is owned by the same SHM slot before suppressing duplicate
+  local-control collection.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:32864`
+  makes the SHM async pump resolve through the owner before touching
+  `controlRegion->slots[]`. A non-SHM or invalid owner aborts because that means
+  a future DPU continuation reached the wrong publication path.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:32988`,
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:33033`,
+  and `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:33105`
+  change async open, start-command, and poll-completion registration to accept a
+  response owner and copy it into the async op.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34217`
+  changes `TupleSinkServiceDispatchLocalControlSlot()` to take a response-owner
+  pointer instead of a boolean async guard.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34361`
+  creates the SHM response owner in `TupleSinkServicePumpControlSlots()` before
+  calling the shared dispatcher.
+
+Important implementation details and decisions:
+
+- Stage 7B.2 is intentionally SHM-owner-only. This is enough to remove the raw
+  slot-index assumption from current async state without inventing the DPU
+  response publication owner before Stage 8 defines the DMA body+publish shape.
+- A non-SHM response owner in the SHM async pump is treated as a service bug and
+  aborts. Expected lifecycle staleness is still handled by the existing
+  request-sequence and slot-state checks; the abort is only for an impossible
+  owner/path mismatch.
+- This is a refactor validation stage. It preserves current SHM command
+  behavior and does not remove the selected-DPU command `not implemented` guard.
+
+Stage 7B.2 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c
+sudo -n -u dbcomm make service-bin client-bin
+git diff --check
+```
+
+Observed result:
+
+- `service-bin` rebuilt successfully.
+- `client-bin` was up to date.
+- `git diff --check` reported no whitespace errors.
+
 ## Next Stage
 
-Stage 7B.2 should add the response-owner abstraction that lets the shared
-local-control dispatcher publish results either to the current SHM slot or to a
-DPU response staging/publication path. Once that exists, staged DPU command
-slots can run through the same semantic handler and Stage 8 can DMA-write the
-response body plus publication word back to host memory. The selected DPU command
-`not implemented` guard should remain until command execution and response
-publication both exist.
-
-This is also the next Stage 7 promotion item, not a separate promotion cleanup:
-the response owner must stop async command handling from assuming an SHM slot
-once the selected-DPU path uses staged request slots. Stage 7A only proves
-request discovery and pull, and Stage 7B.1 only proves the first
-dispatch-boundary refactor.
+The next Stage 7 slice should add the DPU response-owner shape and a staged
+command dispatch path that can run through the shared local-control dispatcher
+without publishing into SHM. The selected DPU command `not implemented` guard
+should remain until command execution and response publication both exist: Stage
+7B.2 only proves that async continuation ownership is no longer hard-coded as a
+raw SHM slot index.
 
 Decisions recorded for Stage 6:
 

@@ -1376,8 +1376,12 @@ service adapters. The standalone host-to-DPU COMCH smoke validates this path wit
 a synthetic `START_COMMAND` SQL request. Stage 7B.1 then extracts the
 local-control semantic dispatcher from SHM slot response publication, while
 keeping async continuations explicitly SHM-slot-owned until a response-owner
-abstraction exists. Real command execution from staged DPU slots, response-body
-DMA writes, and response publication remain pending Stage 7B.2/Stage 8 work.
+abstraction exists. Stage 7B.2 adds the first response-owner abstraction for the
+current SHM slot path: async state now carries a response owner instead of a raw
+slot index, and the SHM async pump rejects non-SHM owners as a service bug. Real
+DPU response-owner metadata, command execution from staged DPU slots,
+response-body DMA writes, and response publication remain pending Stage 7B.3 and
+Stage 8 work.
 
 Tasks:
 
