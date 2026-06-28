@@ -926,6 +926,14 @@ bring-up correctness, not performance.
 
 ## Implementation sequence
 
+Promotion is intentionally embedded in the stage work below. Each stage owns the
+selected-DPU behavior it first makes meaningful: setup in Stage 6, command pull
+in Stage 7, completion publication in Stage 8, payload/basebackup pull in Stage
+9, lifecycle/reconnect in Stage 10, and only the user-facing selector promotion
+in Stage 11. Do not carry a selected-DPU placeholder or host-process SHM escape
+path forward as "later promotion cleanup" once the corresponding stage is
+accepted.
+
 ### Stage 0 — Freeze the migration contract
 
 Deliverable: this document plus a short note in the original DPU plan linking to
