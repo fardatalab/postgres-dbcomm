@@ -1401,8 +1401,14 @@ copy a staged command together with bridge/ring/ordinal metadata and explicitly
 release the DMA staging buffer after making its own local copy. Real DPU
 response-owner metadata was added in Stage 7B.4, along with an explicit guard
 that rejects async DPU-staged local-control continuations until Stage 8 response
-publication exists. Command execution from staged DPU slots, response-body DMA
-writes, and response publication remain pending later Stage 7 and Stage 8 work.
+publication exists. Stage 7B.5 then adds the service-owned staged-command
+dispatch queue and a distinct
+`HOMER_PROGRESS_ACTION_DPU_STAGED_COMMAND_DISPATCH` collector/action. That
+action copies engine-staged commands into service-owned queue entries, releases
+the engine command-pull staging buffer, and remains bounded by scheduler
+`maxItems`; it deliberately does not execute command semantics yet. Command
+execution from those service-owned staged entries, response-body DMA writes, and
+response publication remain pending later Stage 7 and Stage 8 work.
 
 Tasks:
 

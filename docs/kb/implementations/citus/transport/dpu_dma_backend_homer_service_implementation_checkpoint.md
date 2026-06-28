@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 7B.4, the default frontend and service path is still the existing
+As of Stage 7B.5, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -79,6 +79,10 @@ owner metadata and drops `totalStagedCommandRequestCount` back to zero; it does
 not publish a response to host memory. Stage 7B.4 adds the DPU staged-command
 response-owner metadata shape to the local-control dispatcher and makes async
 registration explicitly SHM-only until Stage 8 response publication exists.
+Stage 7B.5 adds a bounded service-owned staged-command dispatch queue plus a
+current-scheduler collector/action that copies engine-staged commands into that
+queue and releases the engine DMA staging buffer. It still does not run command
+semantics or publish a DPU response.
 
 ## Stage 1: Bridge ABI Header
 
@@ -1764,14 +1768,120 @@ Observed result:
 - `client-bin` was up to date.
 - `git diff --check` reported no whitespace errors.
 
+## Stage 7B.5: Service-Owned Staged Command Dispatch Queue
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:147`
+  adds `HomerDpuDmaCopyNextStagedCommand()`, an engine-level helper that finds
+  the next engine-owned staged command without exposing the import/ring tables to
+  the scheduler adapter.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:778`
+  implements that helper by scanning active imports and rings for a
+  `stagedCommandSlotValid` runtime entry, then delegating to
+  `HomerDpuDmaCopyStagedCommand()` for the validated copy.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:493`
+  adds `HOMER_SERVICE_DPU_STAGED_COMMAND_DISPATCH_SLOT_COUNT`, currently `16`.
+  This is a bounded service-owned handoff queue, not an unbounded semantic work
+  list.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:508`
+  adds `HomerServiceDpuStagedCommandDispatchSlot`; and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:517`
+  extends `HomerServiceDpuDmaSchedulerState` with the queue, current count, and
+  high-water diagnostic.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2128`
+  and `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2165`
+  add `HOMER_PROGRESS_COLLECTOR_DPU_STAGED_COMMAND_DISPATCH` and
+  `HOMER_PROGRESS_ACTION_DPU_STAGED_COMMAND_DISPATCH`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34613`
+  through `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34705`
+  add the bounded queue helpers and `HomerServiceDpuStageOneCommandForDispatch()`.
+  The helper copies the staged command into a stack handoff record, releases the
+  engine staging buffer with `HomerDpuDmaReleaseStagedCommandSlot()`, then makes
+  the service-owned dispatch slot visible.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34775`
+  appends the new collector only when
+  `HomerDpuDmaSchedulerFacts.totalStagedCommandRequestCount > 0` and the
+  service-owned queue has free slots.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:36311`
+  implements the bounded action executor. It consumes at most the grant's
+  `maxItems`, does not call `doca_pe_progress()`, and reports
+  `itemsProcessed`, `emptyPolls`, `stillReady`, and `budgetExhausted` through the
+  existing grant-result path.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:798`
+  now validates the new engine helper by using
+  `HomerDpuDmaCopyNextStagedCommand()` before releasing the staged command.
+
+Important implementation details and decisions:
+
+- The new dispatch queue is intentionally service-owned but not yet consumed by
+  semantic command execution. This prevents Stage 7 from dropping a response
+  before Stage 8 has DPU response-body and publication-word DMA writes.
+- The scheduler action is separate from `DPU_COMMAND_PULL`: command-pull submits
+  physical DMA reads, PE drain retires them, and staged-command dispatch moves
+  completed request records into service-owned state. Keeping those as separate
+  actions preserves the nonblocking PE-drain invariant and makes later response
+  publication easier to schedule.
+- The engine helper hides import/ring iteration from
+  `tuple_sink_service_process.c`. The large file remains a scheduler adapter; it
+  does not learn the DMA engine's import table layout.
+- The dispatch queue can fill because Stage 7B.5 does not consume it yet. When
+  full, candidate construction stops scheduling staged-command dispatch. Later
+  semantic dispatch/response-publication work must consume entries before the
+  selected-DPU command path can be accepted.
+
+Stage 7B.5 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/tuple_sink_service_process.c \
+  src/bin/homer_dpu_comch_transport_smoke.c
+sudo -n -u dbcomm make dpu-comch-transport-smoke-bin service-bin client-bin
+git diff --check
+```
+
+The DPU runtime smoke was rebuilt natively on `ssh dpu` under
+`/tmp/homer_dpu_comch_stage7_dispatch_1782632654` and run with:
+
+```sh
+# DPU
+./homer_dpu_comch_transport_smoke --server --import-dma \
+  --submit-control-read --submit-command-pull \
+  --name homer-dpu-comch-stage7-dispatch-rerun-1782632703 \
+  --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0 --timeout-ms 20000
+
+# Host
+./build/homer/homer_dpu_comch_transport_smoke --client --real-mmap \
+  --name homer-dpu-comch-stage7-dispatch-rerun-1782632703 \
+  --dev-pci 0000:21:00.0 --timeout-ms 20000
+```
+
+Observed result:
+
+- `service-bin`, `client-bin`, and `dpu-comch-transport-smoke-bin` built
+  successfully. The only warnings were the existing DOCA deprecated/experimental
+  API warnings for `doca_buf_inventory_buf_reuse_by_args()` and
+  `doca_task_submit_ex()`.
+- `git diff --check` reported no whitespace errors.
+- The runtime smoke reported `client_rc=0 server_rc=0`.
+- The client printed `homer_dpu_comch_transport_smoke: ok`.
+- The server printed `server DMA grouped-control read complete epoch=1 tail=1
+  cookie=65261`, `server DMA command-pull submitted after accepted
+  grouped-control frontier`, `server DMA command-pull complete owner=4242 seq=42
+  ordinal=0 command=6 sql="select 1"`, and
+  `homer_dpu_comch_transport_smoke: ok`.
+
 ## Next Stage
 
-The next Stage 7 slice should add a service-local staged-command dispatch record
-that uses `HomerDpuDmaCopyStagedCommand()`, fills the DPU response owner, and
-then calls `HomerDpuDmaReleaseStagedCommandSlot()` after the request and owner
-metadata have been copied locally. The selected DPU command `not implemented`
-guard should remain until command execution and response publication both exist:
-Stage 7B.4 only proves the response-owner metadata shape and the async guard.
+The next Stage 7 slice should consume service-owned staged-command dispatch
+entries into the local-control semantic dispatcher with a DPU response owner for
+synchronous-only requests, while keeping async DPU-staged requests explicitly
+blocked until Stage 8 response publication exists. The selected DPU command
+`not implemented` guard should remain until command execution and response
+publication both exist.
 
 Decisions recorded for Stage 6:
 
