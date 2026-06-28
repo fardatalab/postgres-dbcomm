@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6B.1, the default frontend and service path is still the existing
+As of Stage 6B.2, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -53,8 +53,14 @@ API, drains completions only through a bounded PE-drain API, and exposes copied
 snapshots only after the completion callback retires the task. The current
 scheduler adapter now calls these engine APIs for
 `HOMER_PROGRESS_ACTION_DPU_GROUPED_CONTROL_READ` and
-`HOMER_PROGRESS_ACTION_DPU_PE_DRAIN`. This still stops before Stage 7 command
-pulling and does not populate semantic ready-ring facts yet.
+`HOMER_PROGRESS_ACTION_DPU_PE_DRAIN`. Stage 6B.2 turns those completed
+host-publish-line snapshots into maintained DPU-local ready-ring facts by
+validating publication epoch, generation, ring identity, entry state, and
+monotonic frontier before incrementing
+`HomerDpuDmaSchedulerFacts.totalDiscoveredReadyRingCount`. This still stops
+before Stage 7 command pulling: the service can discover that a command ring has
+a new accepted host frontier, but it does not yet DMA-pull the command request
+slot.
 
 ## Stage 1: Bridge ABI Header
 
@@ -1223,12 +1229,109 @@ Observed result:
   `server DMA grouped-control read complete epoch=1 tail=17 cookie=65261` and
   `homer_dpu_comch_transport_smoke: ok`.
 
+## Stage 6B.2: Grouped-Control Semantic Ready Facts
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:99`
+  extends `HomerDpuDmaRingRuntime` with accepted host-publish state:
+  `hostPublishAccepted`, `discoveredReady`, `acceptedPublishedEpoch`,
+  `acceptedPublishedTail`, and the last accepted
+  `HomerDpuBridgeHostPublishLine`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:894`
+  keeps physical DMA task retirement as the only place that can turn a completed
+  grouped-control read into semantic state. The completion callback still does
+  not call `doca_pe_progress()` or submit follow-on work.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1108`
+  adds `HomerDpuDmaAcceptGroupedControlSnapshot()`. It treats an unchanged
+  `publishedEpoch` as no new semantic work, because the host may already be
+  preparing the next line body while the old publication word is still visible.
+  Only an advanced nonzero epoch with matching generation/ring identity and a
+  monotonic `publishedTail` can update the accepted frontier.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:367`
+  already rolls per-class `discoveredReadyRingCount` into
+  `HomerDpuDmaSchedulerFacts.totalDiscoveredReadyRingCount`; Stage 6B.2 now
+  populates that count after semantic acceptance.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_transport_smoke.c:766`
+  checks that the real DPU server observes
+  `totalDiscoveredReadyRingCount == 1` after the grouped-control read completes.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:248`
+  checks the same ready-ring fact in the optional same-process grouped-control
+  read path.
+
+Important implementation details and decisions:
+
+- The accepted publication epoch is the semantic gate. Stage 6B.2 deliberately
+  does **not** validate body fields when the epoch is unchanged; doing so would
+  turn a harmless observation of a host-side in-progress rewrite into a false
+  fatal error.
+- Identity mismatch, generation mismatch, unknown entry state, fatal ring flag,
+  unknown workload class, and frontier regression are treated as engine-fatal
+  bug-like validation failures. This matches the current migration assumption
+  that malformed bridge control data means the selected DPU path is unsafe.
+- `discoveredReadyRingCount` counts rings with accepted unread frontier, not
+  individual records. Stage 7 should consume this by adding a command-pull API
+  that reads the accepted ring/frontier state and clears or advances the ready
+  bit only after command request DMA pull has accepted the corresponding work.
+
+Stage 6B.2 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make service-dpu-dma-smoke service-dpu-dma-doca-smoke \
+  dpu-comch-transport-smoke-bin service-bin client-bin
+
+# DPU-side AArch64 rebuild from the changed sources.
+DPU_DIR=/tmp/homer_dpu_comch_stage6b_ready_facts
+ssh dpu "cd $DPU_DIR && gcc -std=gnu99 -Wall -Wextra \
+  -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers \
+  -Wno-deprecated-declarations -DHOMER_DPU_DMA_WITH_DOCA \
+  -DALLOW_EXPERIMENTAL_API -I/opt/mellanox/doca/include \
+  -I/usr/include/libnl3 -Isrc/include \
+  -Isrc/backend/distributed/utils/homer \
+  -o homer_dpu_comch_transport_smoke \
+  src/bin/homer_dpu_comch_transport_smoke.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_comch.c \
+  -L/opt/mellanox/doca/lib/aarch64-linux-gnu \
+  -ldoca_comch -ldoca_dma -ldoca_common"
+
+ssh dpu "cd /tmp/homer_dpu_comch_stage6b_ready_facts && \
+  LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu \
+  ./homer_dpu_comch_transport_smoke --server --import-dma \
+  --submit-control-read --name homer-dpu-comch-stage6b-ready \
+  --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0 \
+  --timeout-ms 20000 \
+  > /tmp/homer-dpu-comch-stage6b-ready-server.log 2>&1" &
+
+LD_LIBRARY_PATH=/opt/mellanox/doca/lib/x86_64-linux-gnu \
+  ./build/homer/homer_dpu_comch_transport_smoke --client --real-mmap \
+  --name homer-dpu-comch-stage6b-ready --dev-pci 0000:21:00.0 \
+  --timeout-ms 20000
+```
+
+Observed result:
+
+- `homer_service_dpu_dma_smoke: ok`
+- `homer_service_dpu_dma_smoke: ok` for the DOCA-enabled build, with only the
+  known DOCA experimental/deprecation warnings.
+- `dpu-comch-transport-smoke-bin`, `service-bin`, and `client-bin` built.
+- Host client printed `client received setup ack generation=1 rings=1
+  imported_bytes=276` and exited `ok`.
+- The DPU server log contained
+  `server DMA grouped-control read complete epoch=1 tail=17 cookie=65261` and
+  `homer_dpu_comch_transport_smoke: ok`. The server would have failed before ack
+  if the new ready-fact assertion had not observed exactly one discovered ready
+  ring.
+
 ## Next Stage
 
-Stage 6B should next turn the completed grouped-control snapshots into DPU-local
-ready-ring facts by validating publication epochs, generations, and monotonic
-frontiers for host-published lines. After that, Stage 7 can replace the selected
-DPU command `not implemented` guard with DPU-pulled command request slots.
+Stage 7 should consume the Stage 6B.2 ready-ring facts by adding a DPU command
+request-pull API. That API should read accepted ring/frontier state, DMA-pull the
+corresponding host request slots into DPU-local staging, and only then clear or
+advance the ready bit for the command ring. The selected DPU command
+`not implemented` guard can then be replaced with DPU-pulled command request
+slots.
 
 Decisions recorded for Stage 6:
 
@@ -1270,9 +1373,6 @@ and acceptance gates of
 The old host-process SHM path can remain buildable during migration as a DPU-off
 comparison path, but selected DPU mode must not use it as a runtime fallback.
 
-After Stage 6B.1, the remaining grouped-control work is not task submission
-itself but semantic interpretation of completed snapshots: validate host
-publication epochs, generations, and monotonic frontiers, then populate
-DPU-local ready facts without reading one tail at a time. Close/close-ack and
-reclaim remain folded into Stage 10 teardown rather than blocking Stage 7
-command-pull work.
+After Stage 6B.2, grouped-control discovery can produce maintained DPU-local
+ready facts. Close/close-ack and reclaim remain folded into Stage 10 teardown
+rather than blocking Stage 7 command-pull work.

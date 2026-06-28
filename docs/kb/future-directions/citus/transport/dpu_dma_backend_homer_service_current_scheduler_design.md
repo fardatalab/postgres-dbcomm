@@ -1219,6 +1219,11 @@ now calls those APIs for `HOMER_PROGRESS_ACTION_DPU_GROUPED_CONTROL_READ` and
 passed with the standalone COMCH transport smoke after adding
 `doca_buf_set_data()` for the source `doca_buf`; without that call the DPU DMA
 task submitted but completed with `Input/Output Operation Failed`.
+Stage 6B.2 then added semantic ready-frontier acceptance for completed
+grouped-control reads: the DPU ignores unchanged publication epochs, treats an
+advanced epoch as the semantic gate, validates generation/ring identity and
+monotonic `publishedTail`, and increments maintained ready-ring facts only for
+rings with new accepted frontier.
 
 Tasks:
 
@@ -1278,9 +1283,12 @@ Tasks:
 - Drain completions only under `DPU_DMA_DRAIN_PE` grants. Done for grouped
   control reads in Stage 6B.1.
 - Validate task owner identity in callbacks. Done in Stage 6B.1. Publication
-  words, generations, and monotonic frontiers must be validated when completed
-  snapshots are converted into ready-ring facts.
+  words, generations, ring identity, entry state, and monotonic frontiers are
+  validated when completed snapshots are converted into ready-ring facts. Done in
+  Stage 6B.2.
 - Populate DPU-local ready bits/counts for rings with new observed frontiers.
+  Done in Stage 6B.2 for grouped-control discovery counts; Stage 7 must add the
+  command-pull API that consumes those ready facts.
 - Report `cqesDrained`, `emptyPolls`, `stillReady`, and `budgetExhausted`.
   Stage 6B.1 reports submitted/completed/empty work through the adapter; richer
   `stillReady`/`budgetExhausted` feedback should be preserved when ready facts
@@ -1318,7 +1326,8 @@ Acceptance:
   DMA task ownership can become ambiguous.
 - Synthetic host publisher can advance frontiers and DPU observes them without
   reading one tail at a time. Done for one host-published line in the Stage 6B.1
-  host-to-DPU COMCH transport smoke.
+  host-to-DPU COMCH transport smoke; Stage 6B.2 extends that smoke to assert the
+  scheduler-visible ready-ring fact after semantic acceptance.
 - Drain action stops on first zero-progress return or budget exhaustion. Done for
   `HomerDpuDmaDrainPe()` in Stage 6B.1.
 - In-flight tasks remain represented in DPU-local facts for later grants. Done
@@ -1328,8 +1337,12 @@ Acceptance:
 - Stale generation callbacks do not publish any host-visible state.
 - Bug-like validation failures, including task-slot generation mismatch,
   malformed owner metadata, unexpected generation mismatch, and non-monotonic
-  frontiers, fail the DPU engine fatally instead of being silently ignored.
+  frontiers, fail the DPU engine fatally instead of being silently ignored. Done
+  for grouped-control semantic acceptance in Stage 6B.2.
 - Unchanged publication words are counted as empty/no-new-work, not as errors.
+  Stage 6B.2 implements this by ignoring body fields when `publishedEpoch` is
+  unchanged; a targeted negative/stress smoke remains useful before performance
+  tuning.
 - Debug invariant mode proves submit actions do not call `doca_pe_progress()` and
   callbacks do not submit follow-on DMA work. Stage 6B.1 implements this shape
   for grouped-control reads; a debug invariant mode can still make it explicit.
@@ -1349,6 +1362,10 @@ Tasks:
 - Make host frontend publish request-ready state through bridge lines.
 - Require completed DPU COMCH/mmap setup before publishing any command request in
   DPU mode.
+- Consume Stage 6B.2 discovered-ready ring facts through a command-pull engine
+  API. The API should expose accepted ring identity/frontier, DMA-pull request
+  slots up to that accepted frontier, and clear or advance the ring ready bit
+  only after the pulled command work has been accepted into DPU-local staging.
 - Add DPU-mode frontend errors for missing setup, stale setup generation, absent
   DPU service, and setup timeout; these errors must occur before any SHM frontend
   mapping or SHM local-service call.
@@ -1393,6 +1410,10 @@ Acceptance:
 - Before real backend command execution, a synthetic request-slot pull test DMA
   reads one fixed request slot into DPU-local staging, validates owner/generation,
   and leaves command semantics unmodified.
+- Ready-fact consumption test proves a grouped-control accepted frontier makes a
+  command ring eligible once, command-pull work consumes or advances that ready
+  fact, and the scheduler no longer sees `totalDiscoveredReadyRingCount > 0`
+  after all accepted command slots have been staged.
 
 ### Stage 8 — Completion/result push
 
