@@ -362,28 +362,82 @@ the existing arguments to avoid a broad runtime-struct refactor. Do not use a
 file-static singleton except as a temporary bring-up stub; a singleton makes
 multi-service tests and restart/teardown generation checks harder.
 
-### Task owner records
+### Task slots and owner records
 
-Every submitted DOCA task needs an owner record:
+Every submitted DOCA task must come from a bounded preallocated task slot. The
+slot owns the DOCA task handle, source/destination buffers where applicable, and
+the metadata that lets the callback interpret the physical completion. Do not
+allocate owner records on the hot path.
+
+The shape should be one owner record per task slot:
 
 ```c
+typedef enum HomerDpuDmaTaskSlotState
+{
+    HOMER_DPU_DMA_TASK_SLOT_FREE = 0,
+    HOMER_DPU_DMA_TASK_SLOT_SUBMITTED,
+    HOMER_DPU_DMA_TASK_SLOT_COMPLETED,
+    HOMER_DPU_DMA_TASK_SLOT_FAILED
+} HomerDpuDmaTaskSlotState;
+
+typedef struct HomerDpuDmaGroupedControlOwner
+{
+    uint32_t controlFirstIndex;
+    uint32_t controlCount;
+    uint32_t localBufferIndex;
+    uint32_t localBufferBytes;
+} HomerDpuDmaGroupedControlOwner;
+
 typedef struct HomerDpuDmaTaskOwner
 {
-    uint32_t workloadClass;
-    uint32_t ringIndex;
     uint32_t taskKind;
-    uint32_t direction;
-    uint64_t ringGeneration;
-    uint64_t firstTail;
-    uint64_t lastTail;
+    uint32_t workloadClass;
+    uint32_t taskSlotIndex;
+    uint32_t ringIndex;
     uint64_t taskGeneration;
-    uint8_t sentinel;
+    uint64_t ringGeneration;
+    uint64_t bridgeGeneration;
+    union
+    {
+        HomerDpuDmaGroupedControlOwner groupedControl;
+        /* Later stages add slot and byte-ring offset/range owners here. */
+    } u;
 } HomerDpuDmaTaskOwner;
+
+typedef struct HomerDpuDmaTaskSlot
+{
+    struct doca_dma_task_memcpy *task;
+    struct doca_buf *srcBuf;
+    struct doca_buf *dstBuf;
+    HomerDpuDmaTaskOwner owner;
+    uint64_t slotGeneration;
+    HomerDpuDmaTaskSlotState state;
+} HomerDpuDmaTaskSlot;
 ```
 
-Callbacks validate generation before touching ring state. A stale callback should
-free/recycle its task owner and increment diagnostics, but must not publish any
-host-visible frontier.
+The callback recovers the task slot through DOCA task user data. `owner` is the
+completion identity: it tells the callback which task slot can be reused, which
+workload class owns the completion, which ring/control slice or future byte-ring
+range it belongs to, which local staging buffer contains copied bytes, and which
+retirement path should run next.
+
+Generation fields have specific roles:
+
+- `taskGeneration`/`slotGeneration` protects task-slot reuse. A mismatch should
+  be treated as a fatal service bug because DOCA should not callback a task after
+  the slot was returned and reused.
+- `ringGeneration` protects logical ring/mailbox reuse. A callback submitted for
+  an old ring generation after teardown or reinitialization is a legitimate
+  lifecycle race; recycle the task and count it diagnostically, but do not mark
+  DPU-local readiness or publish host-visible state.
+- `bridgeGeneration` protects wholesale bridge/control-block replacement. A
+  mismatch is also a lifecycle race if teardown is in progress; otherwise it is
+  suspicious enough to fail fast in debug builds.
+
+For Stage 5 grouped-control reads, do not add payload/slot-specific owner fields
+yet. The required metadata is the local buffer slice plus the first control-line
+index and count. Later payload/slot stages add `slotIndex`, `byteOffset`,
+`byteLength`, `firstTail`, `lastTail`, and related retirement fields.
 
 ### Engine API
 
@@ -451,18 +505,24 @@ Use callbacks for only these operations:
 
 ```text
 1. Recover HomerDpuDmaTaskOwner from task_user_data.
-2. Check taskGeneration, ringGeneration, ringIndex, workloadClass, and taskKind.
-3. On stale generation, recycle the task owner and count a stale callback.
-4. On error callback, record diagnostics and request fatal Homer service
+2. Check taskKind, workloadClass, taskSlotIndex, taskGeneration/slotGeneration,
+   and the relevant ring/bridge generation fields before touching logical state.
+3. On expected lifecycle staleness, such as old ringGeneration after teardown,
+   recycle the task owner and count a stale-lifecycle callback without publishing
+   readiness or host-visible state.
+4. On impossible owner mismatches, task-slot generation mismatch, malformed
+   owner fields, non-monotonic frontiers, or unexpected generation mismatch
+   outside teardown, record diagnostics and request fatal Homer service shutdown.
+5. On error callback, record diagnostics and request fatal Homer service
    shutdown. The first DPU prototype treats DMA task failure as a service bug or
    unrecoverable hardware/runtime failure, not as a recoverable per-ring event.
-5. On successful data task, mark the physical DMA range complete in per-ring
+6. On successful data task, mark the physical DMA range complete in per-ring
    completion state and advance completedContiguousTail if possible.
-6. On successful grouped-control read, validate publication words, generations,
+7. On successful grouped-control read, validate publication words, generations,
    and monotonic frontiers in the local staging buffer, then set DPU-local ready
    bits/counts for rings with new frontiers.
-7. On successful publication task, mark the host-visible frontier as published.
-8. Return the task, buffers, and owner record to reusable pools.
+8. On successful publication task, mark the host-visible frontier as published.
+9. Return the task, buffers, and owner record to reusable pools.
 ```
 
 Callbacks should not dispatch semantic command handlers, submit new DMA work,
@@ -953,19 +1013,32 @@ Deliverable: scheduled DMA reads of host-publish-line slices.
 
 Tasks:
 
+- Enable the minimal real DOCA lifecycle behind `HOMER_SERVICE_ENABLE_DOCA_DMA=1`
+  for grouped-control reads only. Payload pulls, completion pushes, and
+  consumed-head writes remain stubbed.
+- Exchange the host mmap descriptor over COMCH for the real path. A file-based
+  descriptor path may be kept only as a standalone debug harness, not as the
+  Homer service path.
 - Import host mmap descriptor on the DPU side.
 - Allocate reusable local buffers for grouped-control slices.
+- Preallocate a bounded pool of `HomerDpuDmaTaskSlot` records with one
+  `HomerDpuDmaTaskOwner` per DOCA memcpy task.
 - Submit control-read DMA tasks only under `DPU_DMA_SUBMIT_CONTROL_READS` grants.
 - Drain completions only under `DPU_DMA_DRAIN_PE` grants.
-- Validate publication words, generations, and frontiers in callbacks.
+- Validate task owner identity, publication words, generations, and frontiers in
+  callbacks.
 - Populate DPU-local ready bits/counts for rings with new observed frontiers.
 
 Acceptance:
 
 - Synthetic host publisher can advance frontiers and DPU observes them without
   reading one tail at a time.
-- Stale generation, unchanged publication word, and non-monotonic frontier lines
-  are ignored and counted diagnostically.
+- Expected lifecycle staleness, such as old ring generation after teardown, is
+  ignored and counted diagnostically.
+- Bug-like validation failures, including task-slot generation mismatch,
+  malformed owner metadata, unexpected generation mismatch, and non-monotonic
+  frontiers, fail the DPU engine fatally instead of being silently ignored.
+- Unchanged publication words are counted as empty/no-new-work, not as errors.
 - No payload DMA reads are submitted in this stage.
 - A standalone host+DPU grouped-control test proves control-read DMA submission
   and callback retirement are separated: submit action queues reads, PE-drain
@@ -1113,8 +1186,14 @@ Add assertions and diagnostics for these from the first non-stub stages:
 Ready-set building never calls DOCA and never DMA-reads host memory.
 Every DPU DMA action is bounded by an explicit grant.
 Callbacks never call doca_pe_progress().
-Every task owner carries ring generation and task generation.
-Stale callbacks cannot publish host-visible state.
+Every DOCA task comes from a bounded preallocated task slot with one embedded
+owner record.
+Every task owner carries task-slot generation and the relevant ring/bridge
+generation.
+Expected lifecycle-stale callbacks cannot publish DPU-local readiness or
+host-visible state.
+Bug-like owner/generation/frontier validation failures are fatal until a specific
+recoverable policy is designed and validated.
 DPU never reads payload beyond an accepted host-published frontier.
 Host-visible completion frontier is the final same-context publication-word DMA
 task after completion-body DMA tasks.
