@@ -882,6 +882,14 @@ Acceptance:
 Deliverable: `homer_service_dpu_dma.c/.h` with DOCA object lifecycle and zero
 work facts.
 
+Status: completed as a no-DOCA lifecycle/facts skeleton in
+`/data/dbcomm/citus-dbcomm`. The engine creates per-workload-class state,
+reports zero-work scheduler facts, rejects `enableDoca=true` explicitly, links
+into the standalone service binary, and is excluded from `citus.so`. The API
+does not yet take `HomerGrantVector` or `HomerProgressResult` because those
+types are still local to `tuple_sink_service_process.c`; Stage 4 must bridge
+that scheduler-type boundary deliberately.
+
 Tasks:
 
 - Create/destroy engine object.

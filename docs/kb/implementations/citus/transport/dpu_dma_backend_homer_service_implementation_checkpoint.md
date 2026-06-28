@@ -10,7 +10,9 @@ As of Stage 2, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the frontend runs a host-side bridge-memory smoke check and then
-fails real Homer API calls with a deliberate not-implemented error.
+fails real Homer API calls with a deliberate not-implemented error. Stage 3 adds
+a service-side DPU DMA engine skeleton, but it reports only zero-work facts and
+does not yet participate in the service scheduler.
 
 ## Stage 1: Bridge ABI Header
 
@@ -150,13 +152,70 @@ of those backend allocation helpers because it currently allocates with
   tasks.
 - The experimental DPU frontend channel is not runnable for real Homer commands
   yet. It intentionally fails before SHM fallback when selected.
+- Stage 3 keeps DPU engine APIs independent of `HomerGrantVector` and
+  `HomerProgressResult` because those scheduler types still live inside
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  Stage 4 must either move the needed scheduler types into a shared service
+  header or add scheduler adapters inside that file.
 - The one-word publication offset is pinned at offset zero for both hot lines.
   This is a protocol choice for efficient polling and separate one-word DMA
   publication; if a future multi-word sealed snapshot is needed, it should be a
   separate ABI struct rather than mutating these hot lines.
 
+## Stage 3: DPU DMA Engine Skeleton
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:30`
+  defines the engine configuration, including per-class async-window placeholders
+  and `enableDoca`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:40`
+  and `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:54`
+  define class facts and aggregate scheduler facts that ready-set builders can
+  read without performing DOCA calls or DMA reads.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:57`
+  initializes conservative stub defaults.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:78`
+  creates the no-DOCA engine and rejects `enableDoca=true` explicitly.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:148`
+  copies maintained zero-work facts.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:33`
+  validates create/facts/destroy and confirms accidental DOCA enablement fails
+  with a not-implemented error.
+- `/data/dbcomm/citus-dbcomm/Makefile:42` adds `service-dpu-dma-smoke`, and
+  `/data/dbcomm/citus-dbcomm/Makefile:45` links `homer_service_dpu_dma.c` into
+  the standalone service binary.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/Makefile:56` marks
+  `homer_service_dpu_dma.o` as service-only so it is filtered out of `citus.so`.
+
+Stage 3 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make service-dpu-dma-smoke
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm make -C src/backend/distributed all
+sudo -n -u dbcomm make dpu-bridge-abi-check frontend-dma-smoke service-dpu-dma-smoke
+git diff --check
+```
+
+Observed result:
+
+- `homer_service_dpu_dma_smoke: ok`
+- `homer_dpu_bridge_abi_check: ok`
+- `homer_frontend_dma_smoke: ok`
+- `service-bin` and `client-bin` remained buildable/up to date.
+- The extension build completed with `homer_service_dpu_dma.o` excluded from
+  `citus.so` by the service-object filter.
+
+One validation command initially raced two parallel builds/executions of
+`build/homer/homer_service_dpu_dma_smoke` and produced `Permission denied` while
+the file was being rewritten. Rerunning the same checks sequentially passed; the
+failure was a validation-command race, not a code issue.
+
 ## Next Stage
 
-Stage 3 should add `homer_service_dpu_dma.c/.h` with DPU-side engine lifecycle
-state and zero-work scheduler facts. The first version should compile without
-DOCA when DPU mode is off and should not add a private progress loop.
+Stage 4 should add current-scheduler collector/action identities and no-op
+bounded executors. The first design task is deciding how to share or adapt the
+currently file-local scheduler grant/result types without pulling the DPU engine
+into a private scheduler loop.
