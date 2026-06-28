@@ -1164,14 +1164,25 @@ the full standalone cold setup composition: the host exported a real PCI mmap
 descriptor, sent it over COMCH, and the DPU server imported it through the
 service DMA engine. The next Stage 6A slice should integrate this validated
 COMCH lifecycle into service/frontend setup rather than using the standalone
-smoke binary.
+smoke binary. Stage 6A.5 added a reusable service-side
+`HomerServiceDpuComchServer` lifecycle API in
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c`
+and `.h`: it creates the DPU COMCH listener, exposes bounded PE progress,
+reports maintained setup facts, routes received setup messages through
+`HomerServiceDpuComchHandleSetupPayload()`, and uses per-send ack storage so
+async COMCH sends cannot race on a shared ack buffer. It was validated by a
+DPU-side lifecycle smoke with no host peer and by the existing real mmap
+transport smoke. Production service startup still does not allocate this server
+object, and the production host/frontend COMCH client remains pending.
 
 Tasks:
 
 - Implement the minimal COMCH setup message ABI and close/ack shell. The setup
   ABI and setup-ack struct are landed; the close/close-ack shell remains.
 - Integrate the DPU COMCH server so service startup creates the listener and then
-  returns to normal service pumping. Startup must not wait indefinitely for a host
+  returns to normal service pumping. The reusable `HomerServiceDpuComchServer`
+  lifecycle and bounded progress API are landed, but `citus_tuple_sink_service`
+  startup does not allocate it yet. Startup must not wait indefinitely for a host
   DB backend to connect.
 - Implement the host COMCH client in `homer_frontend_dma.c`. The setup-payload
   builder is landed; the standalone transport smoke validates real COMCH
@@ -1183,9 +1194,14 @@ Tasks:
   is attempted in a selected DPU session.
 - Implement the DPU COMCH server in `homer_service_dpu_comch.c/.h`, keeping
   `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter. The
-  setup-payload handler is landed; the standalone transport smoke validates real
-  server lifecycle and the current farnet1 representor choice, but production
-  service integration remains.
+  setup-payload handler and reusable server lifecycle are landed; the standalone
+  transport smoke validates real server lifecycle and the current farnet1
+  representor choice, but production service integration remains.
+- Keep COMCH ack buffers alive until the send completion/error callback. DOCA
+  COMCH sends are asynchronous, so callbacks must not pass a stack ack or a
+  shared scratch ack to `doca_comch_server_task_send_alloc_init()`. Stage 6A.5
+  uses one heap `HomerDpuComchSetupAck` copy per send task and frees it from
+  task user data in the send callback.
 - Implement task-owner allocation, generation validation, callback retirement,
   and task reuse for grouped-control DMA tasks after descriptor import.
 - Submit control-read DMA tasks only under `DPU_DMA_SUBMIT_CONTROL_READS` grants.

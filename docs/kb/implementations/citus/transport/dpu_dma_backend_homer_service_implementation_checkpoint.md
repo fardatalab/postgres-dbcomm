@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6A.4, the default frontend and service path is still the existing
+As of Stage 6A.5, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the frontend runs a host-side bridge-memory smoke check and still
@@ -29,8 +29,12 @@ selection with an explicit local DOCA device PCI: the service defaults to the
 DPU-local `0000:03:00.0` and can be overridden with
 `HOMER_SERVICE_DOCA_DEV_PCI`. Stage 6A.4 extends the standalone COMCH smoke so a
 host client can export a real PCI mmap descriptor and the DPU server can import
-it through the service DMA engine. Production service/frontend startup still
-does not call the COMCH lifecycle directly.
+it through the service DMA engine. Stage 6A.5 adds a reusable service-side
+`HomerServiceDpuComchServer` lifecycle API that creates a real DPU COMCH
+listener, exposes bounded PE progress, and delivers received setup messages to
+the existing mmap-import handler. Production service startup does not allocate
+that server object yet, and production frontend startup still does not call a
+real DOCA COMCH client.
 
 ## Stage 1: Bridge ABI Header
 
@@ -670,15 +674,108 @@ cd /data/dbcomm/citus-dbcomm
 sudo -n -u dbcomm make dpu-comch-transport-smoke-bin dpu-comch-abi-check dpu-bridge-abi-check frontend-dma-smoke service-dpu-dma-smoke service-dpu-dma-doca-smoke service-bin client-bin
 ```
 
+## Stage 6A.5: Reusable Service-Side COMCH Server Lifecycle
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.h:27`
+  defines the validated farnet1 defaults for the service-side COMCH listener:
+  server name `homer-dpu-comch`, DPU-local DOCA device `0000:03:00.0`, and host
+  PF representor `0000:21:00.0`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.h:34`
+  adds `HomerServiceDpuComchServerConfig`, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.h:44`
+  adds `HomerServiceDpuComchServerFacts`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.h:56`
+  declares the reusable server lifecycle API:
+  `HomerServiceDpuComchDefaultServerConfig()`,
+  `HomerServiceDpuComchServerCreate()`,
+  `HomerServiceDpuComchServerProgress()`,
+  `HomerServiceDpuComchServerGetFacts()`, and
+  `HomerServiceDpuComchServerDestroy()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:117`
+  implements `HomerServiceDpuComchServerCreate()`. It starts the DPU-side COMCH
+  listener and returns without waiting for a host backend to connect. In a build
+  without `HOMER_DPU_DMA_WITH_DOCA`, it fails explicitly instead of creating a
+  fake server.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:175`
+  implements `HomerServiceDpuComchServerProgress()`. It runs at most the caller
+  supplied number of `doca_pe_progress()` polls and stops on the first
+  zero-progress poll, so the future scheduler adapter can keep COMCH progress
+  bounded.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:237`
+  implements bounded cleanup-time stop progress in
+  `HomerServiceDpuComchServerDestroy()`. This is teardown cleanup, not a
+  service-private hot-path progress loop.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:282`
+  now checks the setup-ack output pointer before initializing it. This fixes the
+  pre-existing NULL-ack bug in the setup handler.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:548`
+  allocates one `HomerDpuComchSetupAck` copy per async COMCH send and stores it
+  in DOCA task user data; `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:570`
+  and `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:583`
+  free that copy in the send completion/error callbacks. This avoids the
+  tempting but unsafe shared-ack-buffer pattern.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c:667`
+  receives setup messages in the COMCH callback, routes them through
+  `HomerServiceDpuComchHandleSetupPayload()`, counts setup errors, and sends the
+  ack. The callback does not submit DMA work and does not call
+  `doca_pe_progress()`.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_comch_smoke.c:39`
+  adds a DPU-side lifecycle smoke that creates a real DMA engine, creates the
+  COMCH listener, performs bounded progress polls without any host peer, checks
+  maintained facts, and destroys the listener.
+- `/data/dbcomm/citus-dbcomm/Makefile:25` adds
+  `homer_service_dpu_comch_smoke`, and
+  `/data/dbcomm/citus-dbcomm/Makefile:180` links it with `doca-comch`,
+  `doca-dma`, `homer_service_dpu_comch.c`, and `homer_service_dpu_dma.c`.
+
+Scope boundary:
+
+- Stage 6A.5 is the service-side lifecycle boundary, not full production setup.
+  `tuple_sink_service_process.c` still does not create a
+  `HomerServiceDpuComchServer` during service startup, and
+  `homer_frontend_dma.c` still does not implement the host COMCH client.
+- The server API is deliberately nonblocking for normal operation. Startup
+  creates the listener, scheduler-controlled progress later drains the COMCH PE,
+  and callbacks only perform setup-message validation/import plus ack send.
+
+Stage 6A.5 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make service-dpu-dma-smoke dpu-comch-abi-check service-bin client-bin service-dpu-comch-smoke-bin dpu-comch-transport-smoke-bin
+
+rsync -azR src/bin/homer_service_dpu_comch_smoke.c src/bin/homer_dpu_comch_transport_smoke.c src/backend/distributed/utils/homer/homer_service_dpu_comch.c src/backend/distributed/utils/homer/homer_service_dpu_comch.h src/backend/distributed/utils/homer/homer_service_dpu_dma.c src/backend/distributed/utils/homer/homer_service_dpu_dma.h src/include/distributed/homer/homer_dpu_comch_abi.h src/include/distributed/homer/homer_dpu_bridge_abi.h src/include/distributed/homer/homer_abi_version.h dpu:/tmp/homer_dpu_comch_stage6a5_final/
+ssh dpu 'cd /tmp/homer_dpu_comch_stage6a5_final && gcc -std=gnu99 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Werror=vla -Werror=implicit-int -Werror=implicit-function-declaration -Werror=return-type -DHOMER_DPU_DMA_WITH_DOCA -I src/include -I src/backend/distributed/utils/homer -I/opt/mellanox/doca/include -I/usr/include/libnl3 -DALLOW_EXPERIMENTAL_API -o homer_service_dpu_comch_smoke src/bin/homer_service_dpu_comch_smoke.c src/backend/distributed/utils/homer/homer_service_dpu_comch.c src/backend/distributed/utils/homer/homer_service_dpu_dma.c -L/opt/mellanox/doca/lib/aarch64-linux-gnu -ldoca_comch -ldoca_dma -ldoca_common && gcc -std=gnu99 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Werror=vla -Werror=implicit-int -Werror=implicit-function-declaration -Werror=return-type -DHOMER_DPU_DMA_WITH_DOCA -I src/include -I src/backend/distributed/utils/homer -I/opt/mellanox/doca/include -I/usr/include/libnl3 -DALLOW_EXPERIMENTAL_API -o homer_dpu_comch_transport_smoke src/bin/homer_dpu_comch_transport_smoke.c src/backend/distributed/utils/homer/homer_service_dpu_comch.c src/backend/distributed/utils/homer/homer_service_dpu_dma.c -L/opt/mellanox/doca/lib/aarch64-linux-gnu -ldoca_comch -ldoca_dma -ldoca_common && LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu ./homer_service_dpu_comch_smoke --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0 --name homer-dpu-comch-stage6a5-final --progress-iters 16'
+
+# Regression: real mmap setup still works through the existing standalone transport smoke.
+ssh dpu 'cd /tmp/homer_dpu_comch_stage6a5_final && LD_LIBRARY_PATH=/opt/mellanox/doca/lib/aarch64-linux-gnu ./homer_dpu_comch_transport_smoke --server --import-dma --name homer-dpu-comch-stage6a5-final-real --dev-pci 0000:03:00.0 --rep-pci 0000:21:00.0 --timeout-ms 10000'
+LD_LIBRARY_PATH=/opt/mellanox/doca/lib/x86_64-linux-gnu build/homer/homer_dpu_comch_transport_smoke --client --real-mmap --name homer-dpu-comch-stage6a5-final-real --dev-pci 0000:21:00.0 --timeout-ms 10000
+```
+
+Observed result:
+
+- The DPU lifecycle smoke printed
+  `homer_service_dpu_comch_smoke: server started name=homer-dpu-comch-stage6a5-final dev=0000:03:00.0 rep=0000:21:00.0 running=1`
+  followed by `homer_service_dpu_comch_smoke: ok`.
+- The real mmap transport regression printed `client received setup ack
+  generation=1 rings=1 imported_bytes=267` and both host and DPU processes
+  exited with `homer_dpu_comch_transport_smoke: ok`.
+- The only compile warnings were the known DOCA header deprecation warnings for
+  `doca_buf_inventory_buf_reuse_by_args`; no project warning remained.
+
 ## Next Stage
 
-Stage 6A should next integrate the real DOCA COMCH endpoint lifecycle into the
-host frontend setup path and DPU service startup path, using the validated
+Stage 6A should next allocate the reusable `HomerServiceDpuComchServer` from
+the production service startup path and implement the host/frontend COMCH client
+in `homer_frontend_dma.c`. The service-side helper now proves listener creation
+and bounded progress are implementable without a host peer, using the validated
 farnet1 COMCH defaults DPU server `dev=0000:03:00.0` and `rep=0000:21:00.0`
 unless the deployment is explicitly configured otherwise. The DPU service should
 start independently and listen for host setup; it must not block service startup
-waiting for a DB backend. The DPU DMA engine now separately defaults its local
-DMA device to `0000:03:00.0` and accepts `HOMER_SERVICE_DOCA_DEV_PCI` as an
+waiting for a DB backend. The DPU DMA engine separately defaults its local DMA
+device to `0000:03:00.0` and accepts `HOMER_SERVICE_DOCA_DEV_PCI` as an
 override. Stage 6B should then implement grouped-control DMA submit/drain.
 
 Decisions recorded for Stage 6:
@@ -705,6 +802,10 @@ Decisions recorded for Stage 6:
   engine and COMCH listener, then returns to normal service pumping. Host DB
   backends connect later from the DPU frontend setup path, export bridge memory,
   send setup over COMCH, and wait for ack with a finite timeout.
+- COMCH ack sends are asynchronous. Any server callback that sends an ack must
+  keep ack bytes alive until the send completion/error callback runs. Stage 6A.5
+  uses one heap `HomerDpuComchSetupAck` copy per send task and frees it from
+  DOCA task user data.
 - The setup message includes protocol/versioning, message kind, bridge
   generation, feature flags, ring count, descriptor size, mmap export length,
   exported mmap blob, `HomerDpuBridgeControlBlockHeader`,
