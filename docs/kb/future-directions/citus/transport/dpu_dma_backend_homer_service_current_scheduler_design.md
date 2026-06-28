@@ -1429,6 +1429,14 @@ Tasks:
   slots are one owner kind for DPU-off mode; selected DPU mode must use a
   DPU-response owner that carries enough bridge/ring/generation information for
   Stage 8 DMA publication.
+- Do not execute a service-owned DPU staged command unless the response has a
+  safe publication destination. The acceptable intermediate shape is an explicit
+  service-owned "executed response pending DPU publication" queue that preserves
+  the response body plus DPU response-owner metadata and is consumed only by a
+  bounded Stage 8 response-publish action. The unacceptable shape is executing
+  `TupleSinkServiceDispatchLocalControlSlot()` for a DPU-staged command, mutating
+  service state, and then leaving the host with no response-ready publication
+  path.
 - Submit response-body DMA writes followed immediately by the response-ready
   publication-word DMA write on the same ordered context.
 - Preserve request sequence and owner validation.
@@ -1473,6 +1481,9 @@ Acceptance:
   setup or command-pull error.
 - Stage 7 is not accepted if response-owner plumbing still assumes an SHM slot
   for any selected-DPU command request that can become asynchronous.
+- Stage 7 is not accepted if semantic execution of a DPU-staged command can
+  mutate service state before the completed response is either DMA-published to
+  the host or durably staged in a bounded service-owned pending-publication queue.
 - Early response publication negative test fails as expected.
 - Before real backend command execution, a synthetic request-slot pull test DMA
   reads one fixed request slot into DPU-local staging, validates owner/generation,
@@ -1508,6 +1519,11 @@ Tasks:
 - Add a selected-DPU completion-path diagnostic or counter that proves command
   completion became visible through DPU-written publication lines, not through
   the SHM completion mailbox.
+- If Stage 7 introduced an "executed response pending DPU publication" queue,
+  Stage 8 owns draining that queue with same-context response-body DMA writes
+  followed by the response-ready publication-word DMA write. Stage 8 must also
+  own bounded queue retirement and failure handling; the queue is not a
+  substitute for host-visible response publication.
 - Treat Stage 8 promotion work as the completion replacement gate: selected-DPU
   completion polling must consume DPU-written completion/credit publication
   lines and must not use host-process SHM completion mailboxes after selection.

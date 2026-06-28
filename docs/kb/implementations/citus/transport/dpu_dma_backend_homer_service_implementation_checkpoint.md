@@ -1883,6 +1883,13 @@ blocked until Stage 8 response publication exists. The selected DPU command
 `not implemented` guard should remain until command execution and response
 publication both exist.
 
+Important handoff rule: semantic execution of a DPU-staged command must not
+mutate service state unless its response is either DMA-published to host memory
+or copied into a bounded service-owned "executed response pending DPU
+publication" queue that preserves the response body and DPU response-owner
+metadata. The latter is only an intermediate state for a Stage 8 bounded
+response-publish action; it is not host-visible completion.
+
 Decisions recorded for Stage 6:
 
 - Keep new DPU implementation code out of
