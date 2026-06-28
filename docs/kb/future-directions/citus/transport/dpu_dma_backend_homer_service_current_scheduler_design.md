@@ -150,65 +150,75 @@ This matches the hot operations: the DPU often wants to DMA-read only host-owned
 publication lines, while host backends often want to read only DPU-owned credit or
 completion lines.
 
-### Sealed cache-line snapshots
+### Publication-line snapshots
 
-Each hot line should fit in one cache line and use a sealed sequence so a reader
-can reject torn snapshots.
+Each hot line should fit in one cache line. The current design decision is to
+use a single monotonic publication word for the DPU migration hot path. There is
+no known target case in the current byte-ring or slot design that requires a
+begin/end sealed cache-line protocol.
+
+The preferred hot-path protocol is a single monotonic publication word. Use this
+when the publication word is itself the authoritative frontier/epoch, or when it
+points to body bytes in slots that are not overwritten until the consumer has
+returned credit. In that shape, the producer writes the body first and then
+performs one final release/publish write:
 
 ```c
-#define HOMER_DPU_BRIDGE_CACHELINE_BYTES 64U
-
-typedef struct __attribute__((aligned(64))) HomerDpuBridgeHostPublishLine
+typedef struct __attribute__((aligned(64))) HomerDpuBridgeSimpleCreditLine
 {
-    uint64_t sequenceBegin;
-    uint64_t publishedTail;
-    uint64_t publishedObjectFrontier;
-    uint64_t generation;
-    uint64_t flags;
-    uint64_t terminalCode;
-    uint64_t sequenceEnd;
-    uint64_t reserved0;
-} HomerDpuBridgeHostPublishLine;
-
-typedef struct __attribute__((aligned(64))) HomerDpuBridgeDpuCreditLine
-{
-    uint64_t sequenceBegin;
+    uint64_t publishedCreditEpoch;       /* final publication word */
     uint64_t consumedHead;
     uint64_t completedTail;
     uint64_t generation;
     uint64_t flags;
     uint64_t errorCode;
-    uint64_t sequenceEnd;
     uint64_t reserved0;
-} HomerDpuBridgeDpuCreditLine;
+    uint64_t reserved1;
+} HomerDpuBridgeSimpleCreditLine;
 ```
 
-Add static asserts for size and alignment.
+For DPU-produced host-visible lines, submit body DMA tasks first and then submit
+the one-word publication task immediately after them on the same ordered DMA
+context. Do not wait for body completions before submitting the publish task in
+this same-context path. The host polls `publishedCreditEpoch` or the equivalent
+frontier word and accepts it when it matches the expected next value or advances
+monotonically for that ring. If the host must read non-monotonic body fields from
+a reusable control line, it should re-check the publication word after reading
+the body. That double-read publication check is the first fallback before
+introducing a heavier sealed line.
 
-Producer protocol:
+Keep the sealed begin/end sequence only as a fallback pattern for a future ABI
+that needs a consistent multi-word snapshot of a reusable line while the producer
+may start writing the next epoch before the consumer has finished reading the
+current body. The current Homer DPU design should avoid that shape: byte-ring
+contents live in credit-protected ring ranges, and fixed request/response slots
+are not reused until the publication/credit protocol makes reuse legal.
+
+If this fallback is ever introduced, add it as a separate ABI struct with static
+asserts for size and alignment. The begin/end form is stricter and more
+expensive than the simple publication-word form; it is not part of the planned
+hot path and should not be implemented in the first migration stage.
+
+For DPU-produced lines, do not assume a 64-byte DMA write is an atomic publish
+operation. Treat body fields and the final accepted publication word as different
+protocol roles:
 
 ```text
-old = current even sequence
-write sequenceBegin = old + 1
-write all frontier, flag, generation, terminal/error fields
-release fence or store-release appropriate to the producer side
-write sequenceEnd = old + 2
-release-store sequenceBegin = old + 2
+DPU writes body fields or completion/result slot bytes with DMA tasks.
+DPU immediately submits the final publication-word DMA task after the body tasks
+on the same ordered context.
+Host accepts the body only after the publication word reaches the expected epoch
+or frontier and generation/frontier checks pass.
 ```
 
-Consumer protocol:
-
-```text
-copy or DMA-read one or more lines into local memory
-accept line only if sequenceBegin == sequenceEnd and sequenceBegin is even
-accept line only if generation matches the descriptor generation
-accept line only if the frontier is monotonic for that ring
-otherwise ignore this line and retry on a later scheduled poll
-```
-
-This is deliberately stricter than today's host-process SHM path. The DPU sees
-host memory through DMA snapshots, so the bridge needs an explicit snapshot
-contract.
+Make same-context publication an invariant: body DMA tasks and the publication
+DMA task for the corresponding frontier must be submitted on the same DOCA DMA
+context, with `doca_dma_set_ordered_completions()` enabled. The publication task
+should be submitted without `OPTIMIZE_REPORTS` and with
+`DOCA_TASK_SUBMIT_FLAG_FLUSH`. Completion callbacks retire physical task state
+later under scheduler-controlled PE-drain grants; they are separate from the
+submission path. For this prototype, any DOCA DMA task error should be treated as
+a fatal Homer service failure, not as a recoverable per-ring condition.
 
 ### Descriptor table
 
@@ -340,6 +350,15 @@ typedef struct HomerDpuDmaClassState
 `readyCatalogMember` here means an engine-local ready bit/list for rings with
 observed work. It is not the future continuation ready catalog.
 
+The service should own one `HomerDpuDmaEngine *` in a long-lived service runtime
+object, not as a local variable inside the pump. Today's
+[`TupleSinkServiceControlState`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1856) is mostly the current SHM control-region wrapper, so the cleaner target is a
+new broader service runtime object that contains the control state plus the DPU
+engine and is passed down to [`TupleSinkServicePumpOnce()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:36127). A first scaffolding patch may pass an explicit `HomerDpuDmaEngine *` beside
+the existing arguments to avoid a broad runtime-struct refactor. Do not use a
+file-static singleton except as a temporary bring-up stub; a singleton makes
+multi-service tests and restart/teardown generation checks harder.
+
 ### Task owner records
 
 Every submitted DOCA task needs an owner record:
@@ -372,28 +391,33 @@ bool HomerDpuDmaGetSchedulerFacts(HomerDpuDmaEngine *engine,
                                   HomerDpuDmaSchedulerFacts *facts);
 
 bool HomerDpuDmaSubmitControlReads(HomerDpuDmaEngine *engine,
-                                   const HomerProgressGrant *grant,
+                                   const HomerGrantVector *grantVector,
+                                   const HomerProgressSourceRef *source,
                                    HomerProgressResult *result);
 
 bool HomerDpuDmaDrainPe(HomerDpuDmaEngine *engine,
-                        const HomerProgressGrant *grant,
+                        const HomerGrantVector *grantVector,
+                        const HomerProgressSourceRef *source,
                         HomerProgressResult *result);
 
 bool HomerDpuDmaSubmitCommandPulls(HomerDpuDmaEngine *engine,
-                                   const HomerProgressGrant *grant,
+                                   const HomerGrantVector *grantVector,
+                                   const HomerProgressSourceRef *source,
                                    HomerProgressResult *result);
 
 bool HomerDpuDmaSubmitPayloadPulls(HomerDpuDmaEngine *engine,
-                                   const HomerTransportGrant *transportGrant,
-                                   const HomerProgressGrant *grant,
+                                   const HomerGrantVector *grantVector,
+                                   const HomerProgressSourceRef *source,
                                    HomerProgressResult *result);
 
 bool HomerDpuDmaSubmitCompletionPushes(HomerDpuDmaEngine *engine,
-                                       const HomerProgressGrant *grant,
+                                       const HomerGrantVector *grantVector,
+                                       const HomerProgressSourceRef *source,
                                        HomerProgressResult *result);
 
 bool HomerDpuDmaPublishConsumedHeads(HomerDpuDmaEngine *engine,
-                                     const HomerProgressGrant *grant,
+                                     const HomerGrantVector *grantVector,
+                                     const HomerProgressSourceRef *source,
                                      HomerProgressResult *result);
 ```
 
@@ -403,6 +427,47 @@ submit and PE progress for bring-up, the inline progress must consume an explici
 poll budget and report it in `HomerProgressResult`.
 
 Callbacks must not call `doca_pe_progress()` recursively.
+
+### PE callback usage
+
+DOCA DMA callbacks are task-retirement hooks, not a second Homer scheduler. The
+local headers make this explicit:
+
+- `doca_dma_task_memcpy_set_conf()` installs the memcpy task completion and error
+  callbacks before `doca_ctx_start()`.
+- `doca_pe_progress()` is the API that invokes callbacks; it returns `1` when it
+  made progress and `0` otherwise.
+- `doca_task_submit_ex()` accepts `DOCA_TASK_SUBMIT_FLAG_FLUSH` and
+  `DOCA_TASK_SUBMIT_FLAG_OPTIMIZE_REPORTS`. `FLUSH` asks the context to flush
+  this and earlier tasks to hardware; `OPTIMIZE_REPORTS` allows completion
+  callbacks to be deferred until a later non-optimized task/report boundary.
+- The callback documentation says ownership of the task returns to the user
+  inside the callback, and callbacks must not call `doca_pe_progress()`.
+
+Use callbacks for only these operations:
+
+```text
+1. Recover HomerDpuDmaTaskOwner from task_user_data.
+2. Check taskGeneration, ringGeneration, ringIndex, workloadClass, and taskKind.
+3. On stale generation, recycle the task owner and count a stale callback.
+4. On error callback, record diagnostics and request fatal Homer service
+   shutdown. The first DPU prototype treats DMA task failure as a service bug or
+   unrecoverable hardware/runtime failure, not as a recoverable per-ring event.
+5. On successful data task, mark the physical DMA range complete in per-ring
+   completion state and advance completedContiguousTail if possible.
+6. On successful grouped-control read, validate publication words, generations,
+   and monotonic frontiers in the local staging buffer, then set DPU-local ready
+   bits/counts for rings with new frontiers.
+7. On successful publication task, mark the host-visible frontier as published.
+8. Return the task, buffers, and owner record to reusable pools.
+```
+
+Callbacks should not dispatch semantic command handlers, submit new DMA work,
+run COMCH setup, call scheduler planning code, or spin on other completions. If a
+callback discovers follow-on work, it records maintained facts such as
+`discoveredReadyRingCount`, `completionPushQueueDepth`,
+`consumedHeadPublishPendingCount`, or failure bits. The next bounded scheduler
+grant chooses whether to spend CPU on that work.
 
 ## Current scheduler integration
 
@@ -474,6 +539,39 @@ work, and unknown external arrivals. A periodic grouped-control poll is like a
 blind collector: useful and necessary, but not proof that work exists until it
 returns a new frontier.
 
+### Grant model
+
+Decision: DPU DMA actions should use [`HomerGrantVector`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2155) as their authoritative
+budget. `HomerProgressGrant` remains relevant only because the current scheduler
+still stores source identity and legacy source-local limits there.
+
+There are two grant records in the current scheduler:
+
+- [`HomerProgressGrant`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2506) is the source-local grant stored in every action. It carries `maxPolls`,
+  `maxItems`, `maxPumpCalls`, and `flags`. This is the right place for PE poll
+  calls, grouped-control slices, ring inspections, and small control-object
+  counts.
+- [`HomerGrantVector`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2155) is the compiled action's richer budget vector. It carries `maxObjects`,
+  `maxWrs`, and `maxBytes`, which the DPU DMA engine needs for task-submission
+  and byte movement limits.
+
+So DPU submit actions should receive the compiled action grant, or at least the
+`HomerGrantVector` plus a source ref for identity. Do not design new DPU
+executors around `HomerProgressGrant` as the primary budget carrier:
+
+```c
+bool HomerDpuDmaSubmitPayloadPulls(HomerDpuDmaEngine *engine,
+                                   const HomerGrantVector *grantVector,
+                                   const HomerProgressSourceRef *source,
+                                   HomerProgressResult *result);
+```
+
+`HomerProgressResult` remains the unified result type. The distinction is only
+that the current scheduler has a source-local grant plus a richer compiled vector
+rather than a single struct that contains every budget dimension. The DPU path
+should help finish the migration toward vector-based budgeting instead of adding
+new dependencies on the older grant shape.
+
 ### Planning policy
 
 The default plan order should be:
@@ -522,6 +620,57 @@ maxCompletionPublishes
 Every DPU action must return when its grant is exhausted, when it observes no
 progress, or when it cannot submit because a real dependency is blocked. It must
 not spin waiting for a particular DMA task or frontier.
+
+### COMCH and mmap setup lifecycle
+
+COMCH is cold/control-plane setup for this phase, not a hot-path publication
+primitive. It should carry descriptors and lifecycle acks; data movement and
+frontier publication stay in DMA-visible memory.
+
+Initial setup sequence:
+
+```text
+1. Host frontend allocates long-lived bridge, command, completion, and payload
+   memory with cache-line alignment required by homer_dpu_bridge_abi.h.
+2. Host creates a doca_mmap, sets the memory range and PCI read/write
+   permissions, adds the local device, starts the mmap, and exports it with
+   doca_mmap_export_pci().
+3. Host opens/attaches the COMCH client connection to the DPU service and sends:
+   protocol version, feature flags, exported mmap blob, descriptor table,
+   initial generation, ring count, and optional idle-wakeup handles.
+4. DPU service receives the COMCH setup message, imports the mmap with
+   doca_mmap_create_from_export(), validates protocol/descriptor geometry, and
+   creates DPU-local ring/class state in SETUP.
+5. DPU creates or reuses class DMA contexts, attaches them to the PE, configures
+   task pools/callbacks, starts contexts, and marks descriptors ACTIVE only after
+   all buffers/task-owner pools needed for the accepted rings exist.
+6. DPU sends a COMCH setup ack containing accepted generation, feature bits,
+   negotiated class windows, and any rejected ring descriptors.
+7. Host publishes ring frontiers only after setup ack. Until then the DPU must
+   ignore hot-path lines for that generation.
+```
+
+Teardown sequence:
+
+```text
+1. Host publishes DRAINING/CLOSED in the owner line and sends a COMCH close if
+   the connection is still alive.
+2. DPU stops submitting new DMA tasks for that generation, drains or invalidates
+   in-flight tasks through scheduled PE-drain grants, and prevents stale
+   callbacks from publishing host-visible state.
+3. DPU publishes final consumed/error state if the host memory is still valid and
+   sends a COMCH close ack.
+4. Host waits for close ack or whole-service generation reset before unmapping,
+   stopping the mmap, or reusing the address range for a new generation.
+5. If COMCH dies, both sides advance service/ring generation and rely on stale
+   task-owner generation checks to prevent old DMA callbacks from publishing into
+   a reused semantic object.
+```
+
+The DOCA mmap headers state that `doca_mmap_export_pci()` requires a started
+mmap with PCI permission, and that stopping the mmap invalidates imported mmaps.
+That is why the host must not stop/unregister exported memory until the DPU has
+acknowledged teardown or the whole service generation is being abandoned.
 
 ### Result accounting
 
@@ -572,9 +721,10 @@ host memory and publishes a bridge frontier/ready bit. The DPU service then:
 2. DMA-reads the full request slot into DPU-local staging.
 3. Validates slot state, request sequence, owner pid/session id, and generation.
 4. Runs the existing service-side control handler against the staged request.
-5. DMA-writes the response body into the host slot.
-6. After response-data DMA completion, publishes the host-visible response state
-   or response frontier.
+5. Submits response-body DMA writes followed immediately by the response
+   publication-word DMA write on the same ordered DMA context.
+6. Host observes the response only after the publication word reaches the
+   expected epoch/frontier.
 7. Publishes credit/free state only after the host can safely reuse the slot.
 
 This requires refactoring service-side local-control handling so it can process a
@@ -591,9 +741,9 @@ DPU-produced host completions follow the same two-step publication rule as the
 validated DOCA harness:
 
 1. DMA-write completion/result slot bytes into host memory.
-2. Observe the data-DMA completed contiguous frontier.
-3. DMA-write the ready epoch/frontier or DPU credit line.
-4. Host frontend consumes only slots at or below the published epoch/frontier.
+2. Submit the ready epoch/frontier or DPU credit-line publication word
+   immediately after the body writes on the same ordered DMA context.
+3. Host frontend consumes only slots at or below the published epoch/frontier.
 
 Do not publish a ready epoch from a different DMA context unless it is explicitly
 gated on the data context's completed frontier.
@@ -616,6 +766,35 @@ line. The DPU engine:
 A basebackup pump should remain one bounded class/ring action that can issue many
 DMA tasks under one scheduler grant. Do not create one scheduler-visible item per
 DMA task.
+
+## Correctness validation gates
+
+Do not wait for a full runnable Homer path before validating correctness. Each
+stage below should add an executable check that exercises the invariant it
+introduces. The validation ladder is:
+
+1. **ABI/protocol validation**: host-only compile or unit-style checks for struct
+   sizes, cache-line alignment, publication-word monotonicity, generation
+   rejection, frontier monotonicity, byte-ring wrap arithmetic, and slot reuse
+   only after credit.
+2. **DOCA engine standalone validation**: a small host+DPU harness using the same
+   `HomerDpuDmaEngine` internals, before real Homer command semantics. It should
+   allocate/export host memory, import it on the DPU, DMA-read grouped control,
+   DMA-pull synthetic records, DMA-write synthetic credit/completion lines, and
+   verify same-context body+publish ordering.
+3. **Scheduler skeleton validation**: DPU mode off must preserve current plans;
+   DPU mode on with no work must produce bounded empty work and backoff; ready-set
+   building must inspect only maintained DPU-local facts; submit actions must not
+   call `doca_pe_progress()`.
+4. **Thin vertical slices**: bring up grouped-control observation, request-slot
+   pull, response push, one single-session command round trip, synthetic
+   byte-ring pull, and only then full pgbench/basebackup workloads.
+
+Add a debug-only invariant mode early. It should assert same DMA context for
+body+publish, no PE progress from submit actions, no stale-generation
+publication, no DMA beyond accepted frontiers, no slot reuse before credit, and
+fatal shutdown on any DMA task error. This mode can be slow and noisy; it is for
+bring-up correctness, not performance.
 
 ## Implementation sequence
 
@@ -647,7 +826,8 @@ Tasks:
   ring descriptor, control-block header, host-publish line, DPU-credit line, and
   constants.
 - Add static asserts for cache-line size, alignment, and descriptor sizes.
-- Add inline validation helpers for sealed sequence lines.
+- Add inline validation helpers for publication words, generations, and
+  monotonic frontiers.
 - Add comments that define owner, producer, and consumer for every field.
 
 Acceptance:
@@ -656,6 +836,9 @@ Acceptance:
 - Header can be included from host frontend code and service/DPU code without
   PostgreSQL-only or DOCA-only type leakage.
 - Unit or compile-only test rejects malformed line sizes if a field is added.
+- Host-only protocol check covers publication-word expected value, stale
+  generation rejection, monotonic frontier rejection, byte-ring wrap splitting,
+  and slot reuse only after consumed-credit advancement.
 
 ### Stage 2 — Host frontend DMA skeleton
 
@@ -666,7 +849,7 @@ Tasks:
 - Add channel-selection plumbing while keeping SHM default.
 - Allocate aligned bridge memory and placeholder command/completion/payload
   regions.
-- Implement sealed-line publish/read helpers.
+- Implement publication-word publish/read helpers.
 - Add placeholder COMCH setup hooks or explicit `not implemented` errors behind
   the DPU channel switch.
 - Do not submit DMA tasks from backend processes.
@@ -677,6 +860,9 @@ Acceptance:
 - DPU channel can be selected only in an explicit experimental mode.
 - Experimental mode initializes and tears down host bridge memory without command
   execution.
+- Host-only experimental-mode smoke can publish synthetic request/credit
+  frontiers in bridge memory and verify that ordinary frontend API callers still
+  fail with explicit `not implemented` errors before the DPU service is present.
 
 ### Stage 3 — DPU DMA engine skeleton
 
@@ -697,6 +883,9 @@ Acceptance:
 - Service builds without DOCA when DPU mode is off.
 - DPU build creates/destroys engine without leaks.
 - No private progress thread or busy loop exists.
+- Standalone engine lifecycle smoke verifies one PE plus per-class DMA contexts,
+  task pool sizing, callback installation, zero-work facts, and clean teardown on
+  the DPU without registering Homer sessions.
 
 ### Stage 4 — Scheduler skeleton in `machine-baseline`
 
@@ -721,6 +910,9 @@ Acceptance:
 - With DPU mode on and no work, DPU actions are bounded and back off like other
   blind collectors.
 - Ready-set building performs no DOCA calls.
+- No-op DPU action executors consume `HomerGrantVector` budgets, report
+  `emptyPolls`/`budgetExhausted` consistently, and never call
+  `doca_pe_progress()` from submit-style actions.
 
 ### Stage 5 — Grouped-control poll action
 
@@ -732,15 +924,19 @@ Tasks:
 - Allocate reusable local buffers for grouped-control slices.
 - Submit control-read DMA tasks only under `DPU_DMA_SUBMIT_CONTROL_READS` grants.
 - Drain completions only under `DPU_DMA_DRAIN_PE` grants.
-- Validate sealed lines and generations in callbacks.
+- Validate publication words, generations, and frontiers in callbacks.
 - Populate DPU-local ready bits/counts for rings with new observed frontiers.
 
 Acceptance:
 
 - Synthetic host publisher can advance frontiers and DPU observes them without
   reading one tail at a time.
-- Torn/odd/mismatched-generation lines are ignored and counted diagnostically.
+- Stale generation, unchanged publication word, and non-monotonic frontier lines
+  are ignored and counted diagnostically.
 - No payload DMA reads are submitted in this stage.
+- A standalone host+DPU grouped-control test proves control-read DMA submission
+  and callback retirement are separated: submit action queues reads, PE-drain
+  action observes and validates them.
 
 ### Stage 6 — PE drain and task-owner retirement
 
@@ -759,6 +955,8 @@ Acceptance:
 - Drain action stops on first zero-progress return or budget exhaustion.
 - In-flight tasks remain represented in DPU-local facts for later grants.
 - Stale generation callbacks do not publish any host-visible state.
+- Debug invariant mode proves submit actions do not call `doca_pe_progress()` and
+  callbacks do not submit follow-on DMA work.
 
 ### Stage 7 — Command/control request pull
 
@@ -771,8 +969,8 @@ Tasks:
 - DMA-read ready request slots into DPU-local staging.
 - Refactor service local-control handling behind an adapter that accepts staged
   request/response objects.
-- DMA-write response bodies to host memory.
-- Publish response-ready state only after response DMA completion.
+- Submit response-body DMA writes followed immediately by the response-ready
+  publication-word DMA write on the same ordered context.
 - Preserve request sequence and owner validation.
 
 Acceptance:
@@ -782,6 +980,9 @@ Acceptance:
   channel in a single-session test.
 - The same APIs still work through SHM when DPU mode is off.
 - Early response publication negative test fails as expected.
+- Before real backend command execution, a synthetic request-slot pull test DMA
+  reads one fixed request slot into DPU-local staging, validates owner/generation,
+  and leaves command semantics unmodified.
 
 ### Stage 8 — Completion/result push
 
@@ -792,7 +993,8 @@ Tasks:
 - Map current frontend client completion mailbox semantics onto DPU-owned publish
   lines or ready epochs.
 - Implement completion slot DMA write task owners.
-- Publish ready epoch/frontier after data-DMA completion.
+- Submit completion-body DMA writes followed immediately by ready
+  epoch/frontier publication-word DMA writes on the same ordered context.
 - Update host frontend polling to validate DPU-owned credit/completion lines.
 
 Acceptance:
@@ -800,6 +1002,9 @@ Acceptance:
 - Multi-state frontend completion sequence is observed in order.
 - Host never consumes a completion whose slot body is stale or partially written.
 - Split-context no-wait publication is rejected or gated.
+- Same-context body+publish test submits completion-body DMA tasks followed
+  immediately by one publication-word DMA task, with no PE drain in the submit
+  action; the host observes only the final publication word.
 
 ### Stage 9 — Payload and basebackup byte-stream pull
 
@@ -822,6 +1027,10 @@ Acceptance:
 - Ring wrap is handled with two DMA ranges or equivalent staging.
 - Basebackup-like large stream uses bounded windows and does not starve command
   collectors.
+- Synthetic byte-ring pull test runs before real basebackup: host publishes
+  generated records, DPU pulls only bytes at or below the accepted frontier,
+  callbacks advance the completed contiguous frontier, and consumed-head
+  publication happens only after semantic release.
 
 ### Stage 10 — Teardown, failure, and generation reset
 
@@ -829,7 +1038,8 @@ Deliverable: safe lifetime protocol.
 
 Tasks:
 
-- Add draining and failed states to ring descriptors and control lines.
+- Add draining/closed states to ring descriptors and control lines. DMA task
+  errors request fatal service shutdown rather than per-ring recovery.
 - Host sets terminal/draining flags before unregistering memory.
 - DPU stops submitting new tasks after terminal generation transition.
 - DPU drains or invalidates in-flight tasks before acknowledging teardown.
@@ -839,7 +1049,7 @@ Tasks:
 Acceptance:
 
 - Forced backend exit does not allow stale DPU writes into reused memory.
-- DPU DMA error callbacks publish terminal/error state when possible.
+- DPU DMA error callbacks record diagnostics and request fatal service shutdown.
 - Service restart increments generation and rejects old task owners.
 
 ### Stage 11 — Measurement and tuning
@@ -873,11 +1083,12 @@ Callbacks never call doca_pe_progress().
 Every task owner carries ring generation and task generation.
 Stale callbacks cannot publish host-visible state.
 DPU never reads payload beyond an accepted host-published frontier.
-Host-visible completion frontier is published only after completion-data DMA.
+Host-visible completion frontier is the final same-context publication-word DMA
+task after completion-body DMA tasks.
 Host-visible consumed head is published only after contiguous DMA completion and
 semantic release.
-Grouped-control lines are accepted only when sequenceBegin == sequenceEnd,
-sequence is even, generation matches, and frontier is monotonic.
+Grouped-control lines are accepted only when the publication word reaches the
+expected epoch or frontier, generation matches, and frontier is monotonic.
 Periodic grouped-control polling is due-only work unless demanded by a waiter.
 Task-pool exhaustion and host-credit exhaustion are blocked facts, not reasons to
 spin inside an executor.

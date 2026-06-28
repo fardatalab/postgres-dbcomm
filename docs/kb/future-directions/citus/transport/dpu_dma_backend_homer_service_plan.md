@@ -5,6 +5,7 @@
 - **What this doc explains**: the implementation-facing plan for replacing the current host-side standalone Homer service boundary with a DPU-resident Homer service that pulls backend-produced records from host memory using DOCA DMA.
 - **What this doc does not cover**: a final committed implementation, a DPA-kernel port, peer-service RDMA redesign, or a new SQL/session semantic model.
 - **Header snapshot**: DOCA API headers referenced below are copied under [`dpu_dma_backend_homer_service_plan_doca_headers/`](dpu_dma_backend_homer_service_plan_doca_headers/).
+- **Current-scheduler companion**: [`dpu_dma_backend_homer_service_current_scheduler_design.md`](dpu_dma_backend_homer_service_current_scheduler_design.md) tightens this plan for today's `machine-baseline` scheduler, including callback retirement, grouped-control ABI details, grant wiring, COMCH/mmap setup, and staged implementation constraints.
 - **Doc type**: `future-direction`
 
 ## Current Decision

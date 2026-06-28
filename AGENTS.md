@@ -37,22 +37,28 @@ Current filesystem facts:
 - Avoid syncing live database data directories unless PostgreSQL is stopped and
   replacing that data directory is the explicit goal.
 
-Fast-link addresses verified on June 17, 2026:
+Host fast-link addresses verified on June 17, 2026:
 
 - `farnet0`: `10.10.1.100`
 - `farnet1`: `10.10.1.101`
-- `farnet0` DPU (`ssh farnet0`, then `ssh dpu`): `10.10.1.200`
-- `farnet1` DPU (`ssh dpu` from `farnet1`): `10.10.1.202`
 
-The second host fast-link addresses were also configured at that time:
+The DPU fast-link control/data interface to use for DPU-side RDMA/CM work is
+`enp3s0f0s0` on each DPU. DPU access and `enp3s0f0s0` addresses were verified on
+June 28, 2026:
+
+- `farnet0` DPU: from `farnet0`, run `ssh dpu`; `enp3s0f0s0` is
+  `10.10.1.200/24`.
+- `farnet1` DPU: from `farnet1`, run `ssh dpu`; `enp3s0f0s0` is
+  `10.10.1.201/24`.
+
+The second host fast-link addresses were also configured on June 17, 2026:
 
 - `farnet0` host: `10.10.2.100`
 - `farnet1` host: `10.10.2.101`
-- `farnet0` DPU: `10.10.1.201`
-- `farnet1` DPU: `10.10.1.203`
 
-Both host fast-link ports and both DPU fast-link ports reported `400000Mb/s`,
-4 lanes, full duplex, and link detected. The current host setup uses separate
+Both host fast-link ports and both DPU fast-link ports reported `400000Mb/s`, 4
+lanes, full duplex, and link detected in the earlier June checks. Recheck link
+speed before a new performance claim. The current host setup uses separate
 subnets for the two fast-link host lanes:
 
 - lane 0: `farnet1 10.10.1.101/enp33s0f0np0/mlx5_0` to
@@ -165,8 +171,10 @@ ping -c 1 -W 1 -I 10.10.2.101 10.10.2.100
 ping -c 1 -W 1 -I 10.10.1.101 10.10.2.100
 ping -c 1 -W 1 -I 10.10.2.101 10.10.1.100
 ssh farnet0 "ip -br addr; ip route; ip rule"
-ssh dpu "ip -br addr; ip route"
-ssh farnet0 "ssh dpu 'ip -br addr; ip route'"
+ssh dpu "ip -br addr show enp3s0f0s0; ip route"
+ssh farnet0 "ssh dpu 'ip -br addr show enp3s0f0s0; ip route'"
+ssh dpu "sudo -n ping -c 1 -W 1 -I enp3s0f0s0 10.10.1.200"
+ssh farnet0 "ssh dpu 'sudo -n ping -c 1 -W 1 -I enp3s0f0s0 10.10.1.201'"
 ```
 
 For a quick RDMA check of the two farnet host links, run the server on `farnet0`
