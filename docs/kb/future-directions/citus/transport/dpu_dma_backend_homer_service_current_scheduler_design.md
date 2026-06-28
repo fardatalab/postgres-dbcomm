@@ -1199,7 +1199,14 @@ COMCH setup now records each imported mmap in a bounded table keyed by bridge
 generation plus client instance ID, exposes import counts through scheduler
 facts, rejects duplicate setup identity, and destroys every active imported mmap
 during engine teardown. This is still setup/lifecycle work; it does not submit
-grouped-control DMA reads.
+grouped-control DMA reads. Stage 6A.8 then added the production
+host/frontend-side COMCH setup client path in `homer_frontend_dma.c`: normal
+non-DOCA frontend builds fail selected DPU setup explicitly, while DOCA-enabled
+frontend extension builds can export the frontend bridge as a PCI mmap, send the
+setup payload over COMCH, wait for ack with a timeout, and then stop at the
+Stage 7 command-pull `not implemented` guard. The exact PostgreSQL backend
+runtime invocation of that helper against a running DPU service is still a
+pending Stage 6A validation gate.
 
 Tasks:
 
@@ -1210,14 +1217,16 @@ Tasks:
   scheduler PE progress in Stage 6A.6; runtime validation of the exact production
   service binary on the DPU remains a later deployment gate. Startup must not
   wait indefinitely for a host DB backend to connect.
-- Implement the host COMCH client in `homer_frontend_dma.c`. The setup-payload
-  builder is landed; the standalone transport smoke validates real COMCH
-  connect/send/wait, but production frontend integration remains. Host-side
-  setup is allowed to block because it is cold path, but it must have a timeout
-  and explicit diagnostics.
+- Implement the host COMCH client in `homer_frontend_dma.c`. Done in Stage 6A.8
+  for compile/link integration: the helper exports bridge memory as a PCI mmap,
+  sends setup over COMCH, waits for ack with a timeout, and rejects selected DPU
+  mode explicitly in non-DOCA builds. Runtime validation through the exact
+  PostgreSQL backend frontend path remains pending.
 - Replace the current frontend smoke-and-error guard with a real DPU setup
   operation that either completes COMCH/mmap setup or fails before any SHM mapping
-  is attempted in a selected DPU session.
+  is attempted in a selected DPU session. Stage 6A.8 wires this operation before
+  the Stage 7 command-pull `not implemented` error; exact backend/runtime
+  validation remains.
 - Start the runtime promotion path here: after the DPU channel is selected, host
   frontend setup must attempt the real COMCH/mmap setup against the independently
   running DPU service and then either mark the DPU bridge setup-ready or return a
@@ -1267,6 +1276,9 @@ Acceptance:
 - The selected DPU setup path has no SHM fallback branch. In non-DOCA builds it
   may fail with a compile-time capability error; in DOCA-enabled builds it must
   attempt COMCH/mmap setup or return a bounded DPU setup error.
+- Before Stage 6A is closed, the production PostgreSQL backend/frontend path must
+  be exercised against the independently running DPU COMCH service, not only
+  compiled or validated through the standalone transport smoke.
 - DPU COMCH setup imports the host mmap via `HomerDpuDmaImportHostMmapDescriptor()`
   and rejects malformed protocol version, descriptor size, generation, or ring
   geometry with an explicit setup error.

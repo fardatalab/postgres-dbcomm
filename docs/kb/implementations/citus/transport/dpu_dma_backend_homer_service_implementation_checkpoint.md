@@ -6,13 +6,16 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6A.7, the default frontend and service path is still the existing
+As of Stage 6A.8, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
-GUC is enabled, the frontend runs a host-side bridge-memory smoke check and still
-fails real Homer API calls with a deliberate not-implemented error. The
-frontend now also has a COMCH setup-payload builder, but no DOCA COMCH client
-transport yet. The service-side DPU DMA scheduler path is opt-in behind
+GUC is enabled, the default non-DOCA frontend build fails explicitly before any
+SHM mapping. A DOCA-enabled frontend build now runs a host-side bridge-memory
+smoke check, exports that bridge as a DOCA PCI mmap, sends the setup bytes with a
+real COMCH client, waits for setup ack with a timeout, tears the smoke bridge
+down, and still fails real Homer API calls with a deliberate not-implemented
+error because Stage 7 command pulling has not landed. The service-side DPU DMA
+scheduler path is opt-in behind
 `HOMER_SERVICE_ENABLE_DPU_DMA=1`; it reads maintained facts and wires bounded
 DPU actions through `machine-baseline`. The engine now has Stage 5
 service-side DOCA lifecycle scaffolding behind a compile-time
@@ -41,8 +44,9 @@ call a real DOCA COMCH client. Stage 6A.7 replaces the earlier singleton
 imported-host-mmap slot with a bounded import table keyed by bridge generation
 plus client instance ID. This lets the DPU service accept multiple future
 backend/frontend setup imports without conflating their mmap descriptors; duplicate
-setup identity is rejected explicitly. No grouped-control DMA read is submitted
-yet.
+setup identity is rejected explicitly. Stage 6A.8 adds the production frontend
+COMCH setup client code path in `homer_frontend_dma.c` and opt-in DOCA extension
+linkage. No grouped-control DMA read is submitted yet.
 
 ## Stage 1: Bridge ABI Header
 
@@ -933,15 +937,117 @@ Observed result:
 - The only compile warnings were known DOCA header deprecation warnings for
   `doca_buf_inventory_buf_reuse_by_args`.
 
+## Stage 6A.8: Production Frontend COMCH Setup Client
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.h:45`
+  defines `HomerFrontendDmaSetupSmokeResult`, the temporary result struct for
+  the Stage 6A setup-smoke path.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:432`
+  implements `HomerFrontendDmaRunDpuSetupSmoke()`. In normal builds it fails
+  with an explicit `FEATURE_NOT_SUPPORTED` error before SHM fallback is possible.
+  In DOCA-enabled builds it loads cold-path env config and attempts the real
+  COMCH/mmap setup handshake.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:615`
+  implements `HomerFrontendDmaRunDocaSetup()`: allocate a one-ring frontend
+  bridge, build a synthetic ring descriptor, open the configured host DOCA
+  device, export the bridge mmap, build and locally validate the COMCH setup
+  payload, start the COMCH client, wait for ack, copy ack facts into the result,
+  and clean up.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:822`
+  registers the bridge memory with DOCA mmap permissions
+  `DOCA_ACCESS_FLAG_PCI_READ_WRITE` and exports the PCI mmap descriptor with
+  `doca_mmap_export_pci()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:871`
+  creates the DOCA COMCH client, attaches it to a PE, installs state/send/receive
+  callbacks, configures message/queue sizing, and starts the ctx.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:970`
+  implements the cold-path blocking wait. It progresses only the setup COMCH PE,
+  sleeps briefly on zero progress, and enforces
+  `HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1087`
+  validates the setup ack received from the DPU service and treats malformed or
+  negative acks as DPU setup failures.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:641`
+  now calls `HomerFrontendDmaRunDpuSetupSmoke()` from
+  `RemoteExecutionRejectDpuFrontendChannelIfSelected()` after the host-only
+  bridge-memory smoke and before the Stage 7 `not implemented` error.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/Makefile:9` adds opt-in
+  DOCA DMA/COMCH `pkg-config` flags, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/Makefile:96` links those
+  flags into `citus.so` only when `CPPFLAGS` contains
+  `HOMER_DPU_DMA_WITH_DOCA`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/Makefile:60` marks
+  `homer_service_dpu_comch.o` as service-only so the DOCA-enabled frontend
+  extension link keeps service-side COMCH code out of `citus.so`.
+
+Stage 6A.8 design notes:
+
+- The host-side COMCH client lives in `homer_frontend_dma.c` because it is part
+  of the frontend DMA channel setup boundary. This matches the earlier decision
+  to keep semantic request construction in `homer_frontend_control.c` and channel
+  mechanics in the private frontend channel file.
+- COMCH setup remains a cold-path blocking operation and uses a finite timeout.
+  This does not change the hot-path scheduler rule: no scheduler action or
+  callback spins waiting for DOCA progress.
+- The bridge mmap is destroyed immediately after setup ack in this sub-stage.
+  That is valid only because Stage 7 command DMA reads are not submitted yet.
+  The first Stage 7 functional path must retain the frontend bridge allocation
+  and DOCA mmap for the session lifetime.
+- This sub-stage validates compile/link integration of the production frontend
+  helper. The exact PostgreSQL backend runtime path invoking this helper against
+  a running DPU service still needs a dedicated validation gate before Stage 6A
+  can be considered fully closed.
+
+Stage 6A.8 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make frontend-dma-smoke dpu-comch-abi-check service-bin client-bin
+sudo -n -u dbcomm make -C src/backend/distributed utils/homer/homer_frontend_dma.o
+sudo -n -u dbcomm make -B -C src/backend/distributed \
+  utils/homer/homer_frontend_dma.o \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make -B -C src/backend/distributed citus.so \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA' \
+  > /tmp/homer_dpu_frontend_doca_extension_build.log 2>&1
+sudo -n -u dbcomm make -B -C src/backend/distributed \
+  utils/homer/homer_frontend_dma.o \
+  CPPFLAGS='-D_GNU_SOURCE'
+git diff --cached --check
+```
+
+Observed result:
+
+- The default host build/smoke passed, including `homer_frontend_dma_smoke: ok`,
+  `homer_dpu_comch_abi_check: ok`, `service-bin`, `client-bin`, and a default
+  non-DOCA compile of `homer_frontend_dma.o`.
+- The DOCA-enabled compile of `homer_frontend_dma.o` passed with the DOCA headers
+  available under `/opt/mellanox/doca`.
+- The DOCA-enabled `citus.so` link passed. The final link line included
+  `utils/homer/homer_frontend_dma.o`, `-ldoca_comch`, and `-ldoca_dma`; it did
+  not include `utils/homer/homer_service_dpu_comch.o`.
+- The only warnings in the forced extension build were existing unrelated
+  warnings from nested `PG_TRY` macro shadowing in `commands/multi_copy.c` and
+  the existing missing prototype for
+  `CitusInstallRemoteExecutionBackendHooks()` in
+  `remote_execution_backend_bridge.c`.
+- After the DOCA-enabled compile/link check, `homer_frontend_dma.o` was rebuilt
+  again with default `CPPFLAGS='-D_GNU_SOURCE'` so local build artifacts were not
+  left in a DOCA-forced shape.
+
 ## Next Stage
 
-Stage 6A should next implement the host/frontend COMCH client in
-`homer_frontend_dma.c` and replace the experimental smoke-and-error guard with a
-real setup operation that sends the bridge mmap descriptor to the independently
-running DPU service. The service side now owns the COMCH listener and progresses
-it through bounded scheduler actions, and the DMA engine can retain multiple
-imported host mmaps keyed by setup identity. Stage 6B should then implement
-grouped-control DMA submit/drain.
+Stage 6A should next validate the exact PostgreSQL backend/runtime setup path
+against the independently running DPU service, then add the close/close-ack shell
+or move into Stage 6B grouped-control DMA submit/drain if close is intentionally
+deferred to Stage 10 teardown. The service side now owns the COMCH listener and
+progresses it through bounded scheduler actions, the DMA engine can retain
+multiple imported host mmaps keyed by setup identity, and the frontend has the
+opt-in DOCA COMCH setup client. Stage 6B should allocate/arm concrete
+grouped-control DMA tasks after descriptor import and retire them only through
+bounded `DPU_DMA_DRAIN_PE` grants.
 
 Decisions recorded for Stage 6:
 
