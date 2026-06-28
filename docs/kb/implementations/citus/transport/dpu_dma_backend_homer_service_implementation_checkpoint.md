@@ -744,8 +744,9 @@ coverage and validation. The intended path is:
    removed or left only as intentionally separate legacy/development code, not as
    a runtime fallback inside DPU operation.
 
-This promotion rule also changes later acceptance gates: Stage 7 command pull,
-Stage 8 completion/result push, Stage 9 payload/basebackup pull, Stage 10
+This promotion rule is now folded into the later stage TODOs and acceptance gates
+in the current-scheduler design note. Stage 7 command pull, Stage 8
+completion/result push, Stage 9 payload/basebackup pull, Stage 10
 teardown/reconnect, and Stage 11 measurement must all validate the selected DPU
 mode directly. Passing a workload through the old SHM host-process implementation
 is still useful as migration coexistence or comparison, but it is not acceptance

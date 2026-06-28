@@ -1178,6 +1178,9 @@ Tasks:
   connect/send/wait, but production frontend integration remains. Host-side
   setup is allowed to block because it is cold path, but it must have a timeout
   and explicit diagnostics.
+- Replace the current frontend smoke-and-error guard with a real DPU setup
+  operation that either completes COMCH/mmap setup or fails before any SHM mapping
+  is attempted in a selected DPU session.
 - Implement the DPU COMCH server in `homer_service_dpu_comch.c/.h`, keeping
   `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter. The
   setup-payload handler is landed; the standalone transport smoke validates real
@@ -1221,33 +1224,18 @@ Acceptance:
   and callback retirement are separated: submit action queues reads, PE-drain
   action observes and validates them.
 
-### Promotion Path To Non-Experimental DPU Mode
+### Cross-Stage Promotion Rule
 
-The implementation should move from hidden experimental guard to normal DPU mode
-only after the DPU path is a complete Homer channel:
+Promotion from hidden experimental guard to normal DPU mode is implemented by the
+stage tasks below, not by a separate late cleanup. The rule is:
 
-1. **Experimental setup path**: replace the current frontend smoke-and-error path
-   with real host setup against an independently running DPU service. The host
-   exports bridge memory, sends setup over COMCH, and waits for ack with a finite
-   timeout.
-2. **Experimental functional DPU channel**: implement grouped-control DMA reads,
-   PE drain, command pull, completion push, payload/basebackup pulls, and
-   consumed-head publication. A session that selects DPU mode must use DPU DMA or
-   fail explicitly; it must not silently fall back to the old SHM host-process
-   boundary.
-3. **Validation mode**: keep DPU mode opt-in while repeated correctness and
-   lifecycle gates run: setup/teardown, backend connect/disconnect, single-client
-   and multi-client pgbench, payload/basebackup paths as they land, DPU service
-   restart/timeout behavior, and service log scans.
-4. **Non-experimental DPU mode**: replace
-   `citus.enable_experimental_homer_dpu_frontend` with a normal DPU transport or
-   mode selector only after semantics and validation are solid. This selector is
-   for choosing the DPU implementation during migration, not for falling back from
-   DPU to SHM inside one session.
-5. **Default DPU path**: make DPU the normal Homer boundary once correctness,
-   lifecycle stability, and performance are acceptable. At that point SHM should
-   be removed or retained only as separate legacy/development code, not as a
-   runtime fallback for DPU operation.
+- DPU service starts independently and host backends initiate bounded setup.
+- A selected DPU session either uses the DPU DMA/COMCH path or fails explicitly;
+  it must not silently fall back to the old SHM host-process boundary.
+- SHM remains useful during migration as the DPU-off implementation and as a
+  comparison baseline, not as recovery inside DPU mode.
+- The DPU selector becomes non-experimental only after the Stage 7 through Stage
+  11 functional, lifecycle, and measurement gates pass on the DPU path.
 
 ### Stage 7 — Command/control request pull
 
@@ -1257,12 +1245,20 @@ slots, still using existing semantic request/response structs.
 Tasks:
 
 - Make host frontend publish request-ready state through bridge lines.
+- Require completed DPU COMCH/mmap setup before publishing any command request in
+  DPU mode.
+- Add DPU-mode frontend errors for missing setup, stale setup generation, absent
+  DPU service, and setup timeout; these errors must occur before any SHM frontend
+  mapping or SHM local-service call.
 - DMA-read ready request slots into DPU-local staging.
 - Refactor service local-control handling behind an adapter that accepts staged
   request/response objects.
 - Submit response-body DMA writes followed immediately by the response-ready
   publication-word DMA write on the same ordered context.
 - Preserve request sequence and owner validation.
+- Keep the old SHM host-process APIs buildable only as DPU-off migration
+  coexistence; do not add fallback branches from selected DPU command handling to
+  SHM command handling.
 
 Acceptance:
 
@@ -1290,6 +1286,10 @@ Tasks:
 
 - Map current frontend client completion mailbox semantics onto DPU-owned publish
   lines or ready epochs.
+- Split DPU-mode completion polling from the old SHM completion mailbox path so a
+  selected DPU session reads only DPU-published completion/credit lines.
+- Add explicit DPU-mode completion errors for missing imported mmap, stale bridge
+  generation, or absent DPU completion publication.
 - Implement completion slot DMA write task owners.
 - Submit completion-body DMA writes followed immediately by ready
   epoch/frontier publication-word DMA writes on the same ordered context.
@@ -1315,12 +1315,17 @@ service payload transport logic.
 Tasks:
 
 - Register/import byte-ring host memory.
+- Require each DPU-mode payload/basebackup stream to be represented in the COMCH
+  setup descriptors and imported mmap state before the host publishes stream
+  payload readiness.
 - Discover byte-ring `publishedTail` via grouped-control polling.
 - Submit bounded payload DMA reads under payload grants using existing payload
   egress budget shape.
 - Validate transport record headers/generations/checksums where available.
 - Advance completed contiguous byte frontier only from callbacks.
 - Publish consumed head to host only after safe release.
+- Keep mixed foreground/background workload validation on the DPU boundary; do not
+  use local SHM queues as the background-stream escape path in DPU mode.
 
 Acceptance:
 
@@ -1352,6 +1357,10 @@ Tasks:
 - DPU drains or invalidates in-flight tasks before acknowledging teardown.
 - Host does not unmap registered memory until DPU ack or whole-service generation
   reset.
+- Implement host backend reconnect as a fresh host-initiated COMCH setup with a
+  new bridge generation against the already-running DPU service.
+- Treat DPU service restart as a DPU-mode generation failure for existing host
+  sessions; the recovery path is reconnect/re-setup, not SHM continuation.
 
 Acceptance:
 
@@ -1378,6 +1387,10 @@ Tasks:
   interference appears.
 - Tune grouped-control poll cadence: command class frequent/small; byte-stream
   class less frequent/larger; idle wakeup optional.
+- Add measurement preflight checks or counters that prove command, completion,
+  payload, and basebackup records used DPU DMA/COMCH during a DPU-mode run.
+- Measure cold COMCH/mmap setup latency and reconnect latency separately from
+  steady-state hot-path throughput.
 
 Acceptance:
 
