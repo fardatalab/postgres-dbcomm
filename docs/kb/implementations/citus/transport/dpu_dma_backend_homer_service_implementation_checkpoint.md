@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 8B.2, the default frontend and service path is still the existing
+As of Stage 8B.3, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -45,6 +45,11 @@ TCP setup, DPU mmap import, grouped-control read, command pull, and DPU-written
 response publication observed by host memory polling. Full selected-DPU SQL
 frontend execution is still pending and must not be claimed until the frontend
 guard is removed and the negative no-fallback completion gate is validated.
+Stage 8B.3 adds the scheduler scaffold for the production backend-mailbox path:
+`DPU_BACKEND_COMMAND_STAGE`, `DPU_BACKEND_COMMAND_PUBLISH`, and
+`DPU_BACKEND_COMPLETION_PULL` now exist as distinct bounded DPU scheduler
+actions with maintained zero-valued facts. They are intentionally inert until
+the backend-mailbox DMA queues and submission APIs land.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -2084,25 +2089,100 @@ for real `CLIENT_SQL_SESSION`, the DPU still needs a host lifecycle/backend
 mailbox path so it can DMA-write commands into the host socketless backend
 mailbox and DMA-read backend completions before publishing frontend responses.
 
+## Stage 8B.3: Backend-Mailbox Scheduler Scaffold
+
+Implemented in `/data/dbcomm/citus-dbcomm` as commit `3e5f44700`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2138`
+  adds the backend-mailbox DPU collector kinds
+  `HOMER_PROGRESS_COLLECTOR_DPU_BACKEND_COMMAND_STAGE`,
+  `HOMER_PROGRESS_COLLECTOR_DPU_BACKEND_COMMAND_PUBLISH`, and
+  `HOMER_PROGRESS_COLLECTOR_DPU_BACKEND_COMPLETION_PULL`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2179`
+  adds matching action kinds
+  `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMMAND_STAGE`,
+  `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMMAND_PUBLISH`, and
+  `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMPLETION_PULL`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6995`
+  gives those actions stable diagnostic names, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:8038`
+  classifies backend command stage/publish as critical-control and backend
+  completion pull as terminal-visibility.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9525`
+  maps the new collectors to explicit action grants using the collector item
+  budget as `grantVector.maxItems`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10395`
+  places the new collectors in the `machine-baseline` collector phase around
+  command pull, backend command publication, and backend completion pull. This
+  preserves the rule that DPU DMA progress is scheduled as bounded collector
+  work, not through a private DPU loop.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14590`
+  registers the new collectors with the DPU DMA source and existing DPU wait
+  classes. Backend command stage and completion pull wait on grouped-control
+  discovery; backend command publish waits on host credit/task capacity.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35093`
+  extends DPU ready-set construction to use maintained facts for backend command
+  staging, backend command publication, backend completion pull, and PE-drain
+  work. Candidate building still only reads facts and TCP setup state; it does
+  not submit DOCA tasks, call `doca_pe_progress()`, or inspect host memory.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:36693`
+  adds explicit bounded no-op executor branches for the new actions. They
+  report one empty poll until the real backend-mailbox DMA queues and engine
+  APIs exist, so the scaffold cannot accidentally fall through to the older
+  synthetic staged-command dispatch path.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:48`
+  exposes per-class and total scheduler facts for frontend commands staged,
+  backend commands queued/in-flight for publication, backend completions
+  ready/in-flight/staged, and frontend responses pending publication.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:116`
+  adds the corresponding class-state counters, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:441`
+  copies and totals them in `HomerDpuDmaGetSchedulerFacts()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:43`
+  reserves internal task-kind names for backend command body, backend command
+  ready-sequence publication, and backend completion read work. They are not
+  submitted yet.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git diff --cached --check
+sudo -n -u dbcomm make -C src/backend/distributed all
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make service-dpu-dma-smoke frontend-dma-smoke dpu-bridge-abi-check
+```
+
+Observed result:
+
+- `git diff --cached --check` reported no whitespace errors before commit;
+- the extension build completed successfully;
+- the normal service/client build completed successfully;
+- the forced DOCA-enabled service/client build completed successfully, with
+  only the known DOCA experimental/deprecated warnings from NVIDIA headers,
+  `doca_task_submit_ex()`, and `doca_dma_set_ordered_completions()`;
+- `homer_service_dpu_dma_smoke: ok`;
+- `homer_frontend_dma_smoke: ok`;
+- `homer_dpu_bridge_abi_check: ok`.
+
+This substage is intentionally a scheduler and fact scaffold, not a functional
+selected-DPU command path. All new backend-mailbox action facts are still zero
+unless a later engine slice populates them. The selected-DPU frontend guard must
+remain in place until the host lifecycle shim and backend-mailbox DMA publish
+and pull APIs are implemented and validated.
+
 ## Next Stage
 
-The next implementation slice should introduce the selected-DPU lifecycle and
-backend-mailbox bridge needed by real frontend commands. A minimal direct
-synthetic command can still be useful as a service-side mechanism smoke, but it
-is not sufficient for production SQL frontend promotion because DPU-local
-dispatch does not execute work in the host PostgreSQL backend. The selected-DPU
-`not implemented` guard should remain until the real lifecycle/mailbox path has
-both positive DPU publication evidence and negative no-fallback evidence. The
-concrete scheduler contract for that next slice is now recorded in
-[`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md):
-host frontend control-slot pull, backend command staging, backend
-command-mailbox DMA publication, backend completion-mailbox DMA pull/credit, and
-frontend response publication must be separate bounded DPU actions integrated
-through `machine-baseline`, with PE drain as the only DOCA
-completion-retirement point. The next implementation substage should start with
-the scheduler enum/registry scaffold and maintained-fact counters before adding
-real backend-mailbox DMA submits, because candidate building must continue to
-read only maintained facts and must not call DOCA or inspect host memory.
+The next implementation slice should keep the selected-DPU `not implemented`
+guard in place and add the first real backend-mailbox queues behind the Stage
+8B.3 scheduler scaffold. The immediate target is not end-to-end SQL yet; it is
+to populate maintained facts and implement bounded engine APIs for backend
+command publication and backend completion pull so the new scheduler actions can
+become productive without changing scheduler taxonomy again. Candidate building
+must continue to read only maintained facts and must not call DOCA or inspect
+host memory.
 
 Current Stage 6 setup decisions:
 
