@@ -1406,9 +1406,17 @@ dispatch queue and a distinct
 `HOMER_PROGRESS_ACTION_DPU_STAGED_COMMAND_DISPATCH` collector/action. That
 action copies engine-staged commands into service-owned queue entries, releases
 the engine command-pull staging buffer, and remains bounded by scheduler
-`maxItems`; it deliberately does not execute command semantics yet. Command
-execution from those service-owned staged entries, response-body DMA writes, and
-response publication remain pending later Stage 7 and Stage 8 work.
+`maxItems`; it deliberately does not execute command semantics yet. Stage 7B.6
+then adds a second bounded internal queue for executed responses pending DPU
+publication and a separate
+`HOMER_PROGRESS_ACTION_DPU_STAGED_COMMAND_EXECUTE` collector/action. The execute
+action consumes service-owned dispatch entries only when pending-response
+capacity exists, runs `TupleSinkServiceDispatchLocalControlSlot()` with a DPU
+response owner, and stores the completed response plus bridge/ring/generation
+metadata for Stage 8. This separation is intentional: dispatch is the physical
+DMA-staging handoff, execute is the semantic state mutation, and Stage 8 remains
+the only host-visible response publication point. Response-body DMA writes and
+response-ready publication remain pending Stage 8 work.
 
 Tasks:
 
@@ -1429,6 +1437,11 @@ Tasks:
   slots are one owner kind for DPU-off mode; selected DPU mode must use a
   DPU-response owner that carries enough bridge/ring/generation information for
   Stage 8 DMA publication.
+- Keep DPU staged-command dispatch, semantic execution, and response publication
+  as separate scheduler actions. Dispatch owns the copy from transient DMA-engine
+  staging into service-owned state; execute owns local-control state mutation and
+  may run only when the bounded pending-response queue has capacity; response
+  publication owns host-visible DMA writes and retirement.
 - Do not execute a service-owned DPU staged command unless the response has a
   safe publication destination. The acceptable intermediate shape is an explicit
   service-owned "executed response pending DPU publication" queue that preserves
@@ -1484,6 +1497,10 @@ Acceptance:
 - Stage 7 is not accepted if semantic execution of a DPU-staged command can
   mutate service state before the completed response is either DMA-published to
   the host or durably staged in a bounded service-owned pending-publication queue.
+- Stage 7B.6 compile validation is not a substitute for Stage 7 acceptance. It
+  proves only that the bounded pending-response queue and execute action are
+  integrated into the scheduler; end-to-end selected-DPU command acceptance still
+  requires Stage 8 response publication evidence.
 - Early response publication negative test fails as expected.
 - Before real backend command execution, a synthetic request-slot pull test DMA
   reads one fixed request slot into DPU-local staging, validates owner/generation,

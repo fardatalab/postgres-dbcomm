@@ -18,6 +18,11 @@ The active Homer stack is now split into:
 - shared fixed-width ABI headers in `src/include/distributed/homer/homer_*_abi.h`
 - the standalone service process in [`tuple_sink_service_process.c`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1)
 - the service-side RDMA peer transport in [`remote_execution_peer_transport_rdma.c`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:1)
+- in-progress DPU DMA migration scaffolding in the standalone service scheduler:
+  pulled command slots can be copied into a bounded service-owned dispatch queue,
+  executed through a DPU response owner, and retained in a bounded
+  pending-response queue for later Stage 8 DMA publication. This is not yet a
+  host-visible DPU command path.
 
 The mechanical separation has been validated with static include/link checks, local Homer smoke tests, remote RDMA pgbench, and remote RDMA basebackup. The main current operational caveat is not code-level: farnet lane-0 MTU must be consistent across hosts for RDMA-CM/Homer validation.
 
@@ -96,6 +101,28 @@ On the Citus/Homer client side, [`HomerClientOpenBaseBackupStream()`](/data/dbco
 
 The service data path treats basebackup as one payload-object family on the generic payload stream. [`HomerServicePumpOutgoingPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:27648) publishes local payload objects to the peer over RDMA; [`HomerServicePumpIncomingPayloadStream()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:29496) consumes peer-written payload objects; [`HomerServicePumpLocalBaseBackupBlackhole()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28267) is only a local smoke receiver, not a remote RDMA validation path.
 
+### DPU DMA Migration Scaffolding
+
+The DPU path is currently an implementation scaffold inside
+[`tuple_sink_service_process.c`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1),
+not an accepted production transport. The current scheduler-facing slice has
+three separate DPU command stages:
+
+- `HOMER_PROGRESS_ACTION_DPU_COMMAND_PULL` submits bounded command-slot DMA
+  pulls into the DPU DMA engine.
+- `HOMER_PROGRESS_ACTION_DPU_STAGED_COMMAND_DISPATCH` copies engine-owned
+  staged commands into service-owned dispatch slots and releases the transient
+  engine staging buffer.
+- `HOMER_PROGRESS_ACTION_DPU_STAGED_COMMAND_EXECUTE` runs one service-owned
+  staged command through `TupleSinkServiceDispatchLocalControlSlot()` with a DPU
+  response owner, then stores the completed response in a bounded
+  pending-response queue.
+
+The pending-response queue is intentionally not host-visible. Stage 8 must drain
+it by DMA-writing the response body followed by the response-ready publication
+word on the same ordered DOCA DMA context. Until that exists, selected DPU command
+API acceptance cannot be claimed.
+
 ## Milestone History And Design Corrections
 
 - **Remote execution session wrapper**: the early wrapper checkpoint introduced a backend-visible session API over the tuple-route substrate. See [remote_execution_session_wrapper_checkpoint.md](../connection-management/remote_execution_session_wrapper_checkpoint.md).
@@ -105,6 +132,12 @@ The service data path treats basebackup as one payload-object family on the gene
 - **Client SQL pgbench**: typed client SQL sessions proved the foreground pgbench transaction shape through Homer before the later refactor. See [client_sql_session_pgbench_checkpoint.md](../../postgres/client-sql-session/client_sql_session_pgbench_checkpoint.md).
 - **Basebackup**: `TARGET 'homer'` proved the server-side `bbsink` integration and RDMA payload-stream reuse for basebackup archive/manifest objects. See [homer_base_backup_target_checkpoint.md](../../postgres/replication/homer_base_backup_target_checkpoint.md).
 - **Frontend/service separation**: the latest refactor moved the public frontend header to `homer_frontend.h`, split frontend internals, split ABI ownership, and kept service/RDMA objects out of `citus.so`. See [homer_frontend_service_separation_plan.md](../../../future-directions/citus/transport/homer_frontend_service_separation_plan.md).
+- **DPU command-pull scaffolding**: the current DPU migration has progressed
+  through grouped-control discovery, command-slot DMA pull, service-owned staged
+  dispatch, and a bounded executed-response pending-publication queue. This
+  validates scheduler integration and response-owner lifetimes, but Stage 8
+  response DMA publication is still required before a selected DPU command can
+  complete on the host.
 
 Important corrections that survived validation:
 
@@ -141,6 +174,9 @@ The remote pgbench/basebackup numbers are validation checkpoints, not final tune
 
 - The service-side process remains a large monolithic file. It should be split into service modules only after the current frontend/service boundary is stable.
 - The current local frontend channel is still POSIX shared memory. The DPU/DMA channel is intentionally future work; ordinary Citus call sites should not grow direct DMA or RDMA dependencies.
+- The in-progress DPU command path has an internal pending-response queue but no
+  host-visible response DMA publication yet. A command response stored there is
+  durable service state for Stage 8, not a frontend completion.
 - The tuple row format is still a prototype tuple-view row layout, not a canonical cross-platform wire serialization.
 - The remote pgbench c4 path is correct but should still be treated as a shared command/completion transport scaling checkpoint, not final multi-client performance.
 - Basebackup remote RDMA currently validates blackhole/consume semantics on the receiver service; remote materialization is future work.
