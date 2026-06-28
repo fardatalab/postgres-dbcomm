@@ -6,13 +6,15 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 2, the default frontend and service path is still the existing
+As of Stage 4, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the frontend runs a host-side bridge-memory smoke check and then
-fails real Homer API calls with a deliberate not-implemented error. Stage 3 adds
-a service-side DPU DMA engine skeleton, but it reports only zero-work facts and
-does not yet participate in the service scheduler.
+fails real Homer API calls with a deliberate not-implemented error. The
+service-side DPU DMA scheduler path is opt-in behind
+`HOMER_SERVICE_ENABLE_DPU_DMA=1`; it creates the Stage 3 no-DOCA engine, reads
+zero-work facts, and wires no-op bounded DPU actions through `machine-baseline`.
+It still does not submit DOCA DMA tasks or drain a DOCA PE.
 
 ## Stage 1: Bridge ABI Header
 
@@ -152,11 +154,12 @@ of those backend allocation helpers because it currently allocates with
   tasks.
 - The experimental DPU frontend channel is not runnable for real Homer commands
   yet. It intentionally fails before SHM fallback when selected.
-- Stage 3 keeps DPU engine APIs independent of `HomerGrantVector` and
-  `HomerProgressResult` because those scheduler types still live inside
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
-  Stage 4 must either move the needed scheduler types into a shared service
-  header or add scheduler adapters inside that file.
+- Stage 4 kept DPU engine APIs independent of `HomerGrantVector` and
+  `HomerProgressResult`. The current adapter lives inside
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  and maps engine facts into collector/action grants. Later real DMA actions
+  can either stay behind this adapter or move stable scheduler budget/result
+  types into a shared service header.
 - The one-word publication offset is pinned at offset zero for both hot lines.
   This is a protocol choice for efficient polling and separate one-word DMA
   publication; if a future multi-word sealed snapshot is needed, it should be a
@@ -213,9 +216,67 @@ One validation command initially raced two parallel builds/executions of
 the file was being rewritten. Rerunning the same checks sequentially passed; the
 failure was a validation-command race, not a code issue.
 
+## Stage 4: Current Scheduler Skeleton
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1986`
+  adds the fixed `HOMER_PROGRESS_SOURCE_DPU_DMA` source.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2109`
+  adds DPU collector identities for grouped-control reads, PE drains, command
+  pulls, completion pushes, payload pulls, and consumed-head publication.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2145`
+  adds matching scheduler action identities.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3134`
+  adds a fixed DPU DMA source and feedback slot to `ProgressRegistry`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9300`
+  maps every DPU collector to the fixed DPU DMA source.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9440`
+  maps DPU collectors into bounded action grants using the current collector
+  item-budget helper. `DPU_PE_DRAIN` uses the poll budget; the pull/push/publish
+  actions use item budgets.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:10283`
+  admits DPU physical-progress collectors in the `machine-baseline` collector
+  phase before semantic session/payload work.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34417`
+  bridges Stage 3 engine facts into scheduler collector candidates. Ready-set
+  building only reads maintained facts through `HomerDpuDmaGetSchedulerFacts()`;
+  it does not submit DMA, poll host memory, or call `doca_pe_progress()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35818`
+  implements the Stage 4 no-op DPU action executor. It validates the DPU source
+  owner, reports an empty bounded grant through `HomerServiceFinishProgressGrant()`,
+  and explicitly documents that real PE draining must be nonblocking and must
+  not spin when `doca_pe_progress()` returns no work.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:36674`
+  adds the opt-in service env var `HOMER_SERVICE_ENABLE_DPU_DMA`. When enabled,
+  the service creates the no-DOCA Stage 3 engine. `HOMER_SERVICE_ENABLE_DOCA_DMA`
+  is parsed separately and still fails through the Stage 3 not-implemented
+  guard if set.
+
+Stage 4 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm make service-dpu-dma-smoke dpu-bridge-abi-check frontend-dma-smoke
+git diff --check
+```
+
+Observed result:
+
+- `citus_tuple_sink_service` rebuilt successfully with the DPU scheduler
+  skeleton linked in.
+- `client-bin` remained buildable/up to date.
+- `homer_service_dpu_dma_smoke: ok`
+- `homer_dpu_bridge_abi_check: ok`
+- `homer_frontend_dma_smoke: ok`
+- `git diff --check` reported no whitespace errors.
+
 ## Next Stage
 
-Stage 4 should add current-scheduler collector/action identities and no-op
-bounded executors. The first design task is deciding how to share or adapt the
-currently file-local scheduler grant/result types without pulling the DPU engine
-into a private scheduler loop.
+Stage 5 should implement the grouped-control poll action. The important
+validation gate is a standalone synthetic host/DPU publisher test that proves
+the DPU can submit grouped control-line DMA reads under scheduler grants, retire
+the read completions only through bounded PE-drain grants, validate publication
+epochs/generations/frontiers, and populate DPU-local ready facts without reading
+one tail at a time.

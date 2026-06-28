@@ -912,6 +912,16 @@ Acceptance:
 
 Deliverable: DPU collector/action identities and no-op bounded executors.
 
+Status: completed as a current-scheduler adapter in
+`/data/dbcomm/citus-dbcomm`. The service now has a fixed
+`HOMER_PROGRESS_SOURCE_DPU_DMA`, DPU collector/action identities, an opt-in
+`HOMER_SERVICE_ENABLE_DPU_DMA` service knob, DPU collector-candidate construction
+from `HomerDpuDmaGetSchedulerFacts()`, and Stage 4 no-op DPU actions that report
+empty grants through scheduler feedback. The DPU engine API still does not take
+`HomerGrantVector` or `HomerProgressResult`; the adapter inside
+`tuple_sink_service_process.c` owns that translation until real DMA actions make
+the stable shared budget/result surface obvious.
+
 Tasks:
 
 - Extend current collector/action enums.
@@ -926,14 +936,16 @@ Tasks:
 
 Acceptance:
 
-- With DPU mode off, generated plans are byte-for-byte or diagnostically
-  equivalent to today's plans.
-- With DPU mode on and no work, DPU actions are bounded and back off like other
-  blind collectors.
-- Ready-set building performs no DOCA calls.
-- No-op DPU action executors consume `HomerGrantVector` budgets, report
-  `emptyPolls`/`budgetExhausted` consistently, and never call
-  `doca_pe_progress()` from submit-style actions.
+- With DPU mode off, generated plans stay on the existing SHM/RDMA path because
+  no DPU engine is created and the DPU collector builder returns immediately.
+- With DPU mode on and no work, grouped-control discovery is admitted as blind
+  collector work and reports `emptyPolls` through the fixed DPU source feedback.
+- Ready-set building performs no DOCA calls; it only reads maintained Stage 3
+  engine facts.
+- No-op DPU action executors are bounded by current collector grant fields,
+  report `emptyPolls`, and never call `doca_pe_progress()`. Real byte/object/WR
+  `HomerGrantVector` consumption remains a Stage 5+ implementation item once
+  the actions submit actual DOCA DMA tasks.
 
 ### Stage 5 — Grouped-control poll action
 
