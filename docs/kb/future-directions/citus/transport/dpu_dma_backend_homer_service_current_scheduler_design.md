@@ -1173,17 +1173,25 @@ reports maintained setup facts, routes received setup messages through
 async COMCH sends cannot race on a shared ack buffer. It was validated by a
 DPU-side lifecycle smoke with no host peer and by the existing real mmap
 transport smoke. Production service startup still does not allocate this server
-object, and the production host/frontend COMCH client remains pending.
+object, and the production host/frontend COMCH client remains pending. Stage
+6A.6 then wired that server object into production service startup behind
+`HOMER_SERVICE_ENABLE_DPU_DMA=1` plus `HOMER_SERVICE_ENABLE_DOCA_DMA=1`, added
+the service-side COMCH env overrides `HOMER_SERVICE_DPU_COMCH_NAME`,
+`HOMER_SERVICE_COMCH_DEV_PCI`, and `HOMER_SERVICE_COMCH_REP_PCI`, linked the
+service binary with `doca-comch`, and progressed COMCH events only through the
+bounded DPU `PE_DRAIN` scheduler action. Full production service runtime on the
+DPU is still pending; the Stage 6A.6 validation is compile/link coverage plus
+the Stage 6A.5 DPU lifecycle and real mmap transport runtime smokes.
 
 Tasks:
 
 - Implement the minimal COMCH setup message ABI and close/ack shell. The setup
   ABI and setup-ack struct are landed; the close/close-ack shell remains.
 - Integrate the DPU COMCH server so service startup creates the listener and then
-  returns to normal service pumping. The reusable `HomerServiceDpuComchServer`
-  lifecycle and bounded progress API are landed, but `citus_tuple_sink_service`
-  startup does not allocate it yet. Startup must not wait indefinitely for a host
-  DB backend to connect.
+  returns to normal service pumping. Done for service ownership and bounded
+  scheduler PE progress in Stage 6A.6; runtime validation of the exact production
+  service binary on the DPU remains a later deployment gate. Startup must not
+  wait indefinitely for a host DB backend to connect.
 - Implement the host COMCH client in `homer_frontend_dma.c`. The setup-payload
   builder is landed; the standalone transport smoke validates real COMCH
   connect/send/wait, but production frontend integration remains. Host-side
@@ -1196,7 +1204,8 @@ Tasks:
   `tuple_sink_service_process.c` as only a scheduler/lifecycle adapter. The
   setup-payload handler and reusable server lifecycle are landed; the standalone
   transport smoke validates real server lifecycle and the current farnet1
-  representor choice, but production service integration remains.
+  representor choice, and Stage 6A.6 wires service startup/teardown plus bounded
+  `DPU_PE_DRAIN` progress.
 - Keep COMCH ack buffers alive until the send completion/error callback. DOCA
   COMCH sends are asynchronous, so callbacks must not pass a stack ack or a
   shared scratch ack to `doca_comch_server_task_send_alloc_init()`. Stage 6A.5

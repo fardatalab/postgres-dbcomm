@@ -6,15 +6,15 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 6A.5, the default frontend and service path is still the existing
+As of Stage 6A.6, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the frontend runs a host-side bridge-memory smoke check and still
 fails real Homer API calls with a deliberate not-implemented error. The
 frontend now also has a COMCH setup-payload builder, but no DOCA COMCH client
 transport yet. The service-side DPU DMA scheduler path is opt-in behind
-`HOMER_SERVICE_ENABLE_DPU_DMA=1`; it reads maintained zero-work facts and wires
-no-op bounded DPU actions through `machine-baseline`. The engine now has Stage 5
+`HOMER_SERVICE_ENABLE_DPU_DMA=1`; it reads maintained facts and wires bounded
+DPU actions through `machine-baseline`. The engine now has Stage 5
 service-side DOCA lifecycle scaffolding behind a compile-time
 `HOMER_DPU_DMA_WITH_DOCA` gate: task-slot/owner arrays, local grouped-control
 staging buffers, one PE plus per-class DMA contexts, and an imported-host-mmap
@@ -32,9 +32,12 @@ host client can export a real PCI mmap descriptor and the DPU server can import
 it through the service DMA engine. Stage 6A.5 adds a reusable service-side
 `HomerServiceDpuComchServer` lifecycle API that creates a real DPU COMCH
 listener, exposes bounded PE progress, and delivers received setup messages to
-the existing mmap-import handler. Production service startup does not allocate
-that server object yet, and production frontend startup still does not call a
-real DOCA COMCH client.
+the existing mmap-import handler. Stage 6A.6 wires that server object into the
+production service startup path when `HOMER_SERVICE_ENABLE_DPU_DMA=1` and
+`HOMER_SERVICE_ENABLE_DOCA_DMA=1`, adds COMCH server env overrides, progresses
+the COMCH PE through the bounded DPU `PE_DRAIN` scheduler action, and destroys
+the server before the DMA engine. Production frontend startup still does not
+call a real DOCA COMCH client.
 
 ## Stage 1: Bridge ABI Header
 
@@ -765,18 +768,84 @@ Observed result:
 - The only compile warnings were the known DOCA header deprecation warnings for
   `doca_buf_inventory_buf_reuse_by_args`; no project warning remained.
 
+## Stage 6A.6: Production Service COMCH Lifecycle Wiring
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:59`
+  includes the service-side COMCH lifecycle header.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:505`
+  extends `HomerServiceDpuDmaSchedulerState` with a
+  `HomerServiceDpuComchServer *comchServer` owned by the service lifecycle.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34425`
+  now reads `HomerServiceDpuComchServerFacts` while constructing DPU collector
+  candidates. This remains ready-set-safe: it reads maintained service-local
+  facts and does not call DOCA.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34463`
+  makes `HOMER_PROGRESS_COLLECTOR_DPU_PE_DRAIN` ready when either DMA has
+  in-flight PE work or the COMCH listener needs service. COMCH startup progress
+  is known work while the context is not yet running; an already-running
+  listener is blind cold-path polling and remains subject to scheduler
+  feedback/backoff.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35870`
+  executes `HOMER_PROGRESS_ACTION_DPU_PE_DRAIN` by calling
+  `HomerServiceDpuComchServerProgress()` with the granted poll budget. The
+  action stops when the server reports no progress and reports either
+  `cqesDrained` or `emptyPolls` through the existing scheduler result path.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:36730`
+  creates the DPU DMA engine when `HOMER_SERVICE_ENABLE_DPU_DMA=1` as before.
+  If `HOMER_SERVICE_ENABLE_DOCA_DMA=1`, it now also creates the COMCH listener
+  using `HOMER_SERVICE_DPU_COMCH_NAME`, `HOMER_SERVICE_COMCH_DEV_PCI`, and
+  `HOMER_SERVICE_COMCH_REP_PCI` overrides, defaulting to the validated DPU
+  `0000:03:00.0` local device and `0000:21:00.0` host PF representor.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:36853`
+  destroys the COMCH server before destroying the DMA engine.
+- `/data/dbcomm/citus-dbcomm/Makefile:81` links the production service binary
+  with `DOCA_COMCH_CFLAGS` and `DOCA_COMCH_LIBS`, so a service build with
+  `CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'` resolves the COMCH
+  lifecycle calls.
+
+Scope boundary:
+
+- Stage 6A.6 wires production service ownership and bounded scheduler progress
+  for the DPU COMCH listener. It does not yet implement the host/frontend COMCH
+  client, and no production Homer command can complete DPU setup yet.
+- The full production service was compile/link validated with and without
+  `HOMER_DPU_DMA_WITH_DOCA`. Runtime validation of the exact production
+  `citus_tuple_sink_service` binary on the DPU is still pending; the runtime
+  evidence for the COMCH lifecycle remains the DPU-side Stage 6A.5 lifecycle
+  smoke and real mmap transport smoke.
+
+Stage 6A.6 was validated with:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make service-bin client-bin service-dpu-comch-smoke-bin
+sudo -n -u dbcomm make -B service-bin CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make -B service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+```
+
+Observed result:
+
+- The default service/client build passed with the new COMCH object linked into
+  the service binary but with real DOCA code still behind
+  `HOMER_DPU_DMA_WITH_DOCA`.
+- The forced DOCA-enabled service build linked successfully against
+  `doca-comch`, `doca-dma`, and `doca-common`.
+- The normal no-extra-macro service/client binaries were rebuilt afterward so
+  the local build tree was left in the usual state.
+- The only compile warnings in the forced DOCA build were the known NVIDIA DOCA
+  header deprecation warnings for `doca_buf_inventory_buf_reuse_by_args`.
+
 ## Next Stage
 
-Stage 6A should next allocate the reusable `HomerServiceDpuComchServer` from
-the production service startup path and implement the host/frontend COMCH client
-in `homer_frontend_dma.c`. The service-side helper now proves listener creation
-and bounded progress are implementable without a host peer, using the validated
-farnet1 COMCH defaults DPU server `dev=0000:03:00.0` and `rep=0000:21:00.0`
-unless the deployment is explicitly configured otherwise. The DPU service should
-start independently and listen for host setup; it must not block service startup
-waiting for a DB backend. The DPU DMA engine separately defaults its local DMA
-device to `0000:03:00.0` and accepts `HOMER_SERVICE_DOCA_DEV_PCI` as an
-override. Stage 6B should then implement grouped-control DMA submit/drain.
+Stage 6A should next implement the host/frontend COMCH client in
+`homer_frontend_dma.c` and replace the experimental smoke-and-error guard with a
+real setup operation that sends the bridge mmap descriptor to the independently
+running DPU service. The service side now owns the COMCH listener and progresses
+it through bounded scheduler actions, using validated farnet1 defaults unless
+the deployment is explicitly configured otherwise. Stage 6B should then
+implement grouped-control DMA submit/drain.
 
 Decisions recorded for Stage 6:
 
