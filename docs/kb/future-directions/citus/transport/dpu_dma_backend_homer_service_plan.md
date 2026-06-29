@@ -559,6 +559,22 @@ Completion-discovery decision:
   monotonic epochs over a shared clearable bitmap, because backend CPU ORs and
   DPU DMA clears on the same word can lose updates without an explicit protocol.
 
+Selected-DPU command-sequence decision:
+
+- the DPU service owns per-session `commandSequence` assignment for
+  selected-DPU command sessions. The sequence is DPU-local session state keyed by
+  `serviceSessionId`, and is materialized into the backend command mailbox record
+  before backend-command DMA publication.
+- the host frontend learns the assigned sequence through the normal DMA response
+  publication for `CitusRemoteExecStartCommandResponse`; `commandSequence` is a
+  response-body field, so there is no separate DMA just to return the sequence.
+  The response publication remains the same two-step DPU-to-host operation:
+  write the response body, then write the response-ready publication word.
+- do not preserve the old host-process shared-memory response path for
+  selected-DPU commands. That path is only the behavior being replaced: the
+  current frontend waits for the local service to fill the control-slot response
+  and then reads `response->commandSequence`.
+
 The selected-DPU setup order for a command-capable session should be:
 
 1. The real command-session open path detects selected-DPU mode and calls a real

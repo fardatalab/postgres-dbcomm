@@ -1510,7 +1510,13 @@ DMA-staging handoff, execute is the semantic state mutation, and response
 publication is the only host-visible completion point. Stage 8A adds the
 same-context response-body DMA plus response-ready publication-word DMA
 mechanism; Stage 8B wires the real selected-DPU frontend command path to it and
-adds the no-fallback acceptance evidence.
+adds the no-fallback acceptance evidence. Stage 8B.10 implements the first
+production selected-DPU backend-command semantic stage: DPU-local
+`serviceSessionId` state owns `commandSequence`, frontend `START_COMMAND`
+requests are materialized into compact backend command records, and the records
+are queued with backend-mailbox descriptor refs for the later DMA publication
+action. Backend-command DMA publication and backend-completion pull remain the
+next Stage 8B sub-steps.
 
 Tasks:
 
@@ -1686,6 +1692,14 @@ The Stage 8B command scheduler should be implemented as these bounded actions:
    `CitusRemoteExecLocalCommandRecord` exactly as
    `TupleSinkServicePublishLocalCommand()` does at
    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18840`.
+   The selected-DPU service owns the per-session command sequence in
+   DPU-local session state keyed by `serviceSessionId`; the host frontend does
+   not allocate `commandSequence`, and the old host-service
+   `TupleSinkServiceSessionState` is not a fallback owner for selected-DPU
+   sessions. This mirrors the current host-process path where
+   `TupleSinkServicePublishLocalCommand()` increments
+   `currentCommandSequence` and returns it in
+   `CitusRemoteExecStartCommandResponse`.
    It must not mutate a host backend mailbox and must not publish a frontend
    response. Its output is a service-owned queue entry carrying the local command
    record, command sequence, backend-command descriptor identity, frontend
@@ -1720,6 +1734,14 @@ The Stage 8B command scheduler should be implemented as these bounded actions:
    the frontend response body first, then writes the response-ready publication
    word on the same ordered context. It publishes to the frontend
    control-slot/response descriptor role, not to the backend completion mailbox.
+   For `START_COMMAND`, the assigned `commandSequence` is just a field in the
+   existing `CitusRemoteExecStartCommandResponse` response body. Returning it
+   does not require an extra DMA operation beyond this normal response-body DMA
+   write plus the response-ready publication word. This replaces the old
+   host-process shared-memory response path where
+   `StartRemoteExecutionCommandThroughLocalService()` reads
+   `response->commandSequence` after
+   `WaitForRemoteExecutionControlResponse()`.
 7. **PE drain and task retirement**: keep
    `HOMER_PROGRESS_ACTION_DPU_PE_DRAIN` as the only action that calls
    `doca_pe_progress()` and retires DOCA callbacks. Submission actions must not
@@ -1835,6 +1857,12 @@ Implementation substeps for this scheduler contract:
    only if they are renamed or documented as frontend-command and
    pending-response queues; do not let `TupleSinkServiceDispatchLocalControlSlot()`
    remain the production SQL execution step for selected-DPU sessions.
+   Implementation progress: Stage 8B.10 adds the selected-DPU session table and
+   backend-command publish queue. The queue now carries the pulled frontend
+   response owner, DPU-owned command sequence, compact
+   `CitusRemoteExecLocalCommandRecord`, backend command mailbox descriptor ref,
+   and expected backend completion epoch. Backend-completion staging is still
+   pending.
 6. **Backend command publish API**: add a DPU engine API such as
    `HomerDpuDmaSubmitBackendCommandPublication()`. It submits one command record
    body write plus `readySeq` and `publishedEpoch` publication writes under the
