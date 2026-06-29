@@ -61,6 +61,13 @@ smoke but is not yet wired into selected-DPU session open.
 Stage 8B.7 wires those lifecycle mailboxes into the DOCA-enabled selected-DPU
 setup payload as separate mmap exports and descriptor roles. Backend spawn and
 hot mailbox DMA actions are still pending.
+Stage 8B.8 adds DPU-local ready-ref queues so grouped-control discovery can
+preserve exact DMA object identity for bounded executor actions. Stage 8B.9
+adds the selected-DPU lifecycle-open path through host-local backend spawn:
+command-session open now owns persistent TCP/mmap setup state and asks the host
+postmaster to launch the socketless backend against the exported backend
+mailboxes. Hot backend-command publication and completion pull are still
+pending.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -2661,6 +2668,127 @@ Remaining work after this slice:
   DPU-to-host backend-command ready queue rather than bypassing the queue family;
 - backend completion pull should add producers/consumers for the host-to-DPU
   backend-completion queue;
-- selected-DPU backend spawn still needs to move from the setup-smoke guard to
-  the real command-session open path with bounded wait and
-  `completionReadyBitmapEnabled = 0`.
+- selected-DPU start/poll command APIs still stop at the explicit
+  not-implemented guard until backend-command DMA publication and
+  backend-completion DMA pull are wired.
+
+## Stage 8B.9: Selected-DPU Lifecycle Open And Backend Spawn
+
+This slice moves selected-DPU backend spawn into the real command-session open
+path. It is still cold-path/lifecycle work: it does not forward semantic
+commands to the old host Homer service, and it does not yet publish hot commands
+into the backend mailbox.
+
+Implemented Citus changes:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.h:40`
+  adds `HomerFrontendDmaLifecycleBackendSpawnSpec` and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.h:70`
+  declares `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.c:151`
+  implements the host-local spawn submission. It opens
+  `CITUS_REMOTE_EXEC_BACKEND_SPAWN_SHM_NAME`, reserves a spawn slot with an
+  inter-process compare-and-swap, fills `CitusRemoteExecBackendSpawnRequest`,
+  signals postmaster with `SIGUSR1`, and waits up to the configured timeout.
+  The selected-DPU request always uses
+  `serviceSessionIndex = CITUS_REMOTE_EXEC_CONTROL_INVALID_SESSION_INDEX` and
+  `completionReadyBitmapEnabled = 0`, because the DPU discovers backend
+  completions by DMA over the exported completion mailbox rather than by the old
+  host-service completion-ready bitmap.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.c:253`
+  deliberately does not recycle a published spawn slot on timeout. There is no
+  cancel protocol yet; once `REQUEST_READY` is visible, postmaster may still
+  launch the backend and later write the response. A timeout is therefore a
+  bounded selected-DPU setup failure, not an attempted cancellation.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:875`
+  adds `HomerFrontendDmaOpenCommandSession()`: selected-DPU command-session open
+  now performs persistent TCP/mmap setup, waits for the DPU setup ack, then calls
+  the host-local spawn helper before returning the persistent control-channel
+  handle. The env overrides added here are
+  `HOMER_FRONTEND_DPU_SPAWN_TIMEOUT_MS` and
+  `HOMER_FRONTEND_DPU_BACKEND_CPU`; if the latter is absent, it falls back to
+  the existing `HOMER_REMOTE_EXEC_BACKEND_CPU`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:780`
+  changes `OpenCommandSessionThroughLocalService()` to branch to the real DPU
+  command-session open path when `citus.enable_experimental_homer_dpu_frontend`
+  is enabled. The previous setup-smoke-and-fail helper remains for non-promoted
+  operations, but command-session open no longer hides lifecycle work inside the
+  smoke guard.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_internal.h:39`
+  adds `dpuControlChannel` to `RemoteExecutionSessionData`, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend.c:298`
+  stores the selected-DPU channel on open. DPU command sessions skip peer
+  command-completion SHM ring mapping because frontend response publication will
+  be via the exported frontend control slot.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend.c:512`
+  closes the persistent DPU channel locally instead of sending a compatibility
+  close request to the old SHM host service. This preserves the no-fallback rule
+  for selected-DPU sessions during migration.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:1085`
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_control.c:1229`
+  keep start/poll command APIs explicitly blocked for a DPU-opened session, but
+  they now raise the remaining not-implemented error directly instead of running
+  another setup smoke.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_frontend_dma_smoke.c:42` adds a
+  fake-postmaster spawn smoke. When the real PostgreSQL spawn SHM name is absent,
+  the smoke creates a one-slot spawn region, forks a responder, validates that
+  the request disabled the completion bitmap and used the invalid service-session
+  index, publishes an OK response, and checks that the helper frees the slot.
+  If a live postmaster already owns the fixed spawn name, the smoke skips this
+  subtest rather than unlinking a live region.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- \
+  src/bin/homer_frontend_dma_smoke.c \
+  src/backend/distributed/utils/homer/homer_frontend_dma.c \
+  src/backend/distributed/utils/homer/homer_frontend_dma.h \
+  src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.c \
+  src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.h \
+  src/backend/distributed/utils/homer/homer_frontend_control.c \
+  src/backend/distributed/utils/homer/homer_frontend_control.h \
+  src/backend/distributed/utils/homer/homer_frontend.c \
+  src/backend/distributed/utils/homer/homer_frontend_internal.h
+git diff --cached --check -- \
+  src/bin/homer_frontend_dma_smoke.c \
+  src/backend/distributed/utils/homer/homer_frontend_dma.c \
+  src/backend/distributed/utils/homer/homer_frontend_dma.h \
+  src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.c \
+  src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.h \
+  src/backend/distributed/utils/homer/homer_frontend_control.c \
+  src/backend/distributed/utils/homer/homer_frontend_control.h \
+  src/backend/distributed/utils/homer/homer_frontend.c \
+  src/backend/distributed/utils/homer/homer_frontend_internal.h
+sudo -n -u dbcomm make frontend-dma-smoke
+sudo -n -u dbcomm make -C src/backend/distributed all
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm sh -c 'gcc ... -D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA \
+  -c /data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c \
+  -o /data/dbcomm/citus-dbcomm/build/homer/homer_frontend_dma_doca_compile.o'
+```
+
+All commands passed. `homer_frontend_dma_smoke` printed
+`homer_frontend_dma_smoke: ok`; because
+`/dev/shm/citus_remote_exec_backend_spawn_v12` was absent afterward, the
+fake-postmaster subtest created and cleaned up the spawn region in this run.
+The manual DOCA compile keeps the DOCA-only selected-DPU open path type-checked
+until the normal extension build grows a DOCA-linked variant.
+The forced DOCA service/client build passed with the known DOCA
+experimental/deprecation warnings around `doca_task_submit_ex()`,
+`doca_dma_set_ordered_completions()`, and
+`doca_buf_inventory_buf_reuse_by_args()`.
+
+Remaining work after this slice:
+
+- backend command publication must write `CitusRemoteExecLocalCommandRecord`
+  bodies, `readySeq`, and `publishedEpoch` into the exported backend command
+  mailbox by DPU DMA;
+- backend completion pull must DMA-read backend-published completions, publish
+  completion-mailbox credit, and feed frontend response publication;
+- only after those mailbox actions are wired should the selected-DPU start/poll
+  command guards be removed for a narrow SQL command smoke.
