@@ -2315,11 +2315,90 @@ Current Stage 6 setup decisions:
   ack bytes must remain owned until the bounded setup exchange completes or
   fails.
 - The setup message includes protocol/versioning, message kind, bridge
-  generation, feature flags, ring count, descriptor size, mmap export length,
-  exported mmap blob, `HomerDpuBridgeControlBlockHeader`,
-  `HomerDpuBridgeRingDescriptor[]`, and an ack/error result. The struct names
-  still say `Comch` for now, but the active transport is TCP.
+  generation, feature flags, a session-level descriptor table, exported mmap
+  blobs, `HomerDpuBridgeControlBlockHeader`, `HomerDpuBridgeRingDescriptor[]`,
+  and an ack/error result. The struct names still say `Comch` for now, but the
+  active transport is TCP.
+- The setup ABI now carries one descriptor table plus a mmap-export entry table
+  and multiple export blobs in one TCP setup roundtrip. Each export entry
+  identifies its `mmapExportId`, descriptor range, payload offset, and payload
+  length. The descriptors bind to the correct imported mapping through
+  `HomerDpuBridgeRingDescriptor.mmapExportId`.
+- Do not implement one TCP setup message per backend mapping unless this
+  multi-export setup ABI later exposes an unexpected production blocker. One
+  roundtrip per backend/session spawn keeps the cold path simpler to reason
+  about from the frontend and avoids partial DPU session state across several
+  setup messages.
+- Multi-export setup is all-or-nothing on the DPU side: if any export import,
+  descriptor range check, role/shape check, or session/generation identity check
+  fails, reject the setup ack and release only imports created earlier in that
+  same setup message.
 
 After Stage 6B.2, grouped-control discovery can produce maintained DPU-local
 ready facts. Close/close-ack and reclaim remain folded into Stage 10 teardown
 rather than blocking Stage 7 command-pull work.
+
+## Stage 8B.5: Single-Roundtrip Multi-Export TCP Setup ABI
+
+This slice implements the setup decision needed before the host lifecycle shim
+can export real backend mailboxes. It does not yet create backend mailboxes or
+spawn PostgreSQL backends from `homer_frontend_dma.c`; it makes the setup/control
+ABI capable of carrying those mappings in one roundtrip.
+
+Implemented Citus changes:
+
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_comch_abi.h`
+  keeps the legacy `Comch` symbol names but now documents that the active
+  transport is TCP. `HomerDpuComchSetupHeader` now includes
+  `mmapExportCount`, `mmapExportEntryBytes`, and `mmapExportTableOffset`.
+  `HomerDpuComchMmapExportEntry` is a fixed 64-byte entry containing
+  `mmapExportId`, `descriptorFirst`, `descriptorCount`, `mmapExportOffset`, and
+  `mmapExportBytes`.
+- `HomerDpuComchSetupMessageBytesForExports()` and
+  `HomerDpuComchBuildSetupHeaderForExports()` size/build the multi-export
+  payload, while the old single-export helpers remain wrappers for existing
+  smokes and setup callers.
+- `HomerDpuComchValidateSetupMessage()` now validates the export-entry table,
+  requires each descriptor to be covered by exactly one export entry, and checks
+  descriptor `mmapExportId` against its owner export entry.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c`
+  adds `HomerFrontendDmaMmapExport`,
+  `HomerFrontendDmaSetupPayloadBytesForExports()`, and
+  `HomerFrontendDmaBuildSetupPayloadForExports()` so the lifecycle shim can
+  build one setup payload with several host mappings without duplicating ABI
+  layout code.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c`
+  and the legacy
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_comch.c`
+  iterate over `parts.mmapExports[]`, import each export with its descriptor
+  slice, and roll back only exports successfully imported by the current setup
+  message if a later export fails.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c`
+  extends import identity to `(bridgeGeneration, clientInstanceId,
+  mmapExportId)`, accepts descriptor-table slices with a global
+  `descriptorFirst`, and adds
+  `HomerDpuDmaRemoveHostMmapImportForSetupExport()` for partial setup rollback.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_comch_abi_check.c` now includes a
+  positive two-export setup payload test so the validation gate covers the new
+  descriptor/export binding rules.
+
+Important invariant recorded by this slice:
+
+- A duplicate setup failure must not delete an older valid import for the same
+  session identity. Rollback is therefore per export id and is called only for
+  entries already imported by the current setup loop.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make dpu-bridge-abi-check dpu-comch-abi-check service-dpu-dma-smoke frontend-dma-smoke
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm make -C src/backend/distributed all
+git diff --check
+```
+
+All commands passed. A first non-`dbcomm` `make dpu-comch-abi-check` attempt
+failed with `cannot open output file build/homer/homer_dpu_comch_abi_check:
+Permission denied` because `build/homer` is `dbcomm`-owned; rerunning the same
+validation as `dbcomm` passed.

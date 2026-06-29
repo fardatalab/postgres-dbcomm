@@ -357,11 +357,38 @@ Use a regular TCP socket for cold setup, not hot payload movement:
 TCP setup messages should carry:
 
 - protocol version and feature flags
-- mmap export blobs
-- ring descriptors
+- one descriptor table for the whole backend/session setup
+- one mmap-export entry table with one entry per exported host mapping
+- mmap export blobs referenced by that entry table
 - grouped control block descriptor
 - optional sync-event export if idle wakeup mode is enabled later
 - service/session/sink ids
+
+The setup-payload ABI now supports one descriptor table plus a mmap-export entry
+table and multiple mmap export blobs in one setup message. This is the desired
+production shape: a single TCP setup roundtrip with multiple exported mappings,
+not several TCP setup messages for one backend spawn. The backend lifecycle
+naturally has separate mappings: the frontend bridge control slot, the backend
+command mailbox, the backend completion mailbox, and later payload byte rings.
+The backend command/completion mailboxes must remain POSIX SHM objects because
+the spawned PostgreSQL backend derives their names from `serviceSessionId` and
+opens them locally.
+
+Use the existing descriptor-table idea, but add a setup-time mmap-export table.
+Each export table entry should include:
+
+- `mmapExportId`, matching `HomerDpuBridgeRingDescriptor.mmapExportId`
+- `descriptorFirst` and `descriptorCount`, defining which descriptors belong to
+  that imported mapping
+- `mmapExportOffset` and `mmapExportBytes`, pointing into the variable-length
+  setup payload
+
+The DPU service validates and imports the setup as one all-or-nothing operation.
+If any export import, descriptor range check, role/shape check, or
+session/generation identity check fails, the DPU rejects the setup ack and
+releases any imports already created for that message. This keeps selected-DPU
+backend spawn latency to one cold-path roundtrip while avoiding partial
+multi-message session state.
 
 The copied DOCA COMCH headers remain in the header snapshot as historical/reference material for the abandoned setup path. They are not on the immediate implementation path.
 
@@ -396,10 +423,10 @@ Responsibilities:
 Current host-local code that motivates this split:
 
 - `TupleSinkServiceEnsureSessionMailboxes()` in
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18033`
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18105`
   creates and maps the backend command/completion mailboxes today.
 - `TupleSinkServiceSubmitBackendSpawnRequest()` in
-  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18188`
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18260`
   opens the postmaster-owned spawn region, fills
   `CitusRemoteExecBackendSpawnRequest`, signals postmaster, and waits for the
   response.
@@ -422,11 +449,13 @@ The selected-DPU setup order for a command-capable session should be:
    service session id and the existing naming rule.
 3. Host lifecycle shim registers/exports the grouped control block, request
    slots, backend mailboxes, and completion/credit memory that the DPU must DMA.
-4. DPU service imports those descriptors and acknowledges the exact generation,
-   ring geometry, and session identity.
-5. Host lifecycle shim submits `CitusRemoteExecBackendSpawnRequest` locally to
+4. Host lifecycle shim sends one TCP setup payload containing the descriptor
+   table plus all mmap-export entries/blobs required for this session.
+5. DPU service imports those exports atomically as one setup operation and
+   acknowledges the exact generation, ring geometry, and session identity.
+6. Host lifecycle shim submits `CitusRemoteExecBackendSpawnRequest` locally to
    postmaster with the same session identity and backend startup metadata.
-6. Only after setup/import/spawn succeeds may the host publish hot-path DMA
+7. Only after setup/import/spawn succeeds may the host publish hot-path DMA
    frontiers for DPU pull.
 
 The hot path after this setup remains DPU DMA: the host produces records and
@@ -536,9 +565,12 @@ Polling cadence should be scheduler-controlled:
 Setup:
 
 1. Host frontend creates/registers host memory and grouped control block.
-2. Host frontend starts TCP setup and sends descriptors to the DPU service.
-3. DPU imports mmap descriptors and creates local `doca_buf` views.
-4. DPU registers ring descriptors with `HomerDpuDmaEngine`.
+2. Host frontend starts TCP setup and sends one descriptor table plus the
+   mmap-export table/blobs for the selected-DPU session.
+3. DPU imports all mmap descriptors in that setup message and creates local
+   `doca_buf` views.
+4. DPU registers ring descriptors with `HomerDpuDmaEngine` only after every
+   export and descriptor in the setup message validates.
 5. Host publishes a generation-valid control entry only after DPU acknowledges setup.
 
 Steady state:
