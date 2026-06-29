@@ -6,7 +6,7 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of Stage 8B.10, the default frontend and service path is still the existing
+As of Stage 8B.11, the default frontend and service path is still the existing
 host-process SHM/RDMA implementation. The DPU frontend path exists only behind
 the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
 GUC is enabled, the default non-DOCA frontend build fails explicitly before any
@@ -70,9 +70,13 @@ mailboxes. Stage 8B.10 adds the first production selected-DPU backend-command
 semantic stage: the service owns selected-DPU per-session command sequences,
 materializes pulled frontend `START_COMMAND` requests into compact
 `CitusRemoteExecLocalCommandRecord` bodies, resolves the imported backend command
-mailbox descriptor, and queues the record for later backend-command DMA
-publication. Hot backend-command DMA publication and completion pull are still
-pending.
+mailbox descriptor, and queues the record for backend-command DMA publication.
+Stage 8B.11 implements that backend-command publication: the DPU DMA engine now
+copies queued command records into engine-owned source buffers, submits command
+body, slot `readySeq`, and mailbox `publishedEpoch` DMA writes on the ordered
+command context, and moves the corresponding frontend START response into the
+existing response-publication queue after successful submission. Backend
+completion pull is still pending.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -2876,13 +2880,101 @@ Observed result:
 - The final forced normal rebuild passed so `build/homer/citus_tuple_sink_service`
   was left in the default `CPPFLAGS='-D_GNU_SOURCE'` shape.
 
+## Stage 8B.11: Selected-DPU Backend-Command DMA Publication
+
+This slice implements the DPU-to-host backend command mailbox publication step
+that Stage 8B.10 queued but deliberately left inert. It does not yet pull backend
+completion mailboxes.
+
+Implemented Citus changes:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h`
+  declares `HomerDpuDmaSubmitBackendCommandPublication()`. The API accepts a
+  validated `HomerDpuDmaDescriptorRef`, a finalized
+  `CitusRemoteExecLocalCommandRecord`, the chosen command body byte count, and
+  the DPU-owned `commandSequence`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c`
+  adds `HomerDpuDmaBackendCommandBuffer`, `HomerDpuDmaBackendCommandOwner`, and a
+  local backend-command DOCA mmap. The service queue is not used as a DMA source:
+  command bodies are copied into engine-owned buffers so callback retirement can
+  safely happen after the scheduler clears the semantic queue entry.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c`
+  implements `HomerDpuDmaSubmitBackendCommandPublication()`. It validates that
+  the descriptor is a same-generation `BACKEND_COMMAND_MAILBOX` descriptor for
+  the selected `serviceSessionId`, verifies that the command record sequence and
+  byte counts are coherent, checks the command-class async window and free task
+  slots before consuming a queue entry, and then submits three DMA tasks.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c`
+  implements the three-task publication shape in
+  `HomerDpuDmaSubmitOneBackendCommandTask()`: command-slot `record` body,
+  command-slot `readySeq`, and mailbox `publishedEpoch`. The first two tasks use
+  `DOCA_TASK_SUBMIT_FLAG_OPTIMIZE_REPORTS`; the final `publishedEpoch` task uses
+  `DOCA_TASK_SUBMIT_FLAG_FLUSH`. All three tasks use the command workload DMA
+  context, relying on the existing ordered-completion/context setup rather than a
+  per-task synchronous wait.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c`
+  updates task retirement so backend-command source buffers are released only
+  when the final `publishedEpoch` task retires. Failed DOCA callbacks or partial
+  multi-task submission failures put the engine into the fatal state, matching
+  the earlier policy that DMA publication failures are protocol bugs for this
+  prototype.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  replaces the `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMMAND_PUBLISH` placeholder
+  with a bounded `grantVector.maxItems` loop. A queued backend command is
+  consumed only when a pending frontend-response slot is also available. After
+  successful backend-command DMA submission, the corresponding START response is
+  queued for `HOMER_PROGRESS_ACTION_DPU_COMPLETION_PUSH`; callback retirement is
+  resource cleanup and fatal-error detection, not the response-queue gate.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  tightens `HomerServiceAppendDpuDmaCollectorCandidates()` so backend-command
+  publication is planned only when there is backend-command work and
+  pending-response queue capacity.
+
+Ordering and lifetime decisions:
+
+- Backend command publication and frontend START response publication are both
+  submitted on the command DMA context. The START response may enter the
+  response-publication queue after backend-command tasks are submitted, not after
+  their callbacks retire. This preserves async depth while relying on the same
+  ordered-context invariant used elsewhere in the DPU DMA plan.
+- `commandRecordBytes` is preserved as the actual body DMA byte count. With the
+  current default compact-command build this is the finalized `commandBytes`
+  prefix; a non-compact diagnostic build can still request the fixed-size body
+  through `TupleSinkServiceLocalCommandRecordRdmaBytes()`.
+- The backend polls slot-local `readySeq == expectedCommandSequence` before it
+  copies the command body; mailbox `publishedEpoch` is also written because the
+  existing lifecycle/busy checks use it. `publishedEpoch` is the final flushed
+  task in this slice.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- \
+  src/backend/distributed/utils/homer/tuple_sink_service_process.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h
+git diff --check
+sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+```
+
+Observed result:
+
+- `git diff --check` reported no whitespace errors.
+- The normal service/client build passed.
+- The forced DOCA-enabled service/client build passed. It emitted only the known
+  DOCA experimental/deprecation warnings for `doca_task_submit_ex()`,
+  `doca_dma_set_ordered_completions()`, and DOCA buffer-inventory helpers.
+- The final forced normal rebuild passed so `build/homer/citus_tuple_sink_service`
+  was left in the default `CPPFLAGS='-D_GNU_SOURCE'` shape.
+
 Remaining work after this slice:
 
-- implement `HomerDpuDmaSubmitBackendCommandPublication()` so queued backend
-  command records are DMA-written as body, `readySeq`, and `publishedEpoch` on
-  the same ordered command context;
-- retire backend-command publish callbacks and move the staged frontend
-  `START_COMMAND` response into the existing DPU response-publication path;
 - implement backend completion DMA pull and completion-mailbox credit publication;
-- only then remove the selected-DPU start/poll command not-implemented guards for
-  a narrow selected-DPU SQL command smoke.
+- add a backend-command DMA smoke that observes the host mailbox body only after
+  `readySeq`, now that the real API exists;
+- only after backend completion pull lands, remove the selected-DPU start/poll
+  command not-implemented guards for a narrow selected-DPU SQL command smoke.

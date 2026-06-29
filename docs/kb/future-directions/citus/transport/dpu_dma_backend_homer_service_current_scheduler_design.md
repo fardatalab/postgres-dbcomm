@@ -1514,9 +1514,12 @@ adds the no-fallback acceptance evidence. Stage 8B.10 implements the first
 production selected-DPU backend-command semantic stage: DPU-local
 `serviceSessionId` state owns `commandSequence`, frontend `START_COMMAND`
 requests are materialized into compact backend command records, and the records
-are queued with backend-mailbox descriptor refs for the later DMA publication
-action. Backend-command DMA publication and backend-completion pull remain the
-next Stage 8B sub-steps.
+are queued with backend-mailbox descriptor refs. Stage 8B.11 implements the
+backend-command DMA publication action: body, `readySeq`, and `publishedEpoch`
+DMA writes are submitted on the same ordered command context, and the frontend
+START response is queued for the existing response-publication action after
+successful backend-command submission. Backend-completion pull remains the next
+Stage 8B sub-step.
 
 Tasks:
 
@@ -1861,7 +1864,9 @@ Implementation substeps for this scheduler contract:
    backend-command publish queue. The queue now carries the pulled frontend
    response owner, DPU-owned command sequence, compact
    `CitusRemoteExecLocalCommandRecord`, backend command mailbox descriptor ref,
-   and expected backend completion epoch. Backend-completion staging is still
+   and expected backend completion epoch. Stage 8B.11 consumes that queue through
+   the real backend-command DMA submission path and then queues the frontend
+   START response for response publication. Backend-completion staging is still
    pending.
 6. **Backend command publish API**: add a DPU engine API such as
    `HomerDpuDmaSubmitBackendCommandPublication()`. It submits one command record
@@ -1869,6 +1874,11 @@ Implementation substeps for this scheduler contract:
    command workload context, checks task-window capacity before consuming the
    service queue entry, and reports `submittedTasks`, `budgetExhausted`, and
    `stillReady` through `HomerDpuDmaProgressResult`.
+   Implementation progress: Stage 8B.11 adds this API. The current submission
+   shape copies the command record into engine-owned source buffers, submits the
+   body and `readySeq` writes with optimized completion reports, submits
+   `publishedEpoch` with `FLUSH`, and releases the source buffer only when the
+   final publication task retires.
 7. **Backend completion pull API**: add a DPU engine API such as
    `HomerDpuDmaSubmitBackendCompletionPulls()`. It submits completion-slot body
    reads for accepted backend completion frontiers, stages completed bodies in a
@@ -1905,7 +1915,8 @@ Implementation substeps for this scheduler contract:
    - backend-command DMA smoke: DPU writes one
      `CitusRemoteExecLocalCommandRecord` body plus `readySeq`/`publishedEpoch`
      into an exported host mailbox; host CPU validation observes the exact body
-     only after `readySeq`;
+     only after `readySeq`. Stage 8B.11 makes this smoke implementable with the
+     production submission API, but the smoke still needs to be added;
    - backend-completion DMA smoke: host writes one completion body plus
      `publishedEpoch`; DPU pulls it, validates command sequence/epoch, and
      DMA-writes `consumedEpoch`;

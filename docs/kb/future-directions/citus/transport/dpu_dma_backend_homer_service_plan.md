@@ -574,6 +574,16 @@ Selected-DPU command-sequence decision:
   selected-DPU commands. That path is only the behavior being replaced: the
   current frontend waits for the local service to fill the control-slot response
   and then reads `response->commandSequence`.
+- after backend-command DMA submission succeeds, the DPU service may enqueue the
+  corresponding frontend `START_COMMAND` response for the existing response-DMA
+  publication action before backend-command callbacks retire. This is allowed
+  only because backend-command publication and frontend response publication use
+  the same ordered command DMA context. Callback retirement remains resource
+  cleanup and fatal-error detection, not the semantic gate for response queuing.
+- the backend-command DMA body byte count must come from the finalized
+  `TupleSinkServiceLocalCommandRecordRdmaBytes()` result stored with the queued
+  command. The default compact build writes the finalized command prefix; a
+  non-compact diagnostic build can still request the fixed-size body.
 
 The selected-DPU setup order for a command-capable session should be:
 
