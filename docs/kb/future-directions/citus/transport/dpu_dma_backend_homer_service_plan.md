@@ -406,6 +406,11 @@ Split it into a separate private source file if that keeps the frontend channel
 readable, but keep it conceptually under the host DMA frontend, not under the
 DPU service engine.
 
+The first implementation keeps this as a separate host-frontend module,
+`homer_frontend_dma_lifecycle.c/.h`, so new selected-DPU lifecycle code does not
+grow the already large service source and does not mix with DOCA setup helpers
+until the wiring is ready.
+
 Responsibilities:
 
 - create host-local SHM/mailbox objects that PostgreSQL backends must open by
@@ -440,6 +445,20 @@ Current host-local code that motivates this split:
   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2456`
   later maps the command/completion mailboxes by name and runs the socketless
   backend command loop.
+
+Mailbox naming decision:
+
+- selected-DPU lifecycle mailboxes use the backend-visible untagged naming rule
+  from `RemoteExecFormatMailboxNames()`, not the service-only tagged variant in
+  `TupleSinkServiceFormatSessionMailboxNames()`. A spawned PostgreSQL backend
+  derives the names from `serviceSessionId` alone, so a tag would make the
+  backend fail to attach.
+- mailbox creation uses exclusive create semantics. A stale or colliding
+  `serviceSessionId` is a setup error that should be inspected, not silently
+  overwritten.
+- teardown unlinks only mailbox objects this lifecycle owner actually created.
+  Partial setup rollback must not delete an older live or stale object that
+  caused an `EEXIST` failure.
 
 The selected-DPU setup order for a command-capable session should be:
 

@@ -54,6 +54,10 @@ Stage 8B.4 adds explicit bridge descriptor roles so setup/import can
 distinguish frontend control slots, backend command mailboxes, backend
 completion mailboxes, and payload byte rings without inferring role from only
 workload class, direction, and geometry.
+Stage 8B.5 adds the single-roundtrip multi-export setup ABI. Stage 8B.6 adds
+the first host lifecycle shim module for backend-visible command/completion
+mailbox creation and cleanup; it is validated by the host-only frontend DMA
+smoke but is not yet wired into selected-DPU session open.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -2402,3 +2406,64 @@ All commands passed. A first non-`dbcomm` `make dpu-comch-abi-check` attempt
 failed with `cannot open output file build/homer/homer_dpu_comch_abi_check:
 Permission denied` because `build/homer` is `dbcomm`-owned; rerunning the same
 validation as `dbcomm` passed.
+
+## Stage 8B.6: Host Lifecycle Mailbox Shim
+
+This slice begins the host lifecycle shim required before selected-DPU command
+sessions can spawn PostgreSQL backends. It only creates and owns the
+backend-visible command/completion mailboxes; it does not yet submit backend
+spawn requests, register/export those mailbox mappings through DOCA, or remove
+the selected-DPU frontend guard.
+
+Implemented Citus changes:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.h`
+  defines `HomerFrontendDmaLifecycleMailboxes`, the frontend-owned state for one
+  selected-DPU session's backend command and completion mailbox mappings.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.c`
+  implements `HomerFrontendDmaLifecycleFormatMailboxNames()`,
+  `HomerFrontendDmaLifecycleCreateMailboxes()`, and
+  `HomerFrontendDmaLifecycleDestroyMailboxes()`.
+- The naming helper deliberately follows the backend-visible untagged rule from
+  `RemoteExecFormatMailboxNames()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1607`,
+  because spawned PostgreSQL backends open command/completion mailboxes from
+  `serviceSessionId` alone.
+- Creation uses `shm_open(..., O_CREAT | O_EXCL | O_RDWR, 0600)` and initializes
+  `CitusRemoteExecLocalCommandMailbox.protocolVersion`,
+  `CitusRemoteExecLocalCommandMailbox.slotCount`, and
+  `CitusRemoteExecLocalCompletionMailbox.protocolVersion` to match the existing
+  service-created mailbox shape from
+  `TupleSinkServiceEnsureSessionMailboxes()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18105`.
+- The state tracks `ownsCommandMailbox` and `ownsCompletionMailbox`; teardown
+  only unlinks SHM objects that this lifecycle owner successfully created. This
+  prevents partial setup rollback from deleting a stale or live mailbox that
+  caused an `EEXIST` failure.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_frontend_dma_smoke.c` now exercises
+  the lifecycle helper by creating a unique synthetic mailbox pair, checking the
+  initialized protocol fields, and unlinking it.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/Makefile` lists
+  `homer_frontend_dma_lifecycle.o` with the Homer frontend objects, and the
+  top-level `frontend-dma-smoke` target links the lifecycle implementation into
+  the standalone validation binary.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make frontend-dma-smoke
+sudo -n -u dbcomm make -C src/backend/distributed all
+sudo -n -u dbcomm make -j8 service-bin client-bin
+git diff --check
+```
+
+All commands passed. The smoke output was `homer_frontend_dma_smoke: ok`.
+
+Next work after this slice:
+
+- wire the lifecycle owner into selected-DPU session setup;
+- add DOCA mmap registration/export for the command and completion mailboxes as
+  additional multi-export setup entries;
+- submit `CitusRemoteExecBackendSpawnRequest` locally after DPU setup/import
+  succeeds.
