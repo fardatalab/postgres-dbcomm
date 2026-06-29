@@ -1730,7 +1730,14 @@ The Stage 8B command scheduler should be implemented as these bounded actions:
    `consumedEpoch` after the completion body has been safely copied. It replaces
    the service's direct completion consumption in
    `TupleSinkServiceConsumeCompletionMailbox()` at
-   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18371`.
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18473`.
+   The implementation should not try to hide this inside the existing
+   grouped-control read path: `CitusRemoteExecLocalCompletionMailbox` at
+   `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:215`
+   is a fixed-slot backend mailbox, not a `HomerDpuBridgeHostPublishLine`.
+   Completion discovery therefore needs a mailbox-specific control/header DMA
+   read, followed by completion-slot body DMA reads and a consumed-epoch DMA
+   write.
 6. **Frontend response publication**: reuse the Stage 8A
    `HOMER_PROGRESS_ACTION_DPU_COMPLETION_PUSH` shape, but treat it explicitly as
    frontend-response publication. It consumes staged backend completions, writes
@@ -1928,6 +1935,54 @@ Implementation substeps for this scheduler contract:
    - negative no-fallback smoke: if backend completion or frontend response
      publication is disabled/stale, selected-DPU frontend polling fails boundedly
      and never polls the old host-process SHM completion path.
+
+#### Stage 8B.12-8B.15 backend-completion implementation order
+
+The backend-completion direction is now detailed enough to proceed without a new
+design discussion, but it should be implemented in narrower validation slices
+than the earlier single "backend completion pull" bullet implied.
+
+1. **Stage 8B.12: engine-only completion-mailbox DMA smoke.** Extend the TCP
+   smoke/setup path to export one backend completion mailbox descriptor with
+   role `HOMER_DPU_BRIDGE_DESCRIPTOR_ROLE_BACKEND_COMPLETION_MAILBOX`. The host
+   writes one `CitusRemoteExecCommandCompletion` body into
+   `CitusRemoteExecLocalCompletionMailbox.completionSlots[...]` and then
+   publishes the matching `publishedEpoch`. The DPU engine performs a
+   mailbox-control/header DMA read, reads exactly the published completion slot
+   body, validates the command sequence and epoch against the smoke expectation,
+   and DMA-writes `consumedEpoch` back to the host. The host validates
+   `consumedEpoch == publishedEpoch`. This slice deliberately does not route the
+   completion into the production scheduler semantic path.
+2. **Stage 8B.13: production DMA engine completion APIs.** Add task kinds,
+   task-owner metadata, staging buffers, and bounded APIs for completion control
+   reads, completion body reads, and consumed-epoch publication. The expected
+   shape is `HomerDpuDmaSubmitBackendCompletionPulls()` plus a small accessor
+   pair for staged completions, for example
+   `HomerDpuDmaCopyNextStagedBackendCompletion()` and
+   `HomerDpuDmaReleaseStagedBackendCompletion()`. A completion body is accepted
+   into the DPU-owned staging queue before the consumed epoch is published back
+   to the backend mailbox. Completion DMA failures remain fatal prototype bugs,
+   not recoverable per-command errors.
+3. **Stage 8B.14: scheduler semantic integration.** Wire
+   `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMPLETION_PULL` so it consumes staged
+   completion facts under `grantVector.maxItems`, validates
+   `serviceSessionId`, bridge generation, descriptor role, command sequence, and
+   the selected session's one-command-in-flight state, then clears/advances that
+   in-flight state. It should enqueue the existing frontend poll/terminal
+   response for `HOMER_PROGRESS_ACTION_DPU_COMPLETION_PUSH`; it must not revive
+   the old host-process SHM completion path. For the first narrow selected-DPU
+   SQL command smoke, terminal command completion should be returned through the
+   frontend `POLL_COMMAND_COMPLETION` response shape rather than inventing a
+   new host-visible completion mechanism.
+4. **Stage 8B.15: selected-DPU command smoke and negative no-fallback smoke.**
+   After the engine and scheduler paths above land, remove the selected-DPU
+   start/poll guards only for the narrow command-session path being validated.
+   Acceptance requires one real selected-DPU command whose request reaches the
+   backend mailbox by DPU DMA, whose backend completion is pulled by DPU DMA, and
+   whose frontend-visible response is published by DPU DMA. A negative smoke must
+   prove that disabling or corrupting the backend-completion/frontend-response
+   DMA path fails boundedly instead of falling back to host SHM completion
+   polling.
 
 ### Stage 8A — Completion/result push mechanism
 

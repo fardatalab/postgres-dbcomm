@@ -3003,6 +3003,20 @@ Observed result:
 
 Remaining work after this slice:
 
-- implement backend completion DMA pull and completion-mailbox credit publication;
-- only after backend completion pull lands, remove the selected-DPU start/poll
-  command not-implemented guards for a narrow selected-DPU SQL command smoke.
+- Stage 8B.12 should first add an engine-only backend-completion mailbox DMA
+  smoke. The smoke should export the existing backend completion mailbox role,
+  have the host publish one `CitusRemoteExecCommandCompletion` body plus
+  `publishedEpoch`, have the DPU DMA-read the mailbox control/header and slot
+  body, and have the DPU DMA-write `consumedEpoch` back. This validates the DMA
+  object shape and credit publication before production scheduler semantics are
+  involved.
+- Stage 8B.13 should add production DMA engine completion APIs and task-owner
+  metadata for completion-control reads, completion-slot reads, staged
+  completion ownership, and consumed-epoch publication.
+- Stage 8B.14 should wire the scheduler semantic path: staged backend
+  completions clear the selected-DPU one-command-in-flight state and enqueue the
+  existing frontend poll/terminal response for DPU response publication, without
+  using the old host-process SHM completion mailbox.
+- Stage 8B.15 should then remove the selected-DPU start/poll command
+  not-implemented guards only for the narrow selected-DPU SQL command smoke and
+  add the positive plus negative no-fallback validation.

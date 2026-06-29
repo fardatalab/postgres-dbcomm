@@ -558,6 +558,14 @@ Completion-discovery decision:
   compact scan is a bottleneck. If added later, prefer owner-separated
   monotonic epochs over a shared clearable bitmap, because backend CPU ORs and
   DPU DMA clears on the same word can lose updates without an explicit protocol.
+- implement backend-completion migration in explicit slices: first an
+  engine-only TCP smoke where the host publishes one backend completion mailbox
+  slot and the DPU DMA-reads it and writes `consumedEpoch`; then production DMA
+  engine APIs for completion-control reads, completion-slot reads, staged
+  completions, and consumed-epoch publication; then scheduler semantic
+  integration that maps staged completions into the existing frontend poll
+  response path. Do not remove the selected-DPU command guards before this
+  sequence has positive and negative no-fallback evidence.
 
 Selected-DPU command-sequence decision:
 
