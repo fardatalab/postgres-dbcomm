@@ -2531,9 +2531,29 @@ that extra compile, the new selected-DPU setup branch would not be type-checked.
 Remaining work:
 
 - submit `CitusRemoteExecBackendSpawnRequest` locally after DPU setup/import
-  succeeds;
+  succeeds. This must be wired from the real command-session open path, not from
+  the current setup-smoke guard, because the spawn request needs the real
+  `RemoteExecutionSessionIntentSpec` metadata;
 - add the DPU-side backend mailbox DMA actions that write command records into
   the backend command mailbox and pull completion records from the backend
   completion mailbox;
 - only then remove the selected-DPU frontend not-implemented guard for a narrow
   command-session smoke.
+
+Current design decisions for the next slice:
+
+- Backend spawn is still host-local postmaster work. The TCP setup socket carries
+  DPU descriptor/import metadata; it does not replace
+  `CitusRemoteExecBackendSpawnRegion`.
+- Selected-DPU spawn should set `completionReadyBitmapEnabled = 0` and
+  `serviceSessionIndex = CITUS_REMOTE_EXEC_CONTROL_INVALID_SESSION_INDEX`, because
+  there is no host service session table on the selected-DPU hot path. The DPU
+  discovers backend completions by DMA-polling exported completion
+  mailbox/control metadata.
+- Spawn response wait should be bounded. This stage should not add cancel; a
+  timeout is an error/fatal selected-DPU setup failure with teardown.
+- Do not add a separate completion-ready bitmap/hint ABI yet. The first DPU
+  completion pull path should use the compact exported completion mailbox/control
+  metadata and scheduler-bounded scans over active sessions. Add a separate
+  owner-separated epoch/hint structure only if measurements show that compact
+  scan is a bottleneck.

@@ -419,7 +419,7 @@ Responsibilities:
 - connect to the DPU TCP setup listener and exchange mmap export descriptors,
   ring descriptors, feature bits, setup generation, and ack/error status;
 - obtain or confirm DPU-owned Homer session identity such as service session id,
-  service session index, generation, and bridge generation;
+  generation, and bridge generation;
 - submit the backend spawn request to the host postmaster after the mailboxes
   and DPU-visible descriptors are established;
 - report bounded setup, spawn, and teardown errors before any selected-DPU
@@ -476,21 +476,60 @@ Setup-export decision:
   `COMPLETION`, direction `HOST_TO_DPU`, fixed-slot geometry, and the completion
   mailbox control/slot offsets.
 
+Backend-spawn decision:
+
+- backend spawn remains a host-local postmaster operation. The TCP setup socket is
+  only for host frontend <-> DPU service descriptor exchange; it does not replace
+  the host postmaster spawn shared-memory protocol.
+- selected-DPU backend spawn should be driven from the real command-session open
+  path, not from the current setup-smoke guard. The real open path has the
+  `RemoteExecutionSessionIntentSpec` needed for `sessionOpKind`, `databaseId`,
+  and `effectiveUserId`.
+- after DPU setup/import succeeds, the host frontend lifecycle shim submits a
+  `CitusRemoteExecBackendSpawnRequest` to the host postmaster spawn region,
+  using the DPU session id/generation and backend-visible mailbox names already
+  created by the shim.
+- for selected-DPU mode, do not use the old host-service completion-ready bitmap
+  identity: set `completionReadyBitmapEnabled = 0` and
+  `serviceSessionIndex = CITUS_REMOTE_EXEC_CONTROL_INVALID_SESSION_INDEX`. The
+  DPU owns completion discovery by DMA, so there is no host service session table
+  to index.
+- use a bounded wait for the postmaster spawn response. Do not invent a cancel
+  protocol in this stage. If the wait times out, treat selected-DPU session setup
+  as failed/fatal for that open attempt, tear down the DPU setup/mailboxes, and
+  rely on operator/runtime cleanup if a late backend appears.
+
+Completion-discovery decision:
+
+- do not add a second DMA-visible completion-ready bitmap or hint structure in
+  the first implementation.
+- the first DPU completion pull path should use the exported backend completion
+  mailbox/control metadata that already exists, and poll it in the same
+  scheduler-bounded grouped-control style used elsewhere. This is an
+  `O(active sessions)` scan over compact control/header metadata, not a scan over
+  full payload bodies.
+- a separate discovery hint is only worth adding after measurement shows the
+  compact scan is a bottleneck. If added later, prefer owner-separated
+  monotonic epochs over a shared clearable bitmap, because backend CPU ORs and
+  DPU DMA clears on the same word can lose updates without an explicit protocol.
+
 The selected-DPU setup order for a command-capable session should be:
 
-1. Host frontend asks the DPU service over TCP setup for a DPU session allocation
+1. The real command-session open path detects selected-DPU mode and calls a real
+   DPU frontend open helper, rather than the setup-smoke guard.
+2. Host frontend asks the DPU service over TCP setup for a DPU session allocation
    or validates a host-proposed identity.
-2. Host lifecycle shim creates the command/completion mailboxes using the agreed
+3. Host lifecycle shim creates the command/completion mailboxes using the agreed
    service session id and the existing naming rule.
-3. Host lifecycle shim registers/exports the grouped control block, request
+4. Host lifecycle shim registers/exports the grouped control block, request
    slots, backend mailboxes, and completion/credit memory that the DPU must DMA.
-4. Host lifecycle shim sends one TCP setup payload containing the descriptor
+5. Host lifecycle shim sends one TCP setup payload containing the descriptor
    table plus all mmap-export entries/blobs required for this session.
-5. DPU service imports those exports atomically as one setup operation and
+6. DPU service imports those exports atomically as one setup operation and
    acknowledges the exact generation, ring geometry, and session identity.
-6. Host lifecycle shim submits `CitusRemoteExecBackendSpawnRequest` locally to
+7. Host lifecycle shim submits `CitusRemoteExecBackendSpawnRequest` locally to
    postmaster with the same session identity and backend startup metadata.
-7. Only after setup/import/spawn succeeds may the host publish hot-path DMA
+8. Only after setup/import/spawn succeeds may the host publish hot-path DMA
    frontiers for DPU pull.
 
 The hot path after this setup remains DPU DMA: the host produces records and
