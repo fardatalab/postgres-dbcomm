@@ -185,6 +185,52 @@ should only inspect DPU-local counters maintained by the DMA engine:
 - `consumedHeadPublishPending > 0` means credit publication can run
 - `classBlockedOnTaskPool` or `classBlockedOnHostCredit` should appear as blocked reason hints, not as a reason to spin inside the executor
 
+The counters are not enough for efficient execution. They tell the scheduler
+that a class has work, but they do not tell the action executor which imported
+ring or mailbox should be serviced. The DMA engine should therefore maintain
+fixed-size DPU-local ready queues alongside the counters. This is an internal
+scheduler fact cache, not a host-DPU ABI:
+
+- host-to-DPU queues are filled when grouped-control or mailbox-control DMA reads
+  accept a newly advanced host-published frontier
+- DPU-to-host queues are filled when DPU service workflow state produces a
+  command, response, completion, or credit update that must be DMA-written to the
+  host
+- each queue entry should identify the DMA object by at least `{importIndex,
+  ringIndex}`; `ringIndex` alone is not globally unique because it is scoped to
+  one imported descriptor table
+- the entry may also carry a small generation or accepted epoch for stale-entry
+  rejection, but the executor must still revalidate the live ring runtime before
+  submitting DMA
+- per-ring/runtime flags such as `discoveredReady` suppress duplicate queue
+  entries; per-class counters remain the cheap ready-set predicate
+- stale queue entries caused by bounded grants, teardown, or already-consumed
+  frontiers are cleared as normal scheduler state unless they reveal a generation
+  or descriptor identity violation
+
+Use separate ready queues by workload and direction rather than one mixed global
+queue. Command/control latency, backend completion latency, and payload
+throughput need different scheduler policy, queue-depth, and grant treatment:
+
+```text
+host_to_dpu_frontend_command_ready       grouped-control discovered command/control records
+host_to_dpu_backend_completion_ready     backend completion mailbox records
+host_to_dpu_payload_ready                byte-ring/basebackup payload ranges
+dpu_to_host_backend_command_publish      backend command mailbox writes
+dpu_to_host_frontend_response_publish    frontend response/completion writes
+dpu_to_host_credit_publish               consumed-head or credit-line writes
+```
+
+This is the same broad scheduler pattern Homer already needs on the RDMA side:
+network CQEs, remote doorbells, and RDMA send/write completions make local
+service work newly available, but ready-set construction should still consume
+cheap local facts rather than poll hardware or scan all sessions. The DPU DMA
+queues should therefore mirror the RDMA direction: hardware/protocol discovery
+updates local ready facts, then bounded scheduler grants consume the exact ready
+objects. The difference is mechanism, not scheduler ownership: RDMA gets facts
+from CQ/doorbell drains, while DPU DMA gets facts from grouped-control reads,
+DOCA callbacks, and DPU-local workflow queues.
+
 The action executor is where real work happens. Extend
 [`HomerServiceExecuteProgressActionGrant()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35511)
 or the source-plan dispatch path with DPU DMA actions such as:
@@ -677,11 +723,16 @@ Failure handling:
 6. **Scheduler source skeleton**: add DPU DMA source kinds, ready-set counters, action kinds, and no-op bounded executors so the scheduler can choose DPU work before real payload movement exists.
 7. **Grouped control polling action**: DPU DMA-reads grouped control entries only when the scheduler grants `DPU_DMA_CONTROL_POLL`; report empty polls and discovered frontiers through `HomerProgressResult`.
 8. **PE drain action**: drain the DOCA PE only under a scheduler grant, with explicit poll/completion budgets and no nested progress from callbacks.
-9. **Command ring pull**: implement backend-produced command ring records with DPU async DMA reads and consumed-head DMA writes under command-pull grants.
-10. **Completion/result push**: implement DPU DMA writes into host completion/result rings and host consumption through existing frontend completion APIs.
-11. **Basebackup byte-stream pull**: move byte-ring chunk pulling to DPU DMA with larger windows and size-aware queue depth.
-12. **Opt+flush tuning**: enable `OPTIMIZE_REPORTS` plus flushed sentinel by class; measure latency and throughput.
-13. **Policy tuning**: compare class-level versus exact per-session DPU DMA sources, and tune grant order against RDMA CQ drain, local control, command, completion, and payload sources.
+9. **DPU-local ready queues**: add fixed-array per-workload/per-direction ready
+   queues inside the DMA engine. Keep the existing counters as scheduler facts,
+   but stop relying on executor scans to rediscover the exact ready ring when a
+   queue already contains ready refs. Validate bounded dequeue, stale-entry
+   clearing, duplicate suppression, and per-class counters.
+10. **Command ring pull**: implement backend-produced command ring records with DPU async DMA reads and consumed-head DMA writes under command-pull grants.
+11. **Completion/result push**: implement DPU DMA writes into host completion/result rings and host consumption through existing frontend completion APIs.
+12. **Basebackup byte-stream pull**: move byte-ring chunk pulling to DPU DMA with larger windows and size-aware queue depth.
+13. **Opt+flush tuning**: enable `OPTIMIZE_REPORTS` plus flushed sentinel by class; measure latency and throughput.
+14. **Policy tuning**: compare class-level versus exact per-session DPU DMA sources, and tune grant order against RDMA CQ drain, local control, command, completion, and payload sources.
 
 ## Things We Should Not Do First
 

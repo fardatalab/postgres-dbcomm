@@ -2557,3 +2557,17 @@ Current design decisions for the next slice:
   metadata and scheduler-bounded scans over active sessions. Add a separate
   owner-separated epoch/hint structure only if measurements show that compact
   scan is a bottleneck.
+- Before the next backend-mailbox DMA action stage, add DPU-local fixed-array
+  ready-ref queues beside the existing scheduler counters. Counters such as
+  `totalDiscoveredReadyRingCount` remain the cheap ready-set facts, but action
+  executors should consume exact ready refs instead of rescanning all imports and
+  rings. The ref identity is at least `{importIndex, ringIndex}` because
+  `ringIndex` is scoped to one imported descriptor table. Use separate queues by
+  workload and direction: host-to-DPU frontend command/control, host-to-DPU
+  backend completion, host-to-DPU payload, DPU-to-host backend command publish,
+  DPU-to-host frontend response publish, and DPU-to-host credit publish.
+- Treat the DPU-local ready-ref queues as the DOCA DMA counterpart of RDMA-side
+  local ready facts: CQ drains, remote doorbells, and RDMA completions discover
+  exact work, then the scheduler consumes cheap counters and bounded exact ready
+  objects. Do not implement a host-exported bitmap for this; it is a separate
+  hint ABI with no immediate correctness or performance need.

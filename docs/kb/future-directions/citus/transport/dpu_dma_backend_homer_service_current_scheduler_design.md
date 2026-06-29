@@ -652,6 +652,53 @@ work, and unknown external arrivals. A periodic grouped-control poll is like a
 blind collector: useful and necessary, but not proof that work exists until it
 returns a new frontier.
 
+### DPU-local ready-ref queues
+
+The counter facts above are the right interface for ready-set construction, but
+they are not enough for the bounded action executor. A counter can make a DPU DMA
+collector ready, but it does not tell the executor which imported ring or mailbox
+to service. The DMA engine therefore needs fixed-size DPU-local ready-ref queues
+in addition to the counters.
+
+The ready-ref queues are internal scheduler facts, not a host-DPU ABI and not a
+replacement for the grouped control block. A ready ref should identify the DMA
+object by at least `{importIndex, ringIndex}`. `ringIndex` alone is not globally
+unique because it is scoped to one imported descriptor table. When useful, carry
+a generation or accepted epoch so stale queue entries can be rejected cheaply,
+but still revalidate the live descriptor and ring runtime before submitting DMA.
+
+Use separate queues by workload and direction:
+
+```text
+host_to_dpu_frontend_command_ready       frontend command/control records to DMA-read
+host_to_dpu_backend_completion_ready     backend completion mailbox records to DMA-read
+host_to_dpu_payload_ready                byte-ring/basebackup ranges to DMA-read
+dpu_to_host_backend_command_publish      backend command mailbox records to DMA-write
+dpu_to_host_frontend_response_publish    frontend response/completion records to DMA-write
+dpu_to_host_credit_publish               consumed-head/credit-line records to DMA-write
+```
+
+Host-to-DPU queues are filled by discovery paths such as grouped-control or
+mailbox-control DMA reads after a host-published frontier is accepted. DPU-to-host
+queues are filled by local service workflow state when the DPU has semantic work
+ready to publish to host memory. Per-ring runtime flags such as `discoveredReady`
+should suppress duplicate refs, while per-class counters remain the cheap
+ready-set predicate.
+
+Action executors should pop refs under scheduler grants, submit DMA for the
+validated refs, and leave the queue intact when a grant is exhausted. Stale refs
+from teardown, bounded grants, or already-consumed frontiers are normal scheduler
+state and should be cleared with diagnostics; descriptor identity or generation
+violations remain fatal prototype bugs.
+
+This is also the right mental model for RDMA-side Homer work discovery. RDMA CQ
+drains, remote doorbells, and send/write completions discover exact service work
+and update local facts; ready-set construction should then read only cheap local
+counters, while bounded grants consume exact ready objects. DPU DMA differs in
+the discovery mechanism, not in scheduler ownership: grouped-control reads,
+DOCA callbacks, and DPU-local workflow queues play the same role as CQ/doorbell
+drains on the RDMA side.
+
 ### Grant model
 
 Decision: DPU DMA actions should use [`HomerGrantVector`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:2155) as their authoritative
@@ -1770,7 +1817,15 @@ Implementation substeps for this scheduler contract:
    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:403`.
    `HomerServiceAppendDpuDmaCollectorCandidates()` must use only those counters
    plus service-owned queue depths.
-4. **Service-owned queues**: add a selected-DPU command pipeline in
+4. **DPU DMA ready-ref queues**: add fixed-array per-workload/per-direction
+   ready-ref queues inside the DPU DMA engine. These queues hold exact DMA object
+   identities for executor use, while the counters above remain the scheduler
+   predicate. Host-to-DPU queues are filled by accepted grouped-control or
+   mailbox-control snapshots. DPU-to-host queues are filled by local service
+   workflow state. Entries must identify `{importIndex, ringIndex}` and must be
+   revalidated before DMA submission. Do not add a host-exported completion-ready
+   bitmap/hint ABI in this stage.
+5. **Service-owned semantic queues**: add a selected-DPU command pipeline in
    `HomerServiceDpuDmaSchedulerState`: pulled frontend command queue,
    backend-command publish queue, backend-completion staging queue, and frontend
    response pending queue. Queue entries must include the original
@@ -1780,20 +1835,20 @@ Implementation substeps for this scheduler contract:
    only if they are renamed or documented as frontend-command and
    pending-response queues; do not let `TupleSinkServiceDispatchLocalControlSlot()`
    remain the production SQL execution step for selected-DPU sessions.
-5. **Backend command publish API**: add a DPU engine API such as
+6. **Backend command publish API**: add a DPU engine API such as
    `HomerDpuDmaSubmitBackendCommandPublication()`. It submits one command record
    body write plus `readySeq` and `publishedEpoch` publication writes under the
    command workload context, checks task-window capacity before consuming the
    service queue entry, and reports `submittedTasks`, `budgetExhausted`, and
    `stillReady` through `HomerDpuDmaProgressResult`.
-6. **Backend completion pull API**: add a DPU engine API such as
+7. **Backend completion pull API**: add a DPU engine API such as
    `HomerDpuDmaSubmitBackendCompletionPulls()`. It submits completion-slot body
    reads for accepted backend completion frontiers, stages completed bodies in a
    bounded local buffer, and submits/queues the matching backend
    `consumedEpoch` DMA write after the body read callback succeeds. If a backend
    completion contains tuple-result metadata, the staged frontend response must
    carry that metadata forward before response publication.
-7. **Candidate rules and ordering**: update
+8. **Candidate rules and ordering**: update
    `HomerServiceAppendDpuDmaCollectorCandidates()` so:
    - grouped-control read remains blind/speculative and may be backed off after
      empty grants;
