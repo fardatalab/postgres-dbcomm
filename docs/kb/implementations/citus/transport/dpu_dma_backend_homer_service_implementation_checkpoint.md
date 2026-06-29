@@ -2955,26 +2955,54 @@ git clang-format HEAD -- \
   src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
   src/backend/distributed/utils/homer/homer_service_dpu_dma.h
 git diff --check
+sudo -n -u dbcomm make -B -j8 dpu-tcp-transport-smoke-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
 sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
 sudo -n -u dbcomm make -B -j8 service-bin client-bin \
   CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
 sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
 ```
 
+Live host-DPU smoke validation was then run on June 29, 2026:
+
+```sh
+# DPU farnet1-bf3-a
+cd /tmp/homer_dpu_ready_queue_stage
+./homer_dpu_tcp_transport_smoke --server \
+  --dev-pci 0000:03:00.0 \
+  --port 9732 \
+  --timeout-ms 15000
+
+# farnet1 host
+cd /data/dbcomm/citus-dbcomm
+./build/homer/homer_dpu_tcp_transport_smoke --client \
+  --host 10.10.1.201 \
+  --dev-pci 0000:21:00.0 \
+  --port 9732 \
+  --timeout-ms 15000 \
+  --expect-backend-command-publish \
+  --expect-response-publish
+```
+
 Observed result:
 
 - `git diff --check` reported no whitespace errors.
+- `dpu-tcp-transport-smoke-bin` built successfully on the host, and the refreshed
+  source bundle also built successfully on the farnet1 DPU as an aarch64 binary.
 - The normal service/client build passed.
 - The forced DOCA-enabled service/client build passed. It emitted only the known
   DOCA experimental/deprecation warnings for `doca_task_submit_ex()`,
   `doca_dma_set_ordered_completions()`, and DOCA buffer-inventory helpers.
 - The final forced normal rebuild passed so `build/homer/citus_tuple_sink_service`
   was left in the default `CPPFLAGS='-D_GNU_SOURCE'` shape.
+- The live smoke passed. The host client observed
+  `ready_seq=7001 published_epoch=7001` in the backend command mailbox and then
+  observed frontend response publication with `state=4 command_seq=7001`. The
+  DPU server reported `server DMA backend command plus response publication
+  complete tasks=5` and `homer_dpu_tcp_transport_smoke: ok`.
 
 Remaining work after this slice:
 
 - implement backend completion DMA pull and completion-mailbox credit publication;
-- add a backend-command DMA smoke that observes the host mailbox body only after
-  `readySeq`, now that the real API exists;
 - only after backend completion pull lands, remove the selected-DPU start/poll
   command not-implemented guards for a narrow selected-DPU SQL command smoke.

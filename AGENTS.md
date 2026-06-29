@@ -77,10 +77,12 @@ DMA does not take a representor. The Homer DPU DMA engine defaults to
 `0000:03:00.0` and can be overridden with `HOMER_SERVICE_DOCA_DEV_PCI` if the
 DPU device numbering changes.
 
-The standalone TCP transport smoke validates the current cold setup plus Stage 8
-response-publication composition: host PCI mmap export over TCP setup, DPU-side
-import into the DMA engine, DPU grouped-control read, DPU command pull, and DPU
-DMA response-body plus response-ready publication back into host memory.
+The standalone TCP transport smoke validates the current cold setup plus Stage
+8B.11 backend-command/response publication composition: host PCI mmap export
+over TCP setup, DPU-side import into the DMA engine, DPU grouped-control read,
+DPU command pull, DPU DMA backend-command body plus `readySeq`/`publishedEpoch`
+publication into the host backend mailbox, and DPU DMA response-body plus
+response-ready publication back into host frontend memory.
 
 ```sh
 # On the DPU, after compiling/copying the smoke there.
@@ -95,6 +97,7 @@ DMA response-body plus response-ready publication back into host memory.
   --dev-pci 0000:21:00.0 \
   --port 9727 \
   --timeout-ms 15000 \
+  --expect-backend-command-publish \
   --expect-response-publish
 ```
 

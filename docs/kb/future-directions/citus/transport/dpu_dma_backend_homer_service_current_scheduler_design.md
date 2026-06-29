@@ -1915,8 +1915,10 @@ Implementation substeps for this scheduler contract:
    - backend-command DMA smoke: DPU writes one
      `CitusRemoteExecLocalCommandRecord` body plus `readySeq`/`publishedEpoch`
      into an exported host mailbox; host CPU validation observes the exact body
-     only after `readySeq`. Stage 8B.11 makes this smoke implementable with the
-     production submission API, but the smoke still needs to be added;
+     only after `readySeq`. Stage 8B.11 extends the TCP transport smoke for this
+     gate and validates it live on farnet1: the host observed
+     `ready_seq=7001 published_epoch=7001`, and the DPU server completed five
+     backend-command plus response-publication DMA tasks;
    - backend-completion DMA smoke: host writes one completion body plus
      `publishedEpoch`; DPU pulls it, validates command sequence/epoch, and
      DMA-writes `consumedEpoch`;
