@@ -2557,17 +2557,110 @@ Current design decisions for the next slice:
   metadata and scheduler-bounded scans over active sessions. Add a separate
   owner-separated epoch/hint structure only if measurements show that compact
   scan is a bottleneck.
-- Before the next backend-mailbox DMA action stage, add DPU-local fixed-array
-  ready-ref queues beside the existing scheduler counters. Counters such as
-  `totalDiscoveredReadyRingCount` remain the cheap ready-set facts, but action
-  executors should consume exact ready refs instead of rescanning all imports and
-  rings. The ref identity is at least `{importIndex, ringIndex}` because
-  `ringIndex` is scoped to one imported descriptor table. Use separate queues by
-  workload and direction: host-to-DPU frontend command/control, host-to-DPU
-  backend completion, host-to-DPU payload, DPU-to-host backend command publish,
-  DPU-to-host frontend response publish, and DPU-to-host credit publish.
-- Treat the DPU-local ready-ref queues as the DOCA DMA counterpart of RDMA-side
-  local ready facts: CQ drains, remote doorbells, and RDMA completions discover
-  exact work, then the scheduler consumes cheap counters and bounded exact ready
-  objects. Do not implement a host-exported bitmap for this; it is a separate
-  hint ABI with no immediate correctness or performance need.
+- The DPU-local fixed-array ready-ref queue prerequisite is complete in Stage
+  8B.8 below. The next backend-mailbox DMA stage should consume those queues for
+  backend command publication and backend completion pull instead of adding a
+  host-exported bitmap/hint ABI.
+
+## Stage 8B.8: DPU-Local Ready-Ref Queues
+
+This slice implements the internal ready-ref queue prerequisite for
+backend-mailbox DMA work. It does not add new host-DPU ABI fields and does not
+modify RDMA behavior. The goal is to preserve exact DPU DMA object identities
+after discovery while keeping the existing scheduler counters as the cheap
+ready-set predicate.
+
+Implemented Citus changes:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:57`
+  adds `HomerDpuDmaReadyQueueKind` with separate queue families for host-to-DPU
+  frontend command/control, host-to-DPU backend completion, host-to-DPU payload,
+  DPU-to-host backend command publication, DPU-to-host frontend response
+  publication, and DPU-to-host credit publication.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:125`
+  adds `HomerDpuDmaReadyRef`, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:137`
+  adds the fixed-array `HomerDpuDmaReadyQueue`. Ready refs carry at least
+  `{importIndex, ringIndex}` plus descriptor role/workload and generation/epoch
+  diagnostics; `ringIndex` is still scoped to one imported descriptor table.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:182`
+  adds `readyRefQueued` beside `discoveredReady`. This is necessary because a
+  ring can remain semantically ready after one queued ref has been popped, for
+  example when a multi-record accepted frontier still has more command slots to
+  pull.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1505`
+  through
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1837`
+  add ready-queue capacity selection, descriptor-to-queue mapping, stale-entry
+  compaction, enqueue/pop helpers, and unified discovered-ready clear/requeue
+  helpers. Stale ready refs are normal scheduler state; descriptor identity or
+  generation violations still become fatal prototype errors through the existing
+  semantic validation paths.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:636`
+  changes `HomerDpuDmaSubmitCommandPulls()` to consume the host-to-DPU frontend
+  command ready queue instead of scanning every active import/ring to rediscover
+  exact ready rings.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:2768`
+  now enqueues a ready ref when `HomerDpuDmaAcceptGroupedControlSnapshot()`
+  accepts a newly advanced host-published frontier, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:2897`
+  requeues the ring from `HomerDpuDmaAcceptCommandPullSlot()` if more of the
+  accepted command frontier remains after one pulled slot is staged.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3057`
+  allocates every ready queue during engine scaffolding, using configured
+  `ringCapacity` when present and otherwise a conservative per-import bound for
+  the current multi-descriptor selected-DPU setup.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- src/backend/distributed/utils/homer/homer_service_dpu_dma.c
+git diff --cached --check -- src/backend/distributed/utils/homer/homer_service_dpu_dma.c
+sudo -n -u dbcomm make -C src/backend/distributed all
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make frontend-dma-smoke dpu-comch-abi-check service-dpu-dma-smoke
+sudo -n -u dbcomm make dpu-tcp-transport-smoke-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+```
+
+All local commands passed. The DOCA-enabled builds still emit the known DOCA
+experimental/deprecation warnings around `doca_task_submit_ex()` and
+`doca_dma_set_ordered_completions()`.
+
+The cross host-DPU TCP transport smoke was also rerun on farnet1 with a DPU-side
+aarch64 build copied to `/tmp/homer_dpu_ready_queue_stage`:
+
+```sh
+# DPU
+./homer_dpu_tcp_transport_smoke --server \
+  --dev-pci 0000:03:00.0 --port 19729 --timeout-ms 25000
+
+# farnet1 host
+./build/homer/homer_dpu_tcp_transport_smoke --client \
+  --host 10.10.1.201 --dev-pci 0000:21:00.0 \
+  --port 19729 --timeout-ms 25000 --expect-response-publish
+```
+
+Observed result:
+
+```text
+client received TCP setup ack generation=1 rings=1 imported_bytes=284
+client observed DMA response publication state=4 command_seq=7001
+homer_dpu_tcp_transport_smoke: ok
+
+server DMA response publication complete tasks=2
+homer_dpu_tcp_transport_smoke: ok
+```
+
+Remaining work after this slice:
+
+- backend command publication should add producers for the
+  DPU-to-host backend-command ready queue rather than bypassing the queue family;
+- backend completion pull should add producers/consumers for the host-to-DPU
+  backend-completion queue;
+- selected-DPU backend spawn still needs to move from the setup-smoke guard to
+  the real command-session open path with bounded wait and
+  `completionReadyBitmapEnabled = 0`.
