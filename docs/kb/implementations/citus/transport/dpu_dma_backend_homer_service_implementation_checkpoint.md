@@ -58,6 +58,9 @@ Stage 8B.5 adds the single-roundtrip multi-export setup ABI. Stage 8B.6 adds
 the first host lifecycle shim module for backend-visible command/completion
 mailbox creation and cleanup; it is validated by the host-only frontend DMA
 smoke but is not yet wired into selected-DPU session open.
+Stage 8B.7 wires those lifecycle mailboxes into the DOCA-enabled selected-DPU
+setup payload as separate mmap exports and descriptor roles. Backend spawn and
+hot mailbox DMA actions are still pending.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -2462,8 +2465,75 @@ All commands passed. The smoke output was `homer_frontend_dma_smoke: ok`.
 
 Next work after this slice:
 
-- wire the lifecycle owner into selected-DPU session setup;
-- add DOCA mmap registration/export for the command and completion mailboxes as
-  additional multi-export setup entries;
 - submit `CitusRemoteExecBackendSpawnRequest` locally after DPU setup/import
   succeeds.
+
+## Stage 8B.7: Export Lifecycle Mailboxes In Selected-DPU Setup
+
+This slice wires the Stage 8B.6 lifecycle mailboxes into the DOCA-enabled
+selected-DPU setup attempt. It still does not submit backend spawn requests or
+remove the frontend not-implemented guard; the boundary is "backend mailboxes are
+created, registered, exported, and described in the setup payload."
+
+Implemented Citus changes:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c`
+  now includes the lifecycle helper and extends `HomerFrontendDmaDocaSetupState`
+  with lifecycle mailbox state, three descriptors, three mmap-export entries,
+  and separate DOCA mmap/export handles for the frontend bridge, backend command
+  mailbox, and backend completion mailbox.
+- `HomerFrontendDmaOpenDocaControlChannel()` now creates a synthetic
+  `serviceSessionId`, initializes a three-descriptor bridge generation, creates
+  lifecycle mailboxes, exports the bridge and both mailbox mappings with DOCA
+  mmap, and builds one multi-export TCP setup payload through
+  `HomerFrontendDmaBuildSetupPayloadForExports()`.
+- `HomerFrontendDmaBuildDocaSetupDescriptors()` assigns descriptor roles:
+  frontend control slot, backend command mailbox, and backend completion mailbox.
+  The command mailbox is described as `COMMAND` / `DPU_TO_HOST` / fixed-slot; the
+  completion mailbox is described as `COMPLETION` / `HOST_TO_DPU` / fixed-slot.
+- `HomerFrontendDmaBuildDocaSetupExports()` binds each descriptor slice to its
+  own `mmapExportId`, so the DPU service imports the three mappings atomically
+  through the Stage 8B.5 multi-export setup ABI.
+- Cleanup destroys DOCA mmap objects before destroying/unlinking lifecycle
+  mailboxes, so the exported memory remains mapped for the lifetime of the DOCA
+  mmap.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make frontend-dma-smoke dpu-comch-abi-check service-dpu-dma-smoke
+sudo -n -u dbcomm make -C src/backend/distributed all
+sudo -n -u dbcomm make -j8 service-bin client-bin
+sudo -n -u dbcomm sh -c 'gcc -fno-strict-aliasing -fwrapv -fPIC -std=gnu99 \
+  -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
+  -Wno-missing-field-initializers -Wno-clobbered -Wno-declaration-after-statement \
+  -Wendif-labels -Wmissing-format-attribute -Wmissing-declarations \
+  -Wmissing-prototypes -Wshadow -Werror=vla -Werror=implicit-int \
+  -Werror=implicit-function-declaration -Werror=return-type \
+  -D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA \
+  $(pkg-config --cflags doca-dma doca-common 2>/dev/null) \
+  -I/data/dbcomm/citus-dbcomm/src/include \
+  -I/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer \
+  -I/data/dbcomm/pg-citus/include/postgresql/server \
+  -I/data/dbcomm/pg-citus/include/postgresql/internal \
+  -I/data/dbcomm/pg-citus/include \
+  -I/data/dbcomm/citus-dbcomm/vendor/safestringlib/include \
+  -c /data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c \
+  -o /data/dbcomm/citus-dbcomm/build/homer/homer_frontend_dma_doca_compile.o'
+git diff --check
+```
+
+All commands passed. The manual DOCA-enabled compile check is recorded because
+the normal extension build does not define `HOMER_DPU_DMA_WITH_DOCA`; without
+that extra compile, the new selected-DPU setup branch would not be type-checked.
+
+Remaining work:
+
+- submit `CitusRemoteExecBackendSpawnRequest` locally after DPU setup/import
+  succeeds;
+- add the DPU-side backend mailbox DMA actions that write command records into
+  the backend command mailbox and pull completion records from the backend
+  completion mailbox;
+- only then remove the selected-DPU frontend not-implemented guard for a narrow
+  command-session smoke.

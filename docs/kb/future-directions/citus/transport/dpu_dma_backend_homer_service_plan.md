@@ -460,6 +460,22 @@ Mailbox naming decision:
   Partial setup rollback must not delete an older live or stale object that
   caused an `EEXIST` failure.
 
+Setup-export decision:
+
+- the selected-DPU setup payload should export the frontend bridge, backend
+  command mailbox, and backend completion mailbox in the same multi-export TCP
+  setup message;
+- the frontend bridge descriptor remains
+  `HOMER_DPU_BRIDGE_DESCRIPTOR_ROLE_FRONTEND_CONTROL_SLOT`;
+- the command mailbox descriptor uses
+  `HOMER_DPU_BRIDGE_DESCRIPTOR_ROLE_BACKEND_COMMAND_MAILBOX`, workload
+  `COMMAND`, direction `DPU_TO_HOST`, fixed-slot geometry, and the command
+  mailbox control/slot offsets;
+- the completion mailbox descriptor uses
+  `HOMER_DPU_BRIDGE_DESCRIPTOR_ROLE_BACKEND_COMPLETION_MAILBOX`, workload
+  `COMPLETION`, direction `HOST_TO_DPU`, fixed-slot geometry, and the completion
+  mailbox control/slot offsets.
+
 The selected-DPU setup order for a command-capable session should be:
 
 1. Host frontend asks the DPU service over TCP setup for a DPU session allocation
