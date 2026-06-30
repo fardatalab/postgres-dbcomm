@@ -100,14 +100,15 @@ The standalone host-only frontend DMA smoke covers the new lifecycle fields, and
 the existing non-DPU Homer pgbench smoke still passes after the backend protocol
 bump. Follow-up selected-DPU runtime validation built a temporary DPU-side
 service and progressed past the old result-sink fallback, but Stage 8B.16 is
-still not accepted. The next required corrective slice is Stage 8B.17: selected
-DPU backend completion records must be handled as an ordered command-state event
-stream, where `STARTED` is push-visible and nonterminal, and the DMA engine must
-transfer staged backend-completion ownership by claim/borrow rather than
-allowing repeated physical observation while consumed-credit DMA retires. The
-latest selected-DPU retry also exposed a 64-byte DOCA command/control memcpy
-I/O error that must be debugged as a DMA address/buffer-lifetime issue before
-claiming row-producing SQL acceptance.
+still not accepted. Stage 8B.17 is implemented and validated at the engine/TCP
+smoke level: selected-DPU backend completion records are now handled as an
+ordered command-state event stream, where `STARTED` is push-visible and
+nonterminal, and the DMA engine transfers staged backend-completion ownership at
+consumed-credit submission instead of allowing repeated physical observation
+while consumed-credit DMA retires. Full selected-DPU SQL acceptance is still
+blocked earlier in the path by a 64-byte DOCA command/control memcpy I/O error
+in command-pull DMA that must be debugged as a DMA address/buffer-lifetime issue
+before claiming row-producing SQL acceptance.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -3777,3 +3778,165 @@ Validation caveats:
   validation then continued with explicit process checks, shared-memory cleanup,
   a fresh PostgreSQL start, and a fresh Homer service start. Avoid wrapping
   `pkill -f` patterns in a command line that also contains the match string.
+
+## Stage 8B.17: Selected-DPU Backend Completion Event Stream
+
+This slice fixes the semantic bug found during the Stage 8B.16 selected-DPU
+retry: a backend completion mailbox record is an ordered command-state event,
+not necessarily a terminal completion. The selected-DPU path now mirrors that
+contract instead of treating the first backend record as terminal-only.
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:534`
+  adds `HomerServiceDpuCompletionEventSlot`, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:541`
+  replaces the single selected-DPU `backendCompletionReady` slot with a small
+  per-session ordered event queue plus `lastAcceptedBackendCompletionEpoch`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35098`
+  through
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35193`
+  implement queue full/peek/pop/enqueue helpers. Re-observing an already
+  accepted physical backend-completion epoch is now a fatal protocol diagnostic,
+  not duplicate suppression.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35475`
+  changes `HomerServiceDpuAcceptOneBackendCompletion()` to claim one staged DMA
+  completion, validate it against the semantic in-flight command sequence,
+  accept push-visible `STARTED` or terminal states, submit the backend
+  consumed-credit DMA write, and enqueue the frontend-visible event. It no
+  longer compares physical mailbox epoch with semantic command sequence.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35591`
+  changes `HomerServiceDpuStageOnePollCompletionResponse()` to pop exactly one
+  queued event for the requested command sequence. It clears selected-session
+  in-flight state only after returning a terminal event, so a nonterminal
+  `STARTED` event cannot accidentally admit the next command for the same
+  session.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1854`
+  moves staged backend-completion ownership transfer to successful
+  consumed-credit DMA submission: after that point the DMA engine hides the
+  staged record from scheduler facts while `backendCompletionCreditInFlight`
+  pins the local buffer until PE retirement.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1875`
+  renames the staged accessor to `HomerDpuDmaClaimNextStagedBackendCompletion()`
+  and documents the claim/submit boundary.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_tcp_transport_smoke.c:1078`
+  now uses the claim API and
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_tcp_transport_smoke.c:1113`
+  asserts that a backend completion is no longer claimable immediately after
+  consumed-credit submission.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:38754`
+  makes `HomerServiceDpuDmaSchedulerState` static. This was required because the
+  new per-session event queues grew the selected-DPU scheduler state enough to
+  overflow the DPU service's default thread stack when it remained a local
+  variable in `main()`.
+
+Validation on June 30, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git diff --check -- \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/tuple_sink_service_process.c \
+  src/bin/homer_dpu_tcp_transport_smoke.c
+
+sudo -n -u dbcomm make -j8 \
+  service-bin client-bin dpu-tcp-transport-smoke-bin service-dpu-dma-smoke \
+  CPPFLAGS='-D_GNU_SOURCE'
+
+./build/homer/homer_service_dpu_dma_smoke
+rsync -az \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/tuple_sink_service_process.c \
+  src/bin/homer_dpu_tcp_transport_smoke.c \
+  dpu:/tmp/citus-dbcomm-stage8b16/ --relative
+
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16 && \
+  make -j4 service-bin dpu-tcp-transport-smoke-bin CPPFLAGS="-D_GNU_SOURCE"'
+
+# DPU service start check after moving dpuDmaState out of the stack.
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16 && \
+  timeout 5 env HOMER_SERVICE_ENABLE_DPU_DMA=1 \
+    HOMER_SERVICE_ENABLE_DOCA_DMA=1 \
+    HOMER_SERVICE_DOCA_DEV_PCI=0000:03:00.0 \
+    HOMER_SERVICE_DPU_SETUP_BIND_HOST=0.0.0.0 \
+    HOMER_SERVICE_DPU_SETUP_PORT=19729 \
+    ./build/homer/citus_tuple_sink_service'
+
+# Standalone TCP transport smoke on a nondefault port.
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16 && \
+  ./build/homer/homer_dpu_tcp_transport_smoke --server \
+    --dev-pci 0000:03:00.0 --port 19730 --timeout-ms 60000'
+./build/homer/homer_dpu_tcp_transport_smoke --client \
+  --host 10.10.1.201 --dev-pci 0000:21:00.0 \
+  --port 19730 --timeout-ms 30000 \
+  --expect-response-publish \
+  --expect-backend-command-publish \
+  --expect-backend-completion-pull
+```
+
+Observed result:
+
+- Host build and `homer_service_dpu_dma_smoke` passed. The only compiler
+  warnings were the existing DOCA experimental/deprecated API warnings.
+- The DPU service previously crashed immediately at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:38746`
+  when the enlarged `HomerServiceDpuDmaSchedulerState` was still on the DPU
+  thread stack. Moving it to static storage fixed that crash; the foreground
+  `timeout 5` service start reached the TCP listener and exited by timeout
+  rather than by SIGSEGV.
+- The standalone TCP transport smoke passed with:
+
+  ```text
+  client received TCP setup ack generation=1 rings=3 imported_bytes=289
+  client observed DMA backend command publication ready_seq=7001 published_epoch=7001
+  client observed DMA response publication state=4 command_seq=7001
+  client observed DMA backend completion consumed_epoch=1
+  homer_dpu_tcp_transport_smoke: ok
+  ```
+
+  The DPU server reported `server DMA backend command, response, and backend
+  completion pull complete tasks=8`, proving the synthetic backend-completion
+  claim and consumed-credit publication path no longer re-observes the same
+  physical completion after claim.
+
+Selected-DPU SQL is still not accepted. With the DPU service running from
+`/tmp/citus-dbcomm-stage8b16` on port `9727`, the host command:
+
+```sh
+sudo -n -u dbcomm env \
+  HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.201 \
+  HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
+  HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
+  timeout 60 /data/dbcomm/pg-citus/bin/psql \
+    -h /tmp -p 5432 -U dbcomm -X postgres \
+    -v ON_ERROR_STOP=0 \
+    -c "SET citus.enable_experimental_tuple_sink_routing = on;
+        SET citus.enable_experimental_homer_dpu_frontend = on;
+        SELECT pg_catalog.citus_remote_exec_pgbench_transaction(1, 1, 1, 1, 1);"
+```
+
+failed with:
+
+```text
+ERROR:  timed out waiting for Homer DPU command to reach backend-started state
+DETAIL:  session_id=2139083749007686 command_sequence=2 timeout_ms=10000
+```
+
+The DPU service emitted:
+
+```text
+homer DPU DMA: memcpy task failed: Input/Output Operation Failed task_kind=1 workload=1 task_slot=0 import=0 ring=0 task_generation=500938 ring_generation=1 bridge_generation=1 host_bytes=64
+homer DPU DMA: DOCA context state 2 -> 3
+homer DPU DMA: DOCA context state 3 -> 0
+tuple-sink service: DPU DMA PE drain failed:
+```
+
+That failure happens in the frontend command-pull DMA path before the Stage
+8B.17 backend-completion event queue can be exercised by real SQL. The next
+implementation slice should debug the 64-byte command/control DMA task failure:
+verify the exported frontend bridge mapping lifetime, descriptor offset/length
+for ring `0`, DOCA mmap import identity, task local/remote buffer construction,
+and whether the host frontend tears down the export while DPU command-pull DMA
+is still in flight on error paths.
