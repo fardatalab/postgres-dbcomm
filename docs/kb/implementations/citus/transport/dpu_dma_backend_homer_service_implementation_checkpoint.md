@@ -3003,16 +3003,128 @@ Observed result:
 
 Remaining work after this slice:
 
-- Stage 8B.12 should first add an engine-only backend-completion mailbox DMA
-  smoke. The smoke should export the existing backend completion mailbox role,
-  have the host publish one `CitusRemoteExecCommandCompletion` body plus
-  `publishedEpoch`, have the DPU DMA-read the mailbox control/header and slot
-  body, and have the DPU DMA-write `consumedEpoch` back. This validates the DMA
-  object shape and credit publication before production scheduler semantics are
-  involved.
 - Stage 8B.13 should add production DMA engine completion APIs and task-owner
   metadata for completion-control reads, completion-slot reads, staged
   completion ownership, and consumed-epoch publication.
+- Stage 8B.14 should wire the scheduler semantic path: staged backend
+  completions clear the selected-DPU one-command-in-flight state and enqueue the
+  existing frontend poll/terminal response for DPU response publication, without
+  using the old host-process SHM completion mailbox.
+- Stage 8B.15 should then remove the selected-DPU start/poll command
+  not-implemented guards only for the narrow selected-DPU SQL command smoke and
+  add the positive plus negative no-fallback validation.
+
+## Stage 8B.12: Engine-Only Backend-Completion Mailbox DMA Smoke
+
+Stage 8B.12 validates the backend completion mailbox direction without yet
+routing completions through production scheduler semantics. The smoke now
+exports a backend completion mailbox descriptor, has the host pre-publish one
+`CitusRemoteExecCommandCompletion` body plus mailbox `publishedEpoch`, has the
+DPU DMA-read the mailbox control/header and the exact completion slot body, and
+then has the DPU DMA-write `consumedEpoch` back into host memory.
+
+Code changes:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1232`
+  adds `HomerDpuDmaSubmitBackendCompletionControlSmokeRead()`, which validates
+  the `HOMER_DPU_BRIDGE_DESCRIPTOR_ROLE_BACKEND_COMPLETION_MAILBOX` descriptor
+  and reads the fixed mailbox control prefix into DPU-owned staging memory.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1435`
+  adds `HomerDpuDmaSubmitBackendCompletionSlotSmokeRead()`, which reads one
+  `CitusRemoteExecCommandCompletion` slot after the control/header read has
+  accepted `publishedEpoch`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1584`
+  adds `HomerDpuDmaSubmitBackendCompletionConsumedEpochSmokePublication()`,
+  which writes the accepted completion epoch into the backend mailbox
+  `consumedEpoch` field.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_tcp_transport_smoke.c:1022`
+  wires the three DMA steps into the standalone TCP smoke server. The client
+  side waits for the DPU-written consumed epoch through
+  `HomerTcpSmokeWaitForBackendCompletionConsumed()` at
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_tcp_transport_smoke.c:1218`.
+
+Important implementation boundary:
+
+- These functions are explicitly smoke-scoped. They validate object shape,
+  descriptor identity, DMA direction, body read, and credit write, but they do
+  not yet produce production scheduler facts or map the completion into a
+  frontend poll response. Stage 8B.13 should either promote/refactor these
+  pieces into `HomerDpuDmaSubmitBackendCompletionPulls()` or replace them with
+  the production API while preserving the same validation evidence.
+- Completion mailbox control is intentionally separate from grouped-control
+  reads. `CitusRemoteExecLocalCompletionMailbox` is a fixed-slot mailbox with
+  `publishedEpoch`/`consumedEpoch`; it is not a
+  `HomerDpuBridgeHostPublishLine`.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/bin/homer_dpu_tcp_transport_smoke.c
+sudo -n -u dbcomm make -j8 dpu-tcp-transport-smoke-bin
+sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+```
+
+The refreshed source bundle also compiled on the farnet1 DPU:
+
+```sh
+ssh dpu "cd /tmp/homer_dpu_stage8b12 && gcc ... -DHOMER_DPU_DMA_WITH_DOCA \
+  -o homer_dpu_tcp_transport_smoke \
+  src/bin/homer_dpu_tcp_transport_smoke.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c \
+  -L/opt/mellanox/doca/lib/aarch64-linux-gnu -ldoca_dma -ldoca_common"
+```
+
+Live validation on June 29, 2026:
+
+```sh
+# farnet1 DPU
+cd /tmp/homer_dpu_stage8b12
+./homer_dpu_tcp_transport_smoke --server \
+  --dev-pci 0000:03:00.0 \
+  --port 9734 \
+  --timeout-ms 20000
+
+# farnet1 host
+cd /data/dbcomm/citus-dbcomm
+./build/homer/homer_dpu_tcp_transport_smoke --client \
+  --host 10.10.1.201 \
+  --dev-pci 0000:21:00.0 \
+  --port 9734 \
+  --timeout-ms 20000 \
+  --expect-backend-command-publish \
+  --expect-response-publish \
+  --expect-backend-completion-pull
+```
+
+Observed result:
+
+- Host client received setup ack `generation=1 rings=3`.
+- Host observed backend command publication
+  `ready_seq=7001 published_epoch=7001`.
+- Host observed frontend response publication `state=4 command_seq=7001`.
+- Host observed DPU-written backend completion credit `consumed_epoch=1`.
+- DPU server reported
+  `server DMA backend command, response, and backend completion pull complete tasks=8`
+  and `homer_dpu_tcp_transport_smoke: ok`.
+- The final normal rebuild passed after the DOCA-enabled compile, so
+  `build/homer/citus_tuple_sink_service` was left in the default
+  `CPPFLAGS='-D_GNU_SOURCE'` shape.
+
+Remaining work after this slice:
+
+- Stage 8B.13 should add production DMA engine completion APIs and task-owner
+  metadata for completion-control reads, completion-slot reads, staged
+  completion ownership, and consumed-epoch publication. Reuse the Stage 8B.12
+  smoke evidence, but do not expose the smoke-only function names to scheduler
+  code.
 - Stage 8B.14 should wire the scheduler semantic path: staged backend
   completions clear the selected-DPU one-command-in-flight state and enqueue the
   existing frontend poll/terminal response for DPU response publication, without

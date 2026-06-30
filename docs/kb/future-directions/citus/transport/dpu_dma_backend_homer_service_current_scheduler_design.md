@@ -1953,6 +1953,11 @@ than the earlier single "backend completion pull" bullet implied.
    and DMA-writes `consumedEpoch` back to the host. The host validates
    `consumedEpoch == publishedEpoch`. This slice deliberately does not route the
    completion into the production scheduler semantic path.
+   Implementation progress: Stage 8B.12 landed this engine-only smoke. The live
+   farnet1 host-DPU validation on June 29, 2026 observed setup `rings=3`, host
+   backend-command publication `ready_seq=7001 published_epoch=7001`, frontend
+   response publication `state=4 command_seq=7001`, backend completion
+   `consumed_epoch=1`, and DPU server completion with eight DMA tasks.
 2. **Stage 8B.13: production DMA engine completion APIs.** Add task kinds,
    task-owner metadata, staging buffers, and bounded APIs for completion control
    reads, completion body reads, and consumed-epoch publication. The expected
