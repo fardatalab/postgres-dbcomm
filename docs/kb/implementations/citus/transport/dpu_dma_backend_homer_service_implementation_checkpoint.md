@@ -91,6 +91,16 @@ helpers bind/drain the command result tuple sink, and
 borrow/read/release over the tuple sink instead of reading public scalar shortcut
 fields. The lower-level wire/smoke completion structs still carry transitional
 scalar members, but the public wrapper path no longer depends on them.
+The second Stage 8B.16 slice is also implemented and host-validated: selected-DPU
+lifecycle setup now eagerly creates a SQL result byte ring, exports it in the
+initial TCP/DOCA setup descriptor set, passes the result descriptor through
+backend spawn/startup, and makes selected-DPU socketless backends bind that
+pre-created tuple sink instead of opening the old host-service control region.
+The standalone host-only frontend DMA smoke covers the new lifecycle fields, and
+the existing non-DPU Homer pgbench smoke still passes after the backend protocol
+bump. Full selected-DPU SQL runtime validation is still pending because the DPU
+environment currently lacks the project tree/install prefix needed to run the
+DPU-side service binary for this stage.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -3543,6 +3553,117 @@ Implemented Stage 8B.16 frontend completion/result API slice:
   one-column tuple contract, binds the command result sink, borrows tuple views,
   reads an `int4` or `int8` `abalance`, releases each borrow/batch, and errors on
   zero, NULL, or multiple rows.
+
+Implemented Stage 8B.16 selected-DPU lifecycle result-ring slice:
+
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_bridge_abi.h:82`
+  adds `HOMER_DPU_BRIDGE_DESCRIPTOR_ROLE_SQL_RESULT_BYTE_RING`, and the
+  role/shape helpers accept it as a byte-stream host-to-DPU byte-ring descriptor.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:101`
+  and
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:120`
+  add `resultServiceSinkId` plus `resultQueueDescriptor` to backend startup and
+  spawn records. The backend protocol and SHM names were bumped to v14 so mixed
+  old/new binaries fail visibly instead of sharing stale mailbox names.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.h:31`
+  extends `HomerFrontendDmaLifecycleMailboxes` with lifecycle-owned result queue
+  state. The helper creates this queue eagerly with the command/completion
+  mailboxes instead of lazily allocating it on the first row-producing command.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.c:129`
+  sizes the SQL result byte ring as a preallocated tuple-sink byte ring, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.c:421`
+  initializes stable send/receive descriptors for the same SHM object.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.c:287`
+  copies the lifecycle result sink identity and send descriptor into the backend
+  spawn request so the socketless backend can map it without consulting the old
+  host-service control region.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1169`
+  registers/exports the result byte ring mmap with DOCA, and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1551`
+  adds the `SQL_RESULT_BYTE_RING` descriptor to the initial TCP setup payload.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:2401`
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:2698`
+  recognize the SQL result byte-ring descriptor during import validation and
+  ready-queue classification. The descriptor is imported as byte-ring memory, not
+  as a grouped-control publish line.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:2642`
+  validates selected-DPU startup result descriptors, maps the lifecycle-created
+  result queue directly, and seeds session result-sink state.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1041`
+  keeps the normal host-service result-sink path unchanged, while the
+  selected-DPU branch reuses the pre-created queue and fails explicitly if that
+  lifecycle queue is missing. It does not fall back to
+  `RemoteExecOpenServiceOwnedResultSink()`.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_frontend_dma_smoke.c:94` and
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_frontend_dma_smoke.c:230` assert that
+  the lifecycle smoke creates the result queue, propagates the descriptor through
+  spawn, and uses the v14 result queue prefix.
+
+Validation for the selected-DPU lifecycle result-ring slice:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format --force HEAD -- \
+  src/include/distributed/homer/homer_dpu_bridge_abi.h \
+  src/include/distributed/homer/remote_execution_backend_protocol.h \
+  src/backend/distributed/utils/homer/homer_frontend_dma.c \
+  src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.c \
+  src/backend/distributed/utils/homer/homer_frontend_dma_lifecycle.h \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/remote_execution_backend_bridge.c \
+  src/bin/homer_frontend_dma_smoke.c
+sudo -n -u dbcomm make -j8 CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make install-headers install-service-bin install \
+  CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make frontend-dma-smoke service-dpu-dma-smoke \
+  CPPFLAGS='-D_GNU_SOURCE'
+
+cd /data/dbcomm/postgres-citus
+sudo -n -u dbcomm ninja -C build -t clean src/bin/pgbench/pgbench
+sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build src/bin/pgbench/pgbench
+sudo -n -u dbcomm meson install -C build --no-rebuild
+sudo -n -u dbcomm timeout 60 /data/dbcomm/pg-citus/bin/pgbench \
+  -h /tmp -p 5432 -U dbcomm \
+  --homer --homer-database-oid 5 --homer-user-oid 10 \
+  --latency-percentiles --client-cpu=3 \
+  -n -M simple -c 1 -j 1 -t 100 postgres
+```
+
+Observed results:
+
+- Citus/Homer build and install completed. The only compile warnings were
+  existing DOCA experimental/deprecated warnings and pre-existing PostgreSQL
+  warning noise outside this slice.
+- `homer_frontend_dma_smoke: ok`.
+- `homer_service_dpu_dma_smoke: ok`.
+- The installed `libhomer_client.a`, `pgbench`, and
+  `citus_tuple_sink_service` agreed on the v14 backend mailbox names after a
+  forced client/service rebuild and pgbench relink. The first runtime attempt
+  caught this exact install-skew pitfall: `pgbench` was still linked against v13
+  while the service and headers were v14.
+- The local non-DPU Homer pgbench smoke passed: `100/100` transactions,
+  `0.000%` failures, about `2234 TPS`, p50 `0.382 ms`, p95 `0.520 ms`, p99
+  `0.563 ms`.
+- The Homer service log for the smoke showed result-sink create/reclaim and no
+  Homer/DPU result-ring errors. PostgreSQL logged unrelated Citus maintenance
+  daemon warnings while trying to contact remote nodes; those were not part of
+  the local Homer smoke.
+
+Validation caveats:
+
+- The first cleanup attempt after the protocol bump exposed stale PostgreSQL
+  runtime state: a `postgres: remote exec backend` process prevented fast
+  shutdown, and a broad cleanup wrapper again risked self-matching. The accepted
+  smoke used explicit process inspection and targeted PID cleanup before
+  restarting PostgreSQL and the Homer service.
+- Full selected-DPU SQL runtime validation was not run in this checkpoint. On
+  `farnet1`, `ssh dpu` currently reaches the DPU, but the DPU filesystem does not
+  show `/data/dbcomm/citus-dbcomm`, `/data/dbcomm/postgres-citus`, or
+  `/data/dbcomm/pg-citus`, so the DPU-side service binary is not available there
+  for the selected-DPU smoke. The next selected-DPU validation step must deploy or
+  build the DPU service binary on the DPU, then rerun the row-producing SQL smoke
+  and verify it never opens `/citus_remote_execution_control_v27`.
 - `/data/dbcomm/citus-dbcomm/src/backend/distributed/worker/homer/remote_exec_pgbench_transaction.c:379`
   now drains `SELECT abalance` through the tuple-result sink instead of
   `RemoteExecutionCommandCompletion.scalarInt64`.

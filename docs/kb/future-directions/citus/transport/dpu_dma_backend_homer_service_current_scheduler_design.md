@@ -2205,10 +2205,29 @@ than the earlier single "backend completion pull" bullet implied.
       result byte ring. Export/import it with the initial TCP setup. Validation:
       the standalone TCP transport smoke should report the extra descriptor and
       still pass command/completion setup.
+
+      Implementation progress: completed on June 30, 2026 for the host-side
+      lifecycle, setup descriptor, backend spawn/startup ABI, and selected-DPU
+      backend result-queue binding code. The slice uses a distinct
+      `SQL_RESULT_BYTE_RING` bridge descriptor role, exports the result queue in
+      the initial TCP setup, and passes the same queue descriptor through backend
+      spawn so selected-DPU socketless backends can map it without calling the
+      old host-service control region. Host validation passed through the
+      extended `homer_frontend_dma_smoke`, `homer_service_dpu_dma_smoke`, full
+      Citus/Postgres rebuild+install, and the existing non-DPU Homer pgbench
+      smoke after a forced pgbench relink. Full selected-DPU runtime validation
+      remains pending until the DPU service binary is deployed or built on the
+      DPU filesystem.
    3. **Selected-DPU backend mapping slice.** Extend the spawn/startup ABI and
       teach `RemoteExecEnsureSessionResultQueue()` to bind the pre-created result
       queue in selected-DPU mode. Validation: a row-producing selected-DPU SQL
       command must not open `/citus_remote_execution_control_v27`.
+
+      Implementation progress: code for the backend mapping portion landed with
+      the lifecycle result-ring slice, but the acceptance validation is still
+      pending. Keep this sub-slice open until a selected-DPU row-producing SQL
+      smoke proves that `RemoteExecEnsureSessionResultQueue()` uses the
+      lifecycle-created queue and does not reach the old control-region path.
    4. **End-to-end tuple-result smoke slice.** Run selected-DPU `SELECT abalance`
       through the pgbench wrapper and verify the frontend reads the returned
       tuple from the result sink, not from scalar completion fields. This is the
