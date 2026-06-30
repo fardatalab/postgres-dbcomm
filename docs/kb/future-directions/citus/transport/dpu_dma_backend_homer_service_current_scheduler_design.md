@@ -1452,9 +1452,14 @@ Acceptance:
   Stage 6B.2 implements this by ignoring body fields when `publishedEpoch` is
   unchanged; a targeted negative/stress smoke remains useful before performance
   tuning.
-- Debug invariant mode proves submit actions do not call `doca_pe_progress()` and
-  callbacks do not submit follow-on DMA work. Stage 6B.1 implements this shape
-  for grouped-control reads; a debug invariant mode can still make it explicit.
+- Debug invariant mode proves submit actions do not call `doca_pe_progress()`.
+  Callbacks may not recurse into PE progress or run semantic service logic. A
+  narrow exception is allowed for latency-critical DMA-chain continuations: a
+  completion callback may submit a bounded, pre-owned follow-on DMA task for the
+  same chain, such as a host-visible publication word after a response-body DMA
+  completion. Stage 6B.1 implements the stricter retire-only shape for
+  grouped-control reads; response/completion publication needs the chained shape
+  before selected-DPU command acceptance.
 - A standalone host+DPU grouped-control test proves control-read DMA submission
   and callback retirement are separated: submit action queues reads, PE-drain
   action observes and validates them. The existing COMCH smoke is historical
@@ -1565,8 +1570,17 @@ Tasks:
   `TupleSinkServiceDispatchLocalControlSlot()` for a DPU-staged command, mutating
   service state, and then leaving the host with no response-ready publication
   path.
-- Submit response-body DMA writes followed immediately by the response-ready
-  publication-word DMA write on the same ordered context.
+- Do not use repeated `POLL_COMMAND_COMPLETION` request/response loops as the
+  selected-DPU hot-path wait mechanism. The current compatibility bridge can use
+  it only as temporary scaffolding. The target selected-DPU command path is one
+  frontend request plus one host-local wait on a DPU-published frontend
+  completion mailbox/slot.
+- Publish DPU-to-host response/completion bodies through an async two-phase DMA
+  chain under the same command/completion context: submit body DMA first, let PE
+  drain retire the body task, have the body completion callback submit the
+  publication-word DMA, and release the buffer only after the publication task
+  retires. The callback must not call `doca_pe_progress()`, allocate on the hot
+  path, or run command semantics.
 - Preserve request sequence and owner validation.
 - Keep the old SHM host-process APIs buildable only as DPU-off migration
   coexistence; do not add fallback branches from selected DPU command handling to
@@ -1592,6 +1606,35 @@ Tasks:
   and then DPU-pulled request publication. The old host service may remain
   buildable for DPU-off mode, but it must not be the selected-DPU hot-path
   command transport.
+- Add an explicit selected-DPU backend startup mode to the postmaster spawn ABI.
+  The current startup payload in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h`
+  carries only service-session identity and the optional old host-service
+  completion bitmap. That is not enough to tell
+  `ExecuteRemoteExecBackendCommand()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c`
+  to skip the old host-service control region. Extend the spawn request and
+  backend startup data with a small channel/mode field. For selected-DPU mode,
+  the host lifecycle shim sets that mode, keeps
+  `completionReadyBitmapEnabled = 0`, and keeps
+  `serviceSessionIndex = CITUS_REMOTE_EXEC_CONTROL_INVALID_SESSION_INDEX`.
+- Keep the backend mailbox interface name-based, not descriptor-based. The
+  lifecycle shim already creates backend-visible command/completion mailboxes and
+  exports their memory to the DPU service; the spawned PostgreSQL backend should
+  open those POSIX SHM mailboxes by `serviceSessionId`, just as the current
+  socketless backend does. Only the DPU service consumes the TCP/mmap descriptor
+  table.
+- In selected-DPU backend mode, `ExecuteRemoteExecBackendCommand()` must not call
+  `RemoteExecMapControlRegion()`. It should map only the command mailbox and
+  completion mailbox, set `RemoteExecBackendSessionState.controlRegion = NULL`,
+  and rely on `PublishCompletionToMailbox()` plus the backend completion mailbox
+  `publishedEpoch` as the DPU-visible completion publication. This is compatible
+  with `RemoteExecBackendMarkCompletionReady()` because the bitmap flag is
+  disabled.
+- Make backend cleanup optional-control-region safe on both error and normal
+  exits. The current error path guards the control-region pointer and descriptor,
+  while the normal path still assumes they are valid. Selected-DPU backend mode
+  must not unmap NULL or close `-1`.
 
 Acceptance:
 
@@ -1609,6 +1652,14 @@ Acceptance:
   call the SHM frontend path.
 - A DPU-mode command session whose DPU service is absent or times out fails with
   an explicit bounded setup/connection error.
+- A selected-DPU socketless backend log shows mailbox attach without
+  `RemoteExecMapControlRegion()` and without opening
+  `/citus_remote_execution_control_v*`; completion publication advances only the
+  lifecycle-created completion mailbox, and the DPU completion-pull path observes
+  that mailbox by DMA.
+- A negative selected-DPU startup smoke that accidentally reaches the old
+  control-region attach must fail the stage; it is not acceptable to satisfy the
+  selected-DPU smoke by running the backend through old host-service control SHM.
 - The hidden experimental selector remains required, but command API acceptance
   evidence must be collected through the selected DPU path. SHM command success
   is only a DPU-off regression check.
@@ -1987,8 +2038,11 @@ than the earlier single "backend completion pull" bullet implied.
    response for `HOMER_PROGRESS_ACTION_DPU_COMPLETION_PUSH`; it must not revive
    the old host-process SHM completion path. For the first narrow selected-DPU
    SQL command smoke, terminal command completion should be returned through the
-   frontend `POLL_COMMAND_COMPLETION` response shape rather than inventing a
-   new host-visible completion mechanism.
+   frontend `POLL_COMMAND_COMPLETION` response shape only as a temporary
+   compatibility bridge. It is not the target hot path: selected-DPU command
+   execution should move to one command request plus one frontend completion
+   wait, because issuing repeated POLL requests over DPU DMA is unnecessary
+   latency and DMA traffic.
    Implementation progress: Stage 8B.14 landed the scheduler semantic bridge.
    `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMPLETION_PULL` now submits bounded
    backend-completion DMA pulls, accepts staged completions into selected-DPU
@@ -1998,15 +2052,167 @@ than the earlier single "backend completion pull" bullet implied.
    not-yet-complete command returns PENDING and a later poll receives the copied
    backend completion. Validation for this slice is compile/build only; the live
    selected-DPU command smoke remains Stage 8B.15.
-4. **Stage 8B.15: selected-DPU command smoke and negative no-fallback smoke.**
+4. **Stage 8B.15: response-publication correction and selected-DPU command
+   smoke.**
    After the engine and scheduler paths above land, remove the selected-DPU
    start/poll guards only for the narrow command-session path being validated.
+   Before accepting the smoke, replace the current same-action response body plus
+   `RESPONSE_READY` submit with a nonblocking two-phase DMA chain. The body DMA
+   completion callback should submit the response-ready publication DMA directly
+   as a DMA-chain continuation; this keeps latency low without spinning in the
+   submit action or waiting for another scheduler round to arm the publish task.
    Acceptance requires one real selected-DPU command whose request reaches the
    backend mailbox by DPU DMA, whose backend completion is pulled by DPU DMA, and
-   whose frontend-visible response is published by DPU DMA. A negative smoke must
-   prove that disabling or corrupting the backend-completion/frontend-response
-   DMA path fails boundedly instead of falling back to host SHM completion
+   whose frontend-visible response/completion is published by DPU DMA. A negative
+   smoke must prove that disabling or corrupting the backend-completion/frontend
+   publication path fails boundedly instead of falling back to host SHM completion
    polling.
+
+   Implementation finding from the first Stage 8B.15 attempt: submitting the
+   response body DMA and response-ready DMA back-to-back on the same ordered DOCA
+   context was not sufficient for the host frontend, which polls host memory, to
+   consume a coherent response under the current farnet setup
+   (`PCI_WR_ORDERING=force relaxed`). A temporary diagnostic gate that waited for
+   the response-body DMA completion before submitting the response-ready DMA
+   removed the stale/partially visible POLL response symptom. The production fix
+   must be the async callback-chained form above, not the diagnostic blocking
+   gate.
+
+   The same validation attempt then exposed a separate lifecycle blocker: the
+   spawned socketless backend still reached
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:653`
+   and tried to map the old host-process control SHM region
+   `/citus_remote_execution_control_v27`. The backend-spawn/open half of that
+   blocker has now been narrowed: traced validation showed
+   `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest()` publishing selected-DPU
+   mode, `ProcessSpawnRequestSlot()` launching the backend with channel mode 1,
+   and `ExecuteRemoteExecBackendCommand()` skipping the host-service control
+   region while mapping only `/citus_remote_exec_cmd_v13_*` and
+   `/citus_remote_exec_cpl_v13_*`. Keep that backend startup mode.
+
+   Stage 8B.15 still is not accepted. The next old-control-region dependency is
+   SQL result-sink allocation: row-producing commands call
+   `RemoteExecEnsureSessionResultQueue()`, which calls
+   `RemoteExecOpenServiceOwnedResultSink()` and still opens the old host-service
+   control region to allocate a service-owned tuple/result byte ring. The
+   pgbench wrapper reaches this through its `SELECT abalance` command. Selected-DPU
+   mode needs a result/payload queue path that does not ask the old host service
+   to allocate or publish result sinks.
+
+   Concrete implementation order for this blocker:
+
+   1. Extend the backend spawn/startup ABI with a small backend channel mode,
+      for example host-service SHM versus selected-DPU DMA, in
+      `remote_execution_backend_protocol.h`. Keep the extension explicit and
+      versioned by the existing protocol version check.
+   2. Have `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest()` set selected
+      DPU mode when it reserves a postmaster spawn slot, along with
+      `completionReadyBitmapEnabled = 0` and invalid service-session index.
+   3. Copy the mode through `ProcessSpawnRequestSlot()` into
+      `CitusRemoteExecBackendStartupData`.
+   4. Teach `ExecuteRemoteExecBackendCommand()` to branch on that mode: selected
+      DPU mode maps only the backend command/completion mailboxes and skips
+      `RemoteExecMapControlRegion()`, while host-service mode keeps the existing
+      behavior.
+   5. Guard normal backend cleanup for optional control-region mapping.
+   6. Add diagnostic logging/counters that make the selected-DPU backend startup
+      path visible in the smoke logs before retrying the full selected-DPU SQL
+      smoke.
+   7. Add the selected-DPU result-sink replacement before accepting the SQL smoke:
+      either export a lifecycle-created backend result byte ring in the TCP setup
+      descriptor set, or add an explicitly selected-DPU local result queue that is
+      visible to the DPU and published through backend completions. It must not
+      call `RemoteExecOpenServiceOwnedResultSink()` or any old service-owned
+      control-region request in selected-DPU mode.
+
+5. **Stage 8B.16: selected-DPU SQL result/payload queue replacement.**
+   This stage is required before full pgbench-style selected-DPU SQL validation.
+   The immediate failing path is:
+   `citus_remote_exec_pgbench_transaction()` ->
+   `RemoteExecPgbenchExecuteSql(... REMOTE_EXEC_SQL_RESULT_TUPLE ...)` ->
+   `RemoteExecBackendExecuteSqlCommand()` ->
+   `RemoteExecSqlDestStartup()` ->
+   `RemoteExecEnsureSessionResultQueue()` ->
+   `RemoteExecOpenServiceOwnedResultSink()` ->
+   `RemoteExecMapControlRegion()`. Replace that path for selected-DPU backends.
+
+   Implementation direction:
+
+   1. Treat the SQL result payload queue as a real tuple sink, not as a scalar
+      shortcut. `citus_remote_exec_pgbench_transaction()` currently requests
+      `REMOTE_EXEC_SQL_RESULT_TUPLE` for `SELECT abalance`; the selected-DPU path
+      must preserve that semantic and eventually stop depending on
+      `RemoteExecutionCommandCompletion.scalarInt64`.
+   2. Allocate the selected-DPU result byte ring eagerly with the command and
+      completion mailboxes during selected-DPU session lifecycle setup. Do not lazy
+      allocate it on the first row-producing command: lazy allocation would require
+      a second mmap export/import protocol after the DPU session is live.
+   3. Extend the TCP setup descriptor set with a result byte-ring descriptor. The
+      DPU imports it through the same setup message shape as the backend command
+      and completion mailboxes. The descriptor role should make it clear that this
+      is the backend-produced SQL result tuple sink.
+   4. Extend the backend spawn/startup metadata enough for the selected-DPU
+      socketless backend to map the pre-created result queue directly. The backend
+      should derive or receive the queue SHM name, slot count, slot capacity, and
+      persistent sink identity without consulting the old host-service control
+      region.
+   5. In selected-DPU backend mode, make `RemoteExecEnsureSessionResultQueue()`
+      choose the pre-created DPU-visible result queue path instead of
+      `RemoteExecOpenServiceOwnedResultSink()`. It should still call
+      `RemoteExecPrepareResultQueueGeneration()` for each row-producing command so
+      every command publishes a generation-local descriptor with the current
+      `startByteTail`.
+   6. Keep the existing tuple serialization machinery: `RemoteExecSqlDestStartup()`
+      opens or reuses an `OpenCitusTupleSink()` send handle, and
+      `RemoteExecSqlDestReceiveSlot()` appends ordinary tuple batches. Do not add a
+      scalar-only result receiver for pgbench.
+   7. Expose tuple-result metadata through the public frontend completion. Today
+      the backend completion includes `resultFlags`, `resultQueueDescriptor`, and
+      `resultTupleViewContract`, but `RemoteExecutionFillCommandCompletion()` only
+      copies scalar fields into `RemoteExecutionCommandCompletion`. Add the result
+      descriptor/contract to the public completion surface so frontend callers can
+      open the result tuple sink from the completed command.
+   8. Add a shared frontend result-drain API, adapting the existing
+      `homer_client.c` result-sink binding logic into the reusable Homer frontend
+      layer. The pgbench SQL-callable wrapper should use this API to keep one
+      persistent result-sink mapping for the command session, refresh only the
+      per-command generation/start-tail bookkeeping from each completed command,
+      borrow/read the one-column tuple, and release the borrowed tuple/batch.
+      It should not close/remap the result sink per command.
+   9. Remove the pgbench wrapper's dependence on
+      `RemoteExecutionCommandCompletion.scalarInt64`. If complete ABI cleanup is too
+      large for the same patch, leave lower-level scalar fields temporarily unused
+      and documented as obsolete, but do not use them for selected-DPU validation.
+   10. Add a negative validation where selected-DPU result queue setup is disabled
+       and the pgbench SELECT fails boundedly, rather than falling through to
+       `/citus_remote_execution_control_v27`.
+
+   Implementation slices:
+
+   1. **Frontend completion/result API slice.** Completed and validated on
+      June 30, 2026 for the existing non-DPU Homer path. The public
+      `RemoteExecutionCommandCompletion` now carries tuple-result metadata,
+      `RemoteExecutionFillCommandCompletion()` copies it, shared frontend helpers
+      bind/drain the command result tuple sink, and the pgbench wrapper reads
+      `SELECT abalance` by borrow/read/release instead of reading public scalar
+      completion fields. The result-sink mapping remains session-owned and is
+      not closed/remapped per command; only per-command generation/start-tail
+      bookkeeping is refreshed when the physical queue and tuple shape are
+      stable.
+   2. **Selected-DPU lifecycle result-ring slice.** Extend
+      `HomerFrontendDmaLifecycleMailboxes` and
+      `HomerFrontendDmaBuildDocaSetupDescriptors()` with one eagerly created SQL
+      result byte ring. Export/import it with the initial TCP setup. Validation:
+      the standalone TCP transport smoke should report the extra descriptor and
+      still pass command/completion setup.
+   3. **Selected-DPU backend mapping slice.** Extend the spawn/startup ABI and
+      teach `RemoteExecEnsureSessionResultQueue()` to bind the pre-created result
+      queue in selected-DPU mode. Validation: a row-producing selected-DPU SQL
+      command must not open `/citus_remote_execution_control_v27`.
+   4. **End-to-end tuple-result smoke slice.** Run selected-DPU `SELECT abalance`
+      through the pgbench wrapper and verify the frontend reads the returned
+      tuple from the result sink, not from scalar completion fields. This is the
+      acceptance gate for Stage 8B.16 and then Stage 8B.15 can be retried.
 
 ### Stage 8A — Completion/result push mechanism
 
@@ -2021,8 +2227,12 @@ Tasks:
 - Add explicit DPU-mode completion errors for missing imported mmap, stale bridge
   generation, or absent DPU completion publication.
 - Implement completion slot DMA write task owners.
-- Submit completion-body DMA writes followed immediately by ready
-  epoch/frontier publication-word DMA writes on the same ordered context.
+- Submit completion/response body DMA writes before ready epoch/frontier
+  publication-word DMA writes, but do not assume back-to-back submission is a
+  host-visible publication guarantee under forced relaxed PCIe write ordering.
+  For selected-DPU hot-path frontend completion publication, use the same async
+  two-phase DMA-chain rule as Stage 8B.15: body completion callback submits the
+  publication-word DMA, and publication completion retires the buffer.
 - Update host frontend polling to validate DPU-owned credit/completion lines.
 - Remove the selected-DPU completion dependency on host-process SHM completion
   mailboxes. The old mailbox code may remain for DPU-off mode, but DPU-mode
@@ -2031,10 +2241,11 @@ Tasks:
   completion became visible through DPU-written publication lines, not through
   the SHM completion mailbox.
 - The Stage 7B/8A "executed response pending DPU publication" queue is drained
-  with same-context response-body DMA writes followed by the response-ready
-  publication-word DMA write. Stage 8A must also own bounded queue retirement and
-  failure handling; the queue is not a
-  substitute for host-visible response publication.
+  with same-context response-body DMA writes followed by response-ready
+  publication-word DMA writes, but publication must be gated by response-body DMA
+  completion. Use callback-chained publication for the hot path; do not spin in
+  the submit action. Stage 8A must also own bounded queue retirement and failure
+  handling; the queue is not a substitute for host-visible response publication.
 - Treat Stage 8B promotion work as the completion replacement gate: selected-DPU
   completion polling must consume DPU-written completion/credit publication
   lines and must not use host-process SHM completion mailboxes after selection.
@@ -2048,9 +2259,11 @@ Acceptance:
 - Multi-state frontend completion sequence is observed in order.
 - Host never consumes a completion whose slot body is stale or partially written.
 - Split-context no-wait publication is rejected or gated.
-- Same-context body+publish test submits completion-body DMA tasks followed
-  immediately by one publication-word DMA task, with no PE drain in the submit
-  action; the host observes only the final publication word.
+- Same-context body+publish test validates the async two-phase chain: body DMA
+  task submitted first, PE drain retires body completion, the body completion
+  callback submits the publication-word DMA without calling `doca_pe_progress()`,
+  and the host observes only the final publication word after the body is
+  coherent.
 - In DPU mode, completion polling consumes only DPU-published completion/credit
   lines. A missing or invalid DPU completion path must return a DPU-path error,
   not poll the old SHM completion mailbox as a fallback.

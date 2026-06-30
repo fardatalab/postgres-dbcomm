@@ -540,10 +540,58 @@ Backend-spawn decision:
   `serviceSessionIndex = CITUS_REMOTE_EXEC_CONTROL_INVALID_SESSION_INDEX`. The
   DPU owns completion discovery by DMA, so there is no host service session table
   to index.
+- selected-DPU backend startup needs an explicit backend channel mode in
+  `CitusRemoteExecBackendSpawnRequest` and `CitusRemoteExecBackendStartupData`
+  in
+  `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h`.
+  The selected-DPU mode should not pass DOCA descriptors into the backend: the
+  backend is still a host PostgreSQL process and opens the lifecycle-created
+  POSIX command/completion mailboxes by the existing service-session-id naming
+  rule. The descriptors remain for the DPU service import path.
+- in selected-DPU backend mode, `ExecuteRemoteExecBackendCommand()` in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c`
+  must skip `RemoteExecMapControlRegion()` and leave
+  `RemoteExecBackendSessionState.controlRegion == NULL`. Completion publication
+  still writes the backend completion mailbox; `RemoteExecBackendMarkCompletionReady()`
+  becomes a no-op because `completionReadyBitmapEnabled == 0`, and the DPU
+  discovers completion epochs by DMA-reading the exported completion mailbox.
+- the backend normal-exit cleanup must also treat the control region as optional.
+  The error path already guards `controlRegion` and `controlFileDescriptor`; the
+  normal path should do the same so selected-DPU backends can exit without
+  unmapping a NULL control region or closing `-1`.
 - use a bounded wait for the postmaster spawn response. Do not invent a cancel
   protocol in this stage. If the wait times out, treat selected-DPU session setup
   as failed/fatal for that open attempt, tear down the DPU setup/mailboxes, and
   rely on operator/runtime cleanup if a late backend appears.
+- selected-DPU backend startup mode is necessary but not sufficient for SQL
+  command acceptance. Validation showed the backend can correctly skip the old
+  control-region attach and still later reach the same old control-region open
+  through SQL result-sink allocation. In selected-DPU mode,
+  `RemoteExecEnsureSessionResultQueue()` must not call
+  `RemoteExecOpenServiceOwnedResultSink()`, because that helper allocates result
+  queues by sending an old host-service control request.
+- result/payload queues for selected-DPU SQL should follow the same lifecycle
+  rule as command/completion mailboxes: host-local allocation and naming happen
+  in the lifecycle shim, descriptors are exported in the setup message, the DPU
+  imports them, and completions publish descriptor/frontier state through the DPU
+  completion path. Do not add a hidden host-service result-sink fallback for
+  selected-DPU mode.
+- SQL result payloads are tuple sinks, even for pgbench's one-column
+  `SELECT abalance` result. Do not add a selected-DPU scalar-only shortcut and do
+  not accept validation that depends on `RemoteExecutionCommandCompletion` scalar
+  fields. The wrapper should drain the tuple-result sink by borrowing, reading,
+  and releasing the returned tuple/batch while keeping the persistent result-sink
+  mapping alive until session close.
+- The first implementation slice for this decision landed on June 30, 2026:
+  `RemoteExecutionCommandCompletion` exposes tuple-result metadata through the
+  public frontend API, shared frontend helpers bind/drain command result tuple
+  sinks, and the pgbench wrapper no longer reads public scalar completion fields.
+  Lower-level wire/smoke scalar members are still transitional and should not be
+  used for selected-DPU acceptance.
+- selected-DPU result byte rings should be allocated eagerly during session
+  lifecycle setup. Lazy result-ring allocation would require a second DPU mmap
+  export/import path after the command session is live, and it would reintroduce
+  hot-path setup complexity into the first row-producing command.
 
 Completion-discovery decision:
 
@@ -576,22 +624,38 @@ Selected-DPU command-sequence decision:
 - the host frontend learns the assigned sequence through the normal DMA response
   publication for `CitusRemoteExecStartCommandResponse`; `commandSequence` is a
   response-body field, so there is no separate DMA just to return the sequence.
-  The response publication remains the same two-step DPU-to-host operation:
-  write the response body, then write the response-ready publication word.
+  The response publication remains a two-part DPU-to-host operation: write the
+  response body, then write the response-ready publication word. Under the
+  current farnet setup (`PCI_WR_ORDERING=force relaxed`), do not submit those two
+  tasks back-to-back and treat the second as a host-visible publication
+  guarantee. The selected-DPU hot path should use async two-phase DMA
+  publication: response-body completion callback submits the response-ready DMA
+  task, without calling `doca_pe_progress()` or running semantic service logic.
 - do not preserve the old host-process shared-memory response path for
   selected-DPU commands. That path is only the behavior being replaced: the
   current frontend waits for the local service to fill the control-slot response
   and then reads `response->commandSequence`.
+- repeated frontend `POLL_COMMAND_COMPLETION` requests are a temporary
+  compatibility bridge from the host-process Homer path, not the DPU target hot
+  path. Selected-DPU command execution should become one host-published command
+  request plus one host-local wait on a DPU-published frontend completion
+  mailbox/slot.
 - after backend-command DMA submission succeeds, the DPU service may enqueue the
-  corresponding frontend `START_COMMAND` response for the existing response-DMA
-  publication action before backend-command callbacks retire. This is allowed
-  only because backend-command publication and frontend response publication use
-  the same ordered command DMA context. Callback retirement remains resource
-  cleanup and fatal-error detection, not the semantic gate for response queuing.
+  corresponding frontend `START_COMMAND` response, but host-visible publication of
+  that response must follow the async two-phase body-completion-then-publish
+  rule above. Callback retirement remains resource cleanup and fatal-error
+  detection for unrelated tasks; only same-chain publication callbacks may submit
+  the next DMA task.
 - the backend-command DMA body byte count must come from the finalized
   `TupleSinkServiceLocalCommandRecordRdmaBytes()` result stored with the queued
   command. The default compact build writes the finalized command prefix; a
   non-compact diagnostic build can still request the fixed-size body.
+- later performance work should revisit PCIe write ordering. If the machine is
+  switched away from `PCI_WR_ORDERING=force relaxed`, or if per-MKey/non-relaxed
+  ordering is available for these host publication regions, re-test whether a
+  one-phase/single-DMA or back-to-back body-plus-publish shape is correct and
+  faster. Until then, correctness assumes force-relaxed ordering and uses the
+  two-phase DMA chain.
 
 The selected-DPU setup order for a command-capable session should be:
 
@@ -791,6 +855,9 @@ Before treating the design as ready for Homer integration:
 - queue-depth sweep must be repeated in the Homer-like grouped-control path
 - opt+flush sentinel policy must be measured against reliable completions and no `doca_pe_progress()` starvation
 - teardown must prove host memory is not unmapped while DPU tasks can still target it
+- selected-DPU SQL validation must include at least one row-producing command and
+  prove that result-sink setup does not call the old host-service control region
+  (`/citus_remote_execution_control_v27`)
 
 ## Cross-Links
 
