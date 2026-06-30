@@ -3132,3 +3132,118 @@ Remaining work after this slice:
 - Stage 8B.15 should then remove the selected-DPU start/poll command
   not-implemented guards only for the narrow selected-DPU SQL command smoke and
   add the positive plus negative no-fallback validation.
+
+## Stage 8B.13: Production Backend-Completion DMA Engine APIs
+
+Stage 8B.13 promotes the Stage 8B.12 backend-completion DMA smoke into a
+production-shaped engine API surface. The important change is that scheduler
+code no longer needs to call smoke-only functions or know the mailbox read
+sequence directly. It can ask the DMA engine to make bounded progress on
+backend-completion pulls, copy out staged completions that have arrived, and
+publish consumed credit after the completion has been accepted by service-side
+semantic code.
+
+Code changes:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:153`
+  adds `HomerDpuDmaStagedBackendCompletion`, the service-owned copy-out shape
+  that carries the pulled `CitusRemoteExecCommandCompletion`, descriptor
+  identity, completion epoch, and the observed mailbox publication/consumption
+  epochs.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:827`
+  adds `HomerDpuDmaSubmitBackendCompletionPulls()`. The function is bounded by
+  `maxTasks`, does not drain the DOCA PE itself, and first submits mailbox
+  control/header reads before later submitting completion-slot body reads for
+  mailboxes whose `publishedEpoch` has advanced beyond `consumedEpoch`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1852`
+  adds `HomerDpuDmaCopyNextStagedBackendCompletion()`, which copies one
+  completed backend completion body and its descriptor/epoch identity out of
+  the DMA engine's staging buffer.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1925`
+  adds `HomerDpuDmaSubmitBackendCompletionCreditPublication()`, which publishes
+  the accepted completion epoch back into the backend mailbox `consumedEpoch`.
+  This keeps completion acceptance and credit publication explicit for the
+  scheduler integration slice.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_tcp_transport_smoke.c:1020`
+  switches the backend-completion part of the TCP smoke from the Stage 8B.12
+  smoke-only functions to the production-shaped API sequence:
+  `HomerDpuDmaSubmitBackendCompletionPulls()`,
+  `HomerDpuDmaCopyNextStagedBackendCompletion()`, and
+  `HomerDpuDmaSubmitBackendCompletionCreditPublication()`.
+
+Implementation details that matter for the scheduler:
+
+- The production pull API is intentionally non-blocking at the scheduler level:
+  submission and DOCA PE draining are separate actions. The submission path may
+  enqueue up to `maxTasks` reads, but it does not spin waiting for completion.
+- Completion control/header reads that discover no new completion release their
+  temporary staging buffer immediately. This avoids an idle mailbox poll
+  pinning a control buffer until some unrelated future completion.
+- Completion DMA failures are still treated as fatal prototype bugs. This stage
+  does not add per-command recovery semantics.
+- The old Stage 8B.12 smoke-only functions remain available only for direct
+  smoke/debug use; scheduler code should use the production APIs above.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/bin/homer_dpu_tcp_transport_smoke.c
+sudo -n -u dbcomm make -j8 dpu-tcp-transport-smoke-bin
+sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+```
+
+The refreshed source bundle also compiled on the farnet1 DPU as
+`/tmp/homer_dpu_stage8b13/homer_dpu_tcp_transport_smoke`.
+
+Live validation on June 29, 2026:
+
+```sh
+# farnet1 DPU
+cd /tmp/homer_dpu_stage8b13
+./homer_dpu_tcp_transport_smoke --server \
+  --dev-pci 0000:03:00.0 \
+  --port 9735 \
+  --timeout-ms 20000
+
+# farnet1 host
+cd /data/dbcomm/citus-dbcomm
+./build/homer/homer_dpu_tcp_transport_smoke --client \
+  --host 10.10.1.201 \
+  --dev-pci 0000:21:00.0 \
+  --port 9735 \
+  --timeout-ms 20000 \
+  --expect-backend-command-publish \
+  --expect-response-publish \
+  --expect-backend-completion-pull
+```
+
+Observed result:
+
+- Host client received setup ack `generation=1 rings=3`.
+- Host observed backend command publication
+  `ready_seq=7001 published_epoch=7001`.
+- Host observed frontend response publication `state=4 command_seq=7001`.
+- Host observed DPU-written backend completion credit `consumed_epoch=1`.
+- DPU server reported
+  `server DMA backend command, response, and backend completion pull complete tasks=8`
+  and `homer_dpu_tcp_transport_smoke: ok`.
+- The final normal rebuild passed after the DOCA-enabled compile, so
+  `build/homer/citus_tuple_sink_service` was left in the default
+  `CPPFLAGS='-D_GNU_SOURCE'` shape.
+
+Remaining work after this slice:
+
+- Stage 8B.14 should consume `HomerDpuDmaStagedBackendCompletion` records from
+  the service scheduler path, validate selected-DPU command/session identity,
+  clear the one-command-in-flight state, and enqueue the existing frontend
+  poll/terminal response for DPU response publication.
+- Stage 8B.15 should then remove the selected-DPU start/poll command
+  not-implemented guards only for the narrow selected-DPU SQL command smoke and
+  add the positive plus negative no-fallback validation.

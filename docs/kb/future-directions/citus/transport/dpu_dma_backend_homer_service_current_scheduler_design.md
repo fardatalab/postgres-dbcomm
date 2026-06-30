@@ -1968,6 +1968,16 @@ than the earlier single "backend completion pull" bullet implied.
    into the DPU-owned staging queue before the consumed epoch is published back
    to the backend mailbox. Completion DMA failures remain fatal prototype bugs,
    not recoverable per-command errors.
+   Implementation progress: Stage 8B.13 landed
+   `HomerDpuDmaSubmitBackendCompletionPulls()`,
+   `HomerDpuDmaCopyNextStagedBackendCompletion()`, and
+   `HomerDpuDmaSubmitBackendCompletionCreditPublication()`. The TCP smoke now
+   exercises that production-shaped path instead of only smoke-only helper
+   functions. The live farnet1 host-DPU validation on June 29, 2026 again
+   observed setup `rings=3`, backend-command publication
+   `ready_seq=7001 published_epoch=7001`, frontend response publication
+   `state=4 command_seq=7001`, backend completion `consumed_epoch=1`, and DPU
+   server completion with eight DMA tasks.
 3. **Stage 8B.14: scheduler semantic integration.** Wire
    `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMPLETION_PULL` so it consumes staged
    completion facts under `grantVector.maxItems`, validates
