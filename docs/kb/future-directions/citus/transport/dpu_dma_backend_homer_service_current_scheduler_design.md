@@ -2224,10 +2224,17 @@ than the earlier single "backend completion pull" bullet implied.
       command must not open `/citus_remote_execution_control_v27`.
 
       Implementation progress: code for the backend mapping portion landed with
-      the lifecycle result-ring slice, but the acceptance validation is still
-      pending. Keep this sub-slice open until a selected-DPU row-producing SQL
-      smoke proves that `RemoteExecEnsureSessionResultQueue()` uses the
-      lifecycle-created queue and does not reach the old control-region path.
+      the lifecycle result-ring slice. A follow-up validation found and fixed two
+      adjacent implementation bugs: selected-DPU result queue memory must be
+      distinguished from tuple-contract/generation binding, and repeated physical
+      backend-completion observations after terminal POLL response staging must
+      be treated as stale duplicates while consumed-credit DMA retires. The
+      selected-DPU smoke no longer fails at the old result-sink fallback, but the
+      sub-slice remains open because the next retry failed earlier with a
+      64-byte DOCA command/control memcpy I/O error and a timeout waiting for
+      command sequence 2 to reach backend-started state. Do not treat Stage
+      8B.16 as accepted until that DMA/import-lifetime failure is understood and
+      a row-producing selected-DPU SQL smoke passes.
    4. **End-to-end tuple-result smoke slice.** Run selected-DPU `SELECT abalance`
       through the pgbench wrapper and verify the frontend reads the returned
       tuple from the result sink, not from scalar completion fields. This is the

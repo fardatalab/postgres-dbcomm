@@ -3664,6 +3664,62 @@ Validation caveats:
   for the selected-DPU smoke. The next selected-DPU validation step must deploy or
   build the DPU service binary on the DPU, then rerun the row-producing SQL smoke
   and verify it never opens `/citus_remote_execution_control_v27`.
+
+Follow-up selected-DPU validation stop on June 30, 2026:
+
+- A fresh DPU-side build was staged under `/tmp/citus-dbcomm-stage8b16` on the
+  DPU using `/usr/bin/pg_config` and `--without-libcurl` because the DPU does not
+  have the `/data/dbcomm/pg-citus` install prefix or libcurl development linkage.
+  The DPU `service-bin` and `service-dpu-dma-smoke` build passed; the smoke
+  printed `homer_service_dpu_dma_smoke: ok`.
+- The first selected-DPU row-producing SQL retry no longer opened the old
+  `/citus_remote_execution_control_v27` path, but it failed with
+  `selected-DPU backend result queue is not available`. Root cause: selected-DPU
+  startup marked the lifecycle-created result byte ring as `resultQueueReady`
+  before any tuple contract existed, so the first row-producing command treated
+  the zeroed `resultTupleViewContract` as a shape change and cleared the queue.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:141`
+  now adds `resultTupleViewContractReady` to separate "queue memory is mapped"
+  from "this queue is bound to the current tuple shape/generation". The selected-DPU
+  backend binds the tuple contract lazily on the first row-producing command,
+  keeps the lifecycle-created queue mapping, and does not fall back to
+  `RemoteExecOpenServiceOwnedResultSink()`.
+- The next retry progressed past result-queue binding, then hit repeated DPU
+  service diagnostics:
+
+  ```text
+  DPU backend-completion accept failed: backend completion does not match selected-DPU in-flight command
+  completion_sequence=3 completion_epoch=4 in_flight=0 in_flight_sequence=0
+  ```
+
+  Root cause: the DMA engine can keep a staged backend completion visible until
+  the consumed-epoch credit DMA retires, but
+  `HomerServiceDpuStageOnePollCompletionResponse()` clears
+  `backendCompletionReady` as soon as it queues the terminal POLL response.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35418`
+  now treats a repeated backend completion for an already-completed command
+  sequence as a stale physical duplicate instead of a semantic mismatch. It does
+  not accept future or unknown completions.
+- After those two fixes, the selected-DPU SQL retry still did not pass. It failed
+  with:
+
+  ```text
+  ERROR: timed out waiting for Homer DPU command to reach backend-started state
+  DETAIL: session_id=2237133557402275 command_sequence=2 timeout_ms=10000
+  ```
+
+  The DPU service emitted:
+
+  ```text
+  homer DPU DMA: memcpy task failed: Input/Output Operation Failed task_kind=1 workload=1 task_slot=0 import=0 ring=0 ... host_bytes=64
+  tuple-sink service: DPU DMA PE drain failed:
+  ```
+
+  The DPU service then had to be killed after the failed smoke. Treat this as an
+  unexpected Stage 8B.16 validation blocker, not as accepted result-ring
+  validation. The next investigation should focus on the 64-byte command/control
+  DMA task failure and imported host-memory lifetime/state around the command-start
+  path before attempting more semantic scheduler changes.
 - `/data/dbcomm/citus-dbcomm/src/backend/distributed/worker/homer/remote_exec_pgbench_transaction.c:379`
   now drains `SELECT abalance` through the tuple-result sink instead of
   `RemoteExecutionCommandCompletion.scalarInt64`.
