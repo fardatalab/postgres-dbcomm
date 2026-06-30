@@ -3933,10 +3933,134 @@ homer DPU DMA: DOCA context state 3 -> 0
 tuple-sink service: DPU DMA PE drain failed:
 ```
 
-That failure happens in the frontend command-pull DMA path before the Stage
-8B.17 backend-completion event queue can be exercised by real SQL. The next
-implementation slice should debug the 64-byte command/control DMA task failure:
-verify the exported frontend bridge mapping lifetime, descriptor offset/length
-for ring `0`, DOCA mmap import identity, task local/remote buffer construction,
-and whether the host frontend tears down the export while DPU command-pull DMA
-is still in flight on error paths.
+Stage 8B.18 corrected the interpretation of this failure: `task_kind=1` is
+`HOMER_DPU_DMA_TASK_KIND_GROUPED_CONTROL_READ` in
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:50`,
+not command-pull. The I/O failure was a grouped-control discovery read against a
+host export that the frontend had already destroyed during normal selected-DPU
+channel cleanup.
+
+## Stage 8B.18: Stale Grouped-Control Teardown After Host Export Cleanup
+
+This slice fixes the DOCA `Input/Output Operation Failed` that appeared after a
+selected-DPU SQL command completed. The failure was not caused by source/dest
+buffer reuse in the command-pull path. It was caused by the DPU service still
+holding an imported one-shot frontend bridge mmap after the host frontend had
+finished the command, observed the response, and destroyed the exported DOCA
+mmaps in
+`/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1277`.
+The scheduler later issued another blind grouped-control read to ring `0`; DOCA
+correctly completed that task with `DOCA_ERROR_IO_FAILED` because the remote
+export was gone.
+
+Implemented in `/data/dbcomm/citus-dbcomm`:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:258`
+  adds `HomerDpuDmaHostMmapImport.staleTeardownPending`, so a setup whose host
+  export has disappeared can be skipped by new grouped-control discovery
+  submissions while existing callbacks retire.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3260`
+  adds `HomerDpuDmaSetupHasLiveTaskSlots()`. Stale setup import removal is
+  delayed until no non-free task slot still references the same bridge/client
+  setup. This avoids clearing import/ring runtime metadata that later task
+  callbacks still need to release in-flight flags and local buffer ownership.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3682`
+  splits retirement into `HomerDpuDmaRetireTaskSlotInternal()`, preserving the
+  old fatal behavior for real DMA failures while allowing the narrow
+  stale-grouped-control case to count as a failed callback without poisoning the
+  whole engine.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3917`
+  adds `HomerDpuDmaEnsureClassContextRunning()`. A stale grouped-control failure
+  moves the DOCA context through STOPPING back to IDLE; the next real submission
+  restarts it before allocating/submitting the next DMA task.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3963`
+  adds `HomerDpuDmaRetireStaleGroupedControlImport()`, which handles only
+  `DOCA_ERROR_IO_FAILED` for
+  `HOMER_DPU_DMA_TASK_KIND_GROUPED_CONTROL_READ`. Command pull, response
+  publish, backend-command publish, backend-completion pull, and consumed-credit
+  DMA task failures remain fatal correctness bugs.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:694`
+  skips imports marked `staleTeardownPending` in blind grouped-control submit
+  work, preventing repeated reads to a known-dead host export while teardown is
+  waiting for older task callbacks.
+
+Validation on June 30, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format --force HEAD -- \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c
+
+git diff --check -- \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c
+
+sudo -n -u dbcomm make -j8 \
+  service-bin dpu-tcp-transport-smoke-bin \
+  CPPFLAGS='-D_GNU_SOURCE'
+
+rsync -az --delete --exclude build/ --exclude .git/ --exclude configure~ \
+  /data/dbcomm/citus-dbcomm/ dpu:/tmp/citus-dbcomm-stage8b16/
+
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16 && \
+  ./configure --without-libcurl PG_CONFIG=/usr/bin/pg_config && \
+  make -j8 service-bin dpu-tcp-transport-smoke-bin CPPFLAGS="-D_GNU_SOURCE"'
+
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16 && \
+  env HOMER_SERVICE_ENABLE_DPU_DMA=1 \
+      HOMER_SERVICE_ENABLE_DOCA_DMA=1 \
+      HOMER_SERVICE_DOCA_DEV_PCI=0000:03:00.0 \
+      HOMER_SERVICE_DPU_SETUP_BIND_HOST=0.0.0.0 \
+      HOMER_SERVICE_DPU_SETUP_PORT=9727 \
+      ./build/homer/citus_tuple_sink_service \
+      > /tmp/homer_dpu_service_stage8b16_live.log 2>&1 &'
+
+for i in $(seq 1 10); do
+  sudo -n -u dbcomm env \
+    HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.201 \
+    HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
+    HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
+    timeout 45 /data/dbcomm/pg-citus/bin/psql \
+      -h /tmp -p 5432 -U dbcomm -X postgres \
+      -v ON_ERROR_STOP=1 -At \
+      -c "SET citus.enable_experimental_tuple_sink_routing = on;
+          SET citus.enable_experimental_homer_dpu_frontend = on;
+          SELECT pg_catalog.citus_remote_exec_pgbench_transaction(1, 1, 1, 1, 1);"
+done
+```
+
+Observed result:
+
+- The host build passed; warnings were the existing DOCA
+  experimental/deprecated API warnings.
+- The DPU staged tree had to be reconfigured with
+  `./configure --without-libcurl PG_CONFIG=/usr/bin/pg_config` because its
+  generated makefiles still pointed at host-only paths
+  `/data/dbcomm/citus-dbcomm` and `/data/dbcomm/pg-citus/bin/pg_config`.
+- Ten independent selected-DPU SQL calls succeeded against the updated DPU
+  service. The returned scalar values advanced from `4` through `13`, proving
+  the previous one-success-then-setup-timeout behavior was gone for repeated
+  independent setup cycles.
+- The DPU service log showed the expected lifecycle pattern for each call:
+
+  ```text
+  homer DPU DMA: grouped-control read lost host export; marking stale setup teardown ...
+  homer DPU DMA: stale setup imports fully retired; removing bridge_generation=1 ...
+  homer DPU DMA: DOCA context state 2 -> 3
+  homer DPU DMA: DOCA context state 3 -> 0
+  homer DPU DMA: DOCA context state 0 -> 2
+  ```
+
+  The old fatal lines `homer DPU DMA: memcpy task failed: Input/Output
+  Operation Failed ...` followed by `tuple-sink service: DPU DMA PE drain
+  failed:` did not appear during this validation.
+
+Residual issue discovered during validation:
+
+- A single SQL statement that invokes
+  `citus_remote_exec_pgbench_transaction(...)` through `generate_series(1, 100)`
+  timed out at `command_sequence=8` with
+  `timed out waiting for Homer DPU command to reach backend-started state`.
+  A later standalone single selected-DPU call succeeded against the same service,
+  and the ten independent setup-cycle run succeeded, so this is not the same
+  stale grouped-control DOCA I/O failure. Treat it as a separate repeated-command
+  sequencing/lifecycle bug for a later slice.

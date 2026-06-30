@@ -2324,6 +2324,43 @@ than the earlier single "backend completion pull" bullet implied.
    - row-producing selected-DPU SQL drains the tuple result sink by
      borrow/read/release and does not read the obsolete public scalar shortcut.
 
+7. **Stage 8B.18: stale grouped-control export teardown correction.**
+   This corrective slice is now implemented and validated for repeated
+   independent setup cycles. The 64-byte `Input/Output Operation Failed` observed
+   during the Stage 8B.17 retry was initially suspected to be command-pull buffer
+   lifetime, but code inspection corrected that: `task_kind=1` is
+   `HOMER_DPU_DMA_TASK_KIND_GROUPED_CONTROL_READ` in
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:50`.
+   The DPU service was issuing a blind grouped-control discovery read against a
+   one-shot host bridge export after the host frontend had already completed the
+   selected-DPU command and destroyed its exported DOCA mmaps.
+
+   The implemented policy is narrow:
+
+   1. Treat only `DOCA_ERROR_IO_FAILED` on grouped-control discovery reads as an
+      expected stale setup-export teardown condition.
+   2. Mark the import `staleTeardownPending`, skip new grouped-control reads to
+      that import, and delay import destruction until no live task slot still
+      references the same bridge/client setup.
+   3. Keep command pull, response publish, backend-command publish,
+      backend-completion pull, and consumed-credit DMA failures fatal.
+   4. Restart the DOCA context from IDLE on the next real submission after the
+      stale grouped-control failure moves the context through STOPPING to IDLE.
+
+   Validation on June 30, 2026: ten independent selected-DPU SQL calls succeeded
+   against the DPU service on `10.10.1.201:9727`. The DPU log showed the expected
+   stale grouped-control teardown, import removal, context STOPPING/IDLE, and
+   next-submission restart pattern without `tuple-sink service: DPU DMA PE drain
+   failed`.
+
+   Remaining issue from the same validation session: one SQL statement that calls
+   `citus_remote_exec_pgbench_transaction(...)` through `generate_series(1, 100)`
+   timed out at `command_sequence=8`. A standalone single selected-DPU call and
+   ten independent setup cycles succeeded afterward, so this is a separate
+   repeated-command sequencing/lifecycle problem, not the stale grouped-control
+   DOCA I/O failure. Do not fold that bug into the grouped-control teardown
+   policy.
+
 ### Stage 8A — Completion/result push mechanism
 
 Deliverable: DPU DMA writes to host completion/result mailboxes.
