@@ -615,6 +615,54 @@ Completion-discovery decision:
   response path. Do not remove the selected-DPU command guards before this
   sequence has positive and negative no-fallback evidence.
 
+Selected-DPU backend completion event decision:
+
+- a backend completion mailbox record is an ordered command-state event, not
+  necessarily a terminal completion. It may carry `STARTED`, `COMPLETED`, or
+  `FAILED`. `STARTED` is semantically meaningful because row-producing commands
+  use it to publish result-sink readiness and result metadata before terminal
+  completion.
+- mirror the existing host-process service semantics in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`.
+  `TupleSinkServiceConsumeCompletionMailbox()` consumes one physical mailbox
+  epoch, copies the command-state event into session state, publishes
+  push-visible `STARTED` or terminal events, and only terminal states drive
+  command-finished cleanup. `TupleSinkServicePublishClientCommandCompletion()`
+  preserves the ordered frontend-visible event stream where a row-producing
+  command can publish `STARTED` with a result descriptor and later publish
+  `COMPLETED` or `FAILED`.
+- the selected-DPU path must therefore treat `STARTED` as nonterminal but not
+  ignorable. Accepting a `STARTED` event must not clear `commandInFlight`, must
+  not clear `inFlightCommandSequence`, and must not allow the next command for
+  that session to be staged. Only a terminal `COMPLETED` or `FAILED` event may
+  clear the one-command-in-flight state after the frontend-visible terminal
+  response has been queued or published according to the current response
+  publication state machine.
+- validate the semantic command sequence from
+  `CitusRemoteExecCommandCompletion.commandSequence` against the selected-DPU
+  session's in-flight command sequence. Do not compare the physical backend
+  mailbox epoch to the semantic command sequence. The mailbox epoch is only the
+  consumed-credit frontier to write back to the backend mailbox.
+- replace the single selected-DPU `backendCompletionReady` slot with an ordered
+  frontend completion-event queue or equivalent per-session event stream. It
+  must be able to hold `STARTED` and terminal events for the same command in
+  order. The temporary `POLL_COMMAND_COMPLETION` compatibility bridge may pop
+  from this queue, but it must not clear all command state when it returns a
+  nonterminal `STARTED`.
+- replace any engine "peek/copy staged completion" API with claim/borrow
+  ownership transfer. A staged backend completion should become service-visible
+  exactly once. The claim handle should identify the local staging buffer, import
+  and descriptor identity, bridge/ring generation, service session, physical
+  mailbox epoch, and command sequence. A borrowed staging buffer may avoid a copy
+  as long as its lifetime is pinned until the service releases the claim or until
+  response publication no longer needs that memory.
+- keep separate state for service-visible readiness, claimed local-buffer
+  ownership, and consumed-credit DMA. A claimed event may still need a
+  `consumedEpoch` DMA write in flight, but it must no longer be counted as an
+  unclaimed ready event. Observing the same physical completion epoch again after
+  it has been claimed is a service/engine bug to diagnose or fail fatally; do
+  not treat it as a harmless duplicate.
+
 Selected-DPU command-sequence decision:
 
 - the DPU service owns per-session `commandSequence` assignment for
@@ -852,6 +900,12 @@ Before treating the design as ready for Homer integration:
 - command ring pull must pass long 64 B stress with multiple sessions and no stale/torn records
 - completion/result DMA write must pass host-consume stress with early-publish negative controls
 - split-context variants must fail or pass exactly as expected: no-wait split should remain rejected, completion-gated split should pass
+- selected-DPU backend completion handling must preserve the existing
+  push-visible event stream: a row-producing command may produce `STARTED` with
+  result metadata and then one terminal event. `STARTED` must not clear
+  one-command-in-flight state, the physical mailbox epoch must not be compared to
+  the semantic command sequence, and each physical backend completion epoch must
+  be claimed exactly once before consumed-credit DMA publication.
 - queue-depth sweep must be repeated in the Homer-like grouped-control path
 - opt+flush sentinel policy must be measured against reliable completions and no `doca_pe_progress()` starvation
 - teardown must prove host memory is not unmapped while DPU tasks can still target it

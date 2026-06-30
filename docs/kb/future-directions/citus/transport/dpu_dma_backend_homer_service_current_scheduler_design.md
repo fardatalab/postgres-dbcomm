@@ -1757,7 +1757,9 @@ The Stage 8B command scheduler should be implemented as these bounded actions:
    It must not mutate a host backend mailbox and must not publish a frontend
    response. Its output is a service-owned queue entry carrying the local command
    record, command sequence, backend-command descriptor identity, frontend
-   response owner, and expected backend completion epoch.
+   response owner, selected-DPU in-flight command state, and the backend
+   completion mailbox descriptor/credit frontier needed to consume later
+   physical completion epochs.
 4. **Backend command mailbox DMA write**: add a new action such as
    `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMMAND_PUBLISH`. It submits the DMA
    writes that replace `TupleSinkServicePublishLocalCommand()`'s direct CPU
@@ -1776,12 +1778,18 @@ The Stage 8B command scheduler should be implemented as these bounded actions:
    backend-completion facts show `publishedEpoch > lastConsumedEpoch` for a
    selected-DPU session. It DMA-reads the next
    `CitusRemoteExecCommandCompletion` slot, validates protocol version, command
-   sequence, and expected epoch, stages the completion in DPU/service memory,
-   and submits or queues a DMA write of the backend completion mailbox
+   sequence, descriptor identity, generation, and physical mailbox epoch, stages
+   the completion in DPU/service memory, and submits or queues a DMA write of
+   the backend completion mailbox
    `consumedEpoch` after the completion body has been safely copied. It replaces
    the service's direct completion consumption in
    `TupleSinkServiceConsumeCompletionMailbox()` at
    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:18473`.
+   The physical mailbox epoch is not the semantic command sequence. The
+   selected-DPU service must validate
+   `CitusRemoteExecCommandCompletion.commandSequence` against the selected
+   session's in-flight command sequence, and must use the mailbox epoch only as
+   the consumed-credit frontier written back to the backend.
    The implementation should not try to hide this inside the existing
    grouped-control read path: `CitusRemoteExecLocalCompletionMailbox` at
    `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:215`
@@ -1913,7 +1921,7 @@ Implementation substeps for this scheduler contract:
    backend-command publish queue, backend-completion staging queue, and frontend
    response pending queue. Queue entries must include the original
    `CitusRemoteExecControlSlot` request/response owner, backend mailbox
-   descriptor identity, command sequence, expected backend completion epoch, and
+   descriptor identity, command sequence, backend-completion credit frontier, and
    generation tokens. The existing Stage 7 dispatch/execute queues may be reused
    only if they are renamed or documented as frontend-command and
    pending-response queues; do not let `TupleSinkServiceDispatchLocalControlSlot()`
@@ -1922,9 +1930,9 @@ Implementation substeps for this scheduler contract:
    backend-command publish queue. The queue now carries the pulled frontend
    response owner, DPU-owned command sequence, compact
    `CitusRemoteExecLocalCommandRecord`, backend command mailbox descriptor ref,
-   and expected backend completion epoch. Stage 8B.11 consumes that queue through
-   the real backend-command DMA submission path and then queues the frontend
-   START response for response publication. Backend-completion staging is still
+   and selected-DPU in-flight state. Stage 8B.11 consumes that queue through the
+   real backend-command DMA submission path and then queues the frontend START
+   response for response publication. Backend-completion staging is still
    pending.
 6. **Backend command publish API**: add a DPU engine API such as
    `HomerDpuDmaSubmitBackendCommandPublication()`. It submits one command record
@@ -2224,21 +2232,97 @@ than the earlier single "backend completion pull" bullet implied.
       command must not open `/citus_remote_execution_control_v27`.
 
       Implementation progress: code for the backend mapping portion landed with
-      the lifecycle result-ring slice. A follow-up validation found and fixed two
-      adjacent implementation bugs: selected-DPU result queue memory must be
-      distinguished from tuple-contract/generation binding, and repeated physical
-      backend-completion observations after terminal POLL response staging must
-      be treated as stale duplicates while consumed-credit DMA retires. The
-      selected-DPU smoke no longer fails at the old result-sink fallback, but the
-      sub-slice remains open because the next retry failed earlier with a
-      64-byte DOCA command/control memcpy I/O error and a timeout waiting for
-      command sequence 2 to reach backend-started state. Do not treat Stage
-      8B.16 as accepted until that DMA/import-lifetime failure is understood and
-      a row-producing selected-DPU SQL smoke passes.
+      the lifecycle result-ring slice. A follow-up validation found and fixed
+      the result-queue binding bug where selected-DPU result queue memory was not
+      cleanly distinguished from tuple-contract/generation binding. It also
+      exposed a separate selected-DPU backend-completion state-machine bug:
+      repeated physical backend-completion observation is not a harmless
+      duplicate to suppress. The engine/service boundary must make staged
+      backend-completion ownership single-claim, and the selected-DPU semantic
+      layer must handle `STARTED` as a push-visible nonterminal event instead of
+      clearing command in-flight state. The selected-DPU smoke no longer fails at
+      the old result-sink fallback, but the sub-slice remains open because the
+      next retry failed earlier with a 64-byte DOCA command/control memcpy I/O
+      error and a timeout waiting for command sequence 2 to reach
+      backend-started state. Do not treat Stage 8B.16 as accepted until that
+      DMA/import-lifetime failure is understood and a row-producing selected-DPU
+      SQL smoke passes after the Stage 8B.17 completion-event correction.
    4. **End-to-end tuple-result smoke slice.** Run selected-DPU `SELECT abalance`
       through the pgbench wrapper and verify the frontend reads the returned
       tuple from the result sink, not from scalar completion fields. This is the
       acceptance gate for Stage 8B.16 and then Stage 8B.15 can be retried.
+
+6. **Stage 8B.17: selected-DPU backend completion event-stream correction.**
+   This is the next required corrective slice before another row-producing SQL
+   acceptance attempt. The bug exposed by validation is that the selected-DPU
+   path treated a backend completion mailbox record as if it were always the
+   terminal command completion. That is not the existing Homer contract. In the
+   host-process service,
+   `TupleSinkServiceConsumeCompletionMailbox()` consumes one physical mailbox
+   epoch and `TupleSinkServicePublishClientCommandCompletion()` may publish a
+   push-visible `STARTED` event with result metadata before a later terminal
+   `COMPLETED` or `FAILED` event for the same command.
+
+   Implementation direction:
+
+   1. Replace the selected-DPU single `backendCompletionReady` state with an
+      ordered frontend completion-event queue or equivalent per-session event
+      stream. The stream must preserve `STARTED` and terminal events for the
+      same `commandSequence` in mailbox order.
+   2. In `HomerServiceDpuAcceptOneBackendCompletion()`, validate
+      `completion.commandSequence` against the selected session's
+      `inFlightCommandSequence`. Do not compare the physical backend mailbox
+      epoch to the semantic command sequence. Store the physical epoch only as
+      the consumed-credit frontier for the backend completion mailbox.
+   3. On `STARTED`, enqueue or stage the frontend-visible event, including
+      result-sink metadata, but keep `commandInFlight = true` and preserve
+      `inFlightCommandSequence`. A `STARTED` event must not make the session
+      eligible to stage the next command.
+   4. On terminal `COMPLETED` or `FAILED`, enqueue or stage the terminal
+      frontend-visible event. Clear selected-DPU one-command-in-flight state only
+      after the terminal event has been accepted into the response-publication
+      state machine, or keep a terminal-pending state until DMA publication
+      retires if the implementation needs that stronger ownership.
+   5. In the temporary `POLL_COMMAND_COMPLETION` compatibility bridge,
+      `HomerServiceDpuStageOnePollCompletionResponse()` should pop the next
+      queued event for the requested command. Returning a nonterminal `STARTED`
+      must not clear all backend-completion or in-flight state.
+   6. Replace `HomerDpuDmaCopyNextStagedBackendCompletion()`-style peek/copy
+      behavior with a claim/borrow API. The engine should expose each staged
+      physical backend-completion epoch to the service exactly once, for example
+      through a `HomerDpuDmaClaimNextBackendCompletion()` handle that pins the
+      local staging buffer until the service releases it. Borrowing the staging
+      memory is preferred over copying when the response-publication path can
+      respect the borrow lifetime.
+   7. Split engine state into at least three concepts: service-visible
+      unclaimed staged completion, service-claimed local-buffer ownership, and
+      consumed-credit DMA in flight. A claimed event may still need
+      `consumedEpoch` DMA publication, but it must no longer appear in ready
+      facts. If the same physical completion epoch is surfaced twice after
+      claim, fail a debug assertion or fatal diagnostic instead of suppressing it
+      as a duplicate.
+   8. Keep completion DMA failures fatal for this prototype. The Stage 8B.16
+      retry also saw a 64-byte DOCA command/control memcpy I/O error; that must
+      be debugged as an invalid source/destination/buffer-lifetime problem, not
+      converted into a command-level retry policy.
+
+   Acceptance:
+
+   - a selected-DPU row-producing command observes `STARTED` with result metadata
+     and then one terminal event in order, or explicitly validates an existing
+     prearmed-result optimization that suppresses only redundant `STARTED`
+     without losing result metadata.
+   - `STARTED` never clears `commandInFlight`, never clears
+     `inFlightCommandSequence`, and never allows a second command for the same
+     session to be staged before terminal completion.
+   - the service validates semantic `commandSequence` independently from the
+     physical mailbox epoch; a test or diagnostic must catch any path that uses
+     `completionEpoch == commandSequence` as a correctness check.
+   - each backend completion mailbox epoch is claimed once, credited once, and
+     not re-observed by scheduler facts while consumed-credit DMA is still in
+     flight.
+   - row-producing selected-DPU SQL drains the tuple result sink by
+     borrow/read/release and does not read the obsolete public scalar shortcut.
 
 ### Stage 8A — Completion/result push mechanism
 

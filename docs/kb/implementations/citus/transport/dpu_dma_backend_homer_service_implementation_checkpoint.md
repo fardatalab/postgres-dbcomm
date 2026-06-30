@@ -98,9 +98,16 @@ backend spawn/startup, and makes selected-DPU socketless backends bind that
 pre-created tuple sink instead of opening the old host-service control region.
 The standalone host-only frontend DMA smoke covers the new lifecycle fields, and
 the existing non-DPU Homer pgbench smoke still passes after the backend protocol
-bump. Full selected-DPU SQL runtime validation is still pending because the DPU
-environment currently lacks the project tree/install prefix needed to run the
-DPU-side service binary for this stage.
+bump. Follow-up selected-DPU runtime validation built a temporary DPU-side
+service and progressed past the old result-sink fallback, but Stage 8B.16 is
+still not accepted. The next required corrective slice is Stage 8B.17: selected
+DPU backend completion records must be handled as an ordered command-state event
+stream, where `STARTED` is push-visible and nonterminal, and the DMA engine must
+transfer staged backend-completion ownership by claim/borrow rather than
+allowing repeated physical observation while consumed-credit DMA retires. The
+latest selected-DPU retry also exposed a 64-byte DOCA command/control memcpy
+I/O error that must be debugged as a DMA address/buffer-lifetime issue before
+claiming row-producing SQL acceptance.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -3692,16 +3699,23 @@ Follow-up selected-DPU validation stop on June 30, 2026:
   completion_sequence=3 completion_epoch=4 in_flight=0 in_flight_sequence=0
   ```
 
-  Root cause: the DMA engine can keep a staged backend completion visible until
-  the consumed-epoch credit DMA retires, but
-  `HomerServiceDpuStageOnePollCompletionResponse()` clears
-  `backendCompletionReady` as soon as it queues the terminal POLL response.
-- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35418`
-  now treats a repeated backend completion for an already-completed command
-  sequence as a stale physical duplicate instead of a semantic mismatch. It does
-  not accept future or unknown completions.
-- After those two fixes, the selected-DPU SQL retry still did not pass. It failed
-  with:
+  Root cause after review: this was not a harmless duplicate. It was a
+  selected-DPU command-state bug. The current path can treat a backend completion
+  mailbox record as terminal-only, clear `commandInFlight` too early, and
+  compare the physical mailbox epoch with the semantic command sequence. A
+  row-producing command can legitimately produce a `STARTED` event with result
+  metadata before a later terminal event for the same command, so the selected
+  DPU path must mirror the existing host-service event stream.
+- The next fix should replace
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1869`
+  peek/copy behavior with a claim/borrow API for staged backend completions, and
+  should replace the single selected-DPU
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35418`
+  completion-ready shortcut with an ordered frontend completion-event queue.
+  Re-observing the same physical backend completion epoch after claim should be
+  a fatal diagnostic or debug assertion, not duplicate suppression.
+- After the result-queue binding fix and the interim duplicate-suppression
+  experiment, the selected-DPU SQL retry still did not pass. It failed with:
 
   ```text
   ERROR: timed out waiting for Homer DPU command to reach backend-started state
