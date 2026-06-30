@@ -3247,3 +3247,98 @@ Remaining work after this slice:
 - Stage 8B.15 should then remove the selected-DPU start/poll command
   not-implemented guards only for the narrow selected-DPU SQL command smoke and
   add the positive plus negative no-fallback validation.
+
+## Stage 8B.14: Scheduler Backend-Completion Semantics
+
+Stage 8B.14 wires backend-completion DMA results into the current service
+scheduler semantics. The stage still does not enable the public selected-DPU
+frontend API; that remains the Stage 8B.15 runtime smoke. The important
+implementation boundary is now in place: backend completion DMA is accepted into
+DPU-owned selected-session state, and frontend `POLL_COMMAND_COMPLETION`
+requests are answered through the existing DPU response publication queue rather
+than the old host-process SHM completion mailbox.
+
+Code changes:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:533`
+  extends `HomerServiceDpuSelectedSessionState` with the in-flight command kind
+  and flags plus a copied backend completion. This is the selected-DPU semantic
+  state that replaces the old host-service `TupleSinkServiceSessionState`
+  completion fields for this path.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35017`
+  adds `HomerServiceDpuFindSelectedSession()` so completion and poll paths can
+  require an existing selected-DPU session instead of silently creating state for
+  unexpected completions.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35364`
+  adds `HomerServiceDpuAcceptOneBackendCompletion()`. It copies one staged
+  backend completion from the DMA engine, validates service session, command
+  sequence, epoch, protocol, and command kind against the selected-session
+  one-command-in-flight state, submits backend-mailbox `consumedEpoch` credit,
+  and only then records the completion in selected-session state.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35464`
+  adds `HomerServiceDpuStageOnePollCompletionResponse()`. It consumes a pulled
+  frontend `POLL_COMMAND_COMPLETION` request, queues a pending DPU response, and
+  returns either a PENDING completion while the backend command is still in
+  flight or the copied terminal backend completion once available.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35601`
+  updates the older staged-command fallback so it will not consume selected-DPU
+  `START_COMMAND` or `POLL_COMMAND_COMPLETION` slots if scheduler ordering grants
+  that fallback before the selected-DPU actions.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35789`
+  fixes the DPU candidate builder to compute `pendingResponseFreeSlots` before
+  it gates backend-command publication. The previous ordering left this value at
+  zero when the backend-command publish candidate was considered.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:37393`
+  replaces the `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMPLETION_PULL` stub with a
+  bounded executor. It may submit backend-completion DMA pulls, accept already
+  staged backend completions, and stage frontend poll responses; it does not
+  call `doca_pe_progress()`.
+
+Semantic decisions:
+
+- Completion acceptance is gated by successful submission of the backend
+  mailbox consumed-epoch DMA write, not by the later PE callback. A repeated
+  observation of the same staged backend completion before that credit retires
+  is treated as a duplicate observation and ignored rather than as a fatal
+  mismatch.
+- The frontend poll slot is not held open while waiting for the backend. If the
+  backend completion is not ready, the DPU response path returns a PENDING
+  `CitusRemoteExecCommandCompletion`; the frontend can issue another poll. This
+  follows the existing polling API and avoids parking host-visible response
+  slots inside the service.
+- A selected-DPU session cannot accept a new frontend `START_COMMAND` while it
+  has either an in-flight command or an unconsumed terminal backend completion.
+  This preserves the one-command-at-a-time invariant that the current frontend
+  command API already assumes.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- src/backend/distributed/utils/homer/tuple_sink_service_process.c
+sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make -B -j8 service-bin client-bin \
+  CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_DMA_WITH_DOCA'
+sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+git diff --check --cached -- src/backend/distributed/utils/homer/tuple_sink_service_process.c
+```
+
+Observed result:
+
+- The normal service/client build passed.
+- The forced DOCA-enabled service/client build passed. It emitted only the
+  known DOCA experimental/deprecation warnings for `doca_task_submit_ex()`,
+  `doca_dma_set_ordered_completions()`, and DOCA buffer-inventory helpers.
+- The final forced normal rebuild passed so
+  `build/homer/citus_tuple_sink_service` was left in the default
+  `CPPFLAGS='-D_GNU_SOURCE'` shape.
+- No live selected-DPU command runtime validation was claimed in this stage.
+  Stage 8B.15 must remove the public frontend not-implemented guards for the
+  narrow selected-DPU SQL command path and run the positive/negative no-fallback
+  smoke.
+
+Remaining work after this slice:
+
+- Stage 8B.15 should enable the narrow selected-DPU frontend start/poll command
+  path, run the real host-DPU command smoke, and verify that disabling the DPU
+  response/credit path fails instead of silently using the SHM fallback.

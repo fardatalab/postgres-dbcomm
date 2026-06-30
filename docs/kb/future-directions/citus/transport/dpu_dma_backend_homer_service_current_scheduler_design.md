@@ -1989,6 +1989,15 @@ than the earlier single "backend completion pull" bullet implied.
    SQL command smoke, terminal command completion should be returned through the
    frontend `POLL_COMMAND_COMPLETION` response shape rather than inventing a
    new host-visible completion mechanism.
+   Implementation progress: Stage 8B.14 landed the scheduler semantic bridge.
+   `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMPLETION_PULL` now submits bounded
+   backend-completion DMA pulls, accepts staged completions into selected-DPU
+   session state after consumed-epoch credit submission, and stages frontend
+   `POLL_COMMAND_COMPLETION` responses for the existing DPU completion-push
+   action. The frontend poll slot is not held while waiting for the backend; a
+   not-yet-complete command returns PENDING and a later poll receives the copied
+   backend completion. Validation for this slice is compile/build only; the live
+   selected-DPU command smoke remains Stage 8B.15.
 4. **Stage 8B.15: selected-DPU command smoke and negative no-fallback smoke.**
    After the engine and scheduler paths above land, remove the selected-DPU
    start/poll guards only for the narrow command-session path being validated.
