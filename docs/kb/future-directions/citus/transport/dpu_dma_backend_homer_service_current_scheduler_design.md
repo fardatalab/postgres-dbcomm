@@ -2453,6 +2453,51 @@ than the earlier single "backend completion pull" bullet implied.
       until a deliberate crash-recovery policy exists, but it must not be part of
       the accepted steady path.
 
+   Enforcement mechanism:
+
+   - The DMA engine owns the teardown correctness invariant; scheduler ordering is
+     not sufficient. Each imported setup needs an explicit lifecycle state such
+     as `ACTIVE`, `CLOSING`, and `CLOSED`.
+   - Every submit path must require `import->state == ACTIVE` before allocating
+     or submitting a DOCA task. A teardown request transitions the import to
+     `CLOSING`, and from that point all grouped-control, command-pull,
+     backend-completion-pull, payload, response, and credit-publication submit
+     actions must skip or reject that import without touching host memory.
+   - Every DOCA task owner already identifies its import through the owner
+     metadata consumed by
+     `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3190`.
+     Stage 8B.21 should add per-import in-flight accounting: increment before a
+     submitted task becomes visible to DOCA, decrement only in the centralized
+     retirement path at
+     `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3682`.
+   - Callbacks for a `CLOSING` import are retirement-only. They may free task
+     handles/bufs and decrement counters, but they must not enqueue ready refs,
+     publish host-visible state, or schedule follow-on semantic work. If normal
+     teardown observes unfinished command/response work that would require a
+     semantic completion, treat that as a teardown-ordering bug until explicit
+     cancellation semantics are designed.
+   - PE draining remains a normal scheduler-granted action. Teardown must not spin
+     inside the close path waiting for completions; it should keep scheduling
+     bounded `DPU_PE_DRAIN` work while per-import or global in-flight counts are
+     nonzero.
+   - Add a separate DPU teardown-finalize action/fact: a closing import is
+     finalizable only when `import->inflightTaskCount == 0`. Only that action may
+     destroy DPU-side imported mmap/descriptors and send the teardown ack to the
+     host.
+   - The task-slot scan in
+     `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3254`
+     should become a debug assertion/check against the per-import counter, not
+     the production gate.
+
+   Required invariant:
+
+   ```text
+   ACTIVE permits new DMA task submission.
+   CLOSING forbids new submission and permits retirement only.
+   CLOSING && inflightTaskCount == 0 permits DPU import removal and teardown ack.
+   The host may destroy exported DOCA mmaps only after receiving teardown ack.
+   ```
+
    Acceptance: closing a selected-DPU pgbench client/session produces an explicit
    teardown request and ack, DPU logs show import quiesce before host mmap
    destruction, and no grouped-control read to the closed import reaches
