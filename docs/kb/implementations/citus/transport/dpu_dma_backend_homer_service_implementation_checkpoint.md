@@ -4064,3 +4064,26 @@ Residual issue discovered during validation:
   and the ten independent setup-cycle run succeeded, so this is not the same
   stale grouped-control DOCA I/O failure. Treat it as a separate repeated-command
   sequencing/lifecycle bug for a later slice.
+
+Design correction after the Stage 8B.18 validation discussion:
+
+- The nonfatal stale grouped-control handler is a transitional guardrail for the
+  current one-shot setup lifetime. It is not the target selected-DPU teardown
+  protocol. The next plan stages in
+  `/data/dbcomm/postgres-citus/docs/kb/future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md`
+  require an explicit teardown/quiesce/ack path before the host destroys exported
+  DOCA mmaps; after that, `DOCA_ERROR_IO_FAILED` during normal teardown should be
+  fatal during validation.
+- The selected-DPU compatibility loop in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1040`
+  still issues `POLL_COMMAND_COMPLETION` control requests while waiting for a
+  command to reach `STARTED` or terminal state. That is not the target DPU hot
+  path; the frontend should wait on the host-visible completion mailbox that the
+  DPU publishes by DMA.
+- The three-DMA backend-command publication in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1173`
+  is also transitional. For selected-DPU mode, the plan is to remove slot-local
+  `readySeq` semantics and use two DMA tasks: command record body followed by
+  mailbox `publishedEpoch` as the final publication gate. A single-DMA
+  body+publish write is intentionally not the target under the current
+  `PCI_WR_ORDERING=force relaxed` machine setup.

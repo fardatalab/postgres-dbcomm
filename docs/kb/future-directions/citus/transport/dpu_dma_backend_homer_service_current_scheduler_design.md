@@ -2361,6 +2361,103 @@ than the earlier single "backend completion pull" bullet implied.
    DOCA I/O failure. Do not fold that bug into the grouped-control teardown
    policy.
 
+8. **Stage 8B.19: remove selected-DPU compatibility poll requests.**
+   This is the next selected-DPU command-path cleanup after the completion event
+   stream is present. The selected-DPU frontend currently preserves the original
+   public `START_COMMAND` contract by looping inside
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1040`
+   and issuing repeated `POLL_COMMAND_COMPLETION` request/response cycles through
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1081`.
+   That loop is transitional and must not be the DPU hot path.
+
+   Target design:
+
+   1. Keep the external API contract that `START_COMMAND` returns only after the
+      backend has reached `STARTED` or a terminal state.
+   2. Satisfy that contract by waiting on the host-visible completion/response
+      mailbox that the DPU writes by DMA, not by posting new
+      `POLL_COMMAND_COMPLETION` control requests.
+   3. The wait is a local host-memory wait/poll over a DPU-published completion
+      event epoch/state word. It may spin for now, but it must not allocate or
+      publish another frontend control request for the same command.
+   4. `POLL_COMMAND_COMPLETION` can remain as a compatibility path for old
+      non-DPU/peer protocol shapes until those are cleaned up, but selected-DPU
+      command validation must assert that no poll requests are generated on the
+      measured command path.
+
+   Acceptance: a selected-DPU pgbench command reaches `STARTED`/terminal by one
+   frontend `START_COMMAND` publication plus DPU DMA completion publication.
+   Diagnostic counters or logs must prove the selected-DPU path did not submit
+   `POLL_COMMAND_COMPLETION` request slots.
+
+9. **Stage 8B.20: reduce selected-DPU backend-command publication to two DMA
+   tasks.**
+   The current selected-DPU backend-command publication in
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1173`
+   submits three DMA tasks: command record body, slot-local `readySeq`, and
+   mailbox `publishedEpoch`. This mirrors the existing host/RDMA backend ABI,
+   where `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:422`
+   waits for `readySeq == expectedCommandSequence`. For selected-DPU mode this is
+   too expensive and redundant.
+
+   Target design:
+
+   1. Use two DMA tasks for selected-DPU backend command delivery: record body
+      first, mailbox `publishedEpoch` second.
+   2. The final `publishedEpoch` DMA is the publication gate and must be submitted
+      on the same ordered command DMA context after the record-body DMA, with the
+      final task using `DOCA_TASK_SUBMIT_FLAG_FLUSH`.
+   3. Do not use a single large DMA task for the publication word under the
+      current farnet setup because `PCI_WR_ORDERING=force relaxed` means the host
+      CPU could observe the publication word before earlier bytes in that same
+      write are safely consumable.
+   4. Remove `readySeq` from the selected-DPU backend command semantics. The
+      field may remain for existing host-process/RDMA paths until those ABIs are
+      separately simplified, but selected-DPU backend startup/dispatch should
+      validate command readiness from mailbox `publishedEpoch` plus the copied
+      command record's `commandSequence`/metadata.
+
+   Acceptance: selected-DPU backend-command publication uses exactly two DOCA DMA
+   submissions per command before later batching/coalescing work. The backend no
+   longer waits on slot-local `readySeq` for selected-DPU mode, and validation
+   runs under `PCI_WR_ORDERING=force relaxed`.
+
+10. **Stage 8B.21: explicit selected-DPU setup teardown and DMA quiesce.**
+   Stage 8B.18 made a grouped-control `DOCA_ERROR_IO_FAILED` recoverable only so
+   the current prototype could survive one-shot host mmap destruction. That is
+   not the target lifecycle. Normal selected-DPU teardown must prevent stale
+   exports from being read in the first place.
+
+   Target design:
+
+   1. Add an explicit selected-DPU teardown operation over the setup/lifecycle
+      control channel. The host identifies the `bridgeGeneration` and
+      `clientInstanceId` being closed before destroying any exported DOCA mmap.
+   2. On teardown request, the DPU marks the import closing and immediately stops
+      submitting new grouped-control, command-pull, completion-pull, payload, or
+      credit-publication work for every descriptor in that import.
+   3. The DPU drains already-submitted tasks for the import through normal
+      scheduler-granted PE progress. No callback may publish new readiness or
+      host-visible state after the import is closing.
+   4. Replace the current task-slot scan with per-import in-flight accounting
+      before making this path performance-relevant. The scan in
+      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3254`
+      is a transitional guardrail, not the final hot/lifecycle design.
+   5. Once the per-import in-flight count reaches zero, the DPU removes imported
+      mmaps/descriptors and sends a teardown ack. Only after that ack may the host
+      call `doca_mmap_destroy()` in
+      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1277`.
+   6. After this stage, `DOCA_ERROR_IO_FAILED` on grouped-control read during
+      normal teardown is a bug and should be fatal during validation. The Stage
+      8B.18 nonfatal stale handler may remain only as an abnormal-crash diagnostic
+      until a deliberate crash-recovery policy exists, but it must not be part of
+      the accepted steady path.
+
+   Acceptance: closing a selected-DPU pgbench client/session produces an explicit
+   teardown request and ack, DPU logs show import quiesce before host mmap
+   destruction, and no grouped-control read to the closed import reaches
+   `DOCA_ERROR_IO_FAILED`.
+
 ### Stage 8A — Completion/result push mechanism
 
 Deliverable: DPU DMA writes to host completion/result mailboxes.
