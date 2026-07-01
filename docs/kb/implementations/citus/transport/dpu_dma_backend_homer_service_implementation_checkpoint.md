@@ -4087,3 +4087,137 @@ Design correction after the Stage 8B.18 validation discussion:
   mailbox `publishedEpoch` as the final publication gate. A single-DMA
   body+publish write is intentionally not the target under the current
   `PCI_WR_ORDERING=force relaxed` machine setup.
+
+## Stage 8B.21: Explicit TCP Teardown And DPU DMA Quiesce
+
+Stage 8B.21 replaces the accepted steady-path interpretation of stale
+grouped-control `DOCA_ERROR_IO_FAILED` with an explicit close handshake. The
+Stage 8B.18 stale handler still exists as abnormal/crash-path scaffolding, but
+normal selected-DPU close now asks the DPU to quiesce and remove imported host
+mmaps before the host destroys its exported DOCA mmaps.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_comch_abi.h:219`
+  adds `HomerDpuComchBuildCloseHeader()`. The close request deliberately reuses
+  the fixed 128-byte setup header shape with `messageKind =
+  HOMER_DPU_COMCH_MESSAGE_CLOSE`, `bridgeGeneration`, and `clientInstanceId`, so
+  the existing TCP reader can parse the message kind after one fixed header
+  read.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:571`
+  now sends the close handshake from `HomerFrontendDmaCloseControlChannel()`
+  before `HomerFrontendDmaCleanupDocaSetup()` destroys host DOCA mmaps. The
+  blocking cold-path send/read lives in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1683`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c:39`
+  adds `HOMER_SERVICE_DPU_SETUP_TCP_CLIENT_WAITING_CLOSE_DRAIN`. The TCP setup
+  server accepts the close request, marks imports closing, then holds the TCP
+  connection until the DMA engine reports the setup identity drained. The drain
+  and finalization check is in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c:475`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3490`
+  adds `HomerDpuDmaBeginHostMmapImportTeardown()`, which transitions all imports
+  for the setup identity from active to closing and stops new DMA submissions.
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3548`
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3587`
+  implement drained/finalize checks.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3358`
+  adds `HomerDpuDmaImportCanSubmit()`. Current submit/discovery paths check it
+  before touching descriptors or host memory. Closing imports stay allocated so
+  callbacks can retire their owners, but they are no longer submit-capable.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3364`
+  and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3372`
+  maintain per-import in-flight accounting. Task creation increments next to the
+  existing class-level in-flight counters; centralized retirement in
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3875`
+  decrements after the task owner has released ring/runtime state.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_tcp_transport_smoke.c:765`
+  extends the host-DPU TCP smoke with `HomerTcpSmokeSendClose()`, and
+  `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_tcp_transport_smoke.c:816`
+  keeps the DPU-side smoke server alive until a second ack proves close
+  finalization completed.
+
+Validation on June 30, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format --force HEAD -- \
+  src/include/distributed/homer/homer_dpu_comch_abi.h \
+  src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/homer_frontend_dma.c \
+  src/bin/homer_dpu_tcp_transport_smoke.c
+
+sudo -n -u dbcomm make -j8 \
+  service-bin dpu-tcp-transport-smoke-bin \
+  CPPFLAGS='-D_GNU_SOURCE'
+
+rsync -az \
+  src/include/distributed/homer/homer_dpu_comch_abi.h \
+  dpu:/tmp/citus-dbcomm-stage8b16/src/include/distributed/homer/homer_dpu_comch_abi.h
+rsync -az \
+  src/backend/distributed/utils/homer/homer_frontend_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c \
+  dpu:/tmp/citus-dbcomm-stage8b16/src/backend/distributed/utils/homer/
+rsync -az \
+  src/bin/homer_dpu_tcp_transport_smoke.c \
+  dpu:/tmp/citus-dbcomm-stage8b16/src/bin/homer_dpu_tcp_transport_smoke.c
+
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16 && \
+  make -j8 dpu-tcp-transport-smoke-bin service-bin CPPFLAGS="-D_GNU_SOURCE"'
+
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16; \
+  (timeout 30s ./build/homer/homer_dpu_tcp_transport_smoke \
+    --server --dev-pci 0000:03:00.0 --host 0.0.0.0 \
+    --port 19727 --timeout-ms 20000 \
+    > /tmp/homer_dpu_tcp_close_server.log 2>&1 &)'
+
+./build/homer/homer_dpu_tcp_transport_smoke \
+  --client --host 10.10.1.201 --dev-pci 0000:21:00.0 \
+  --port 19727 --timeout-ms 20000 \
+  --expect-backend-command-publish \
+  --expect-response-publish \
+  --expect-backend-completion-pull
+```
+
+Observed result:
+
+- Host and DPU builds passed. The warnings were the existing DOCA
+  experimental/deprecated API warnings.
+- The host client completed setup, backend-command DMA publication,
+  response-body plus response-ready DMA publication, backend-completion pull plus
+  consumed-credit publication, and close ack:
+
+  ```text
+  client received TCP setup ack generation=1 rings=3 imported_bytes=283
+  client observed DMA backend command publication ready_seq=7001 published_epoch=7001
+  client observed DMA response publication state=4 command_seq=7001
+  client observed DMA backend completion consumed_epoch=1
+  client received TCP close ack generation=1
+  homer_dpu_tcp_transport_smoke: ok
+  ```
+
+- The DPU server log showed explicit quiesce instead of stale grouped-control
+  failure:
+
+  ```text
+  homer DPU DMA: setup import closing bridge_generation=1 client_instance_id=1 mmap_export_id=1 inflight=0
+  server DMA backend command, response, and backend completion pull complete tasks=8
+  homer_dpu_tcp_transport_smoke: ok
+  ```
+
+Current limitations:
+
+- The close handshake was validated through the standalone TCP/DMA smoke, not
+  yet through installed PostgreSQL selected-DPU SQL. That is intentional for
+  this slice because the selected-DPU frontend still has the separate Stage
+  8B.19 compatibility poll-loop issue.
+- The Stage 8B.18 stale grouped-control handler remains in code for abnormal
+  host crash or missing-close diagnostics. Once the selected-DPU SQL path
+  consistently uses this close handshake, normal teardown validation should fail
+  if `DOCA_ERROR_IO_FAILED` appears on grouped-control reads.

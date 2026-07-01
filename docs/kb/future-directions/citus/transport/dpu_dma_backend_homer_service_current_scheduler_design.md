@@ -2428,6 +2428,14 @@ than the earlier single "backend completion pull" bullet implied.
    not the target lifecycle. Normal selected-DPU teardown must prevent stale
    exports from being read in the first place.
 
+   Implementation status: the first explicit TCP close/quiesce/ack path landed
+   after Stage 8B.18. The implemented code adds a close request over the setup
+   TCP socket, a DPU import lifecycle state, per-import in-flight task counters,
+   close-drain waiting in the TCP setup server, and a TCP/DMA smoke validation
+   that covers setup, command/response/completion DMA, and close ack. The
+   implementation details and evidence are recorded in
+   `/data/dbcomm/postgres-citus/docs/kb/implementations/citus/transport/dpu_dma_backend_homer_service_implementation_checkpoint.md`.
+
    Target design:
 
    1. Add an explicit selected-DPU teardown operation over the setup/lifecycle
@@ -2480,10 +2488,12 @@ than the earlier single "backend completion pull" bullet implied.
      inside the close path waiting for completions; it should keep scheduling
      bounded `DPU_PE_DRAIN` work while per-import or global in-flight counts are
      nonzero.
-   - Add a separate DPU teardown-finalize action/fact: a closing import is
-     finalizable only when `import->inflightTaskCount == 0`. Only that action may
-     destroy DPU-side imported mmap/descriptors and send the teardown ack to the
-     host.
+   - The initial implementation keeps close-finalize inside the setup TCP
+     progress action: a close connection enters `WAITING_CLOSE_DRAIN`, normal
+     PE-drain actions retire DMA tasks, and a later bounded setup TCP progress
+     call finalizes once `import->inflightTaskCount == 0`. If teardown starts to
+     contend with hotter work, split this into a separate scheduler fact/action
+     without changing the engine-owned invariant.
    - The task-slot scan in
      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3254`
      should become a debug assertion/check against the per-import counter, not
@@ -2501,7 +2511,9 @@ than the earlier single "backend completion pull" bullet implied.
    Acceptance: closing a selected-DPU pgbench client/session produces an explicit
    teardown request and ack, DPU logs show import quiesce before host mmap
    destruction, and no grouped-control read to the closed import reaches
-   `DOCA_ERROR_IO_FAILED`.
+   `DOCA_ERROR_IO_FAILED`. The standalone TCP/DMA smoke has passed this gate; the
+   installed PostgreSQL selected-DPU SQL path should use the same close handshake
+   once the separate Stage 8B.19 poll-loop cleanup is addressed.
 
 ### Stage 8A — Completion/result push mechanism
 
