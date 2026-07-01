@@ -111,6 +111,13 @@ completion event line. Stage 8B.20/8B.21 then validates repeated row-producing
 selected-DPU SQL calls and fixes close/reopen state leakage by resetting
 service-side selected-session semantic state after DMA import drain and before
 descriptor destruction.
+Stage 9.1 adds the first synthetic payload byte-ring pull smoke: the TCP setup
+smoke exports a `PAYLOAD_BYTE_RING` descriptor, the DPU discovers its
+host-published frontier through grouped-control DMA, pulls a wrapped 64-byte
+payload as two DMA reads, and publishes consumed-head credit back to the host
+with the same two-phase body-plus-publication DMA chain used for DPU-to-host
+response/event lines. This validates the byte-ring mechanics but does not yet
+wire real basebackup or production payload streams into selected-DPU mode.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -4450,3 +4457,107 @@ Validation pitfall:
 - Avoid `pkill -f './build/homer/citus_tuple_sink_service'` inside an SSH command
   string; it can match and kill the SSH wrapper itself. Use exact service PIDs or
   `pgrep -x citus_tuple_sin` when cleaning the DPU process.
+
+## Stage 9.1: Synthetic Payload Byte-Ring Pull Smoke
+
+Stage 9.1 starts the payload/basebackup migration with an engine-level synthetic
+byte-ring test instead of switching real basebackup first. The goal is to
+validate the DPU-pull byte-ring mechanics, wrap splitting, and DPU-to-host
+consumed-credit publication against the same host-DPU TCP setup smoke used by
+Stage 8B.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c`
+  adds DPU-local byte-stream staging buffers, a local DOCA mmap for those
+  buffers, byte-ring task owner metadata, and three task kinds:
+  `BYTE_RING_PULL`, `BYTE_RING_CREDIT_BODY`, and `BYTE_RING_CREDIT_PUBLISH`.
+- `HomerDpuDmaSubmitByteRingSmokePull()` submits one contiguous host-to-DPU byte
+  DMA read from an accepted `PAYLOAD_BYTE_RING` frontier. The helper
+  intentionally rejects a single wrap-crossing range; the smoke splits wrap into
+  two DMA reads.
+- `HomerDpuDmaCopyByteRingSmokeBuffer()` copies the completed staged segment and
+  releases the local byte-stream buffer. This is smoke scaffolding, not the final
+  basebackup payload queue API.
+- `HomerDpuDmaSubmitByteRingConsumedHeadSmokePublication()` writes
+  `HomerDpuBridgeDpuCreditLine` body fields first and uses the body completion
+  callback to submit the one-word `publishedCreditEpoch` DMA with
+  `DOCA_TASK_SUBMIT_FLAG_FLUSH`. The semantic owner frontier for both credit
+  tasks is the consumed head, not `consumedHead + DMA copy bytes`.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_dpu_tcp_transport_smoke.c` now exports
+  four descriptors: frontend control slot, backend command mailbox, backend
+  completion mailbox, and one synthetic `PAYLOAD_BYTE_RING`. The payload ring
+  contains a generated 64-byte record that wraps a 128-byte ring at absolute
+  offsets `96..160`.
+- The smoke client waits for the DPU credit line by polling only
+  `publishedCreditEpoch`, then validates `consumedHead == completedTail == 160`
+  and the ring identity echoes.
+
+Important implementation finding:
+
+- The byte-ring smoke exposed a grouped-control staging bug.
+  `HomerDpuDmaSubmitOneGroupedControlRead()` was not reassigning
+  `owner.u.groupedControl.localBufferIndex` after task-slot retirement reset the
+  owner. Concurrent grouped-control reads could therefore reuse staging buffer 0
+  and validate the wrong cache line. The fix assigns the grouped-control staging
+  buffer from the current task-slot index at submit time. This matters for all
+  multi-ring grouped-control polling, not just payload byte rings.
+
+Validation on July 1, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format --force HEAD -- \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/bin/homer_dpu_tcp_transport_smoke.c
+sudo -n -u dbcomm make -j8 service-bin dpu-tcp-transport-smoke-bin CPPFLAGS='-D_GNU_SOURCE'
+
+rsync -az src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  dpu:/tmp/citus-dbcomm-stage8b16/src/backend/distributed/utils/homer/
+rsync -az src/bin/homer_dpu_tcp_transport_smoke.c \
+  dpu:/tmp/citus-dbcomm-stage8b16/src/bin/
+ssh dpu "cd /tmp/citus-dbcomm-stage8b16 && \
+  make -j8 service-bin dpu-tcp-transport-smoke-bin CPPFLAGS='-D_GNU_SOURCE'"
+
+ssh dpu "cd /tmp/citus-dbcomm-stage8b16 && \
+  ./build/homer/homer_dpu_tcp_transport_smoke \
+    --server --dev-pci 0000:03:00.0 --host 0.0.0.0 \
+    --port 19727 --timeout-ms 30000"
+
+./build/homer/homer_dpu_tcp_transport_smoke \
+  --client --host 10.10.1.201 --dev-pci 0000:21:00.0 \
+  --port 19727 --timeout-ms 30000 \
+  --expect-backend-command-publish \
+  --expect-response-publish \
+  --expect-backend-completion-pull \
+  --expect-byte-ring-pull
+```
+
+Observed accepted output:
+
+```text
+client received TCP setup ack generation=1 rings=4 imported_bytes=282
+client observed DMA backend command publication published_epoch=7001
+client observed DMA response publication state=4 command_seq=7001
+client observed DMA backend completion consumed_epoch=1
+client observed DMA byte-ring consumed_head=160 completed_tail=160
+client received TCP close ack generation=1
+homer_dpu_tcp_transport_smoke: ok
+
+server DMA backend command, response, backend completion, and byte-ring pull complete tasks=13
+homer_dpu_tcp_transport_smoke: ok
+```
+
+Remaining Stage 9 work:
+
+- Replace synthetic payload generation with real selected-DPU byte-stream
+  producers.
+- Add production scheduler actions for byte-ring pull windows and contiguous
+  completion-frontier retirement instead of smoke-only copy-out helpers.
+- Wire basebackup/result payload streams to publish host byte-ring frontiers and
+  reject missing/stale selected-DPU setup instead of falling back to host-process
+  SHM queues.
+- Add payload/basebackup counters for host-published frontiers, submitted pulls,
+  completed contiguous bytes, and consumed-head DMA publications.

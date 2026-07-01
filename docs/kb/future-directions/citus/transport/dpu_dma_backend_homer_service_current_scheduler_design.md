@@ -2768,6 +2768,12 @@ Acceptance:
   generated records, DPU pulls only bytes at or below the accepted frontier,
   callbacks advance the completed contiguous frontier, and consumed-head
   publication happens only after semantic release.
+  Implementation progress: Stage 9.1 has passed this synthetic gate for a
+  wrapped 64-byte payload over the host-DPU TCP setup smoke. The accepted run
+  validates grouped-control discovery of a `PAYLOAD_BYTE_RING`, two host-to-DPU
+  payload DMA reads for wrap split, and two-phase DPU-to-host consumed-credit
+  publication. Real selected-DPU basebackup/result byte-stream integration,
+  production pull-window scheduling, and payload counters remain Stage 9 work.
 - A DPU-mode payload/basebackup stream whose DPU setup is missing, stale, or
   generation-mismatched fails explicitly before payload publication; it must not
   switch the stream back to local SHM queues.
