@@ -2528,6 +2528,14 @@ than the earlier single "backend completion pull" bullet implied.
       validate command readiness from mailbox `publishedEpoch` plus the copied
       command record's `commandSequence`/metadata.
 
+   Implementation status on July 1, 2026: the two-task publication path is
+   implemented in
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1380`.
+   The selected-DPU backend read path in
+   `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:404`
+   now waits on mailbox `publishedEpoch` instead of slot-local `readySeq` and
+   fatals if `publishedEpoch` skips the expected command sequence.
+
    Acceptance: selected-DPU backend-command publication uses exactly two DOCA DMA
    submissions per command before later batching/coalescing work. The backend no
    longer waits on slot-local `readySeq` for selected-DPU mode, and validation
@@ -2562,11 +2570,19 @@ than the earlier single "backend completion pull" bullet implied.
       before making this path performance-relevant. The scan in
       `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3254`
       is a transitional guardrail, not the final hot/lifecycle design.
-   5. Once the per-import in-flight count reaches zero, the DPU removes imported
-      mmaps/descriptors and sends a teardown ack. Only after that ack may the host
-      call `doca_mmap_destroy()` in
-      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1277`.
-   6. After this stage, `DOCA_ERROR_IO_FAILED` on grouped-control read during
+   5. Once the per-import in-flight count reaches zero, the DPU must finalize
+      service-side semantic state for every selected-DPU session owned by the
+      closing setup identity before destroying imported descriptors. This is
+      separate from physical DMA quiesce: command sequence, in-flight command,
+      backend-completion event queue, pending backend-command publication,
+      pending frontend-response publication, and staged dispatch state all belong
+      to the service scheduler and can outlive the imported mmap unless reset
+      explicitly.
+   6. Only after semantic close finalization and import destruction may the DPU
+      send a teardown ack. Only after that ack may the host call
+      `doca_mmap_destroy()` in
+      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1304`.
+   7. After this stage, `DOCA_ERROR_IO_FAILED` on grouped-control read during
       normal teardown is a bug and should be fatal during validation. The Stage
       8B.18 nonfatal stale handler may remain only as an abnormal-crash diagnostic
       until a deliberate crash-recovery policy exists, but it must not be part of
@@ -2605,6 +2621,19 @@ than the earlier single "backend completion pull" bullet implied.
      call finalizes once `import->inflightTaskCount == 0`. If teardown starts to
      contend with hotter work, split this into a separate scheduler fact/action
      without changing the engine-owned invariant.
+   - Close finalization must call a scheduler-owned semantic reset before the DMA
+     engine destroys descriptors. The implementation uses the TCP close-finalize
+     callback in
+     `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c:475`,
+     maps the closing `(bridgeGeneration, clientInstanceId)` to descriptor
+     `serviceSessionId` values through
+     `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3801`,
+     and clears selected-session state in
+     `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34835`.
+     The reset must fail, not silently discard work, if any matching command is
+     still in flight, any backend-completion event is queued, or any matching
+     staged dispatch/backend-command/frontend-response publication slot remains
+     occupied.
    - The task-slot scan in
      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3254`
      should become a debug assertion/check against the per-import counter, not
@@ -2615,16 +2644,21 @@ than the earlier single "backend completion pull" bullet implied.
    ```text
    ACTIVE permits new DMA task submission.
    CLOSING forbids new submission and permits retirement only.
-   CLOSING && inflightTaskCount == 0 permits DPU import removal and teardown ack.
+   CLOSING && inflightTaskCount == 0 permits scheduler semantic close reset.
+   Semantic close reset clears selected-session state only when no unfinished
+   semantic work remains for that session.
+   Semantic close reset plus DPU import removal permits teardown ack.
    The host may destroy exported DOCA mmaps only after receiving teardown ack.
    ```
 
    Acceptance: closing a selected-DPU pgbench client/session produces an explicit
    teardown request and ack, DPU logs show import quiesce before host mmap
    destruction, and no grouped-control read to the closed import reaches
-   `DOCA_ERROR_IO_FAILED`. The standalone TCP/DMA smoke has passed this gate; the
-   installed PostgreSQL selected-DPU SQL path should use the same close handshake
-   once the separate Stage 8B.19 poll-loop cleanup is addressed.
+   `DOCA_ERROR_IO_FAILED`. Repeated selected-DPU open/close validation must also
+   prove command sequence/frontier state does not leak into the next open if the
+   current prototype reuses a `serviceSessionId`. The standalone TCP/DMA smoke
+   passed the physical close/quiesce gate; installed PostgreSQL selected-DPU SQL
+   must pass the semantic close/reopen gate as well.
 
 ### Stage 8A — Completion/result push mechanism
 

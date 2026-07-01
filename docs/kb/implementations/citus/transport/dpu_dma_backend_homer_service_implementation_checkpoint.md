@@ -6,16 +6,19 @@ This note tracks landed implementation stages for the DPU-pull Homer migration.
 The target design remains
 [`dpu_dma_backend_homer_service_current_scheduler_design.md`](../../../future-directions/citus/transport/dpu_dma_backend_homer_service_current_scheduler_design.md).
 
-As of the in-progress Stage 8B.15 validation, the default frontend and service path is still the existing
-host-process SHM/RDMA implementation. The DPU frontend path exists only behind
-the explicit hidden GUC `citus.enable_experimental_homer_dpu_frontend`; when the
-GUC is enabled, the default non-DOCA frontend build fails explicitly before any
-SHM mapping. A DOCA-enabled frontend build exports a synthetic bridge as a DOCA
-PCI mmap and now sends the setup bytes over a regular TCP setup socket, not
-DOCA COMCH. The setup path has been refactored into a persistent opaque
-frontend control channel, but real Homer API calls still fail with a deliberate
-not-implemented error because the SQL frontend has not yet been promoted into a
-runnable selected-DPU command path.
+As of the Stage 8B.20/8B.21 validation on July 1, 2026, the default frontend and
+service path is still the existing host-process SHM/RDMA implementation. The DPU
+frontend path exists only behind the explicit hidden GUC
+`citus.enable_experimental_homer_dpu_frontend`; when the GUC is enabled, the
+default non-DOCA frontend build fails explicitly before any SHM mapping. A
+DOCA-enabled frontend build exports a persistent bridge as a DOCA PCI mmap and
+sends setup bytes over a regular TCP setup socket, not DOCA COMCH. The narrow
+row-producing selected-DPU SQL path now runs through real DPU-pulled command
+publication, selected-DPU backend execution, tuple-result queue binding,
+DPU-pulled backend completion, and DPU-published frontend terminal completion.
+It remains an experimental selected-DPU path, not the final DPU-offloaded Homer
+transport: broader workloads, payload/basebackup migration, reconnect/crash
+policy, and performance tuning are still pending.
 
 The service-side DPU DMA scheduler path is opt-in behind
 `HOMER_SERVICE_ENABLE_DPU_DMA=1`; it reads maintained facts and wires bounded
@@ -42,10 +45,7 @@ response-ready publication-word DMA write through
 `HomerDpuDmaSubmitCommandResponsePublication()`. The standalone TCP transport
 smoke validates the host-DPU composition end to end: real host mmap export over
 TCP setup, DPU mmap import, grouped-control read, command pull, and DPU-written
-	response publication observed by host memory polling. Full selected-DPU SQL
-	frontend execution is still pending and must not be claimed until selected-DPU
-	commands, completions, and result/payload queues all avoid the old host-service
-	SHM control region and the negative no-fallback completion gate is validated.
+response publication observed by host memory polling.
 Stage 8B.3 adds the scheduler scaffold for the production backend-mailbox path:
 `DPU_BACKEND_COMMAND_STAGE`, `DPU_BACKEND_COMMAND_PUBLISH`, and
 `DPU_BACKEND_COMPLETION_PULL` now exist as distinct bounded DPU scheduler
@@ -72,11 +72,11 @@ semantic stage: the service owns selected-DPU per-session command sequences,
 materializes pulled frontend `START_COMMAND` requests into compact
 `CitusRemoteExecLocalCommandRecord` bodies, resolves the imported backend command
 mailbox descriptor, and queues the record for backend-command DMA publication.
-Stage 8B.11 implements that backend-command publication: the DPU DMA engine now
-copies queued command records into engine-owned source buffers, submits command
-body, slot `readySeq`, and mailbox `publishedEpoch` DMA writes on the ordered
-command context, and moves the corresponding frontend START response into the
-	existing response-publication queue after successful submission. Stage 8B.12
+Stage 8B.11 first implemented backend-command publication with command body,
+slot `readySeq`, and mailbox `publishedEpoch` DMA writes. Stage 8B.20 replaces
+that selected-DPU path with two DMA writes: command body followed by flushed
+mailbox `publishedEpoch`, and selected-DPU socketless backends now wait on
+`publishedEpoch` rather than slot-local `readySeq`. Stage 8B.12
 through Stage 8B.14 add the engine and scheduler pieces for pulling backend
 completions into selected-DPU session state. The first Stage 8B.15 runtime
 attempt validated that selected-DPU backend startup mode reaches the socketless
@@ -105,10 +105,12 @@ smoke level: selected-DPU backend completion records are now handled as an
 ordered command-state event stream, where `STARTED` is push-visible and
 nonterminal, and the DMA engine transfers staged backend-completion ownership at
 consumed-credit submission instead of allowing repeated physical observation
-while consumed-credit DMA retires. Full selected-DPU SQL acceptance is still
-blocked earlier in the path by a 64-byte DOCA command/control memcpy I/O error
-in command-pull DMA that must be debugged as a DMA address/buffer-lifetime issue
-before claiming row-producing SQL acceptance.
+while consumed-credit DMA retires. Stage 8B.19B removes the hot compatibility
+`POLL_COMMAND_COMPLETION` request loop by adding a DPU-published frontend
+completion event line. Stage 8B.20/8B.21 then validates repeated row-producing
+selected-DPU SQL calls and fixes close/reopen state leakage by resetting
+service-side selected-session semantic state after DMA import drain and before
+descriptor destruction.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -4088,6 +4090,36 @@ Design correction after the Stage 8B.18 validation discussion:
   body+publish write is intentionally not the target under the current
   `PCI_WR_ORDERING=force relaxed` machine setup.
 
+## Stage 8B.20: Two-DMA Selected-DPU Backend Command Publication
+
+Stage 8B.20 removes the selected-DPU backend-command `readySeq` DMA task. The
+old three-task shape was correct for the host-service command mailbox ABI, but
+selected-DPU backends can use the mailbox-level `publishedEpoch` as the command
+publication word.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1380`
+  now submits exactly two selected-DPU backend-command DMA tasks: command record
+  body with `DOCA_TASK_SUBMIT_FLAG_OPTIMIZE_REPORTS`, followed by mailbox
+  `publishedEpoch` with `DOCA_TASK_SUBMIT_FLAG_FLUSH`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:404`
+  passes `selectedDpuBackendChannel` into
+  `RemoteExecBackendReadStableCommandRecord()`. Selected-DPU backends poll
+  `commandMailbox->publishedEpoch` as the publication word, while the older
+  host-service path continues to use slot-local `readySeq`.
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h`
+  keeps `readySeq` in the ABI for older paths but documents that selected-DPU
+  mode uses mailbox `publishedEpoch` for publication.
+
+Important invariant:
+
+- The two DMA writes must be submitted on the same ordered command DMA context.
+  With the current farnet setup using `PCI_WR_ORDERING=force relaxed`, the final
+  `publishedEpoch` is deliberately a separate flushed DMA task. A future
+  experiment should retest a single body+publication write after changing the
+  machine ordering policy, but that is not the accepted selected-DPU path today.
+
 ## Stage 8B.21: Explicit TCP Teardown And DPU DMA Quiesce
 
 Stage 8B.21 replaces the accepted steady-path interpretation of stale
@@ -4221,6 +4253,88 @@ Current limitations:
   host crash or missing-close diagnostics. Once the selected-DPU SQL path
   consistently uses this close handshake, normal teardown validation should fail
   if `DOCA_ERROR_IO_FAILED` appears on grouped-control reads.
+
+Follow-up selected-DPU SQL close/reopen correction on July 1, 2026:
+
+- Repeated row-producing SQL through
+  `pg_catalog.citus_remote_exec_pgbench_transaction(...)` exposed a separate
+  close/reuse bug after the physical close handshake was in place. The frontend
+  channel and host mailboxes were destroyed and recreated on every SQL wrapper
+  close/open, so the new backend command mailbox expected command sequence `1`.
+  The DPU service-side selected-session table still held the previous
+  `currentCommandSequence` for the same reused prototype `serviceSessionId`, so
+  it tried to publish command sequence `8` and the selected-DPU backend correctly
+  failed with `selected-DPU backend command publication skipped expected
+  sequence`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c:475`
+  now calls a close-finalize callback after
+  `HomerDpuDmaHostMmapImportTeardownDrained()` reports the import drained and
+  before `HomerDpuDmaFinalizeHostMmapImportTeardown()` destroys descriptor
+  state.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3801`
+  adds `HomerDpuDmaSetupContainsServiceSession()`, a read-only lookup used while
+  descriptors still exist. It maps the close identity
+  `(bridgeGeneration, clientInstanceId)` to descriptor `serviceSessionId` values;
+  this cannot use `bridgeGeneration` alone because each frontend bridge starts at
+  generation `1`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34835`
+  adds `HomerServiceDpuResetSelectedSessionForClose()`. It resets selected-DPU
+  scheduler state only after checking that no command is in flight, no backend
+  completion event remains queued, and no matching staged dispatch,
+  backend-command publication, or frontend-response publication slot is still
+  occupied. A violation is a close-ordering bug and fails close finalization; it
+  is not treated as harmless stale state.
+
+Validation:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format --force HEAD -- \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.h \
+  src/backend/distributed/utils/homer/tuple_sink_service_process.c
+
+sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make install-headers install-service-bin install
+
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16 && \
+  make -j8 service-bin CPPFLAGS="-D_GNU_SOURCE"'
+
+sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql \
+  -h /tmp -p 5432 -U dbcomm -v ON_ERROR_STOP=1 postgres \
+  -c "SET client_min_messages = warning;
+      SET citus.enable_experimental_tuple_sink_routing = on;
+      SET citus.enable_experimental_homer_dpu_frontend = on;
+      SELECT count(*), min(v), max(v)
+      FROM (SELECT pg_catalog.citus_remote_exec_pgbench_transaction(1,1,1,1,1) AS v
+            FROM generate_series(1,100)) s;"
+```
+
+Observed result:
+
+- Host build/install passed, including `homer_dpu_bridge_abi_check`,
+  `homer_dpu_comch_abi_check`, `homer_frontend_dma_smoke`, and
+  `homer_service_dpu_dma_smoke`.
+- The DPU-side service build passed in `/tmp/citus-dbcomm-stage8b16`.
+- Repeated selected-DPU SQL passed: the 20-call run returned `count=20`,
+  `min=59`, `max=78`; the 100-call run returned `count=100`, `min=79`,
+  `max=178`; after the final stricter underflow check was added and the rebuilt
+  DPU binary was restarted, a 50-call rerun returned `count=50`, `min=229`,
+  `max=278`.
+- The DPU log showed close-time semantic reset, for example:
+
+  ```text
+  homer DPU DMA: setup import closing bridge_generation=1 client_instance_id=858475 mmap_export_id=1 inflight=1
+  tuple-sink service: reset selected-DPU session on close service_session_id=3743352342089392 bridge_generation=1 last_sequence=7 last_completion_epoch=8
+  ```
+
+- A DPU log scan for `fatal|failed|error|stale|timeout|mismatch|skipped|unfinished`
+  returned no matches for the accepted run.
+- The PostgreSQL log still had unrelated background warnings about
+  `dbcomm@10.10.1.100:5432` closing connections; those were not emitted by the
+  selected-DPU command path and were not correlated with the accepted SQL runs.
 
 ## Stage 8B.19B: Selected-DPU Frontend Completion Event Line
 
