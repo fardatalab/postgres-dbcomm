@@ -4221,3 +4221,118 @@ Current limitations:
   host crash or missing-close diagnostics. Once the selected-DPU SQL path
   consistently uses this close handshake, normal teardown validation should fail
   if `DOCA_ERROR_IO_FAILED` appears on grouped-control reads.
+
+## Stage 8B.19B: Selected-DPU Frontend Completion Event Line
+
+Stage 8B.19B removes the selected-DPU frontend's temporary
+`POLL_COMMAND_COMPLETION` request/response loop from the pgbench wrapper hot path.
+The host now waits on a DPU-published completion event line in the exported bridge
+mmap instead of sending additional poll requests through the frontend control
+slot.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_dpu_bridge_abi.h`
+  adds `HOMER_DPU_BRIDGE_DESCRIPTOR_ROLE_FRONTEND_COMPLETION_EVENT` and
+  `HomerDpuBridgeFrontendCompletionEvent`. `publishedEpoch` is the first word so
+  the host can poll one publication word and then validate the copied body.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c`
+  eagerly allocates and exports one cache-line-aligned frontend completion event
+  line with the existing bridge mmap. `HomerFrontendDmaPollCommandCompletion()`
+  now polls that event line and no longer reserves/publishes a
+  `POLL_COMMAND_COMPLETION` control slot.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c`
+  adds two ordered DPU-to-host DMA task kinds for the event line: one body write
+  and one final `publishedEpoch` write with `DOCA_TASK_SUBMIT_FLAG_FLUSH`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`
+  publishes queued terminal selected-DPU completion events through the DPU DMA
+  engine as part of the existing `HOMER_PROGRESS_ACTION_DPU_COMPLETION_PUSH`
+  scheduler action.
+
+Important scoped invariant:
+
+- The Stage 8B.19B event line is terminal-only. Backend `STARTED` is still
+  accepted, credited, and used to keep selected-session state coherent, but it is
+  not copied into the single host-polled event line. Publishing both `STARTED`
+  and terminal events into one line would admit an overwrite race: the host CPU
+  could observe the `STARTED` publication and copy the body while the DPU is
+  already writing the terminal body. Add a consumed ack or a multi-slot event ring
+  before exposing a multi-state selected-DPU frontend event stream.
+
+Validation on July 1, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format --force HEAD -- \
+  src/backend/distributed/utils/homer/homer_frontend_dma.c \
+  src/backend/distributed/utils/homer/homer_frontend_dma.h \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.c \
+  src/backend/distributed/utils/homer/homer_service_dpu_dma.h \
+  src/backend/distributed/utils/homer/tuple_sink_service_process.c \
+  src/include/distributed/homer/homer_dpu_bridge_abi.h
+
+sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make install-headers install-service-bin install
+
+cd /data/dbcomm/postgres-citus
+sudo -n -u dbcomm env CCACHE_DISABLE=1 \
+  ninja -C build src/backend/postgres src/bin/pgbench/pgbench
+sudo -n -u dbcomm meson install -C build --no-rebuild
+
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16 && \
+  make -j8 service-bin CPPFLAGS="-D_GNU_SOURCE"'
+```
+
+The DPU service must be started with DPU DMA enabled; otherwise the process runs
+without the TCP setup listener:
+
+```sh
+ssh dpu 'cd /tmp/citus-dbcomm-stage8b16 && \
+  env HOMER_SERVICE_ENABLE_DPU_DMA=1 \
+      HOMER_SERVICE_ENABLE_DOCA_DMA=1 \
+      HOMER_SERVICE_DPU_SETUP_BIND_HOST=0.0.0.0 \
+      HOMER_SERVICE_DPU_SETUP_PORT=9727 \
+      HOMER_SERVICE_DOCA_DEV_PCI=0000:03:00.0 \
+      ./build/homer/citus_tuple_sink_service \
+      > /tmp/homer_dpu_stage8b19b.log 2>&1 < /dev/null &'
+```
+
+PostgreSQL was restarted with the frontend DPU setup variables in the postmaster
+environment:
+
+```sh
+sudo -n -u dbcomm env \
+  HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.201 \
+  HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
+  HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 \
+  HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
+  /data/dbcomm/pg-citus/bin/pg_ctl \
+  -D /data/dbcomm/pg-citus/data \
+  -l /data/dbcomm/pg-citus/data/postgres.log \
+  start -w
+```
+
+Accepted smoke:
+
+```sh
+sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql \
+  -h /tmp -p 5432 -U dbcomm -v ON_ERROR_STOP=1 -AtX postgres \
+  -c "SET client_min_messages = warning;
+      SET citus.enable_experimental_tuple_sink_routing = on;
+      SET citus.enable_experimental_homer_dpu_frontend = on;
+      SELECT pg_catalog.citus_remote_exec_pgbench_transaction(1, 1, 1, 1, 1);"
+```
+
+The single smoke returned `36`; ten independent selected-DPU SQL calls returned
+`37` through `46`. The DPU service log for the accepted run had no matches for
+`fatal`, `failed`, `error`, `stale`, `timeout`, `mismatch`, `invalid`, or `poll`.
+
+Validation pitfall:
+
+- Setting `HOMER_FRONTEND_DPU_SETUP_HOST` and related variables only on the
+  `psql` client command is insufficient. The selected-DPU frontend code runs
+  inside the PostgreSQL backend process, so those variables must be present in the
+  postmaster environment.
+- Avoid `pkill -f './build/homer/citus_tuple_sink_service'` inside an SSH command
+  string; it can match and kill the SSH wrapper itself. Use exact service PIDs or
+  `pgrep -x citus_tuple_sin` when cleaning the DPU process.

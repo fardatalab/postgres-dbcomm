@@ -2445,6 +2445,62 @@ than the earlier single "backend completion pull" bullet implied.
       DPU-published completion event line before selected-DPU waits can stop
       using temporary `POLL_COMMAND_COMPLETION` request slots.
 
+      July 1, 2026 Stage 8B.19B implementation result: selected-DPU command
+      waiting now uses a DPU-published frontend completion event line exported in
+      the bridge mmap. The ABI adds
+      `HOMER_DPU_BRIDGE_DESCRIPTOR_ROLE_FRONTEND_COMPLETION_EVENT` and
+      `HomerDpuBridgeFrontendCompletionEvent`; the host frontend exports one
+      cache-line-aligned event line and
+      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1078`
+      polls its `publishedEpoch` instead of reserving and publishing a
+      `POLL_COMMAND_COMPLETION` control slot. The DPU service submits the
+      event body and final `publishedEpoch` as two ordered DPU-to-host DMA tasks
+      through
+      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:1196`,
+      and the scheduler wires queued terminal selected-DPU completions into that
+      path at
+      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:35698`.
+
+      Important scoped correction: the Stage 8B.19B event line is terminal-only.
+      Publishing both backend `STARTED` and terminal events into one host-polled
+      event line would let the DPU overwrite the body while the host CPU is still
+      copying it. Until we add either a consumed ack or a multi-slot event ring,
+      `STARTED` is accepted and credited from the backend mailbox but is not
+      exposed to the host frontend. This matches the target hot path for current
+      pgbench commands: the host sends one command and waits for the terminal
+      completion/result.
+
+      Validation: host Citus build/install, host Postgres build/install, and DPU
+      service build passed with only existing DOCA deprecated/experimental
+      warnings. PostgreSQL was restarted with
+      `HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.201`,
+      `HOMER_FRONTEND_DPU_SETUP_PORT=9727`,
+      `HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0`, and
+      `HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000`; the DPU service was started
+      from `/tmp/citus-dbcomm-stage8b16` with
+      `HOMER_SERVICE_ENABLE_DPU_DMA=1`, `HOMER_SERVICE_ENABLE_DOCA_DMA=1`, and
+      `HOMER_SERVICE_DOCA_DEV_PCI=0000:03:00.0`, then confirmed listening on TCP
+      setup port `9727`. One selected-DPU SQL smoke and ten independent
+      selected-DPU SQL calls succeeded:
+
+      ```sh
+      sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql \
+        -h /tmp -p 5432 -U dbcomm -v ON_ERROR_STOP=1 -AtX postgres \
+        -c "SET client_min_messages = warning;
+            SET citus.enable_experimental_tuple_sink_routing = on;
+            SET citus.enable_experimental_homer_dpu_frontend = on;
+            SELECT pg_catalog.citus_remote_exec_pgbench_transaction(1, 1, 1, 1, 1);"
+      ```
+
+      The single smoke returned `36`; the ten-call run returned `37` through
+      `46`. The DPU service log had no `fatal`, `failed`, `error`, `stale`,
+      `timeout`, `mismatch`, `invalid`, or `poll` matches during the accepted
+      run. The source-level check for no selected-DPU poll request is that
+      `HomerFrontendDmaPollCommandCompletion()` no longer calls
+      `HomerFrontendDmaReserveControlSlot()` or
+      `HomerFrontendDmaPublishControlSlotRequest()`; those control-slot
+      publications are now limited to START/close setup operations.
+
 9. **Stage 8B.20: reduce selected-DPU backend-command publication to two DMA
    tasks.**
    The current selected-DPU backend-command publication in
