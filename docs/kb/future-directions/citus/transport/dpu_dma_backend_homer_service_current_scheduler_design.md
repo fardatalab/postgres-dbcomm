@@ -2370,25 +2370,80 @@ than the earlier single "backend completion pull" bullet implied.
    `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_dma.c:1081`.
    That loop is transitional and must not be the DPU hot path.
 
-   Target design:
+   Corrected target design:
 
-   1. Keep the external API contract that `START_COMMAND` returns only after the
-      backend has reached `STARTED` or a terminal state.
-   2. Satisfy that contract by waiting on the host-visible completion/response
-      mailbox that the DPU writes by DMA, not by posting new
-      `POLL_COMMAND_COMPLETION` control requests.
-   3. The wait is a local host-memory wait/poll over a DPU-published completion
-      event epoch/state word. It may spin for now, but it must not allocate or
-      publish another frontend control request for the same command.
-   4. `POLL_COMMAND_COMPLETION` can remain as a compatibility path for old
-      non-DPU/peer protocol shapes until those are cleaned up, but selected-DPU
-      command validation must assert that no poll requests are generated on the
-      measured command path.
+   1. In selected-DPU mode, `START_COMMAND` means the DPU accepted the command,
+      assigned a `commandSequence`, and reserved the bounded publication resources
+      needed to release the original START slot. It must not wait for the
+      socketless backend to publish `STARTED`.
+   2. The START response carries `PENDING` plus `commandSequence`. This is not a
+      failure and not a compatibility shortcut; backend-visible states are separate
+      completion events.
+   3. Backend `STARTED`, `COMPLETED`, and `FAILED` all flow through the same
+      selected-DPU backend-completion event stream. The first backend completion
+      must not be special-cased because START is waiting.
+   4. Resource capacity is reserved at selected-DPU command acceptance. Later
+      backend-command publication must not discover that there is no completion
+      publication owner for the command it already accepted.
+   5. The final cleanup remains to replace selected-DPU
+      `POLL_COMMAND_COMPLETION` request slots with a host-local wait/poll over a
+      DPU-published completion event line. Until that event line exists, the
+      temporary DPU poll request path is only a validation bridge and not the
+      target hot path.
 
-   Acceptance: a selected-DPU pgbench command reaches `STARTED`/terminal by one
-   frontend `START_COMMAND` publication plus DPU DMA completion publication.
-   Diagnostic counters or logs must prove the selected-DPU path did not submit
-   `POLL_COMMAND_COMPLETION` request slots.
+   Substage acceptance:
+
+   - Stage 8B.19A: selected-DPU `START_COMMAND` returns `PENDING` plus
+     `commandSequence`, reserves START ACK publication capacity during command
+     staging, and never holds the original START slot until backend `STARTED`.
+     Backend completions are accepted uniformly into the selected-DPU completion
+     event queue.
+   - Stage 8B.19B: selected-DPU command waiting observes a DPU-published
+     completion event line directly from host memory and no longer submits
+     `POLL_COMMAND_COMPLETION` request slots. Diagnostic counters or logs must
+     prove the selected-DPU path did not submit poll request slots.
+
+   June 30, 2026 validation attempt: this stage is **not accepted**. A narrow
+   implementation that kept the original START slot open and queued the START
+   response only after backend-completion acceptance removed the frontend's
+   internal compatibility poll loop, but installed selected-DPU SQL still timed
+   out waiting for the START response. The first fix attempt also showed that
+   selected-session in-flight state must itself keep the
+   `DPU_BACKEND_COMPLETION_PULL` collector eligible; relying on staged frontend
+   `POLL_COMMAND_COMPLETION` requests was an accidental progress trigger. After
+   adding that bounded selected-session backend-completion wait fact, validation
+   exposed a harder DOCA failure instead:
+      `HOMER_DPU_DMA_TASK_KIND_BACKEND_COMPLETION_CONTROL_READ` failed with
+      `DOCA_ERROR_IO_FAILED` for the exported backend-completion mailbox
+      (`task_kind=8 workload=2 host_bytes=64`). The immediate root cause was that
+      `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:4865`
+      used the size of the DPU's cache-line-aligned local snapshot as the remote
+      DMA read length. The exported backend-completion mailbox ABI has only a
+      24-byte control prefix:
+      `/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_backend_protocol.h:233`.
+      The fix is to DMA-read exactly
+      `offsetof(CitusRemoteExecLocalCompletionMailbox, completionSlots)`, leaving
+      the local snapshot alignment as private DPU storage. After that fix, one
+      selected-DPU SQL smoke and ten repeated independent selected-DPU SQL calls
+      completed without a task-kind-8 DOCA failure.
+
+      Design correction from the same review: keeping the original START control
+      slot open and later queuing a START response is rejected. START is an
+      accepted/sequenced ACK; backend STARTED and terminal states then flow
+      uniformly through the backend-completion event stream and DPU
+      response-publication path. The first backend completion must not be
+      special-cased only because START is waiting.
+
+      July 1, 2026 Stage 8B.19A implementation result: selected-DPU START now
+      returns `PENDING` plus `commandSequence` after command staging, reserves the
+      START ACK publication slot before consuming the pulled START command, and
+      removes `startResponsePending`/`startResponseCommand`. Backend completions
+      are accepted uniformly into the selected-DPU completion-event queue. Host
+      and DPU service builds passed; one selected-DPU SQL smoke plus ten repeated
+      independent selected-DPU SQL calls completed without DPU log errors. Stage
+      8B.19B remains open because the host still needs a persistent
+      DPU-published completion event line before selected-DPU waits can stop
+      using temporary `POLL_COMMAND_COMPLETION` request slots.
 
 9. **Stage 8B.20: reduce selected-DPU backend-command publication to two DMA
    tasks.**
