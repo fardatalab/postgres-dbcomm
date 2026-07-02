@@ -1,28 +1,28 @@
 # kernel stack timing
 
-1. use perf record (PG now enables/disables it at logical query-cycle boundaries)
+1. start `perf record` manually on the node being measured
 
 ```bash
-mkfifo /tmp/perf_ctl
-sudo perf record -a -F 200 -e cpu-clock:k -g --kernel-callchains -P --control=fifo:/tmp/perf_ctl --delay=-1 -o perf.data
+sudo perf record -a -F 200 -e cpu-clock:k -g --kernel-callchains -P -o perf.data
 ```
 
-this will keep running, and we should run this (in a separate terminal) before any Citus/Postgres start executing queries/transactions
+This keeps running until interrupted. Start it in a separate terminal before the
+measured Citus/Postgres query or transaction begins, and stop it with `Ctrl-C`
+after the measured work finishes.
 
-1. Start running with Citus as usual, then once it’s done, use Ctrl-C to stop perf, which should generate a `perf.data`
-2. Dump meaningful data from it:
+2. Dump meaningful data from the resulting `perf.data`:
 
 ```bash
 sudo perf script -i perf.data -F comm,period,event,ip,sym,dso > perf.txt
 ```
 
-4. Pair the perf run with the matching timing denominator from the same
-   perf-enabled run on the same node:
+3. Pair the perf run with the matching timing denominator from the same
+   perf-captured run on the same node:
 
 - single-query or single log slice:
 
 ```bash
-# timing_summary.csv must come from the same perf-enabled run and same node
+# timing_summary.csv must come from the same perf-captured run and same node
 python3 aggregate_timing.py coordinator.log --view summary > timing_summary.csv
 python3 sum_net.py perf.txt --aggregate-csv timing_summary.csv
 ```
@@ -30,20 +30,20 @@ python3 sum_net.py perf.txt --aggregate-csv timing_summary.csv
 - explicit transaction aggregation:
 
 ```bash
-# txn_summary.csv must come from the same perf-enabled run and same node
+# txn_summary.csv must come from the same perf-captured run and same node
 python3 aggregate_transaction_timing.py coordinator.log > txn_summary.csv
 python3 sum_net.py perf.txt --aggregate-csv txn_summary.csv
 ```
 
-## Current backend semantics
+## Current capture semantics
 
-- PG aligns FIFO perf control with the same logical query-cycle boundary used by
-  `QUERY_ACTIVE_WALL`, including extended protocol until the matching
-  `ReadyForQuery()`.
-- Perf is still node-wide because the command uses `perf record -a`, so backend
-  code coordinates it with a shared first-enable/last-disable refcount:
-  the recorder stays enabled while at least one backend on the node is inside a
-  logical query cycle.
+- Perf capture is manual. The backend no longer opens a FIFO or toggles perf at
+  logical query-cycle boundaries.
+- Perf is node-wide because the command uses `perf record -a`. Keep the manual
+  capture window tight around the measured query, transaction, or benchmark row
+  whose PostgreSQL timing log will supply `QUERY_ACTIVE_WALL`.
+- If the manual capture window includes unrelated backend, kernel, or network
+  activity on the same node, `sum_net.py` will include those kernel samples.
 
 ## How to interpret the result
 
@@ -60,7 +60,7 @@ python3 sum_net.py perf.txt --aggregate-csv txn_summary.csv
 
   `kernel_net_avg_cores ~= sampled_kernel_net_ns / query_active_wall_ns`
 
-- `query_active_wall_ns` must come from the same run with perf enabled. Do not
+- `query_active_wall_ns` must come from the same run captured by perf. Do not
   reuse a denominator from a separate no-perf baseline run, because the perf
   run is the run whose sampled kernel CPU is being measured.
 
@@ -77,7 +77,7 @@ python3 sum_net.py perf.txt --aggregate-csv txn_summary.csv
   measurements, but it is not per-query attribution anymore.
 - If you intentionally run multiple clients concurrently and treat the whole run
   as one measurement, then sum `query_active_wall_ns` across all matching query
-  or transaction rows on that node for that same perf-enabled run and use that as the
+  or transaction rows on that node for that same perf-captured run and use that as the
   denominator.
 - Do not divide a concurrent node-wide perf run by one transaction's or one
   query's `query_active_wall_ns`.

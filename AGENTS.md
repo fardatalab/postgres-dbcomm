@@ -1,65 +1,150 @@
-# General Rules to Follow
-
-- Always critically analyze the user's proposal and request first. Make corrections if the user seems to be misinformed or stated something inaccurate or incorrect. Also watch out for major points that you think might be a bug/inconsistency/incorrect assumption or understanding etc. in the current/existing code or discussion; raise concerns and give reasons/evidence why you think that is the case.
-  - If the user acknowledges the corrections or concerns (either explicitly or implicitly), or simply moves on to another question/point, or just generally doesn't further pursue the corrected proposal or statements, assume the user has understood the correction and thus no need to continue raising it, unless it becomes clear later that confusions still exist.
-- This is a research and prototyping scenario, and code will evolve rapidly. Being able to quickly understand the code, clearly debug, spot and unravel potential issues and bugs is a must; then it is performance, always keep performance in mind when proposing solutions, implementing the code, and reviewing; security and code smell comes last, the bare minimum of security will do, code smell will exist due to rapid code evolution, but we should not be too concerned with eliminating them (you can raise this during discussions, but no need to be fixated on addressing them in your proposed plans or when implementing). This also means that when planning changes to make, there is no need to maintain backward compatibility when behaviors change, unless the user specifically asks for it, or it is clear that there will be two active paths in the codebase (i.e., not a direct replacement); do make it clear in the comments how and why the behavior changed in corresponding code locations.
-  - Always strive for the best performance, but without sacrificing ease of debugging and readability. This is a systems work, where the hot data path performance is critical; we can tolerate a slower control path, so keep this in mind when planning and proposing solutions.
-
-
-## Chat, Planning, Brainstorm, Analyze, Explain, Discuss, Describe
-
-- Do not just vaguely describe the functionalities and general workflow, always refer to the major important functions used when explaining. Always refer to both the function name and the location in its source file. This is not limited to function invocations only, but generally, any symbol in the code, for example, when referring to an `if` branch or a case of a switch statement, or a specific variable etc., refer to them with their names as well as location to be found.
-  - Use markdown format for such references, for example, your output should look like: ``` [symbol](<path>:line) performs serialization...``` when explaining a certain function. Remember NOT to wrap markdown links inside code blocks (back ticks).
-  - For example, when explaining `FunctionA` calls `FunctionB` in a loop, give the source file and location of both the definition of `FunctionA` and the call site of `FunctionB` within `FunctionA`; similarly, if explaining `FunctionB` further calling `FunctionC`, give the source file and location of the call site of `FunctionC` within `FunctionB`. Do so for all such scenarios when explaining. Again, this extends to other code occurrences, for example, branches such as `if` statement or `switch` of `case`s, loops, and generally, any line or blocks of code referenced.
-  
-- Prefer giving more detailed response and analysis, include not only the conclusions, but also the high level reasoning and analysis steps that help arrive at the conclusion.
-- When brainstorming solutions, aim to find at least two (or three) approaches, describe them concisely but in details, and compare their pros and cons.
-
-
-
-## Editing files and Implementing code
-
-- Always explain the changes applied and code implemented, and how it is different from the original code, and why the proposed change is applied (what does the new code address or provide, etc.). If there are some things that are discussed earlier but not yet implemented or require further discussion/clarification etc., remind the user as part of their next step.
-- Include inline comments to explain code blocks and intentions, things to beware of, assumptions and caveats etc., where applicable; for new functions added, include block comments to describe its overall functionality. This applies to all edits, both modifying existing code and implementing new ones, you should do so diligently; beware of outdated comments when modifying existing code, and make sure to update them as needed.
-- In case there are things that you had to improvise and think on your feet during your implementation, and that it wasn't explicitly part of the plan that or have not been discussed previously, always explicitly tell the user about it at the end of implementing when you summarize and explain changes. This rule applies only to small but important details, including but not limited to: assumptions about something in the code, things that are or needs to be correlated, particular order of function calls etc., adding new fields to a struct or extra bookkeeping done; these should also be documented through block or inline comments, as well as through defensive checks and error/warning print or assertions. However, for larger aspects or features, you must raise it to the user and discuss further to form a more concrete plan instead of improvising and making assumptions for the user.
-- Use defensive programming; proactively anticipate error scenarios, make ample use of debugging checks and prints, use assertions etc. Document the intentions/assumptions with inline comments.
-  - More generally, use plenty of logging prints at points of interest (especially on control paths and all potential error paths, be more reserved if it is on the hot data path), including but not limited to certain transitions/handoffs, different lifecycle stages, certain settings being set or code paths/branches triggered; this highly depends on the concrete scenario, just keep this in mind while implementing.
-  - When debugging with the user, you are encouraged to think about what extra info would be helpful to narrow down the problem, and subsequently add more debug prints to obtain them, and discuss with the user on how to debug further; you are also encouraged to add extra checks and guards, even on the critical path, if you suspect something wrong.
-- DO NOT edit or remove any existing commented out code blocks, they serve to remind us what the original or previous code and logic is.
-- Whenever possible, and especially for small or sparse edits, DO NOT directly modify code in place, instead, try to comment out original code lines or small blocks and add new modified code/logic around it; or comment out the whole original function, and implement/edit the whole function if there are many edits to perform. Only modify in place if the user asks so, or explain why it is impossible or a bad idea to modify in place. When commenting out existing code/blocks, add a short comment before the commented out block to remind us about the original intent/logic.
-  - For each function added or edited, add or modify the documentation for the whole function as well
-- There is no need to write any test code, or run any command, scripts, etc. for testing purposes, unless the user explicitly asks for it; however, you are welcome to suggest how to run/test/verify things.
-
-## Performance Considerations
-
-In general, treat the code as a research work for high performance data processing (database) systems. Some common considerations include, but not limited to:
-
-- mutex or locking should be avoided on the hot data path, instead, the design should aim to use atomics, or simply forgo the necessary protection (for example, making it per-thread).
-- memory allocation should not happen on the critical path, exactly how this can be done depends on the specific scenario, but for example, we may preallocate and reuse, using slots or ring buffers etc. to get around dynamic allocation; the design space is very open, and you should think about how to achieve this efficiently.
-- avoid cache line bouncing/thrashing and use cache line aligned data structures where applicable.
-
 ## Cluster Setup
 
-- The current cluster is the `node-0` to `node-4` setup, and commands should be issued as `JasonHu` over SSH to those hosts.
-- The install prefix for both Postgres and Citus on every node is `~/pg` (that is, `/users/JasonHu/pg` on this workspace), not `/data/dbcomm/pg` or any other cluster-specific path from the copied tree.
-- If a build tree was copied in with `scp`, reconfigure it before installing so generated paths are rewritten for the new cluster.
-- For Postgres, reconfigure the Meson build under `build/` with the new prefix, then install from that build tree.
-- For Citus, rerun `./configure` in `/users/JasonHu/citus-dbcomm` with `PG_CONFIG=~/pg/bin/pg_config`, then rebuild and install so `Makefile.global`, `config.status`, and the cached build metadata point at the new prefix.
-- Before validating, make sure any stale build artifacts or previously installed libraries are removed if they were copied from another cluster; a clean rebuild is what makes the Citus preload work reliably on this setup.
-- The validation path on each node is: start Postgres from `~/pg`, connect with `psql`, and run `CREATE EXTENSION citus;` successfully. `CREATE EXTENSION IF NOT EXISTS citus;` is also fine when rerunning the validation on a node that already has the extension.
-- The fast-link fabric for this cluster is `enp23s0f0`, with addresses in `10.10.1.0/24`. The current node mapping is `node-0` coordinator `10.10.1.2`, `node-1` worker primary `10.10.1.3`, `node-2` worker primary `10.10.1.1`, `node-3` standby for node-1 `10.10.1.4`, and `node-4` standby for node-2 `10.10.1.5`.
-- On every node, allow the `10.10.1.0/24` fabric in `pg_hba.conf` for both normal and replication connections so the workers, standbys, and coordinator can talk over the fast link.
-- On the coordinator, run `SELECT citus_set_coordinator_host('10.10.1.2', 5432);` so worker metadata points at the coordinator on the fast fabric.
-- On the coordinator, register or move the active workers with `citus_update_node(1, '10.10.1.3', 5432)` and `citus_update_node(2, '10.10.1.1', 5432)`, then update the physical standbys with `citus_update_node(3, '10.10.1.4', 5432)` and `citus_update_node(4, '10.10.1.5', 5432)`.
-- On the worker primaries, set `listen_addresses = '*'`, `wal_level = 'replica'`, `max_wal_senders = '10'`, `max_replication_slots = '10'`, and `wal_keep_size = '1GB'`, then bootstrap the standbys from those primaries with `pg_basebackup -R -X stream -C -S worker1_slot` and `pg_basebackup -R -X stream -C -S worker2_slot`.
-- After the standby bootstrap, make sure `primary_conninfo` on `node-3` points at `10.10.1.3` and `node-4` points at `10.10.1.1`, and keep the matching `primary_slot_name` values.
-- For the synchronous-commit benchmark, set `synchronous_standby_names = 'FIRST 1 (worker1_stby)'` on `node-1` and `synchronous_standby_names = 'FIRST 1 (worker2_stby)'` on `node-2` so `on`, `remote_write`, and `remote_apply` really wait for the physical standbys.
-- Set `citus.enable_repartition_joins = 'on'` on every node in this cluster.
-- For a quick end-to-end verification, create a small distributed table on the coordinator, run a short `pgbench` write loop against the coordinator IP (`10.10.1.2`), then compare `count(*)` and `max(id)` on each worker primary versus its standby. Matching counts after the benchmark are the proof that the physical replicas are following the primaries correctly.
-- For a faithful pgbench benchmark on Citus, use the standard `pgbench -i` initializer on the coordinator with a scale factor that is at least as large as the largest `-c` you plan to test; for the current 1..32 sweep, the repository defaults to `-s 32`. Then distribute the built-in tables with `create_distributed_table('pgbench_accounts', 'aid')`, `create_distributed_table('pgbench_branches', 'bid')`, `create_distributed_table('pgbench_tellers', 'tid')`, and `create_distributed_table('pgbench_history', 'aid', colocate_with => 'pgbench_accounts')`; after distribution, run `truncate_local_data_after_distributing_table(...)` on each table so only the distributed placements remain visible.
-- The repository includes `scripts/setup_pgbench_citus.sh` for that initialization flow, `scripts/pgbench_report.py` for summarizing `pgbench` throughput and sampled latency percentiles, and `scripts/run_pgbench_sync_commit_bench.py` for sweeping `synchronous_commit` across `off`, `local`, `on`, `remote_write`, and `remote_apply` while varying `-c` from 1 to 32, capping `-j` with a smaller client-side worker pool, and running `pgbench -M prepared` so transaction concurrency is controlled by sessions rather than extra client threads.
-- For the benchmark tuning pass, keep the cluster on the fast-link fabric and raise the runtime settings on every node to something closer to a dedicated benchmark server: `max_connections` around `300`, `shared_buffers` around `32GB`, `max_wal_size` around `8GB`, `checkpoint_timeout` around `15min`, and `min_wal_size` around `2GB`. These settings need a restart where PostgreSQL requires one, so apply them before the benchmark sweep.
-- For the vanilla comparison benchmark, repurpose `node-0` as a plain PostgreSQL primary and `node-3` as its physical standby. On `node-0`, disable the Citus preload in `~/pg/data/postgresql.conf` by commenting out the `shared_preload_libraries='citus'` line, then reset the GUC with `ALTER SYSTEM RESET shared_preload_libraries;` and restart. After that, set `wal_level = 'replica'`, `max_wal_senders = '10'`, `max_replication_slots = '10'`, `wal_keep_size = '1GB'`, and `synchronous_standby_names = 'FIRST 1 (vanilla_stby)'` on the vanilla primary, bootstrap `node-3` with `pg_basebackup -R -X stream -C -S vanilla_slot`, and rewrite `primary_conninfo` on `node-3` so it uses `application_name=vanilla_stby`. The benchmark database is `pgbench_vanilla`, initialized with the standard `pgbench -i -s 32` flow.
-- The repository includes `scripts/setup_pgbench_vanilla.py` for the vanilla primary/standby setup, `scripts/run_pgbench_sync_commit_bench_vanilla.py` for sweeping the same synchronous-commit matrix against `pgbench_vanilla` on the vanilla primary, and `scripts/plot_pgbench_sync_commit_comparison.py` for a side-by-side Citus-vs-vanilla plot grid. The vanilla benchmark keeps the same `-M prepared`, `-c 1..32`, capped client-side worker threads, and sampled logging approach as the Citus sweep so the results stay directly comparable.
-- For the background network-interference benchmark on Citus, reuse the distributed `pgbench_accounts` table as the large worker-to-coordinator read source and create a dedicated distributed `bg_sink` table for coordinator-to-worker COPY writes. The repository now includes `scripts/setup_citus_network_interference.py` to restore node-0 back to Citus, create or refresh the sink table, and skip pgbench reinitialization when the distributed tables are already present; `scripts/run_citus_network_interference_bench.py` runs the foreground `pgbench` workload at fixed `-c 16` while background reader and writer loops run in parallel at levels 1, 2, 4, and 8 per direction across the full `off`, `local`, `on`, `remote_write`, and `remote_apply` synchronous-commit matrix; and `scripts/plot_citus_network_interference.py` plots TPS, p50, and p99 versus background level.
-- For the vanilla network-interference benchmark, repurpose node-0 as a plain PostgreSQL primary and node-3 as its physical standby, keep node-1 as the generator host for the background reader/writer traffic, and use the standard `pgbench_vanilla` schema together with a local `bg_sink` table on the primary. The repository now includes `scripts/setup_pgbench_vanilla_interference.py` for the vanilla prepare step, `scripts/run_pgbench_network_interference_vanilla.py` for sweeping the same foreground `pgbench` workload at fixed `-c 16` with background levels 0, 1, 2, 4, and 8, and `scripts/plot_pgbench_network_interference_comparison.py` for the Citus-vs-vanilla comparison figure. After the vanilla run, restore the cluster back to Citus with `scripts/setup_citus_network_interference.py` so node-0 is again the coordinator and node-3 returns to the worker-1 standby role.
+- This branch documents the DPU repartition-join measurement setup, not the
+  older pgbench transaction-latency benchmark setup.
+- Use PostgreSQL branch `pg-17-timings-latency-dpu` with Citus branch
+  `timings-latency-dpu`.
+- The active PostgreSQL cluster has exactly three nodes:
+  - coordinator: `farnet1` host OS, `10.10.1.101` on `enp33s0f0np0`
+  - worker: `farnet1-bf3-a` DPU OS, `10.10.1.201` on `enp3s0f0s0`
+  - worker: `farnet0-bf3-a` DPU OS, `10.10.1.200` on `enp3s0f0s0`
+- `farnet0` host OS is only the management host for its DPU worker; it is not a
+  PostgreSQL worker for this setup.
+- The DPU management path is host-local `tmfifo_net0`: from `farnet1`, use
+  `ubuntu@192.168.100.2` for `farnet1-bf3-a`; from `farnet0`, use
+  `ubuntu@192.168.100.2` for `farnet0-bf3-a`.
+- Do not configure physical replicas for this measurement. Avoid
+  `citus_add_secondary_node()`, `pg_basebackup`, replication slots,
+  synchronous replica-wait settings, and replica-specific `pg_hba.conf` entries
+  unless a separate experiment explicitly reintroduces physical replication.
+
+## Build And Install
+
+- The install prefix for both PostgreSQL and Citus on every PostgreSQL node is
+  `~/pg`.
+- If a PostgreSQL or Citus build tree was copied from another machine,
+  reconfigure it before installing so generated paths are rewritten for the
+  current node.
+- For PostgreSQL, reconfigure the Meson build under `build/` with the `~/pg`
+  prefix, then install from that build tree.
+- For Citus, rerun `./configure PG_CONFIG=$HOME/pg/bin/pg_config` from the
+  Citus checkout, then rebuild and install so `Makefile.global`,
+  `config.status`, and cached build metadata point at the node-local
+  PostgreSQL installation.
+- Before validating, remove stale copied install artifacts if they can shadow
+  the current build. A clean rebuild is the reliable way to make the Citus
+  preload match this PostgreSQL tree.
+
+## PostgreSQL Configuration
+
+- Apply configuration in the active data directory for the `~/pg` install on
+  each node, usually `~/pg/data/postgresql.conf` and `~/pg/data/pg_hba.conf`.
+- Set these values in `postgresql.conf` on all three PostgreSQL nodes:
+
+```conf
+listen_addresses = '*'
+shared_preload_libraries = 'citus'
+logging_collector = on
+log_destination = 'stderr'
+log_directory = 'log'
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
+citus.enable_repartition_joins = on
+```
+
+- Restart PostgreSQL after changing `shared_preload_libraries` or
+  `logging_collector`; a reload is not enough for those settings.
+- Allow normal PostgreSQL traffic among the three `10.10.1.0/24` fabric
+  addresses in `pg_hba.conf`, for example:
+
+```conf
+host    all     all     10.10.1.0/24     trust
+```
+
+- Use stricter authentication if the fabric is not isolated. The repartition-join
+  measurement itself does not need physical-replica-specific `pg_hba.conf`
+  entries.
+
+## Citus Metadata
+
+- Start PostgreSQL from `~/pg` on all three nodes and verify that
+  `CREATE EXTENSION IF NOT EXISTS citus;` succeeds.
+- On the coordinator, set the coordinator host and add the two DPU workers:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS citus;
+SELECT citus_set_coordinator_host('10.10.1.101', 5432);
+SELECT citus_add_node('10.10.1.201', 5432);
+SELECT citus_add_node('10.10.1.200', 5432);
+```
+
+- If the coordinator still has metadata from an older setup, remove or update
+  stale node rows before running measurements. Verify the result with:
+
+```sql
+SELECT nodeid, nodename, nodeport, isactive
+FROM pg_dist_node
+ORDER BY nodeid;
+```
+
+Only `10.10.1.201` and `10.10.1.200` should appear as active Citus workers for
+this setup.
+
+## TPC-H Data Preparation
+
+- The intended TPC-H scale factor for the measured repartition-join runs is
+  SF10. The local data lives under `/data/dbcomm/tpch-kit/dbgen/dss-output`, and
+  the database name used by the existing helper scripts is `tpch_sf10`.
+- Create the schema from `/data/dbcomm/tpch-kit/dbgen/dss.ddl` on the
+  coordinator, then distribute tables before loading data:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS citus;
+SET citus.shard_count = 32;
+
+SELECT create_reference_table('region');
+SELECT create_reference_table('nation');
+
+SELECT create_distributed_table('customer', 'c_custkey', shard_count := 32);
+SELECT create_distributed_table('orders', 'o_orderkey', shard_count := 32);
+SELECT create_distributed_table('lineitem', 'l_orderkey', shard_count := 32);
+SELECT create_distributed_table('part', 'p_partkey', shard_count := 32);
+SELECT create_distributed_table('supplier', 's_suppkey', shard_count := 32);
+SELECT create_distributed_table('partsupp', 'ps_partkey', shard_count := 32);
+```
+
+- Keep `orders`/`lineitem` colocated on order key and `customer` distributed on
+  customer key for Q3-style repartition measurements. Changing those keys can
+  turn the measured query into a different plan shape.
+- Load `.tbl` files with `sed 's/|$//'` piped into psql `\copy`, because TPC-H
+  data files have a trailing `|` field separator that PostgreSQL CSV input
+  should not see.
+- Run `ANALYZE` after loading and verify SF10 row counts: `region` 5, `nation`
+  25, `supplier` 100000, `part` 2000000, `partsupp` 8000000, `customer`
+  1500000, `orders` 15000000, and `lineitem` 59986052.
+- Use fixed query files from `/data/dbcomm/tpch-queries`, not the raw
+  `/data/dbcomm/tpch-kit/dbgen/queries-sf10` files, unless the raw generated SQL
+  has been repaired first.
+
+## Measurement Artifacts
+
+- The spreadsheet rows are assembled manually from script outputs, not generated
+  directly by one spreadsheet exporter.
+- Use `fdl_utils/aggregate_timing.py --view summary` on each node's collector log
+  from the same measured repartition-join run.
+- For kernel TCP/IP and socket-stack CPU, start `perf record` manually in a
+  separate terminal on the node being measured:
+
+```bash
+sudo perf record -a -F 200 -e cpu-clock:k -g --kernel-callchains -P -o perf.data
+```
+
+- Stop perf with `Ctrl-C` after the measured window, then run:
+
+```bash
+sudo perf script -i perf.data -F comm,period,event,ip,sym,dso > perf.txt
+python3 fdl_utils/sum_net.py perf.txt --aggregate-csv <same-node-timing-summary.csv>
+```
+
+- Keep the perf capture and timing summary paired by node and measurement
+  window. A coordinator perf run should not be divided by a worker timing
+  summary, and a wide perf window should not be paired with a narrow query log.
