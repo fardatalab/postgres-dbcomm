@@ -27,7 +27,13 @@ endif
 
 pgbench = executable('pgbench',
   pgbench_sources,
-  dependencies: [frontend_code, libpq, thread_dep],
+  dependencies: [
+    frontend_code,
+    libpq,
+    thread_dep,
+    dependency('doca-dma', required: true),
+    dependency('doca-common', required: true),
+  ],
   include_directories: [
     include_directories('.'),
     include_directories('/data/dbcomm/pg-citus/include/postgresql/server'),

@@ -3,8 +3,11 @@
 backend_build_deps = [backend_code]
 backend_sources = []
 backend_link_with = [pgport_srv, common_srv]
+doca_dma_dep = dependency('doca-dma', required: true)
+doca_common_dep = dependency('doca-common', required: true)
 homer_client_dep = declare_dependency(
   include_directories: include_directories('/data/dbcomm/pg-citus/include/postgresql/server'),
+  dependencies: [doca_dma_dep, doca_common_dep],
 )
 backend_build_deps += homer_client_dep
 

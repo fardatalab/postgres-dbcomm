@@ -118,6 +118,15 @@ payload as two DMA reads, and publishes consumed-head credit back to the host
 with the same two-phase body-plus-publication DMA chain used for DPU-to-host
 response/event lines. This validates the byte-ring mechanics but does not yet
 wire real basebackup or production payload streams into selected-DPU mode.
+Stage 8C now has a standalone direct-forwarding mechanism smoke in
+`homer/doca_validation/doca_pci_rdma_bridge_validation.c`: the host exports a
+PCI-visible source buffer and an RDMA-visible target buffer, the DPU imports the
+host PCI mmap, and the DPU posts a `doca_rdma_task_write()` whose source
+`doca_buf` points at PCI-imported host memory. This validates the core direct
+small-record transfer mechanism for 64 B, 1 KiB, and 4 KiB records, but does not
+yet implement the production scheduler ready queues, multi-session lane
+ownership, RDMA completion retirement, or source-credit publication required for
+Stage 8C acceptance inside Homer.
 
 The next production selected-DPU command milestone must also add a host
 lifecycle shim, not a host-service hot-path fallback. The DPU service cannot
@@ -4458,6 +4467,82 @@ Validation pitfall:
   string; it can match and kill the SSH wrapper itself. Use exact service PIDs or
   `pgrep -x citus_tuple_sin` when cleaning the DPU process.
 
+## Stage 8C.0: Direct PCI-Source RDMA Mechanism Smoke
+
+Stage 8C targets direct small-record forwarding from PCI-imported host source
+memory to an RDMA-visible destination. Before wiring that into the service
+scheduler, the standalone validation harness proves that the installed farnet1
+DOCA stack accepts a PCI-imported host mmap as the source of a DPU-controlled
+RDMA write.
+
+Implemented behavior:
+
+- `/data/dbcomm/postgres-citus/homer/doca_validation/doca_pci_rdma_bridge_validation.c`
+  runs as a two-process host/DPU smoke. The host role exports one source mmap
+  with `doca_mmap_export_pci()` and one target mmap with
+  `doca_mmap_export_rdma()`. The DPU role imports the source mmap with
+  `doca_mmap_create_from_export()`, imports the target RDMA descriptor, and
+  submits a `doca_rdma_task_write()`.
+- The DPU source `doca_buf` is created with
+  `doca_buf_inventory_buf_get_by_data()`, not address-only
+  `doca_buf_inventory_buf_get_by_addr()`. The data-length-bearing buffer is
+  required for the RDMA write to carry valid source bytes.
+- `/data/dbcomm/postgres-citus/homer/doca_validation/Makefile` builds the direct
+  DOCA RDMA smoke, an ibverbs RDMA baseline, and a DOCA-DMA-plus-ibverbs-RDMA
+  hybrid harness beside the earlier `doca_homer_validation` DMA harness.
+- `/data/dbcomm/postgres-citus/homer/doca_validation/README.md` records the
+  reproducible host/DPU runbook, expected success markers, and the current
+  direct-vs-staged small-record observations.
+
+Validation on July 2, 2026:
+
+```sh
+cd /data/dbcomm/postgres-citus
+make -C homer/doca_validation clean
+make -C homer/doca_validation
+
+rsync -az --delete --exclude doca_homer_validation \
+  --exclude doca_pci_rdma_bridge_validation \
+  --exclude ibverbs_rdma_write_validation \
+  --exclude doca_dma_ibverbs_rdma_validation \
+  homer/doca_validation/ dpu:/tmp/doca_validation/
+ssh dpu "make -C /tmp/doca_validation clean && make -C /tmp/doca_validation"
+```
+
+Then the direct PCI-source RDMA smoke was run for `--bytes=64`, `--bytes=1024`,
+and `--bytes=4096` with host PCI device `0000:21:00.0`, host RDMA device
+`mlx5_0`/GID index `3`, DPU DOCA device `0000:03:00.0`, and DPU RDMA device
+`mlx5_2`/GID index `1`.
+
+Observed accepted output:
+
+```text
+bytes=64 artifact=/tmp/hbr_stage8c_smoke_64_1782971892 host_rc=0 dpu_rc=0
+HBR_HOST_VALIDATED direct_pci_source_rdma_write bytes=64
+HBR_DPU_DONE mode=direct-pci-rdma bytes=64 iterations=1 window=1
+
+bytes=1024 artifact=/tmp/hbr_stage8c_smoke_1024_1782971917268138866 host_rc=0 dpu_rc=0
+HBR_HOST_VALIDATED direct_pci_source_rdma_write bytes=1024
+HBR_DPU_DONE mode=direct-pci-rdma bytes=1024 iterations=1 window=1
+
+bytes=4096 artifact=/tmp/hbr_stage8c_smoke_4096_1782971919675164316 host_rc=0 dpu_rc=0
+HBR_HOST_VALIDATED direct_pci_source_rdma_write bytes=4096
+HBR_DPU_DONE mode=direct-pci-rdma bytes=4096 iterations=1 window=1
+```
+
+Remaining Stage 8C work:
+
+- Add production direct-small-record ready queues in the DPU transfer engine,
+  populated only after grouped-control or mailbox discovery accepts a
+  host-published frontier.
+- Add reusable direct RDMA lane/task ownership with explicit lane id plus
+  generation/op id, and reject stale completion or stale lane observations.
+- Retire direct RDMA completions through DOCA RDMA callbacks or verbs CQ drain
+  under bounded scheduler grants.
+- Publish host source credit only after the RDMA completion frontier is known,
+  then validate multi-session 64 B, 1 KiB, and 4 KiB stress rather than only the
+  single-operation mechanism smoke above.
+
 ## Stage 9.1: Synthetic Payload Byte-Ring Pull Smoke
 
 Stage 9.1 starts the payload/basebackup migration with an engine-level synthetic
@@ -4550,14 +4635,384 @@ server DMA backend command, response, backend completion, and byte-ring pull com
 homer_dpu_tcp_transport_smoke: ok
 ```
 
+## Stage 9.2: Payload Send-CQ Identity Cleanup
+
+Stage 9.2 removes the hot payload send-CQ stream lookup by `serviceStreamId`.
+This is a prerequisite for selected-DPU mirror-source egress because send-CQ
+retirement must release the exact local source owner, and the callback should not
+scan `CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS` streams for every payload CQE.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:3189`
+  `TupleSinkServiceEncodePayloadWrId()` now encodes payload WR ids as:
+  payload tag, completion kind, 6-bit stream table index, 16-bit stream
+  generation, and 40-bit local completion token. Encode-time checks reject
+  stream indexes and tokens that do not fit the layout; static asserts require
+  the stream table to fit in the 6-bit field and require a 64-bit verbs `wr_id`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:22046`
+  `HomerServicePayloadStreamSendCqIdentity()` derives the compact identity from
+  the active stream table entry. It uses the low 16 bits of `serviceStreamId` as
+  a generation guard.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:13658`
+  `HomerServiceHandlePayloadSendCqeFromDrain()` now indexes directly into
+  `streamEntries[streamIndex]` and validates the decoded generation before
+  applying DATA or receiver-head ACK owner retirement.
+- Receiver-head ACK completions now use local ACK-owner tokens rather than
+  consumed-head byte frontiers as their CQE identity. The state added at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1636`
+  tracks `receiverHeadAckNextToken`, `receiverHeadAckCompletedToken`, and
+  `receiverHeadAckTokens[]`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:29124`
+  `HomerServiceTrackReceiverHeadAckOwner()` assigns the next ACK token while
+  retaining the actual consumed head in the owner slot. The post sites at
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:29475`
+  and `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:30739`
+  pass `{streamIndex, generation, ackToken}` to
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c:9643`
+  `TupleSinkServicePostPeerUint64WithImmediateResultRdma()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:29211`
+  `HomerServiceRetireReceiverHeadAckOwners()` requires the CQE token to match
+  the next FIFO ACK owner exactly and advances `receiverHeadAckCompletedHead`
+  from the stored owner tail after retirement. A duplicate, stale, or skipped
+  token is treated as an error rather than a harmless re-observation.
+
+Validation on July 2, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+git clang-format HEAD -- \
+  src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.c \
+  src/backend/distributed/utils/homer/remote_execution_peer_transport_rdma.h \
+  src/backend/distributed/utils/homer/tuple_sink_service_process.c
+sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+```
+
+The build succeeded. The only warnings were existing DOCA experimental/deprecated
+API warnings from `homer_service_dpu_dma.c` and DOCA headers.
+
+Runtime validation on July 2, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm make install-headers install-service-bin install
+
+rsync -az --delete \
+  --exclude data/ \
+  --exclude '*.log' \
+  --exclude logfile \
+  --exclude stage_tmp/ \
+  --rsync-path='sudo -n -u dbcomm rsync' \
+  /data/dbcomm/pg-citus/ \
+  farnet0:/data/dbcomm/pg-citus/
+
+ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
+  -h /tmp -p 5432 -U dbcomm \
+  --homer \
+  --homer-database-oid '5' \
+  --homer-user-oid '10' \
+  --homer-peer-host 10.10.1.101 \
+  --homer-peer-port 9717 \
+  --homer-peer-node 1 \
+  --latency-percentiles \
+  --client-cpu=3 \
+  -n -M simple -c 1 -j 1 -t 1000 postgres"
+
+/usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
+  -h /tmp -p 5432 -U dbcomm \
+  -X none -c fast \
+  -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2' \
+  -v
+```
+
+The install step also ran the local smoke checks:
+`homer_dpu_bridge_abi_check: ok`, `homer_dpu_comch_abi_check: ok`,
+`homer_frontend_dma_smoke: ok`, and `homer_service_dpu_dma_smoke: ok`.
+The remote pgbench smoke completed `1000/1000` transactions with zero failed
+transactions. The remote RDMA basebackup blackhole completed successfully in
+`real 13.25` seconds. Fresh Homer service log scans on both farnet hosts had
+zero matches for send-CQ token, stale stream identity, payload failure, DOCA
+failure, `ERROR`, `FATAL`, or `PANIC` patterns. The PostgreSQL log still
+contained unrelated Citus maintenance warnings about connecting to
+`10.10.1.100:5432`; those warnings did not fail the Homer smoke paths and were
+not emitted by the Homer service logs.
+
+## Stage 9.9: Selected-DPU Mirror Source Egress Slice
+
+Stage 9.9 wires the first zero-copy selected-DPU payload egress path. It is a
+bounded slice, not the final basebackup path: the helper only claims a completed
+DMA mirror range when the entire staged range can be forwarded as complete
+transport records. That restriction keeps the ownership invariant simple while
+the later Stage 9 work handles appendable mirror buffers or basebackup
+fragmentation out of borrowed mirror storage.
+
+Design correction recorded after Stage 9.9: the all-or-nothing release
+restriction is not the target design. The selected-DPU egress path should borrow
+a staged mirror range, post and retire any useful prefix, release only that
+prefix on send-CQ completion, and resume the next borrow at the unreleased
+suffix. This lets RDMA egress fragment by bytes for WR budget, remote-ring wrap,
+and remote credit without copying into `sendQueue`. The peer-visible byte-ring
+publication frontier still must land on a transport-record frontier unless the
+receiver protocol grows explicit partial-record buffering.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3190`
+  `HomerDpuDmaUnclaimMirroredByteRange()` reverses a scheduler borrow that did
+  not reach downstream RDMA ownership. This is necessary for zero-WR/backpressure
+  post failures: unclaiming makes the mirrored bytes retryable, while releasing
+  would eventually publish host consumed-head credit for bytes the peer never
+  received.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28357`
+  `HomerServicePumpOutgoingDpuMirrorByteRingPayload()` parses the borrowed
+  `HomerDpuDmaMirroredByteRange`, validates each existing transport record with
+  the same payload validators as the legacy byte-ring sender, registers the
+  DPU-local mirror allocation with the peer connection, and posts RDMA writes
+  directly from the mirror memory through
+  `TupleSinkServicePostPeerRegisteredPayloadBatchWithTailImmediateResultRdma()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28751`
+  attaches the claimed mirror range to the payload send-owner before posting.
+  Send-CQ retirement reaches
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14986`
+  `HomerServiceReleasePayloadSendOwnerSource()`, which releases the DPU mirror
+  range only after the downstream RDMA source lifetime is over. Host consumed-head
+  DMA publication remains a separate scheduler action.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28927`
+  dispatches a ready selected-DPU byte-ring stream to the mirror-source helper
+  before trying to register or use the legacy `sendQueue`. If there is no ready
+  mirror range and no legacy byte-ring mapping, the stream simply waits for
+  `DPU_PAYLOAD_PULL`/PE-drain work instead of failing on a missing SHM queue.
+- A trailing producer wrap gap inside a staged mirror range can be claimed and
+  released without a payload RDMA post. A real partial transport record is still
+  deferred; Stage 9 is not accepted until the selected-DPU path can handle
+  basebackup-sized records without falling back to `sendQueue`.
+
+Planned replacement for the current limitation:
+
+- Add a DMA-engine prefix release API, for example
+  `HomerDpuDmaReleaseMirroredByteRangePrefix(engine, range, releaseEnd, ...)`.
+  It should validate that the prefix belongs to the claimed range, advance the
+  staged range's absolute start and local data offset, keep the mirror buffer
+  staged while a suffix remains, and free/requeue the buffer only when the whole
+  range has been released.
+- Change payload send-owner metadata so a `DPU_MIRROR` owner records the exact
+  posted source prefix, not the entire claimed mirror range. DATA send-CQ
+  retirement releases that prefix; a retryable zero-WR post failure unclaims and
+  releases nothing; reset/abort cleanup releases only the accepted prefix after
+  the QP is fenced.
+- Reuse the existing transport-fragment receiver contract. The DPU egress path
+  may split RDMA WRs at arbitrary byte boundaries internally, but the final
+  peer tail publication should expose complete transport records/fragments to
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:30272`
+  `HomerServicePayloadTransportHeaderReady()` and
+  `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:30425`
+  `HomerServicePumpIncomingByteRingPayload()`.
+
+Validation on July 2, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make -j8 service-bin client-bin service-dpu-dma-smoke CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm env HOMER_DPU_DMA_SMOKE_RUN_GROUPED_CONTROL_READ=1 \
+  ./build/homer/homer_service_dpu_dma_smoke
+git diff --check
+```
+
+The service/client build and explicit smoke rebuild succeeded. The only compiler
+warnings were the existing DOCA experimental/deprecated API warnings. The rebuilt
+`homer_service_dpu_dma_smoke` printed `homer_service_dpu_dma_smoke: ok`, and the
+grouped-control/mirrored-ring smoke also printed `homer_service_dpu_dma_smoke:
+ok`. `git diff --check` reported no whitespace errors.
+
+## Stage 9.10: DPU Mirror Prefix Release And Resume
+
+Stage 9.10 implements the release-prefix design correction from Stage 9.9. A
+borrow still describes the currently staged mirror range, but downstream RDMA
+egress can now attach only the source prefix it actually posted to the
+send-owner slot. Send-CQ retirement releases that prefix, advances the staged
+mirror buffer's absolute start and local data offset, and leaves any suffix
+borrowable without another host-to-DPU DMA pull.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.h:302`
+  declares `HomerDpuDmaReleaseMirroredByteRangePrefix()`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:3239`
+  implements prefix release. It validates descriptor ownership, staged/claimed
+  state, local address identity, absolute frontier identity, and
+  `dataOffset + copiedBytes` bounds. A partial release updates
+  `absoluteStart`, `dataOffset`, and `copiedBytes`, clears only the claimed bit,
+  and keeps the same DPU-local mirror buffer staged. A full release preserves
+  the old free/requeue behavior.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:2976`
+  now materializes borrowed ranges from `byteBuffer->bytes + dataOffset`, so a
+  resumed suffix points at the correct DPU-local address instead of the original
+  buffer base.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:7146`
+  resets `dataOffset` to zero when a new host-to-DPU byte-ring pull is accepted,
+  preventing stale offset state from a reused byte-stream buffer.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:14961`
+  releases `DPU_MIRROR` send-owner sources through the prefix API.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28368`
+  no longer rejects a staged mirror range solely because parsing stopped before
+  the range end after at least one complete record was accumulated. It claims the
+  staged range, builds a prefix-shaped `HomerDpuDmaMirroredByteRange`, stores
+  that prefix in the payload send-owner, and posts RDMA directly from that
+  prefix.
+- `/data/dbcomm/citus-dbcomm/src/bin/homer_service_dpu_dma_smoke.c:394`
+  extends the grouped-control/mirrored-ring smoke: the first 32-byte mirrored
+  payload segment is released as a 16-byte prefix, consumed-head credit is
+  published for that prefix, the remaining 16-byte suffix is claimed from the
+  same DPU-local buffer, and the suffix is then released and credited.
+
+Validation on July 2, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make -j8 service-bin client-bin service-dpu-dma-smoke CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm env HOMER_DPU_DMA_SMOKE_RUN_GROUPED_CONTROL_READ=1 \
+  ./build/homer/homer_service_dpu_dma_smoke
+git diff --check
+```
+
+The targeted build passed, the default make-run smoke printed
+`homer_service_dpu_dma_smoke: ok`, the explicit grouped-control smoke printed
+`homer_service_dpu_dma_smoke: ok`, and `git diff --check` reported no
+whitespace errors.
+
+## Stage 9.11: Borrowed-Mirror Basebackup Fragment Generation
+
+Stage 9.11 implements the first DPU-mirror-specific transport-fragment sender
+for basebackup-sized records. It keeps the existing receiver protocol: RDMA WRs
+may use arbitrary byte prefixes from a borrowed mirror range, but every
+peer-visible byte-ring tail publication still exposes valid Homer transport
+records. Generated fragment transport headers are sourced from the existing RDMA
+connection header pool; payload bytes are read directly from DPU-local mirror
+memory and are not copied into `sendQueue`.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:16475`
+  adds `HomerServiceAppendOutgoingDpuMirrorBaseBackupFragmentWrite()`. The
+  helper validates active basebackup fragment state, checks that the borrowed
+  mirror range contains the bytes being posted, emits generated FIRST,
+  continuation, and LAST transport headers, and advances
+  `batchSourceByteTail` after every posted mirror prefix so send-CQ retirement
+  can release DPU mirror space incrementally.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28649`
+  extends `HomerServicePumpOutgoingDpuMirrorByteRingPayload()` to continue an
+  active DPU-mirror basebackup fragment before parsing a new record.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28904`
+  starts DPU-mirror basebackup fragmentation when a valid basebackup transport
+  record is larger than the currently borrowed mirror range.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28995`
+  also routes the diagnostic `HOMER_BULK_FRAGMENT_BYTES` split through the
+  DPU-mirror fragment helper when the full record is already present in the
+  borrowed range.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:29211`
+  validates every DPU-mirror payload write target against the peer byte-ring
+  storage range before posting the RDMA batch.
+
+Important invariant: for DPU mirror sources, source-byte release and semantic
+object completion are intentionally decoupled. A non-LAST fragment stores a
+send-owner byte tail at the posted mirror prefix, but leaves the semantic tail
+unchanged. On send-CQ retirement, the DPU mirror prefix can be released and host
+credit can later be published for those bytes even though the basebackup object
+is not semantically complete until the LAST fragment reaches the peer.
+
+Validation on July 2, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make -j8 service-bin client-bin service-dpu-dma-smoke CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm env HOMER_DPU_DMA_SMOKE_RUN_GROUPED_CONTROL_READ=1 \
+  ./build/homer/homer_service_dpu_dma_smoke
+git diff --check
+```
+
+The targeted service/client/smoke build passed. The explicit grouped-control
+smoke printed `homer_service_dpu_dma_smoke: ok`, and `git diff --check`
+reported no whitespace errors. This is still a compile/engine-regression gate;
+the next Stage 9 validation must exercise real selected-DPU payload/basebackup
+traffic through the DPU mirror egress path.
+
 Remaining Stage 9 work:
 
 - Replace synthetic payload generation with real selected-DPU byte-stream
   producers.
-- Add production scheduler actions for byte-ring pull windows and contiguous
-  completion-frontier retirement instead of smoke-only copy-out helpers.
+- Add production scheduler evidence for byte-ring pull windows, mirror-source
+  RDMA posts, send-CQ mirror release, and consumed-head publication under a real
+  selected-DPU payload stream instead of only the standalone engine smoke.
 - Wire basebackup/result payload streams to publish host byte-ring frontiers and
   reject missing/stale selected-DPU setup instead of falling back to host-process
   SHM queues.
 - Add payload/basebackup counters for host-published frontiers, submitted pulls,
   completed contiguous bytes, and consumed-head DMA publications.
+
+## Stage 9.12: Selected-DPU Mirror-Only Egress Gate
+
+Stage 9.12 removes the selected-DPU byte-ring egress fallback to the legacy
+host-process `sendQueue` source. This does not globally delete `sendQueue`: the
+fixed-slot and DPU-off paths still depend on it. The accepted boundary for this
+slice is narrower and production-relevant: when the DPU DMA scheduler is
+enabled, outgoing byte-ring payload/basebackup streams must use DPU-local mirror
+memory as the RDMA source, and an absent ready mirror range means the scheduler
+must run `DPU_PAYLOAD_PULL`/PE-drain work rather than falling through to a local
+SHM source.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6135`
+  adds `HomerServicePayloadStreamUsesDpuMirrorSource()`, a single predicate for
+  the selected-DPU mirror-source boundary.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:6333`
+  teaches payload egress frontier facts to use completed mirror ranges as the
+  ready-byte hint instead of `sendQueue.byteRingControl` when selected-DPU is
+  active.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:12268`
+  makes outgoing readiness return false for selected-DPU byte rings when no
+  mirror range is ready, preventing accidental readiness from a local
+  `sendQueue`.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:16857`
+  makes `TupleSinkServiceEnsureSendQueueMemoryRegion()` fail explicitly if a
+  selected-DPU byte-ring stream tries to register the legacy source mapping.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:29517`
+  makes `HomerServicePumpOutgoingPayloadStream()` return after a selected-DPU
+  mirror readiness miss. The next useful work is DMA pull/PE progress, not
+  legacy source-queue egress.
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:34285`
+  skips stream-open `sendQueue` RDMA registration for selected-DPU byte-ring
+  streams. The DPU mirror allocation is registered by the mirror egress helper
+  only when the selected-DPU path needs it.
+
+Important invariant: `sendQueue` is now a legacy/non-selected source. A
+selected-DPU byte-ring stream may still carry historical struct fields while the
+surrounding code is being migrated, but those fields must not be the RDMA source
+or readiness source for selected-DPU payload/basebackup egress.
+
+Validation on July 2, 2026:
+
+```sh
+cd /data/dbcomm/citus-dbcomm
+sudo -n -u dbcomm make -j8 service-bin client-bin service-dpu-dma-smoke CPPFLAGS='-D_GNU_SOURCE'
+sudo -n -u dbcomm env HOMER_DPU_DMA_SMOKE_RUN_GROUPED_CONTROL_READ=1 \
+  ./build/homer/homer_service_dpu_dma_smoke
+git diff --check
+```
+
+The targeted rebuild passed. The default make-run smoke and explicit
+grouped-control smoke both printed `homer_service_dpu_dma_smoke: ok`. The only
+compiler warnings were the existing DOCA experimental/deprecated API warnings.
+`git diff --check` reported no whitespace errors.
+
+Remaining Stage 9 work:
+
+- Run real selected-DPU payload/basebackup traffic through the mirror-only path.
+  Stage 9.12 proves the fallback is removed at compile/engine-smoke scope, not
+  that a production basebackup stream has completed end to end.
+- Add production scheduler counters for mirror-ready bytes, mirror RDMA posts,
+  send-CQ mirror releases, and consumed-head DMA publications.
+- Continue removing legacy `sendQueue` fields only where the DPU-mode setup and
+  real producer wiring have made them structurally unreachable. Do not remove
+  them globally while DPU-off and fixed-slot paths still use the legacy source.

@@ -123,6 +123,39 @@ it by DMA-writing the response body followed by the response-ready publication
 word on the same ordered DOCA DMA context. Until that exists, selected DPU command
 API acceptance cannot be claimed.
 
+The selected-DPU payload/basebackup path has progressed into Stage 9 mirrored
+byte-ring implementation. The remote RDMA basebackup runtime gate now passes
+through the selected-DPU mirror-only path, but mixed foreground command plus
+background basebackup validation remains future Stage 9 promotion work.
+Host-side basebackup publishing in
+[`HomerClientReserveBaseBackupRecordForObject()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2786)
+and
+[`HomerClientSubmitBaseBackupRecord()`](/data/dbcomm/citus-dbcomm/src/bin/homer_client.c:2989)
+now uses exact source-record sizes instead of a fixed selected-DPU source
+envelope. The temporary fixed-envelope protocol was rejected because it added
+source slack that was neither semantic payload nor physical wrap gap. The current
+PostgreSQL `bbsink` integration uses a scratch buffer to adapt the generic
+`bbsink` producer contract: it learns `archive_contents(len)`, reserves exactly
+the transport header plus semantic header plus payload bytes through
+`HomerClientReserveBaseBackupRecordForObjectPayload()`, copies the object into
+the exact byte-ring record, and publishes that exact record. This is correct for
+Stage 9 cleanup, but not the final no-copy shape; the later performance cleanup
+should move reservation into producer-loop sites before archive bytes are read.
+
+On the service side,
+[`HomerServicePumpOutgoingDpuMirrorByteRingPayload()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:28827)
+parses only bytes present in the completed DPU mirror range while using the
+accepted host tail only to prove physical wrap. A full matching header whose
+body is not yet mirrored is treated as a capped-DMA local view and requests a
+mirror append; a full nonmatching header is a protocol/visibility failure.
+[`HomerServiceAppendOutgoingDpuMirrorBaseBackupFragmentWrite()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:16588)
+now forwards exact basebackup object bytes from the DPU-local mirror and no
+longer carries fixed-envelope slack. Source-skip is reserved for physical wrap
+gaps. Grouped-control discovery is kept as bounded known work while host rings
+are imported, because host tail publication has no separate doorbell and
+suppressing grouped-control reads can deadlock a full producer ring waiting for
+credit.
+
 ## Milestone History And Design Corrections
 
 - **Remote execution session wrapper**: the early wrapper checkpoint introduced a backend-visible session API over the tuple-route substrate. See [remote_execution_session_wrapper_checkpoint.md](../connection-management/remote_execution_session_wrapper_checkpoint.md).
@@ -138,6 +171,15 @@ API acceptance cannot be claimed.
   validates scheduler integration and response-owner lifetimes, but Stage 8
   response DMA publication is still required before a selected DPU command can
   complete on the host.
+- **Selected-DPU mirrored basebackup**: Stage 9 validation corrected the
+  byte-ring wrap protocol for capped DMA pulls. Padding records and a
+  selected-DPU wrap flag were removed; regular pre-wrap transport headers now
+  prove wrap gaps when a full header fits, and accepted host tails prove only
+  trailer-smaller-than-header gaps. Follow-up design review rejected the fixed
+  selected-DPU source envelope as a steady-state protocol. Stage 9 cleanup now
+  publishes exact source-record sizes via a scratch-buffer adapter, while the
+  final performance cleanup should move exact reservation into the PostgreSQL
+  producer loop and remove that scratch copy.
 
 Important corrections that survived validation:
 
@@ -167,6 +209,23 @@ Runtime validation after rebuilding/installing and syncing `/data/dbcomm/pg-citu
 - remote pgbench c4: `40000/40000`, `0` failures, about `10134.20 TPS`, p99 `0.589 ms`
 - remote RDMA basebackup: first run `real 6.22`, warmed repeat `real 4.14`
 - service log scans after the corrected run had no `status=12`, transport retry, fatal, panic, or assertion lines
+- selected-DPU remote RDMA basebackup after the no-padding wrap correction and
+  no-stats rebuild:
+  `pg_basebackup -X none -c fast -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2'`
+  completed in `real 51.34`; receiver final head WIMM reported
+  `final_tail=23732382600`, and DPU/receiver/postgres log scans had no
+  protocol reset, stale header, DOCA task failure, timeout, fatal, panic, or
+  assertion lines. The DPU log scan matched only expected reclaim and setup
+  import-closing lifecycle lines.
+- selected-DPU remote RDMA basebackup after exact source-record cleanup and
+  DPU import teardown ownership cleanup:
+  `pg_basebackup -X none -c fast -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2'`
+  completed in `real 27.60`. The fixed-envelope/source-skip issue did not
+  recur, PostgreSQL logged no errors, and the DPU owner-abort path released the
+  borrowed mirror source instead of wedging teardown. This is still not a clean
+  Stage 9 acceptance run: DPU and receiver service logs reported RDMA send/recv
+  CQ close/reset messages after receiver quiesce, so peer close ordering remains
+  follow-up lifecycle work.
 
 The remote pgbench/basebackup numbers are validation checkpoints, not final tuned benchmark claims.
 
@@ -180,6 +239,20 @@ The remote pgbench/basebackup numbers are validation checkpoints, not final tune
 - The tuple row format is still a prototype tuple-view row layout, not a canonical cross-platform wire serialization.
 - The remote pgbench c4 path is correct but should still be treated as a shared command/completion transport scaling checkpoint, not final multi-client performance.
 - Basebackup remote RDMA currently validates blackhole/consume semantics on the receiver service; remote materialization is future work.
+- Selected-DPU basebackup correctness is validated for the standalone remote
+  RDMA basebackup path. Mixed foreground command plus background basebackup
+  validation is still required before treating Stage 9 as the complete migrated
+  workload-interference baseline.
+- Selected-DPU basebackup currently has a residual peer RDMA teardown caveat:
+  successful runs may still close by reset after receiver quiesce. That no
+  longer corrupts or wedges DPU mirror ownership, but the log scan is not clean
+  and the peer close ordering should be fixed before Stage 9 is accepted. The
+  current DPU setup `CLOSE_ACK` path proves only a narrow DMA-import drain; the
+  Stage 10 plan now requires a scheduler-owned close-drain proof that also waits
+  for borrowed mirrored byte ranges, RDMA send owners, receiver-head/final-close
+  owners, ready refs, staged command/response queues, and payload close ops
+  before the DPU sends `CLOSE_ACK` and before the host destroys exported mmap
+  resources.
 - The current farnet lane-0 validation path requires matching host MTUs. If farnet1 `enp33s0f0np0` is MTU `9000`, farnet0 `enp33s0f0np0` must also be MTU `9000`.
 
 ## Related

@@ -197,6 +197,73 @@ Current empirical status from the standalone harness:
 - DPU async DMA-write plus a later DMA frontier write, after observing the completed contiguous payload frontier, passed the corresponding host-consume stress under `force_relax`.
 - Sync-event worked as a practical publish/wakeup value for the validated host-produce/DPU-pull and DPU-produce/host-consume harness protocols, including early-publish negative controls that failed as expected.
 - Split DMA contexts are not a publication ordering primitive. The 64 B `write-publish-split-nowait` validation failed when payload DMA and tail DMA were submitted to separate contexts without waiting for the data context's completed frontier. The split completion-gated variant passed.
+- A later direct-forwarding probe, [`doca_pci_rdma_bridge_validation.c`](/data/dbcomm/postgres-citus/homer/doca_validation/doca_pci_rdma_bridge_validation.c:1),
+  passed 64 B and 4 KiB farnet1 host-to-DPU tests where the DPU used a host
+  PCI-imported source mmap as the source buffer of a `doca_rdma_task_write()` to
+  an RDMA-exported target buffer. This supports prototyping direct
+  DPU-controlled backend-ring-to-frontend-ring RDMA forwarding as an alternative
+  to always staging bytes in DPU-local memory. The source buffer must be created
+  with `doca_buf_inventory_buf_get_by_data()` so the RDMA write has a data
+  length.
+- The same direct-forwarding harness compared direct PCI-source RDMA against
+  DMA-pull-into-DPU-memory followed by RDMA write. After fixing the harness to
+  use a fixed window of reusable DOCA task/buffer lanes, callback resubmit, and
+  an explicit host-ready gate before DPU timing, direct PCI-source RDMA reached
+  about `4.47M` ops/s for 64 B records at window 64 and `4.62M` ops/s /
+  `4514` MiB/s for 1 KiB records at window 128. Staged DMA-then-RDMA reached
+  about `2.47M` ops/s for 64 B and `2.63M` ops/s / `2570` MiB/s for 1 KiB. At
+  1 MiB/window 128, direct reached about `11821` MiB/s and staged reached about
+  `15238` MiB/s. The earlier about-`1 GiB/s` large-transfer numbers were a
+  harness artifact from starting the DPU before the host endpoint was fully
+  ready and from polling the DPU with repeated SSH commands during timing.
+- An ibverbs companion harness on the same path reached about `9.77M` ops/s at
+  64 B, `14.07M` ops/s / `13736` MiB/s at 1 KiB, and `18013` MiB/s at 1 MiB
+  with spread buffers. `ib_write_bw` on the same devices reported `242.99` Gb/s
+  for 1 MiB/TX-depth-128, and `--use_old_post_send` still reported `240.75`
+  Gb/s. This confirms the RDMA path itself is healthy and the remaining DOCA-vs-
+  verbs gap is API/source-path/progress overhead, not a broken link.
+- A ready-gated low-window sweep is more representative of dependent
+  command/completion traffic. Direct PCI-source RDMA reached about `390k` ops/s
+  for 64 B/window 1, `787k` at window 2, `1.38M` at window 4, `2.50M` at window
+  8, and roughly `4.4M-4.6M` from windows 16 through 128. For 1 KiB records it
+  reached about `374k` ops/s at window 1, `1.25M` at window 4, `3.96M` at
+  window 16, and `4.88M` at window 128. The ibverbs baseline was close at window
+  1 but scaled much further at high depth: `19.7M` ops/s for 64 B/window 128
+  and `18.0M` ops/s for 1 KiB/window 128.
+- Staged DMA-then-RDMA remains the wrong small-record default: it reached about
+  `238k` ops/s at 64 B/window 1 and `2.71M` at 64 B/window 128, because each
+  semantic record requires a DMA operation followed by an RDMA operation.
+- A separate hybrid probe using DOCA DMA for the host-source pull and ibverbs
+  RC RDMA write from DPU-local staging memory reached about `261k` ops/s at
+  64 B/window 1, `2.27M` at 64 B/window 16, and `4.12M` at 64 B/window 128.
+  For 1 KiB it reached about `253k`, `2.20M`, and `3.87M` ops/s at windows
+  1/16/128. A fresh direct DOCA RDMA rerun reached about `397k`, `4.44M`, and
+  `4.12M` ops/s for 64 B at the same windows and about `386k`, `4.22M`, and
+  `4.49M` ops/s for 1 KiB. This reinforces that the DMA-plus-RDMA hybrid is not
+  a better small-record default, although it tied direct around `15 GiB/s` at
+  1 MiB/window 128 in this run.
+- The hybrid probe exposed a real harness bug that is also a Homer design
+  warning: lane/resource ownership must be carried explicitly. Recovering the
+  lane as `op_index % window` is wrong once completions can arrive out of order.
+  The fixed harness packs lane id plus operation id in both DOCA task user data
+  and verbs `wr_id`.
+- `doca_task_submit_ex()` with `DOCA_TASK_SUBMIT_FLAG_OPTIMIZE_REPORTS` plus a
+  non-optimized flushed sentinel was validated in the direct, hybrid, and
+  all-DOCA staged probes. Direct DOCA RDMA did not materially improve in the
+  selected runs. The hybrid path improved the 1 MiB/window 128 point from about
+  `15152` to `16745` MiB/s, but hurt 64 B and was mixed for 1 KiB. All-DOCA
+  staged improved from about `13334` MiB/s to `15628` MiB/s even at
+  `report_interval=2`, and up to `15970` MiB/s at `report_interval=128`; this
+  means the bulk benefit is not only a very-large-window artifact. Treat
+  opt+flush as a throughput-batch tool, not a latency-sensitive
+  command/completion publication default. If adjacent bytes share one lifetime
+  and one publication boundary, prefer one larger DMA/RDMA task over many
+  optimized tasks plus a sentinel.
+- The corrected harness validates DOCA task-object reuse for this path. It
+  keeps one task/buffer lane per in-flight operation, uses
+  `doca_buf_inventory_buf_reuse_by_data()` and
+  `doca_buf_inventory_buf_reuse_by_addr()` to reposition buffer handles, updates
+  task fields, and resubmits from callbacks after DOCA returns ownership.
 - The installed headers still do not make sync-event or COMCH a documented general release/acquire fence for arbitrary unrelated memory. Treat the harness result as evidence for the exact protocol shape, not a license to reorder data writes and notification freely.
 - The current PCI-export path could not combine `DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING` with PCI read/write permissions; `doca_mmap_set_permissions()` rejected that combination. Global/firmware `PCI_WR_ORDERING=force_relax` remains the adversarial validation environment.
 
@@ -244,6 +311,21 @@ For very small control requests, measure two options instead of assuming DMA win
 The current local control path is cold enough that debuggability may matter more than squeezing the last cycles out of COMCH during session open.
 
 For pgbench-like command/completion rings, assume `K=1` within one session until proven otherwise: the next command often depends on the previous completion. Coalescing across sessions should therefore be DOCA/initiator-side completion-report coalescing on a shared DMA context, not a single semantic tail for many sessions. For throughput byte streams such as basebackup-like rings, use larger contiguous DMA tasks and less frequent per-session tail/consumed updates when the byte-ring layout allows it.
+
+Decision for the first DPU-backed Homer implementation:
+
+- **Small records** such as pgbench command/completion records should use direct
+  DPU-controlled DOCA RDMA from PCI-imported host memory. The experiments show
+  that staging adds one extra device operation and loses for low-depth and
+  moderate-depth small records.
+- **Large bulk records** such as basebackup payloads should use DOCA DMA pulls
+  into DPU-local staging memory followed by ibverbs RDMA writes from that
+  DPU-local memory. Use opt+flush on the DOCA DMA side for genuine multi-task
+  batches, but first coalesce adjacent bytes into the largest sensible
+  contiguous range when they share the same publication boundary.
+- **All-DOCA staged bulk transfer** remains a fallback and comparison point,
+  not the selected basebackup path. It is close with opt+flush, but the
+  selected high-throughput path is DOCA DMA plus ibverbs RDMA.
 
 ## Performance Guidance
 
