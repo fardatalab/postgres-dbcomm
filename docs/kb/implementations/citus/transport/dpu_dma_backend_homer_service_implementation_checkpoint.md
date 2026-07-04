@@ -5016,3 +5016,204 @@ Remaining Stage 9 work:
 - Continue removing legacy `sendQueue` fields only where the DPU-mode setup and
   real producer wiring have made them structurally unreachable. Do not remove
   them globally while DPU-off and fixed-slot paths still use the legacy source.
+
+## Stage 10.0: Selected-DPU Close Lifecycle And Cross-Run Reclaim
+
+Reported bug: a remote selected-DPU RDMA basebackup
+(`pg_basebackup -X none -c fast -t 'homer:mode=rdma,host=...,port=9717,node=2'`)
+moved the full ~23 GB payload correctly, then **timed out at CLOSE** — the host
+`pg_basebackup` failed after ~10 s with `Homer base backup target failed during
+close stream / DPU close socket exchange failed`. The data plane was never the
+problem; the close/reclaim lifecycle was.
+
+The failure turned out to be a **stack of independent defects, each masking the
+next** — the debugging value is in that layering, so it is recorded in order:
+
+1. **Design smell / Component B (the CLOSE_ACK gate was coupled to the full RDMA
+   close).** The setup `CLOSE_ACK` (host-visible permission to destroy the
+   exported host mmap) was gated on the *semantic* byte-stream close (final tail
+   freeze, `CLOSE_SINK` round-trip, receiver credit), which is peer-dependent and
+   against a blackhole receiver never completed. The host memory lifetime must
+   only depend on **local resource/owner drain**: in-flight DMA retired + all
+   discovered host bytes DMA-pulled into the DPU-local mirror. Fix: a **phased
+   import teardown** — a new `HOMER_DPU_DMA_HOST_MMAP_IMPORT_HOST_DETACHED`
+   lifecycle state; at `CLOSE_ACK` free only `import->mmap` and keep the DPU-local
+   mirror + descriptors + ringRuntime alive for background RDMA egress; full-free
+   the import later from a background reclaim pass. Import-state gate split so no
+   host-memory-touching work runs at `HOST_DETACHED`: `CanSubmit` (ACTIVE-only,
+   commands/discovery/host-writes) vs `CanDrainHostRing` (ACTIVE‖CLOSING, byte-ring
+   pull) vs `CanEgressMirror` (ACTIVE‖CLOSING‖HOST_DETACHED, mirror egress
+   family). The `CLOSE_ACK` predicate
+   `HomerServiceDpuPayloadStreamsDrainedForClosingSetup()` was rewritten to
+   lifetime-only (`LocalHandleCount==0` + pull-complete
+   `acceptedPublishedTail==completedByteTail`), dropping the peer/egress/credit
+   terms.
+
+2. **Fix A — the background import reclaim raced the sender semantic close and
+   destroyed the frontier it depends on (the actual cross-run leak).** After
+   Component B, the background full-free
+   (`HomerDpuDmaReclaimDetachedImports()`) freed the DPU-mirror import the instant
+   egress drained (`completedByteTail==releasedByteTail`) — the *same instant* the
+   sender-side close would first observe `sendSourceDrained`. Once the import is
+   gone, `HomerDpuDmaByteRingFrontierForServiceSink()` returns `found=false`,
+   which flips `sendSourceDrained` false, which makes
+   `HomerServicePayloadMustProgressBeforeClose()` return true, which classifies
+   the close `CLOSE_OR_RECLAIM_BLOCKED` (not `PENDING`) — so the `CLOSE_RECLAIM`
+   scheduler action is **never granted** and `TupleSinkServicePeerCloseSinkBestEffort()`
+   **never runs**. The sender-side payload stream leaks; leaked streams accumulate
+   ~1/run and tax the per-iteration active-stream scan (O(n) cross-run wall-time
+   decay: 28→63→93→124 s). Fix: gate the import full-free on a new per-import
+   `senderCloseReleased` flag that the service sets from its single central
+   binding-clear once the semantic close is done with the mirror.
+
+3. **Gate 2 — `sendRetired` compared records against bytes for byte-ring
+   streams.** With the close finally scheduled, it wedged at the first leg of
+   `PeerCloseSinkBestEffort` (`BLOCK_FINAL_PAYLOAD_SEND_CQ`): `finalPayloadSendRetired`
+   never latched because `sendRetired` compared `payloadSenderCompletedHead` (a
+   cumulative **record** count for byte-ring, ~6.6k) against `payloadCloseFinalTail`
+   (a **byte** position, ~23e9). A latent bug, unreachable until the close began
+   to actually run. Fix: compare a unit-consistent completed frontier
+   (`payloadByteSenderPostedTail` for byte-ring). With that, legs 2 (peer quiesce)
+   and 3 (final credit) converged on their own — their prerequisites were already
+   satisfied.
+
+Cleanup landed alongside the fix:
+
+- **`OPTIMIZE_REPORTS` kept.** The backend-command body's
+  `DOCA_TASK_SUBMIT_FLAG_OPTIMIZE_REPORTS` had been removed during the
+  investigation on suspicion it stranded completions at close. A/B re-validation
+  showed the close converges with it restored (the sole OPTIMIZE_REPORTS task is
+  always immediately followed by its `publishedEpoch` FLUSH partner, so no
+  completion is structurally unflushed) — the removal was redundant; kept for the
+  hot-path CQE reduction.
+- **close-flush-nudge removed.** The DPU-local FLUSH "nudge" issued during the
+  CLOSE_ACK drain was a band-aid for the original gate-scoping hang. With the real
+  fixes in place, hardware validation confirmed the close converges without it
+  (`doca_pe_progress()` via `HomerDpuDmaDrainPeForClose()` surfaces the in-flight
+  completions on its own), so the whole `HOMER_DPU_DMA_TASK_KIND_CLOSE_FLUSH_NUDGE`
+  / `HomerDpuDmaFlushClosingImportClasses` / `HomerDpuDmaSubmitOneCloseFlushNudge`
+  machinery was deleted.
+- **`ClearStagedCommandSlot` widened** from `CanSubmit` (ACTIVE-only) to run at any
+  lifecycle state, with the discovery requeue kept ACTIVE-only — so a reclaim at
+  `HOST_DETACHED` with a still-staged command cannot leak a command buffer + class
+  counter. Inert for basebackup; defensive for a future multi-command workload.
+
+Implemented behavior:
+
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c:341`
+  `HomerDpuDmaHostMmapImport.senderCloseReleased`;
+  `:5875` `HomerDpuDmaDetachHostMmapForClose()` (free host mmap at CLOSE_ACK, set
+  `HOST_DETACHED`); `:5927` `HomerDpuDmaReclaimDetachedImports()` (background
+  full-free, gated on `senderCloseReleased` + egress-drained); `:6002`
+  `HomerDpuDmaMarkImportSenderCloseReleased()` (service→engine release signal,
+  matched by descriptor session/sink).
+- `/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:37540`
+  `HomerServiceDpuPayloadStreamsDrainedForClosingSetup()` rewritten lifetime-only;
+  `:24385` `HomerServiceClearPayloadStreamPeerBinding()` calls
+  `HomerDpuDmaMarkImportSenderCloseReleased()` for DPU-mirror streams; `:25181`
+  the unit-consistent `senderCompletedFrontier` in
+  `TupleSinkServicePeerCloseSinkBestEffort()`; `:24817`
+  `HomerServicePayloadSendSourceDrainedForClose()` and `:12324`
+  `HomerServicePayloadMustProgressBeforeClose()` are the readiness predicates the
+  reclaim race broke.
+
+Validation (July 4, 2026, warmed, both diagnostic and non-diagnostic builds; DPU
+sender + farnet0 receiver + farnet1 host): four back-to-back remote RDMA
+basebackups on one long-lived service set, `rc=0` every run, **flat** wall time
+~29-31 s (was escalating 28/63/93/124 s), farnet0 `byte-ring basebackup blackhole
+complete objects=6636` every run. Diagnostic build confirmed the full lifecycle:
+`setup import closing` → `CLOSE_ACK` → `setup import host-detached` →
+`reclaiming host-detached import` (4/4, now AFTER the close), the receiver's
+`CLOSE_SINK -> quiesced peerBindingStillActive=0`, and no cross-run stream
+accumulation (`active_streams`/`peer_bound` stay flat at 1). The pgbench legs in
+that pass (local + remote RDMA) exercised the **host-service** command path, not
+the selected-DPU DMA command path — see Stage 10.1: fix A as written above
+REGRESSED the selected-DPU pgbench session-reopen path, and the polarity fix for
+that is recorded there. This Stage 10.0 basebackup result still holds.
+
+Known limitation observed during validation (pre-existing, unrelated to this
+stage): the selected-DPU frontend build rejects local blackhole basebackup
+(`mode=blackhole,node=1`) with `selected-DPU basebackup requires mode=rdma with a
+resolved peer endpoint`. Not a regression from this stage.
+
+## Stage 10.1: `senderCloseReleased` polarity regressed selected-DPU SQL reopen
+
+Validating the selected-DPU path for **pgbench** (the CLIENT_SQL_SESSION command
+path, which Stage 10.0 did not exercise on the DPU DMA path) surfaced a regression
+introduced by Stage 10.0's **fix A**. A single selected-DPU SQL call worked, but a
+workload that opens/closes multiple Homer sessions **within one long-lived backend**
+failed on the **second** session open at DPU TCP setup:
+
+```
+Homer DPU TCP setup failed ... error=host mmap setup generation/client/export already imported
+```
+
+Root cause — a **default-polarity error** in fix A. `senderCloseReleased` was born
+`false` (the import slot's `memset` at `homer_service_dpu_dma.c` `HomerDpuDmaClear
+HostMmapImport`) and was only ever flipped `true` at
+`HomerServiceClearPayloadStreamPeerBinding` — a path **only a peer-bound byte-ring
+payload sender reaches**. A selected-DPU SQL session also imports the three
+command/completion control mailboxes (descriptor roles `FRONTEND_CONTROL_SLOT` /
+`BACKEND_COMMAND_MAILBOX` / `BACKEND_COMPLETION_MAILBOX` — **not** byte rings, so
+they never match the release's byte-ring `(session,sink)` lookup) plus, for some
+topologies, a non-peer-bound result ring. Those imports stayed `false` forever, so
+the reclaim gate at `HomerDpuDmaReclaimDetachedImports()` never full-freed them.
+They sat `HOST_DETACHED` permanently, leaking the `(bridge_generation,
+client_instance_id, mmap_export_id)` setup identity; because the whole workload
+reuses one backend PID (same `client_instance_id`) with `bridge_generation` reset
+to 1, the next open reused that identity and
+`HomerDpuDmaImportHostMmapDescriptorForSetup()` rejected it at
+`HomerDpuDmaFindHostMmapImportSlot(...) >= 0` (`homer_service_dpu_dma.c:4422`).
+Basebackup masked this entirely: its only import IS a peer-bound payload sender,
+which does get released — so the Stage 10.0 reclaim ran 4/4 and looked perfect.
+
+Fix — **invert the polarity**: `senderCloseReleased` now DEFAULTS to *released*
+(`true`) at import creation, and is *held* (`false`) only where it is actually
+needed — a locally-initiated peer-bound DPU-mirror sender whose sender-side
+semantic close reads the mirror frontier.
+
+- `homer_service_dpu_dma.c`: set `senderCloseReleased = true` in
+  `HomerDpuDmaImportHostMmapDescriptorForSetup()` at import creation; new
+  `HomerDpuDmaHoldImportForSenderClose(engine, session, sink)` (mirror of
+  `...MarkImportSenderCloseReleased`, sets the flag `false`). The reclaim gate line
+  (`!import->senderCloseReleased`) is unchanged.
+- `tuple_sink_service_process.c`: `HomerServiceBindPeerToPayloadStream()` calls the
+  new hold, gated on `locallyInitiated && HomerServicePayloadStreamUsesDpuMirror
+  Source(streamEntry)`. The import is guaranteed to already exist (created at DPU
+  TCP setup with its full descriptor table before the peer bind), and is matched by
+  the same `(parentServiceSessionId, serviceStreamId)` the release uses.
+
+Net: control-mailbox and non-peer-bound imports are never held → reclaim on close →
+SQL session reopen works; the basebackup payload mirror is held at bind and released
+at binding-clear exactly as before → Stage 10.0 still holds.
+
+Validation (July 4, 2026, warmed, non-diag, full three-role selected-DPU: farnet1
+host + farnet0 RDMA receiver + farnet1 DPU native ARM service). **PASS**, both gates,
+with log evidence that the selected-DPU DMA command path (not a host-service/libpq
+fallback) actually executed:
+
+- **Primary (the regression):** the DPU-frontend SQL path — `SELECT pg_catalog.
+  citus_remote_exec_pgbench_transaction(...)` under `citus.enable_experimental_homer
+  _dpu_frontend = on` (this, NOT `pgbench --homer`, is what reaches
+  `backendChannelMode SELECTED_DPU_DMA`) — driven 50 times inside **one** backend via
+  `generate_series(1,50)`. All 50 reopens reused the identical
+  `client_instance_id=2053266, bridge_generation=1` (the exact reused-PID/reset-
+  generation trap: 50 sessions × 4 control-mailbox imports = 200 `setup import
+  closing` lines at that identity), `count=50, min=316, max=365`, rc=0, and **zero**
+  `host mmap setup ... already imported` anywhere in the DPU log. Every one of those
+  control-mailbox imports was created AND reclaimed — no stranding.
+- **Regression guard (no re-leak):** four warm selected-DPU RDMA basebackups on one
+  long-lived service set, rc=0 each, **flat** wall time 29.21/29.56/29.82/29.12 s (no
+  cross-run escalation), farnet0 `byte-ring basebackup blackhole complete
+  objects=6642` **identical** on all four runs (the `6642` vs Stage 10.0's `6636` is
+  data-dir growth, not a leak — flatness across runs is the signal). DPU import
+  counters `setup import closing` and `reclaiming host-detached import` each advanced
+  +1 per run (basebackup's single peer-bound payload-mirror import, created and fully
+  reclaimed every run). Process preflight clean on all three roles before and after.
+
+Operational notes surfaced by the validation (durable): (1) the DPU native ARM build
+tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 HEAD and can carry stale
+uncommitted diffs in the very files under test — sync the changed source (verified by
+itemized rsync) and rebuild `service-bin` on the DPU before trusting a selected-DPU
+run. (2) The DPU frontend requires the `HOMER_FRONTEND_DPU_SETUP_*` / DOCA env in the
+**postmaster** environment, not just the client.
