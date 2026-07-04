@@ -153,3 +153,28 @@ ordering-gap, or failed-transaction symptoms.
 - The full `10` warmed c4 plus `5` c4-with-basebackup acceptance matrix from the
   future plan was not run in this checkpoint. The committed evidence is the
   compile/install gate plus remote c1/c4 correctness and warmed c4 performance.
+
+## Follow-up (July 2026): legacy peer POLL_COMMAND_COMPLETION removed
+
+The deprecated service↔service peer `POLL_COMMAND_COMPLETION` path was removed from
+`tuple_sink_service_process.c` (the peer POLL responder, the async local-control
+relay + its state-machine phases, the DPU staged-POLL responder, the
+`terminalCompletionPendingPeerPoll` field, and the peer-protocol union members; the
+peer-protocol enum value `CITUS_REMOTE_EXEC_PEER_REQUEST_POLL_COMMAND_COMPLETION = 4`
+is left as a reserved/deprecated slot to avoid renumbering). It was verified dead as
+the NORMAL path: cross-node command completion is now push-driven for BOTH session
+classes — client-SQL via `TupleSinkServicePublishPeerClientCommandCompletion`, and
+non-client (generic `SQL_COMMAND`) via `TupleSinkServicePublishPeerCommandCompletion`
+into `peerCommandCompletionRing`. The frontend/control POLL (control-ABI enum 5,
+`TupleSinkServiceHandlePollCommandCompletion`) and the frontend poll API are kept.
+
+**Caveat for anyone reviving Citus backend-to-backend COPY:** removing the peer POLL
+also removed the *fallback* for the non-client control POLL. If a frontend control
+POLL for a non-client cross-node command session ever races ahead of the push-ring
+delivery, it now returns an error instead of relaying a peer POLL (the push-ring is
+the sole path). This was NOT a concern for the pgbench (client-SQL) or basebackup
+workloads and was not validated against Citus b2b COPY — that workload is currently
+outdated/unmaintained and expected to break for unrelated reasons, so it was
+intentionally excluded from the removal's light validation. Re-verify the non-client
+completion path (push-ring reliability, or reinstate a fallback) before relying on
+b2b COPY again.
