@@ -38,6 +38,15 @@
 #include "receivelog.h"
 #include "streamutil.h"
 
+/*
+ * Homer receiver launcher: the selected-DPU basebackup RECEIVE-consume client lives in
+ * the Citus tree's homer_client.a (already linked into this frontend via meson).  The
+ * --homer-receive mode drives it (open RECEIVE session -> poll-and-blackhole -> close)
+ * without any libpq/replication flow.  See RunHomerReceiveConsume().  The header is
+ * frontend-safe (stdint/stdbool + Homer ABI only; DOCA handles are void*).
+ */
+#include "distributed/homer/remote_execution_client.h"
+
 #define ERRCODE_DATA_CORRUPTED	"XX001"
 
 typedef struct TablespaceListCell
@@ -2351,6 +2360,76 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 }
 
 
+/*
+ * RunHomerReceiveConsume drives the selected-DPU basebackup RECEIVE-consume client to
+ * completion, then exits.  This is the farnet0 host sink for the DPU receiver relay: the
+ * far sender (pg_basebackup on the peer, unchanged) RDMAs the archive stream into the
+ * farnet0 DPU landing ring; the DPU service relays it via DOCA DMA into this process's
+ * imported role-7 consumer ring; here we poll-and-blackhole (count bytes, discard) until
+ * the DPU publishes the EOS terminal (entryState=CLOSED, surfaced as *streamComplete),
+ * then close so CLOSE_ACK detaches.  No libpq/replication flow is involved.
+ *
+ * Correlation (must match the far sender's session identity, or the DPU RECEIVE-bind
+ * never arms): destinationNodeId == the sender target's node=N; databaseOid/userOid ==
+ * the sender backend's MyDatabaseId/GetUserId; slotCount/payloadCapacityBytes == the
+ * sender geometry (same-storage constraint for the position-preserving relay).  The DPU
+ * setup endpoint/device come from HOMER_FRONTEND_DPU_SETUP_HOST/_PORT/HOMER_FRONTEND_
+ * DOCA_DEV_PCI (point these at the LOCAL farnet0 DPU).
+ */
+static void
+RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots, uint32 payloadBytes)
+{
+	HomerClientBaseBackupStreamOptions options;
+	HomerClientBaseBackupStream stream;
+	char		error[HOMER_CLIENT_ERROR_BYTES];
+	uint64		deliveredTotal = 0;
+	bool		complete = false;
+
+	HomerClientDefaultBaseBackupStreamOptions(&options);
+	options.targetMode = HOMER_CLIENT_BASEBACKUP_MODE_RDMA;
+	options.destinationNodeId = nodeId;
+	options.databaseOid = dbOid;
+	options.userOid = userOid;
+	options.slotCount = slots;
+	options.payloadCapacityBytes = payloadBytes;
+
+	error[0] = '\0';
+	if (!HomerClientOpenBaseBackupReceiveStreamSelectedDpu(&options, &stream, error, sizeof(error)))
+		pg_fatal("homer receive: could not open receive-consume session: %s", error);
+
+	pg_log_info("homer receive: consuming basebackup stream node=%d db=%u user=%u slots=%u bytes=%u",
+				nodeId, dbOid, userOid, slots, payloadBytes);
+
+	/*
+	 * Blackhole consume loop: HomerClientPollBaseBackupReceive drains the DPU-produced
+	 * tail (advances consumedHead = Loop-2 back-pressure credit) and sets *complete when
+	 * the DPU's EOS terminal is observed AND everything has been drained.  A short pause
+	 * keeps a single receiver from spinning a core hot; the payload is discarded.
+	 */
+	while (!complete)
+	{
+		error[0] = '\0';
+		if (!HomerClientPollBaseBackupReceive(&stream, &deliveredTotal, &complete, error, sizeof(error)))
+		{
+			(void) HomerClientCloseBaseBackupStream(&stream, NULL, 0);
+			pg_fatal("homer receive: poll failed (delivered=%llu): %s",
+					 (unsigned long long) deliveredTotal, error);
+		}
+		if (!complete)
+			pg_usleep(50);		/* 50us; blackhole, no payload read */
+	}
+
+	pg_log_info("homer receive: stream complete, delivered_bytes=%llu",
+				(unsigned long long) deliveredTotal);
+
+	error[0] = '\0';
+	if (!HomerClientCloseBaseBackupStream(&stream, error, sizeof(error)))
+		pg_fatal("homer receive: close failed: %s", error);
+
+	pg_log_info("homer receive: closed (CLOSE_ACK)");
+}
+
+
 int
 main(int argc, char **argv)
 {
@@ -2390,9 +2469,28 @@ main(int argc, char **argv)
 		{"manifest-force-encode", no_argument, NULL, 6},
 		{"manifest-checksums", required_argument, NULL, 7},
 		{"sync-method", required_argument, NULL, 8},
+		/* Homer receiver launcher (selected-DPU basebackup RECEIVE-consume mode). */
+		{"homer-receive", no_argument, NULL, 9},
+		{"homer-node", required_argument, NULL, 10},
+		{"homer-database-oid", required_argument, NULL, 11},
+		{"homer-user-oid", required_argument, NULL, 12},
+		{"homer-slots", required_argument, NULL, 13},
+		{"homer-bytes", required_argument, NULL, 14},
 		{NULL, 0, NULL, 0}
 	};
 	int			c;
+
+	/*
+	 * Homer receiver launcher state (--homer-receive and its correlation/geometry
+	 * arguments).  Defaults for slots/bytes match the DPU basebackup runbook geometry
+	 * (slots=8, bytes=8388608); node/db/user must be provided to match the far sender.
+	 */
+	bool		homer_receive = false;
+	int32		homer_node = 0;
+	uint32		homer_database_oid = 0;
+	uint32		homer_user_oid = 0;
+	uint32		homer_slots = 8;
+	uint32		homer_bytes = 8388608;
 
 	int			option_index;
 	char	   *compression_algorithm = "none";
@@ -2569,6 +2667,24 @@ main(int argc, char **argv)
 				if (!parse_sync_method(optarg, &sync_method))
 					exit(1);
 				break;
+			case 9:
+				homer_receive = true;
+				break;
+			case 10:
+				homer_node = atoi(optarg);
+				break;
+			case 11:
+				homer_database_oid = (uint32) strtoul(optarg, NULL, 10);
+				break;
+			case 12:
+				homer_user_oid = (uint32) strtoul(optarg, NULL, 10);
+				break;
+			case 13:
+				homer_slots = (uint32) strtoul(optarg, NULL, 10);
+				break;
+			case 14:
+				homer_bytes = (uint32) strtoul(optarg, NULL, 10);
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -2585,6 +2701,24 @@ main(int argc, char **argv)
 					 argv[optind]);
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
+	}
+
+	/*
+	 * Homer receiver launcher: run the selected-DPU basebackup RECEIVE-consume client and
+	 * exit, skipping the entire libpq/replication path below.  This is a distinct role
+	 * (the farnet0 host sink for the DPU receiver relay), not a normal backup, so it needs
+	 * none of the target/basedir/connection validation that follows.
+	 */
+	if (homer_receive)
+	{
+		if (homer_node <= 0 || homer_database_oid == 0 || homer_user_oid == 0)
+			pg_fatal("--homer-receive requires --homer-node, --homer-database-oid, and --homer-user-oid "
+					 "matching the far sender's session identity");
+		if (homer_slots == 0 || homer_bytes == 0)
+			pg_fatal("--homer-receive requires nonzero --homer-slots and --homer-bytes matching the sender geometry");
+
+		RunHomerReceiveConsume(homer_node, homer_database_oid, homer_user_oid, homer_slots, homer_bytes);
+		exit(0);
 	}
 
 	/*
