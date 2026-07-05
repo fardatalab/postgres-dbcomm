@@ -367,3 +367,46 @@ should match, back up the target files, then rsync ONLY the changed files
 (itemized) — do not blindly overwrite other DPU files (they carry the needed
 build-dependency diffs) and do not `git reset`/`stash` the DPU tree (that would
 revert its other files to the behind-HEAD state and break the build).
+
+## Runbook — DPU Homer service bootstrap from farnet1 host (rsync + build, system pg)
+
+Decided July 5, 2026: the DPU only needs the Homer service (`citus_tuple_sink_service`), built
+against **system pg** (`/usr/bin/pg_config`, PostgreSQL 16.14) — NOT our custom pg. Rationale: the
+Homer wire/ABI is defined by the Citus headers, not Postgres; the service's only pg dependency is
+generic (`postgres.h`/`palloc`/`pg_attribute.h` in `tuple_sink_service_process.c`), none of which is
+where our fork diverges — which is why the validated farnet1 DPU **sender** already builds against
+system pg and interoperates with the host's custom-pg backend. (Making the Homer backend truly
+pg-independent, or the Part 3.5 DPU-deform, are separate follow-ups.) Source lives at
+`~/dbcomm/citus-dbcomm` on the DPU (NOT `/data/dbcomm` — the DPU has no `/data/dbcomm` and we don't
+create one; the Makefile is location-independent via `$(citus_abs_srcdir)`).
+
+**Proven recipe (farnet1 DPU, July 5, 2026 — builds aarch64 with the Gap 2/3/EOS receiver code):**
+```sh
+# 1. rsync the current citus source from farnet1 host into the DPU tree.
+#    farnet1 DPU (reachable as `ssh dpu` from farnet1):
+ssh dpu 'mkdir -p ~/dbcomm/citus-dbcomm'
+rsync -a --exclude 'build/' --exclude '.git/' --exclude '*_bak' --exclude '*.bak' \
+      --exclude 'configure~' --exclude '*.o' --exclude '*.log' \
+      /data/dbcomm/citus-dbcomm/ dpu:dbcomm/citus-dbcomm/
+#    farnet0 DPU (reachable only as `ssh dpu` FROM farnet0 — double hop): stage on farnet0 host,
+#    then push locally to its DPU:
+rsync -a --exclude 'build/' --exclude '.git/' --exclude '*_bak' --exclude '*.bak' \
+      --exclude 'configure~' --exclude '*.o' --exclude '*.log' \
+      /data/dbcomm/citus-dbcomm/ farnet0:/tmp/citus-dbcomm-src/
+ssh farnet0 "ssh dpu 'mkdir -p ~/dbcomm/citus-dbcomm'; rsync -a /tmp/citus-dbcomm-src/ dpu:dbcomm/citus-dbcomm/"
+
+# 2. configure for THIS tree/location against system pg, then build ONLY the service.
+#    --without-libcurl: libcurl (anonymous-stats dep) is absent on the DPU and not needed.
+#    PG_CONFIG=/usr/bin/pg_config: use system pg (this rewrites Makefile.global citus_abs_srcdir +
+#    PG_CONFIG for the DPU; a stale host Makefile.global otherwise pins /data/dbcomm/... and fails).
+ssh dpu 'cd ~/dbcomm/citus-dbcomm && PG_CONFIG=/usr/bin/pg_config ./configure --without-libcurl \
+         && make -j4 service-bin CPPFLAGS="-D_GNU_SOURCE"'
+
+# 3. verify aarch64 + the receiver code is present.
+ssh dpu 'file ~/dbcomm/citus-dbcomm/build/homer/citus_tuple_sink_service | grep aarch64; \
+         grep -c HomerServicePumpIncomingByteRingDpuRelay ~/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c'
+```
+The DPU runs `~/dbcomm/citus-dbcomm/build/homer/citus_tuple_sink_service` directly (no install
+prefix, no `/data/dbcomm/pg-citus` needed at build or runtime; `ldd` is clean). Only `service-bin`
+is needed on the DPU — `client-bin`/`libhomer_client.a` is for the HOST frontend (`pg_basebackup`),
+not the DPU. Re-sync just the changed homer files + `make service-bin` for later iterations.
