@@ -327,6 +327,33 @@ BIND_HOST` for DPU↔DPU (DPU fast-link `10.10.1.200`/`10.10.1.201` vs host `10.
 rebuild of the Gap 2/3/EOS service on both DPU ARM trees. This is exploratory, not a documented
 procedure — drive it interactively/diagnostically, not as a blind subagent run.
 
+### e2e run #1 (July 5, 2026): INCONCLUSIVE — farnet0 DPU is UNPROVISIONED (hard blocker)
+
+A run-validation subagent got through prerequisite 1 (farnet1 installed artifacts confirmed to carry
+the new code — `pg_basebackup` has `homer-receive`, `libhomer_client.a` exports the receive symbols,
+`citus_tuple_sink_service` has the relay) and then hit a hard deployment gap it could not resolve as
+a routine recovery:
+
+- **The farnet0 DPU (`farnet0-bf3-a`, aarch64) has NO citus build environment at all** — no
+  `/home/ubuntu/citus-dbcomm` tree (`fatal: cannot change to ... No such file or directory`),
+  `/home/ubuntu/dbcomm/` is empty, and no `citus_tuple_sink_service` binary anywhere on its
+  filesystem. The farnet1 DPU (the SENDER, previously validated) has the full tree + expected
+  in-progress diffs. So the receiver-side DPU was never provisioned: this is a first-time
+  BOOTSTRAP (clone + vendor submodules + DOCA SDK wiring for that board), NOT a "sync 5 changed
+  files into an existing tree" drift recovery. STEP 1 (DPU liveness gate) could not even be
+  attempted — there is no receiver DPU binary to start.
+- **Secondary (non-fatal):** farnet0 host's `/data/dbcomm/postgres-citus` and `/data/dbcomm/
+  citus-dbcomm` are DANGLING symlinks to a removed NFS path (`/data/jason/fdl1data/dbcomm/...`),
+  the stale-export trap CLAUDE.md warns about. The farnet0 host role only needs the installed
+  prefix (which synced fine as a real 143M dir), so this does not block this test, but it will
+  recur for any future source-tree sync to the farnet0 host.
+
+CONCLUSION: the code side is complete + committed + buildable (farnet1 confirmed); the e2e blocker
+is pure infrastructure — the farnet0 DPU must be bootstrapped with a native aarch64 build env
+matching the farnet1 DPU (source + submodules + DOCA SDK) before prerequisite 3/STEP 1 can run. This
+is a human infrastructure decision (how to get source onto that DPU; how to match its DOCA setup),
+raised to the user.
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the
