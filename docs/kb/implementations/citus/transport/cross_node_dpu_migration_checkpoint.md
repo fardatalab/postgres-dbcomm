@@ -212,12 +212,54 @@ unchanged.
 The receiver relay, Loop-1 credit tie, and `receiverCloseReleased` lifecycle are
 validated end-to-end by P1.
 
-## P1 — basebackup receiver DPU offload (planned)
+## P1 — basebackup receiver DPU offload (Gaps 1–3 DONE + compile-clean; e2e blocked on launcher)
 
 Sender unchanged (pg_basebackup → farnet1 DPU pull + RDMA egress). Receiver:
 farnet0 DPU service RDMAs into the landing region, DMA-writes to a host consumer
 ring drained by a minimal farnet0 host sink (Homer consume API, blackhole).
 First cross-node milestone; validates P0b's full receive path.
+
+**Gap 1 — receive-consume client functions: DONE** (citus `55e944cf6`).
+`HomerClientOpenBaseBackupReceiveStreamSelectedDpu` + `HomerClientPollBaseBackupReceive`
+(`homer_client.c`), role-7 `PAYLOAD_BYTE_RING_DPU_TO_HOST`, `direction=RECEIVE`. No caller yet.
+
+**Gap 2 — receiver DPU byte-range relay + workload-agnostic RECEIVE-bind: DONE** (citus
+`2459afa14`). SINGLE-RING regime. Engine helpers `HomerDpuDmaFindDpuToHostByteRingRef` (resolve
+the one role-7 ring by role — a command-less receive consumer has no bridgeGeneration to key on)
+and `HomerDpuDmaGetByteRingWriteFrontier` (writtenTail + writeInFlight + host storage). Service
+`HomerServicePumpIncomingByteRingDpuRelay`, reached by an early branch in
+`HomerServicePumpIncomingByteRingPayload` gated on `BASE_BACKUP_STREAM` + `UsesDpuMirrorSource`:
+submits one contiguous `[writtenTail, publishedTail)` segment per pass (split only at the shared
+ring wrap), credits the far sender at the completed `writtenTail` (overwrite-safe because the
+sender publishes only at record boundaries), keeps the stream hot via `progressResult->stillReady`.
+No in-pump parse — close is CLOSE_SINK-driven and the anchor is byte conservation; the DPU
+object-parse (`objects=N`) is a deferred, additive side-reader. RECEIVE-bind:
+`HomerServiceFindPeerBoundReceiveRelayStream` attaches the receive-consume client to the
+peer-provisioned stream by the STANDARD session identity (base compat + peer-bound + byte-ring),
+replacing the Citus-COPY sinkKey exact-attach for the basebackup family; sets
+`relayConsumerAttached` (the relay rendezvous gate). New stream fields relayConsumerAttached /
+relayTargetResolved / relayTargetDescriptorRef / relayCreditedTail.
+
+**Gap 3 — receiver close twin: DONE** (citus `50efa0dbf`). Import `receiverCloseReleased`
+(default-released, same polarity as `senderCloseReleased`); `ReclaimDetachedImports` skips
+`!receiverCloseReleased` and adds a role-7 relay-drain gate (`writtenTail == publishedProducedTail
+&& !byteRingWriteInFlight`, inlined role check so the non-DOCA path avoids the DOCA-only
+predicate); role-based `HoldImportForReceiverClose` / `MarkImportReceiverCloseReleased`. Service
+holds at the RECEIVE-bind and releases at `HomerServiceClearPayloadStreamPeerBinding` (reached only
+once `HomerServiceReceivePayloadTransportIsDrained`, i.e. consumedHead == landingFinalTail); relay
+forces the final credit while `receivedPeerClosePending` so consumedHead reaches landingFinalTail.
+Composition: relay drains → IsDrained → close advances → RECLAIMABLE → binding clear releases the
+hold → reclaim still waits for the last produced-tail publish → free.
+
+**BLOCKER — farnet0 receive-consume LAUNCHER (design decision, raised to user).** Gap 1's client
+has no caller. On the DPU the relay early branch idles until `relayConsumerAttached` is set by a
+RECEIVE OpenSession, so without a running host consumer the far sender's landed bytes are never
+relayed/credited and basebackup would hang. Need a minimal farnet0 host process driving the Gap 1
+client (open receive session → export consumer ring → poll-blackhole → close). User preference:
+reuse existing basebackup binary/code, not a new standalone binary. Options: (a) `--homer-receive`
+consume mode on `pg_basebackup`; (b) receive-consume mode on `homer_dpu_tcp_transport_smoke`;
+(c) minimal standalone receiver. Also a runbook same-storage geometry constraint (host consumer
+ring storage == landing ring storage) for the position-preserving relay.
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
