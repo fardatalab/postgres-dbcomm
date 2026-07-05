@@ -175,6 +175,40 @@ pull) still observed; clean close (`free_task_slots=3072/3072`, host-detached,
 `tasks=28`, both sides `ok`). The DPU base was verified byte-identical to farnet1
 committed `da1629847` for both changed files before syncing the uncommitted delta.
 
+### P0b Design B — landing-region / receive-ring reconciliation (DONE + DPU-smoke validated)
+
+**Decision (user-approved July 5, 2026).** R1 defined the engine landing region as a
+*flat, header-less payload buffer* (DMA source = `landingRegion + ringOffset`, offset 0
+= payload byte 0). The service receive ring is `control | byteStorage`, and the **far
+sender RDMA-writes payload into byteStorage AND `publishedTail` into the control block at
+`ringAddress`** — one contiguous RDMA-registered region, control at the front, storage at
+`ringAddress + controlBytes` (`HomerServiceValidatePeerByteRingTailTarget` /
+`HomerServicePayloadByteRingStorageAddress`, `tuple_sink_service_process.c`). Zero-copy
+relay forces the DMA-source and the RDMA-target to be the *same* bytes, so the two layouts
+must reconcile. To keep the **sender unchanged** (plan mandate), chose **Design B**: back
+the receive ring's *whole* `control | byteStorage` mapping onto the landing region, and add
+an engine `landingPayloadOffset` (= `sizeof(control)`) so the WRITE_BODY source is
+`landingRegion + landingPayloadOffset + ringOffset`. Rejected **A** (decouple control +
+IMM-derived tail — changes the sender/wire) and **C** (per-stream arbitrary DMA source —
+larger engine API, replaces R1's single-landing-region model).
+
+**Engine change (citus, DONE):** `HomerDpuDmaEngineConfig.landingPayloadOffset` +
+engine field (default 0 keeps the smoke and the host→DPU pull correct); WRITE_BODY source
+and both landing-bound guards (`HomerDpuDmaSubmitByteRingWrite` covers-ring guard + the
+per-task source bound) add the offset; `HOMER_DPU_DMA_DEFAULT_LANDING_REGION_BYTES` bumped
+to `8 MiB + 64 KiB` (Design B needs `sizeof(control) + ringBytes`, not just `ringBytes`).
+**Validation:** DPU aarch64 TCP smoke PASS with a nonzero offset (128) configured on the
+engine and the synthetic fills shifted to match — a wrong offset would relay the
+zero-filled `[0,128)` prefix and fail the client byte-pattern checks, so PASS *proves* the
+arithmetic; all pre-existing legs + the Loop-2 round-trip still pass, clean close.
+
+**Service side (NEXT, validated by P1):** back `localReceiveByteRing.mappingAddress` with
+`HomerDpuDmaGetLandingRegionMemory` in the DPU case (a `backedByLandingRegion` flag so
+`HomerServiceResetPayloadStreamEntry` does not `free()` the engine-owned buffer); set
+`landingPayloadOffset = sizeof(CitusHomerPayloadByteRingControl)` at engine create; the
+RDMA registration (`:16241`, already `true`) and OPEN advertisement (`:25742`) are
+unchanged.
+
 The receiver relay, Loop-1 credit tie, and `receiverCloseReleased` lifecycle are
 validated end-to-end by P1.
 
