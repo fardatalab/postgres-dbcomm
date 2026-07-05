@@ -112,7 +112,7 @@ host-detached, `tasks=16` complete, no stuck-inflight, no fatal, both sides `ok`
 Caveat: this is the DOCA-DMA/TCP-setup tier only; the RDMA peer path that will
 actually land bytes into the landing region is validated by P0b/P1.
 
-## P0b — RDMA landing + credit loops + setup (planned)
+## P0b — RDMA landing + credit loops + setup (in progress)
 
 Builds on R1. Components: (2) the service receive ring backed by the engine
 landing region, RDMA-`REMOTE_WRITE`-registered + DMA-source, advertised in the
@@ -122,7 +122,61 @@ peer OPEN response; (Loop 2) activate the host-publish-line read for role-7 ring
 when the far sender's RDMA advances the landing tail); (Loop 1) credit the far
 sender up to `writtenTail`; and a `receiverCloseReleased` lifecycle gate mirroring
 `senderCloseReleased` (default released, held at bind, released at binding-clear).
-Validated end-to-end by P1.
+
+### Engine Loop-2 back-pressure (DONE + DPU-smoke validated July 5, 2026)
+
+Three edits in `homer_service_dpu_dma.c`, isolating the *write-side* gate from the
+existing pull-side machinery so the DPU→host relay reacts to the host consumer's
+`consumedHead` without ever being scheduled off it:
+
+1. `HomerDpuDmaDescriptorUsesHostPublishLine` (`:4726`) now returns true for role 7
+   (`PAYLOAD_BYTE_RING_DPU_TO_HOST`) — so grouped-control DMA-reads the host publish
+   line for these rings. Inverted role vs host→DPU: the HOST is the consumer, so the
+   line's frontier field carries the host's `consumedHead`, landed into
+   `ringRuntime->acceptedPublishedTail`.
+2. `HomerDpuDmaAcceptGroupedControlSnapshot` (`:8815`) advances `acceptedPublishedTail`
+   for a role-7 ring but **deliberately skips the discovered-ready enqueue**
+   (`!HomerDpuDmaDescriptorIsDpuToHostByteRing(...)` guard). A DPU-produced ring is
+   service-driven (`HomerServicePump*` submits the write on landed-tail advance), NOT
+   pull-ready-queue-driven — it must never land on a host-produced pull queue.
+3. `HomerDpuDmaSubmitByteRingWrite` (`:3070`) gates on the producible window: if
+   `newProducedTail > acceptedPublishedTail + ringStorageBytes` it **defers**
+   (retryable: `emptyPolls=1, stillReady=true`, returns true) rather than errors.
+   Before the host publishes anything `acceptedPublishedTail == 0`, so the DPU may
+   fill the ring exactly once (up to `ringStorageBytes`) — correct, since the host
+   must consume before the producer wraps onto unconsumed bytes.
+
+**Smoke design decision — mid-stream round-trip, new ring 5, dual-role flag.** The
+`homer_dpu_tcp_transport_smoke` gains a Loop-2 leg on a new small DPU→host ring
+(index 5, `LOOP2_RING_BYTES`), gated by `--expect-loop2-backpressure` on BOTH
+roles. A server-only proof was rejected: pre-publishing `consumedHead` at setup
+fails because the earlier pull-leg grouped-control read (which now covers role-7
+rings) would raise ring-5's `acceptedPublishedTail` prematurely and the defer would
+never fire; the `publishedEpoch == acceptedPublishedEpoch → early-return` gate is
+what keeps the zero-initialized ring inert until the host bumps its epoch. So the
+leg is a genuine round-trip mirroring the real receiver: DPU fills to boundary
+(write A, epoch 1) → attempts a wrap write that **DEFERS** (asserted) → host
+consumes `LOOP2_WRAP_BYTES` and publishes `consumedHead` (epoch 1) on ring-5's host
+publish line → DPU grouped-control-reads it → retried wrap write **PROCEEDS**
+(epoch 2) → host validates post-wrap ring content by absolute offset
+(`pattern(a) = base + a`, physical `= offset + a % ringBytes`). The leg is skipped
+entirely when the flag is absent on either side (no regression to existing
+invocations), because the DPU leg blocks on the host publish.
+
+**Validation (July 5, 2026, DPU aarch64 native TCP smoke, fabric-free): PASS.** The
+defer/credit/proceed evidence appeared in the required cross-process order — DPU
+`server Loop-2 wrap write deferred as expected` → host `client Loop-2 published
+consumedHead=16` → DPU `server Loop-2 wrap write proceeded after host consumedHead
+credit` → host `client Loop-2 back-pressure proceeded: produced_tail=80 epoch=2`
+(post-wrap bytes validated by absolute offset). No regression: the setup ack now
+reports `rings=6` and the ring-4 single-shot leg still reports `produced_tail=48
+epoch=1`; all pre-existing legs (backend command/response/completion, byte-ring
+pull) still observed; clean close (`free_task_slots=3072/3072`, host-detached,
+`tasks=28`, both sides `ok`). The DPU base was verified byte-identical to farnet1
+committed `da1629847` for both changed files before syncing the uncommitted delta.
+
+The receiver relay, Loop-1 credit tie, and `receiverCloseReleased` lifecycle are
+validated end-to-end by P1.
 
 ## P1 — basebackup receiver DPU offload (planned)
 
