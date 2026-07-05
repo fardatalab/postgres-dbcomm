@@ -261,6 +261,72 @@ consume mode on `pg_basebackup`; (b) receive-consume mode on `homer_dpu_tcp_tran
 (c) minimal standalone receiver. Also a runbook same-storage geometry constraint (host consumer
 ring storage == landing ring storage) for the position-preserving relay.
 
+### Design note — receive EOS is an explicit terminal signal (strands + all-of gate)
+
+The host consumer cannot INFER end-of-stream: only the DPU knows all three of (1) the far sender
+sent CLOSE_SINK, (2) landingFinalTail is frozen, (3) every landed byte has been relayed
+(writtenTail == landingFinalTail, no write in flight). So the DPU must emit an EXPLICIT terminal
+signal — the same rationale that justifies CLOSE_ACK (the host cannot infer when the DPU finished
+detaching, so the DPU explicitly ACKs). EOS and CLOSE_ACK are TWO explicit signals, not one:
+EOS ("stream done") is what lets the host START its close; CLOSE_ACK ("detach done") ENDS it. Under
+the current host-initiated close handshake they cannot merge (ordering: the host needs EOS to
+initiate close, and CLOSE_ACK responds to that initiation). The one way to merge them is to REVERSE
+the handshake for the receiver — the DPU, which owns EOS knowledge, initiates the close-request and
+the host tears down + acks — but that needs a DPU->host push on the setup socket (today it is
+request/response, host-initiated). Deferred; the milestone uses a separate EOS signal + the existing
+host-initiated close.
+
+The three conditions above are precisely an ALL_OF gate whose satisfaction fires the terminal
+continuation. In the planned async-continuation scheduler they become independent STRANDS
+(far-sender-close strand, relay-drain strand, no-inflight strand) joined by an all-of gate, with the
+EOS/CLOSE_ACK emission as the joined continuation — the receive-close analogue of the sender's
+command/completion two-strand join already modeled in the plan.
+
+## Launcher + EOS terminal: DONE (blocker above resolved)
+
+- **EOS terminal (citus `fb7b50601`):** `HomerDpuDmaSubmitByteRingWriteTerminal` publishes the
+  payload-less terminal produced-tail (entryState=CLOSED) at the current writtenTail, reusing the
+  ordered tail-body→tail-publish task pair; the relay emits it once when `receivedPeerClosePending
+  && writtenTail == publishedTail && !writeInFlight` (new `relayTerminalPublished` stream flag).
+- **Launcher (postgres `830c3a4d216`):** `pg_basebackup --homer-receive` (option a chosen). Drives
+  Gap 1's client to completion, no libpq flow. Built + linked against `libhomer_client.a` + DOCA;
+  the installed `libhomer_client.a` + Homer headers were STALE (pre-Gap-1) and were
+  rebuilt/reinstalled so the receive symbols resolve.
+
+## Runbook — cross-node DPU-receiver basebackup (NEW topology; validation pending)
+
+Sender is UNCHANGED (`pg_basebackup -t 'homer:mode=rdma,...'` on farnet1 → farnet1 DPU pull + RDMA
+egress). NEW: the receiver is the **farnet0 DPU** service (not the farnet0 host service), which lands
+the RDMA in DPU memory (Component 2) and relays to a farnet0 host consumer:
+
+```sh
+# farnet0 host: the receive-consume sink. Point the frontend setup at the LOCAL farnet0 DPU.
+# node/db/user MUST match the sender's session identity (target node=N, backend MyDatabaseId/
+# GetUserId == DBOID/USEROID); slots/bytes MUST match the sender geometry (same-storage relay).
+HOMER_FRONTEND_DPU_SETUP_HOST=<farnet0 DPU addr> HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
+HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 \
+  /data/dbcomm/pg-citus/bin/pg_basebackup --homer-receive \
+    --homer-node 2 --homer-database-oid "$DBOID" --homer-user-oid "$USEROID" \
+    --homer-slots 8 --homer-bytes 8388608
+```
+
+**Correctness anchors:** byte conservation (host `delivered_bytes` == landing tail == sender-produced
+bytes) + intended-path confirmation (farnet0 DPU service log shows RDMA landing in DPU + the relay
+`writtenTail`/terminal advancing, NOT a host-service blackhole; consumer logs `stream complete` +
+`closed (CLOSE_ACK)`).
+
+**OPEN QUESTION blocking the e2e run — the DPU↔DPU receive topology has never been exercised.**
+The current validated basebackup DPU path is farnet1-DPU → farnet0-**HOST**-service (RDMA lands in
+farnet0 host memory, `host=10.10.1.100`). The receiver relay REQUIRES the service on the farnet0
+**DPU** (only the DPU has the DOCA DMA engine), so the sender must RDMA-egress to the farnet0 DPU and
+both nodes' DPUs must run the peer transport (the plan's "confirm/require DPU↔DPU"). Unknowns to
+resolve before a run: (1) the sender target `host=` and the receiver-service `HOMER_SERVICE_PEER_
+BIND_HOST` for DPU↔DPU (DPU fast-link `10.10.1.200`/`10.10.1.201` vs host `10.10.1.100`/`.101`, same
+`/24`); (2) whether farnet0 DPU-side peer-RDMA accept from the farnet1 DPU works on this fabric
+(cross-lane RDMA has historically failed with transport-retry per CLAUDE.md); (3) the native DPU
+rebuild of the Gap 2/3/EOS service on both DPU ARM trees. This is exploratory, not a documented
+procedure — drive it interactively/diagnostically, not as a blind subagent run.
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the
