@@ -354,6 +354,63 @@ matching the farnet1 DPU (source + submodules + DOCA SDK) before prerequisite 3/
 is a human infrastructure decision (how to get source onto that DPU; how to match its DOCA setup),
 raised to the user.
 
+### e2e run #2 (July 5, 2026): PASS — P1 basebackup receiver DPU offload validated END TO END
+
+The farnet0 DPU was bootstrapped (native aarch64 `~/dbcomm/citus-dbcomm` built against system pg16;
+see the bootstrap runbook below) and the full DPU↔DPU receive path ran clean. This is the first
+cross-node DPU milestone in the plan.
+
+- **Topology exercised:** farnet1 host PG + `pg_basebackup -t 'homer:mode=rdma,host=10.10.1.200,
+  port=9717,node=2,slots=4,bytes=1048576'` (sender) → farnet1 DPU pull + RDMA egress → **farnet0 DPU**
+  receiver service (RDMA lands in DPU memory, relays to host) → farnet0 host `pg_basebackup
+  --homer-receive` consumer. DPU↔DPU peer RDMA on the fast link (`10.10.1.201`→`10.10.1.200`,
+  `enp3s0f0s0`) CONFIRMED WORKING — the plan's "confirm/require DPU↔DPU" unknown is resolved.
+- **Geometry constraint (important):** the DPU landing region must hold the WHOLE receive ring
+  (`slots × (header + bytes)`); default landing region is ~8.4 MB (`HOMER_DPU_DMA_DEFAULT_LANDING_
+  REGION_BYTES`). The runbook's `slots=8,bytes=8388608` → ~67 MB ring → too big (and raising the
+  landing region to 100 MB crashed DOCA). Use `slots=4,bytes=1048576` (~4 MB ring) for the receiver.
+- **Correctness:** 3 clean measured runs (2 back-to-back, no restart), each `homer receive: stream
+  complete, delivered_bytes=N` → `homer receive: closed (CLOSE_ACK)` → exit 0; sender `base backup
+  completed` rc=0; byte conservation `delivered_bytes` vs `du -sb data` = consistent ~1.244% (tar
+  header/padding overhead). Intended path confirmed on the farnet0 DPU log: RDMA landing in DPU +
+  relay `published_tail`/terminal + the close reaching `host-detached`/`reclaiming`, NOT a
+  host-service blackhole and NOT a spin.
+
+**Bugs fixed en route to this PASS:**
+1. RECEIVE OpenSession `peerEndpoint.protocolVersion` unset → rejected (client fix, `1d396e2cf`).
+2. Receiver queue-descriptor fill crash for the basebackup relay (`85026213e`).
+3. Diagnostic self-clobber erasing the real error (`27cab4ae7`).
+4. **Rendezvous order-dependency (`4e4c8bad4`):** the relay armed only when the consumer opened AFTER
+   the far-sender stream existed; in the intended consumer-first order it never armed and the relay
+   hung with no data moving. Fixed by arming on the role-7 import resolve (order-independent).
+5. **Close-hang (`1c6b8e7f4`) — the last blocker.** Full transfer + byte conservation succeeded but
+   the consumer hung at close (`DPU close socket exchange failed`). Root cause proven by a
+   close-window DOCA trace (`-DHOMER_DPU_DMA_CLOSE_DIAG`, now close-window-gated): it was NOT a DOCA
+   completion problem — both grouped-control CQEs reap, `inflight→0`, context RUNNING. The wedge is
+   the SEMANTIC close-drain: `HomerClientCloseBaseBackupStream` is SHARED between the SEND and
+   RECEIVE-consume paths but hardcoded the `CLOSE_SESSION` request `direction = SEND`. A receive
+   consumer's close therefore hit `TupleSinkServiceHandleCloseSession`'s SEND branch, which errors
+   `send side was not open` (sendHandleCount==0) and returns WITHOUT clearing `receiveHandleCount`.
+   The lingering `receiveHandleCount` kept `HomerServicePayloadStreamsDrainedForClosingSetup`'s
+   local-handle gate non-zero, so CLOSE_ACK was never emitted and the TCP setup-close timed out. Fix:
+   send `CLOSE_SESSION` with `stream->queueDescriptor.direction` (SEND for the sender, RECEIVE for the
+   consumer). Client-only; the service already had the correct RECEIVE arm; sender path unchanged.
+   **Lesson for the shared send/receive client helpers: any control message they emit must carry the
+   stream's real direction, never a hardcoded one.**
+
+**Open follow-ups (unrelated to the close fix; do not block P1):**
+- **Receiver-DPU DOCA mid-transfer flakiness (~50% cold hit rate this session):** a fresh receiver
+  DPU service intermittently faults mid-transfer with `memcpy task failed: Input/Output Operation
+  Failed` (byte-ring write, `task_kind=16`), which resets the DOCA context (`state 2→3→0`) and aborts
+  the transfer BEFORE the close path. A full service+PG restart warms past it (it succeeded on retry
+  every time). This is the DOCA cold-start flakiness CLAUDE.md already flags; worth its own
+  reliability investigation, but it is a warmup issue, not a correctness bug.
+- **Mid-transfer abort is not signalled to clients:** when that DMA fault fires, the service tears
+  down the transport (peer `DISCONNECTED`, session reclaimed) but sends NO protocol notification to
+  the still-waiting `pg_basebackup` sender and `--homer-receive` consumer, so both hang indefinitely
+  (flat network counters) until killed. A real robustness gap in the failure path (the happy-path
+  close is now correct; the failure path needs the same "tell the peer" discipline).
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the
