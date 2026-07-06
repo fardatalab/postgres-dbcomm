@@ -16,6 +16,7 @@ remote execution session semantics.
 
 <!-- kb-docs:start -->
 - [byte_ring_payload_stream_checkpoint.md](byte_ring_payload_stream_checkpoint.md) - Current checkpoint for the service-to-service byte-ring RDMA substrate used by Homer basebackup streams.
+- [dpu_payload_byte_ring.md](dpu_payload_byte_ring.md) - DPU payload byte-ring: wrap-gap protocol, the mirror-must-be-1:1-with-source invariant, the reframing record-header-parse egress, and the mirror-ring stall bug + decided constant-size fix.
 - [dpu_dma_backend_homer_service_implementation_checkpoint.md](dpu_dma_backend_homer_service_implementation_checkpoint.md) - Stage-by-stage implementation checkpoint for the DPU-pull Homer service migration.
 - [homer_current_implementation_checkpoint.md](homer_current_implementation_checkpoint.md) - Current canonical implementation map for the landed Homer frontend, service, shared ABI, RDMA transport, tuple COPY, pgbench, and basebackup paths after the frontend/service separation refactor.
 - [payload_doorbell_token_v15_checkpoint.md](payload_doorbell_token_v15_checkpoint.md) - Landed checkpoint for peer protocol v15 payload doorbell tokens and fixed service-owned payload ready queues.
