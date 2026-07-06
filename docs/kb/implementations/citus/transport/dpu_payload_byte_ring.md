@@ -50,49 +50,110 @@ bytes and starts the record at storage offset 0. See the producer at
 `tuple_sink_service_process.c:28322-28325` (`if (contiguousBytes < recordBytes)
 recordStart += contiguousBytes;`).
 
+**Design principle (DECIDED — wrap is geometry-only, never content).** Wrap-gap
+handling is a pure byte-ring-*geometry* concern on BOTH sides; it must never depend
+on a record's *semantic identity* (ordinal, generation, record-kind). Reading the
+transport-header **length** field is byte-ring framing, not "content" — that is
+allowed and is exactly the fit test; the semantic identity is what must never be
+consulted to decide gap-vs-record. Concretely:
+
+- **Producer:** open the gap by the fit test alone (`contiguousBytes < recordBytes`
+  ⇒ skip the tail, restart at offset 0), and leave a **readable transport-length
+  header at the record cursor even in the gap** so the consumer's fit test always
+  has a length to read. The selected-DPU basebackup producer does this by copying
+  the real next-record `CitusTupleSinkTransportHeader` into the gap
+  (`homer_client.c:3814-3838`) — which doubly serves the DPU egress's wrap proof.
+- **Consumer:** detect the gap by geometry only — (1) `contiguousBytes <
+  minRecordBytes` ⇒ no record can start here; (2) transport length `recordBytes >
+  contiguousBytes` ⇒ the record will not fit before the wrap ⇒ gap. Skip the dead
+  trailer to offset 0; never inspect ordinal/generation/kind to decide a gap.
+- **Anti-pattern (deprecated, do not carry forward):** the host-service tuple
+  producer leaves *stale* bytes in the gap (no readable length header), which forced
+  its consumer (`HomerClientDrainResultSinkUntil`) to guess the gap via an
+  ordinal/protocol *content-mismatch*. That is the wrong pattern and exists only in
+  the soon-to-be-deleted host-service path. New producers/consumers — basebackup
+  now, the Part 3.5 DPU tuple sink later — are geometry-only.
+
 Consequences that MUST be preserved:
 
 - **The tail counts through the gap.** `publishedTail` advances by the skipped
   gap bytes as well as the real bytes (the gap is "published" as dead bytes), so
   credit accounting stays a simple monotonic byte count. The consumer must skip
   the same gap using the same `contiguousBytes < recordBytes` test.
-- **This is separate from semantic fragmentation.** Semantic fragmentation
-  splits a large *object* into multiple transport fragments (each with its own
-  header). The wrap gap is purely *physical* ring layout. The DPU egress tracks
-  the two independently: `outgoingSourceSkipActive` / `outgoingSourceSkipTail`
-  (`tuple_sink_service_process.c:1623-1632`) skip physical wrap-gap bytes without
-  emitting any peer-visible object, while `outgoingFragment*` fields drive
-  semantic fragmentation. A byte counted in a wrap gap must never publish an
-  object.
-- **Both the destination (peer) ring AND the source ring obey it.** The egress
-  applies the gap rule when writing to the peer ring
-  (`tuple_sink_service_process.c:16872-16890`, advancing `batchRemoteTail` past a
-  remote wrap gap) and when reading source objects (source-skip above).
+- **Transport fragmentation is position-preserving byte chunking, NOT semantic
+  re-framing.** The RDMA/DMA substrate may move the same bytes in arbitrary-sized
+  chunks (scheduler pacing / HOL-blocking), but each chunk lands at its true absolute
+  offset, adds nothing (no per-chunk header, no FRAGMENT flags), and the destination is
+  byte-identical — so whole records reassemble for free. (History: the egress once did
+  *semantic* re-framing with `outgoingFragment*` + generated FRAGMENT headers + a
+  service-side reassembler; that was removed on July 6 — see the cross-node checkpoint
+  "P1.5". The `FRAGMENT_FIRST/LAST` ABI bits are now unused/reserved.)
+- **The wrap gap is relayed VERBATIM and skipped by geometry.** Because mirror-1:1
+  makes source ring == peer ring, the egress writes `[absoluteStart, absoluteEnd)` (gap
+  padding included) to matching offsets; the consumer skips the gap by geometry
+  (`recordBytes > contiguousBytes`). The old separate source-skip (`outgoingSourceSkip*`)
+  is gone — one wrap split (`ringBytes - absolute % ringBytes`) now covers it, in the
+  shared helper `HomerByteRingRelayNextChunk`.
 
-## Directions and their consumers (the asymmetry that is real, not artifact)
+## Directions and their consumers (now SYMMETRIC — both pure byte relays)
 
-The two directions have genuinely different consumers, which is why they are NOT
-symmetric implementations:
+As of July 6 (P1.5, see cross-node checkpoint) both directions are the SAME
+position-preserving, object-agnostic byte relay — no record parse, no re-framing, split
+only at the ring wrap and scheduler/credit limits, sharing `HomerByteRingRelayNextChunk`:
 
-- **host→DPU pull (sender side, basebackup egress)** — the DPU pulls the host
-  producer ring into a DPU-local **mirror**, then **reframes**: it parses each
-  source record's `CitusTupleSinkTransportHeader` + basebackup header out of the
-  mirror and re-fragments the payload into *peer-ring-sized* fragments, stamping
-  new `FRAGMENT_FIRST/LAST/EOS` transport headers per fragment
-  (`tuple_sink_service_process.c:16673-16919`). The host does not know the peer
-  ring geometry; the DPU does — so reframing is the DPU's job, and it REQUIRES
-  each source record's fixed-size **header to be contiguous** to parse it. The
-  *payload* is byte-fragmentable freely (clamped to the wrap-bounded slice); only
-  the header needs contiguity.
-- **DPU→host write (receiver side, basebackup relay)** — a **pure byte relay**:
-  the far sender RDMA-writes byte ranges into the DPU landing ring and the DPU
-  DMA-relays `[writtenTail, publishedTail)` to the host consumer ring, split only
-  at the wrap. No header parsing. See the receiver relay in
-  `HomerServicePumpIncomingByteRingDpuRelay`.
+- **host→DPU pull → RDMA egress (sender side, basebackup)** — the DPU pulls the host
+  producer ring into a DPU-local **mirror**, then RDMA-relays the ready mirror range
+  `[absoluteStart, absoluteEnd)` verbatim to the peer ring at matching offsets
+  (`HomerServicePumpOutgoingDpuMirrorByteRingPayload`). Byte-only; a chunk may end
+  mid-record (the no-torn frontend defers until the record is whole; RC write ordering
+  puts payload before the tail doorbell).
+- **DPU→host write (receiver side, basebackup relay)** — the same shape over DMA: the far
+  sender RDMA-writes byte ranges into the DPU landing ring and the DPU DMA-relays
+  `[writtenTail, publishedTail)` to the host consumer ring, split only at the wrap. No
+  header parse. See `HomerServicePumpIncomingByteRingDpuRelay`.
 
-So "make both directions a ring for symmetry" is only half-right: the receiver is
-already a ring *because* it does not parse records; the sender parses framing
-headers, so its mirror must still honor "a header never straddles the wrap."
+(Historical note: the sender egress used to be the asymmetric one — it parsed framing
+headers and re-fragmented per record. That reframing was removed; the two directions are
+now genuine mirror images. Routing the receive relay through `HomerByteRingRelayNextChunk`
+and the two-ring tuple path are tracked follow-ups.)
+
+## The frontend byte-ring sink core (host consumer) — no-torn-object + geometry-only gaps
+
+The FINAL host consumer (basebackup `--homer-receive` now; the Part 3.5 DPU tuple
+sink later) drains WHOLE objects out of the host consumer ring through ONE shared
+inline core: `src/include/distributed/homer/homer_byte_ring_sink.h`
+(`HomerByteRingSinkDrain`). It is header-only so it compiles into the external
+client TU (`homer_client.c`, no `postgres.h`) and, later, a backend TU, with no
+link wiring. It enforces, once, what every byte-ring sink shares:
+
+- **No torn object:** deliver an object only when its whole `[transport header +
+  payload]` span is contiguous (always true for a real record — records never
+  straddle the wrap) AND fully published; otherwise defer (VISIBILITY_PENDING). The
+  Homer user is never handed a partial object.
+- **Geometry-only wrap-gap skip** (per the principle above): `contiguousBytes <
+  minRecordBytes`, or transport length `recordBytes > contiguousBytes`, ⇒ advance
+  `consumedHead` through the dead trailer to offset 0. Gap dead bytes are NOT counted
+  as delivered (so `delivered_bytes` reflects real object bytes, ~1.24% header
+  overhead, not the raw published tail with its ~13.79% gap+header inflation).
+- **consumedHead is Loop-2 back-pressure:** advance it only past fully-delivered
+  objects; the DPU relay must not wrap onto an object still being read.
+
+The per-object type injects only `minRecordBytes`/`maxRecordBytes` and a
+`validateAndDeliver` (envelope correctness + the actual hand-up); gap detection lives
+entirely in the core.
+
+**Bug the core was born with (FAIL #2 — fixed).** The core was first extracted from
+the tuple host-service consumer, so it inherited that consumer's *content-mismatch*
+gap detector and MISSED the general geometric fit test. On basebackup — whose gap (by
+the geometry-only production rule above) holds a copied header with the MATCHING
+ordinal — the copied header classified "expected", sailed past the mismatch skip, and
+the no-torn gate read `recordBytes > contiguousBytes` as "not published yet, wait"
+instead of "won't fit ⇒ gap", so the drain stalled forever at the first wrap and
+back-pressured the far sender into a 99% CPU producer-reserve spin. Fix: split the
+gate so `recordBytes > contiguousBytes` (at the ring end, fully published) is a
+wrap-gap skip, not a visibility defer. **Lesson: this is precisely why wrap detection
+must be geometry-only — a content/identity detector is structurally blind to a gap
+that, by design, carries a valid header with the matching identity.**
 
 ## Frontiers
 

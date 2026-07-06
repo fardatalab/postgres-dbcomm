@@ -422,7 +422,78 @@ cross-node DPU milestone in the plan.
   service tears down the transport (peer `DISCONNECTED`, session reclaimed) but sends NO protocol
   notification to the still-waiting `pg_basebackup` sender and `--homer-receive` consumer, so both
   hang until killed. A real robustness gap in the failure path (happy-path close is correct; the
-  failure path needs the same "tell the peer" discipline).
+  failure path needs the same "tell the peer" discipline). **Hit operationally (July 6):** a
+  back-pressured sender walsender spinning in `HomerClientReserveBaseBackupRecordForObjectPayload`
+  **ignores SIGTERM** — the producer-reserve busy-loop has no `CHECK_FOR_INTERRUPTS`, so a graceful
+  cancel does nothing and only SIGKILL stops it (which forces a postmaster crash-recovery cycle). The
+  reserve loop should poll for query cancel/terminate, not only its own terminal-stream check.
+- **Wrap-gap is geometry-only — DECIDED (July 6).** Wrap-gap detection must never consult record
+  *semantic identity* (ordinal/generation/kind); it is pure byte-ring geometry on both producer and
+  consumer. Producers must leave a readable transport-length header in the gap (basebackup copies the
+  real next-record header; the Part 3.5 DPU tuple sink producer MUST do the same, not leave stale
+  bytes). The shared frontend sink core (`homer_byte_ring_sink.h`) detects gaps by geometry only; its
+  content-mismatch path is legacy support for the deprecated host-service tuple producer's stale-bytes
+  gaps and is removable once that path is deleted. This corrected the FAIL #2 sink-core stall (the
+  extracted core inherited the tuple content-mismatch detector and was blind to basebackup's
+  matching-ordinal copied-header gap). Canonical write-up + the production-side requirement live in
+  `dpu_payload_byte_ring.md` ("Design principle (DECIDED — wrap is geometry-only, never content)" and
+  "The frontend byte-ring sink core"). Part 3.5's `deliverObject` (host `base+offset` fixup +
+  borrow-then-release) plugs into that geometry-only core.
+
+## P1.5 — position-preserving object-agnostic egress (de-reframe): DONE + validated (July 6, 2026)
+
+The P1 receiver validated byte CONSERVATION with a blackhole that never parsed records. The first
+**parsing** consumer (the shared frontend sink core) then stalled: gdb on the live stuck receiver
+showed it wedged on the first ~1 MiB archive record carrying `FRAGMENT_FIRST` (transport
+`payloadBytes=1048408` vs the semantic header's `1048576`) — the sink core validates whole objects and
+rejected the fragment forever → back-pressure → walsender 99.8% spin. Root cause: the **sender egress
+was re-framing** — for a basebackup object whose payload was not yet fully in the DPU mirror, it emitted
+multiple peer transport records, each with a freshly *generated* `CitusTupleSinkTransportHeader` +
+FRAGMENT_FIRST/LAST, undone by a service-ingress reassembler. This is always-on for the cross-node
+egress (mirror-range driven), NOT the `HOMER_BULK_FRAGMENT_BYTES` diagnostic knob (which was 0).
+
+**Decision (user):** transport-level fragmentation IS intended — RDMA/DMA chunking so the scheduler can
+pace and cut head-of-line blocking — but it must be **object/semantic-agnostic and position-preserving**:
+move the SAME bytes in arbitrary-sized chunks to the SAME destination offsets, adding nothing (no
+per-chunk header, no FRAGMENT flags, no reassembly). The byte ring always holds whole records; the
+frontend always reads whole objects; the same principle applies on BOTH production (sender) and
+detection (receiver), and to single-ring (basebackup) and future two-ring (tuple) alike. No branch on
+object family or ring topology.
+
+**Implemented (citus, uncommitted on `homer-dpu-migration`):**
+- `HomerServicePumpOutgoingDpuMirrorByteRingPayload` (`tuple_sink_service_process.c`) is now a SINGLE
+  object-agnostic byte-range relay — the RDMA mirror of the receive relay
+  `HomerServicePumpIncomingByteRingDpuRelay`. It relays `[readyRange.absoluteStart, absoluteEnd)`
+  verbatim to the peer ring at matching offsets (`num_sge==1`, `prepend=false`), sliced only at the ring
+  wrap + scheduler/credit/substrate limits via the new shared helper `HomerByteRingRelayNextChunk`. No
+  header parse, no re-framing, byte-only (frozen semantic tail; `payloadEosPosted` not set — basebackup
+  close is already byte-only). Producer wrap-gap padding is relayed verbatim (source-skip deleted); the
+  consumer skips it by geometry. The record-parse loop + the DPU-mirror fragment helper +
+  `forcedFragmentBytes` gate were deleted (~430-line loop → ~30-line relay).
+- **Detection side made purely geometric**: the shared sink core's residual content-based
+  `classifyHeader` (ordinal-mismatch) wrap detector was removed (`homer_byte_ring_sink.h`,
+  `homer_client.c`); the ordinal check became envelope VALIDATION inside `validateAndDeliver`. Both
+  sides now use one rule set: geometry-detectable gaps + position-preserving chunks; geometry skip +
+  whole-object delivery; no content/identity input to fragmentation or wrap handling.
+- `HomerByteRingRelayNextChunk` is factored for reuse — routing the receive relay through it + the
+  two-ring tuple path are tracked follow-ups.
+
+**Validation (July 6, cross-node DPU-receiver basebackup e2e, both DPUs rebuilt):** PASS, reproducible.
+Sender `pg_basebackup -t 'homer:mode=rdma,host=10.10.1.200,port=9717,node=2,slots=4,bytes=1048576'`
+rc=0 (cold 15.15s, warm 13.83/13.81s); receiver `--homer-receive` `stream complete,
+delivered_bytes≈23.2 GB` → `closed (CLOSE_ACK)` every run; **every traced record `flags=0` (no FRAGMENT
+on the wire)**; ~3159 wrap gaps skipped purely by geometry; exactly 1 transient no-torn defer per run
+(a chunk ended mid-record, consumer deferred one poll then delivered — the designed safety); intended
+relay path (`peer-provisioned receive sink` → `payload close QUIESCED final_tail==final_head` →
+`reason=peer-close-drained`), not a host-service fallback. delivered vs `du -sb data` = −0.34% (within
+the ~1.24% band). The ~1 MiB records that fragmented+stalled before now arrive WHOLE — proof the
+position-preserving sub-record chunking reassembles for free.
+
+**Deferred (Stage 2-4 cleanup, separate follow-up):** remove the DEAD fragmentation machinery on the
+deprecated host-service paths (legacy sendQueue pump fragmentation, `HomerServiceForcedBulkFragmentBytes`,
+`outgoingFragment*`/`reassembly*` fields, the non-DPU CPU reassembler, header-ready FRAGMENT flag bits).
+Behavior-neutral; banked the working fix first. The diagnostic byte-ring sink trace
+(`HOMER_BYTE_RING_SINK_TRACE`, budget-capped) is kept **gated off by default**.
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
