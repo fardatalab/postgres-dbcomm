@@ -398,18 +398,31 @@ cross-node DPU milestone in the plan.
    **Lesson for the shared send/receive client helpers: any control message they emit must carry the
    stream's real direction, never a hardcoded one.**
 
-**Open follow-ups (unrelated to the close fix; do not block P1):**
-- **Receiver-DPU DOCA mid-transfer flakiness (~50% cold hit rate this session):** a fresh receiver
-  DPU service intermittently faults mid-transfer with `memcpy task failed: Input/Output Operation
-  Failed` (byte-ring write, `task_kind=16`), which resets the DOCA context (`state 2→3→0`) and aborts
-  the transfer BEFORE the close path. A full service+PG restart warms past it (it succeeded on retry
-  every time). This is the DOCA cold-start flakiness CLAUDE.md already flags; worth its own
-  reliability investigation, but it is a warmup issue, not a correctness bug.
-- **Mid-transfer abort is not signalled to clients:** when that DMA fault fires, the service tears
-  down the transport (peer `DISCONNECTED`, session reclaimed) but sends NO protocol notification to
-  the still-waiting `pg_basebackup` sender and `--homer-receive` consumer, so both hang indefinitely
-  (flat network counters) until killed. A real robustness gap in the failure path (the happy-path
-  close is now correct; the failure path needs the same "tell the peer" discipline).
+**Follow-ups:**
+- **RESOLVED — the "~50% mid-transfer flakiness" was NOT DOCA cold-start; it was our uncapped DMA
+  write** (fix citus `78dda4a68`, validated 5/5 clean). The relay's DPU→host byte-ring write submitted
+  a single memcpy of up to a full landing-ring-wrap segment (~MBs); the receiver DPU's device max
+  memcpy buf size is **2,097,152 bytes (2 MiB)**, and relay writes that raced ahead of the consumer
+  reached ~2.13 MB — just over the cap — so DOCA accepted them at submit (buffers pass bounds checks)
+  but failed them at COMPLETION with `IO_FAILED`, resetting the context and aborting the transfer
+  before close. The pull path never hit this (bounded by its 64 KB mirror buffer); only the zero-copy
+  receive write, sourcing a contiguous landing ring, was uncapped. Fix: query
+  `doca_dma_cap_task_memcpy_get_max_buf_size` at device selection, store `engine->maxDmaBufBytes`, and
+  clamp every byte-ring write to it (the relay's edge-triggered loop submits the remainder). Lesson:
+  the substrate advertises a per-task DMA max — query and respect it, do not assume.
+- **NEXT (active) — unify the sender pull-mirror pool → a contiguous ring.** The DMA-cap fix makes the
+  WRITE side adapt to the 2 MiB cap (it already sources a contiguous landing ring). The sender-side
+  pull mirror is still a **pool of fixed 64 KB `byteStreamBuffers`**, so the pull is pinned at 64 KB
+  and does NOT use the cap headroom — it respects the cap trivially but can't adapt to it. Unify the
+  sender mirror to a contiguous ring like the receiver's landing region so the pull DMAs
+  `min(contiguous-to-wrap, maxDmaBufBytes)` per task and the 64 KB slot artifact is gone. This is a
+  refactor of the validated sender pull+egress path (staging, RDMA egress source, range-release/wrap
+  bookkeeping) — do it as its own change with its own sender-egress byte-conservation validation.
+- **Mid-transfer abort is not signalled to clients:** when a data-path DMA/RDMA fault DOES fire, the
+  service tears down the transport (peer `DISCONNECTED`, session reclaimed) but sends NO protocol
+  notification to the still-waiting `pg_basebackup` sender and `--homer-receive` consumer, so both
+  hang until killed. A real robustness gap in the failure path (happy-path close is correct; the
+  failure path needs the same "tell the peer" discipline).
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
