@@ -662,6 +662,21 @@ before writing it. Options on the table: (1) client exports role-7 at SQL-sessio
 standalone DPU role-7 receive session keyed to the SQL serviceSessionId; (3) a decoupled smoke to validate
 D+E + client finalize before the full pgbench integration. Stage D+E stands regardless of which is chosen.
 
+**Smoke-first de-risking DONE (July 7, 2026 — citus `3941f57bc`; user chose smoke-first then session integration).**
+The deform was extracted out of the 42k-line service file into its own linkable unit
+`homer_tuple_deform.c/.h` (`HomerTupleDeformBatchToDecoded` + `HomerTupleDeformDecodedRecordUpperBound`) so the
+SAME deform links into both the service relay and a standalone smoke (no drifting copy). The client FINALIZE
+landed as postgres.h-free inlines in `homer_decoded_tuple_abi.h` (`HomerDecodedTupleCursor{Init,Next}`) — the
+REAL Stage F cursor, shared so smoke + pgbench client run identical code. `src/bin/homer_tuple_deform_smoke.c`
+(`make tuple-deform-smoke`, in `all`) builds synthetic packed batches the way the producer packs (null bitmap +
+MAXALIGN(8) + store_att_byval), runs the real deform then the real finalize, and checks recovered values:
+single int4 (negatives + NULL), int4/int8/int2 alignment + middle NULL, 0-row EOS batch, and the upper bound —
+**ALL PASS**. This validates the byte-layout agreement (the highest-risk novelty) on CPU before any 3-machine
+run. Build wiring: deform added to `HOMER_SERVICE_OBJS` (kept out of citus.so) + the service-bin recipe.
+**Next: the full pgbench session integration (the C.2/F fork above) — architecture still to lock (Option 1
+session-scoped role-7 vs Option 2 separate receive session); a large client+service+ABI+gating feature best
+started with fresh context.**
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the
