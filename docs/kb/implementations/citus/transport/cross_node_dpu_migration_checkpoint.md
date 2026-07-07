@@ -592,6 +592,43 @@ EOS → terminal); F client borrow finalize + wire `pgbench --homer` to consume 
 Validation: `pgbench --homer` remote-RDMA DPU-enabled, `abalance` correctness + intended-path proof. Large,
 multi-session; committed A/B/C.1 + the plan + this note make it resumable.
 
+**Stage D decoded-record layout DECIDED (July 7, 2026 — the plan's deferred "mechanical details"):**
+The layout + its alignment math live in ONE shared, `postgres.h`-free header
+`src/include/distributed/homer/homer_decoded_tuple_abi.h` with inline helpers, so the service deform
+(a PG-backend TU — has `MAXALIGN`/`fetch_att`) and the client finalize (an external TU — reads `values[i]`
+as `uint64` and casts, no PG macros) CANNOT disagree byte-for-byte. Same discipline as `homer_byte_ring_sink.h`.
+One transport record per batch (`CitusTupleSinkTransportHeader` envelope unchanged), body =
+`HomerDecodedTupleBatchHeader { protocolVersion, headerBytes, attributeCount, tupleCount, payloadBytes }`
+then per tuple, each MAXALIGN(8)-aligned:
+`HomerDecodedTupleHeader { decodedTupleBytes, attributeCount }` · `uint8 nulls[attributeCount]` ·
+(pad 8) `uint64 values[attributeCount]` · (pad 8) varlena section.
+Decisions + reasoning:
+- **`values[]` is a flat Datum array** (O(1) attr access) — THIS is the offload: it eliminates the
+  client's sequential MAXALIGN-stepping/length-prefix walk (the expensive part of `DecodeTupleViewFromTupleSinkRow`).
+- **by-value → inline `Datum`; by-ref/varlena → byte OFFSET from the decoded-tuple start** into the
+  co-located varlena section (client finalize: `values[i] = tupleStart + offset`). Offsets are unavoidable
+  for by-ref (a by-ref Datum is a host pointer the DPU can't know). Both sides pick Datum-vs-offset from the
+  contract's `attributeByVal`.
+- **per-tuple `decodedTupleBytes` length prefix** so the client advances tuple→tuple with NO walk (keeps the
+  offload total). Variable-stride ready (varlena); for pgbench int4 it's a constant ~24-byte stride.
+- **varlena implemented but UNVALIDATED by the pgbench smoke** (`SELECT abalance` is a single int4, by-value).
+  Copy varlena bytes VERBATIM (header included — `PG_DETOAST_DATUM_PACKED` may be short- or long-header;
+  client reads via the value's own `VARSIZE_ANY`), each varlena field MAXALIGN(8) in the section. The by-ref
+  arm carries a loud defensive log/guard so a future varlena workload flags "validate me" rather than silently
+  trusting untested math. Rationale to implement-now-with-guard rather than scope-out: the plan designed the
+  offset layout, the by-ref arm is small, and a half-path is more confusing than a guarded complete one.
+- **source ring == host role-7 ring == 8 MiB** (`HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`), required because
+  `HomerDpuDmaSubmitByteRingWrite(absoluteStart, TUPLE_SOURCE)` addresses source `% sourceStorage` AND host
+  `% hostStorage` with ONE absolute — so **source space and host space are the same absolute space** (both
+  start at 0, both advance by decoded bytes). **Landing space is separate** (advances by PACKED bytes) — the
+  three-position-space decoupling. Credit far sender at landing-consumed (deform copied the bytes out), NOT
+  at the DMA writtenTail (which is source→host).
+- **the deform reuses `HomerByteRingSinkDrain` for its landing-ring READ loop** (proven wrap-gap geometry +
+  no-torn gate + consumedHead advance); its `validateAndDeliver` deforms into the source ring and returns
+  false to defer on Loop-2 source-ring-full (so consumedHead/credit naturally back-pressure the far sender).
+  The deform is the SOURCE-ring PRODUCER, so it applies the producer wrap-gap protocol (pad + copy the real
+  transport header into the gap) so the DMA'd bytes are geometry-skippable by the client sink core.
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the
