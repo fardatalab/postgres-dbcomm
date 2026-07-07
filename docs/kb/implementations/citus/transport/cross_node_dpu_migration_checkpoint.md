@@ -629,6 +629,39 @@ Decisions + reasoning:
   The deform is the SOURCE-ring PRODUCER, so it applies the producer wrap-gap protocol (pad + copy the real
   transport header into the gap) so the DMA'd bytes are geometry-skippable by the client sink core.
 
+**Stage D+E IMPLEMENTED + committed (July 7, 2026 — citus `eacc6b559`, kb `86520bb525e`):** the shared header,
+the deform (per-row + per-batch + upper-bound), and `HomerServicePumpIncomingTupleViewDpuTwoRingRelay`
+(branched at the TUPLE_VIEW_BATCH DPU dispatch under `UsesDpuMirrorSource`). Compile+link clean. NOT yet
+runtime-validated (folds into the pgbench e2e). One link-time lesson: the standalone service binary does NOT
+link PG's error reporting, so `fetch_att` (its `default: elog(ERROR)` arm) cannot be used even on untaken
+paths — by-value Datum reconstruction is via an elog-free `HomerServiceFetchByValDatum` (pure cast macros).
+
+**Stage C.2/F integration is a DESIGN FORK, not the plan's mechanical "reuse basebackup role-7 + swap the
+callback" (BLOCKED on a decision — July 7, 2026).** Mapping the client SQL-result lifecycle showed the plan's
+assumption is wrong in three load-bearing ways:
+- The SQL result sink is the **receive-half of the CLIENT_SQL_SESSION**, bound per-command from the completion
+  view (`HomerClientOpenResultSinkFromCompletionView` `homer_client.c:5334` -> `...FromDescriptor:5139` ->
+  `HomerClientRebindResultSink:5294`), NOT a standalone receive session like basebackup
+  (`HomerClientOpenBaseBackupReceiveStreamSelectedDpu:2893`, which has its own OpenSession(RECEIVE)).
+- The result ring is a **local host-shm ring on the client's (farnet0) machine, created by the tuple-sink
+  SERVICE** (`tuple_sink_service_process.c:18433`); the farnet0 service RDMA-receives result bytes and writes
+  them into that shm (service-passive), and the client just `shm_open`/`mmap`s it and polls `publishedTail`
+  (`HomerClientDrainResultSinkUntil:5422`, row-count-only at `:5619`). There is no client-side network I/O,
+  no DPU credit line, no exported ring on the SQL path.
+- The DPU-vs-SHM selection for SQL is **server-side** (`citus.enable_experimental_homer_dpu_frontend`), and
+  that path is a **not-yet-implemented bring-up stub** (`HomerFrontendDmaRaiseNotImplemented`
+  `homer_frontend_dma.c:191`) on the BACKEND frontend; the standalone `pgbench --homer` client has NO DPU
+  result path at all. Nothing in the pgbench/client path selects DPU -- a new gating signal is required.
+So C.2/F needs BOTH (A) a new client role-7 DPU result consumer wired into the SQL session's per-command
+completion flow, AND (B) making the farnet0 service's SQL-session receive stream a TUPLE_VIEW_BATCH
+DPU-mirror-source stream that targets the client's exported role-7 ring (so the Stage-D relay branch fires)
+instead of the service-owned shm ring, PLUS a new DPU-select signal. This touches the OpenSession ABI + the
+service SQL receive-stream setup + the client drain contract -- a larger feature to align with the user
+before writing it. Options on the table: (1) client exports role-7 at SQL-session-open + an OpenSession
+"DPU result receive" flag drives the service to set up the landing-backed receive stream; (2) a separate
+standalone DPU role-7 receive session keyed to the SQL serviceSessionId; (3) a decoupled smoke to validate
+D+E + client finalize before the full pgbench integration. Stage D+E stands regardless of which is chosen.
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the
