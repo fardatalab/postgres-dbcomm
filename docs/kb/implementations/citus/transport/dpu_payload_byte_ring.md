@@ -86,8 +86,12 @@ Consequences that MUST be preserved:
   offset, adds nothing (no per-chunk header, no FRAGMENT flags), and the destination is
   byte-identical — so whole records reassemble for free. (History: the egress once did
   *semantic* re-framing with `outgoingFragment*` + generated FRAGMENT headers + a
-  service-side reassembler; that was removed on July 6 — see the cross-node checkpoint
-  "P1.5". The `FRAGMENT_FIRST/LAST` ABI bits are now unused/reserved.)
+  service-side reassembler. The live DPU egress was de-reframed on July 6 (checkpoint
+  "P1.5"); the dead fragmentation machinery — the `outgoingFragment*`/`reassembly*` fields,
+  `HomerServiceForcedBulkFragmentBytes`/`HOMER_BULK_FRAGMENT_BYTES`, the legacy-pump
+  fragment path, and the CPU reassembler — was then deleted in "P1.6", which also made
+  header-ready + the reassembler *reject* any FRAGMENT bit. The `FRAGMENT_FIRST/LAST` ABI
+  bits are now reserved and never produced.)
 - **The wrap gap is relayed VERBATIM and skipped by geometry.** Because mirror-1:1
   makes source ring == peer ring, the egress writes `[absoluteStart, absoluteEnd)` (gap
   padding included) to matching offsets; the consumer skips the gap by geometry

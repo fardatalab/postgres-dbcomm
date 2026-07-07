@@ -489,11 +489,61 @@ relay path (`peer-provisioned receive sink` → `payload close QUIESCED final_ta
 the ~1.24% band). The ~1 MiB records that fragmented+stalled before now arrive WHOLE — proof the
 position-preserving sub-record chunking reassembles for free.
 
-**Deferred (Stage 2-4 cleanup, separate follow-up):** remove the DEAD fragmentation machinery on the
-deprecated host-service paths (legacy sendQueue pump fragmentation, `HomerServiceForcedBulkFragmentBytes`,
-`outgoingFragment*`/`reassembly*` fields, the non-DPU CPU reassembler, header-ready FRAGMENT flag bits).
-Behavior-neutral; banked the working fix first. The diagnostic byte-ring sink trace
-(`HOMER_BYTE_RING_SINK_TRACE`, budget-capped) is kept **gated off by default**.
+**Deferred (Stage 2-4 cleanup):** DONE in **P1.6** below — the dead fragmentation machinery on the
+deprecated host-service paths was removed and the receive relay unified onto the shared chunk helper.
+The diagnostic byte-ring sink trace (`HOMER_BYTE_RING_SINK_TRACE`, budget-capped) is kept **gated off by
+default**.
+
+## P1.6 — dead-fragmentation removal + relay unification: DONE + validated (July 6, 2026, citus `8f9963d33`)
+
+P1.5 made the LIVE DPU egress position-preserving but banked the fix before removing the now-dead
+fragmentation machinery on the deprecated/non-DPU paths, and left the receive relay carrying its own
+copy of the chunk math. P1.6 removes the dead code and unifies the one remaining chunk computation. Net
+**−522 lines** in `tuple_sink_service_process.c` (44 insertions, 575 deletions) + a reserved-macro note
+in `homer_tuple_abi.h`. Behavior-neutral: the only *exercised* change is the relay refactor, which is
+byte-identical to the code it replaced.
+
+**Removed (all dead-for-the-live-path):**
+- **Legacy host-service sender fragmentation** — `HomerServicePumpOutgoingByteRingPayload` no longer
+  fragments; deleted `HomerServiceAppendOutgoingBaseBackupFragmentWrite`,
+  `HomerServiceForcedBulkFragmentBytes` + the `HOMER_BULK_FRAGMENT_BYTES` env knob, and the
+  `outgoingFragment*` stream fields. Its fragmentation was doubly-gated (`basebackup &&
+  forcedFragmentBytes>0`) — a diagnostic opt-in, NOT always-on like the P1.5 egress bug — so removal
+  changes no default run.
+- **Receiver CPU reassembler** — `HomerServiceProcessReceivedBaseBackupTransportRecord` keeps only the
+  whole-record branch + a defensive guard that turns any stray FRAGMENT flag into a hard error; the
+  FIRST/continuation/LAST reassembly branches and the `reassembly*` accumulator fields of
+  `HomerBaseBackupPayloadState` are gone.
+- **Header-ready** — `HomerServicePayloadTransportHeaderReady` allows only `EOS`; any FRAGMENT bit is an
+  error, and the FIRST-fragment min-size branch is deleted. With the reassembler guard, the receiver now
+  REJECTS fragmentation structurally, so a clean full-EOS run is proof no path re-frames.
+- **ABI** — `CITUS_TUPLE_SINK_TRANSPORT_FLAG_FRAGMENT_FIRST/LAST` (`homer_tuple_abi.h`) kept RESERVED
+  ("no longer produced") so the bit positions are not reassigned to a meaning an old peer could misread.
+
+**Relay unification:** `HomerServicePumpIncomingByteRingDpuRelay`'s inline chunk math now calls the
+shared `HomerByteRingRelayNextChunk` (factored in P1.5). The receive relay (DMA) and the RDMA egress now
+share ONE position-preserving, wrap-aware, arbitrary-size chunk computation
+(min of range / ring-wrap / credit / substrate-cap) — byte-identical to the prior inline math. The
+relay's only credit gate at this layer is the engine's Loop-2 host back-pressure (deferred inside
+submit), so the source range itself is passed as the credit bound.
+
+**Validation (July 6, cross-node DPU-receiver basebackup e2e, both DPUs rebuilt with the new binary):**
+PASS, first attempt, no DOCA cold-start flakiness. Deployment verified current (`grep -c
+HomerServiceForcedBulkFragmentBytes` == 0 on both DPU sources + installed host service, fresh binaries).
+Intended DPU↔DPU DOCA-DMA relay confirmed on both DPU logs (sender: persistent outgoing RDMA peer
+transport + DOCA `doca_enabled=1`; receiver: `peer-provisioned receive sink`, `final receiver head WIMM
+... final_tail==consumed_head==26507315464`), not a libpq/host-CPU fallback. All 3 runs reached `stream
+complete` + `closed (CLOSE_ACK)` with no stall; delivered vs `du -sb data` (23,295,123,768 B): warm
+repeat 23,215,190,170 B (−0.34%), bonus `bytes=65536` run 23,252,392,378 B (−0.18%), both inside the
+~1.24% band. Warm repeat rc=0 at 9.40s real (primary geometry `slots=4,bytes=1048576`); the `bytes=65536`
+force-chunk run also delivered whole objects to EOS (8.13s rc=0), extra confidence the shared relay
+handles small sub-record segments + mid-record tails. No throughput-regression claim (no documented
+reference band for this path); correctness + anti-stall + intended-path are the pass criteria.
+
+**Remaining follow-up:** the two-ring tuple DPU path (Part 3.5) reusing this same relay with
+consumer-side EOS ordinal sourcing (deform: RDMA landing ring → DMA source ring → host). Not started —
+it is a new build with design decisions and a different validation workload (Citus backend-to-backend
+COPY), scoped as its own effort, not part of this cleanup.
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
