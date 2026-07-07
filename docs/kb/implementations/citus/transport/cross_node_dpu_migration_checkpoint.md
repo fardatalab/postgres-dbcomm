@@ -540,10 +540,57 @@ force-chunk run also delivered whole objects to EOS (8.13s rc=0), extra confiden
 handles small sub-record segments + mid-record tails. No throughput-regression claim (no documented
 reference band for this path); correctness + anti-stall + intended-path are the pass criteria.
 
-**Remaining follow-up:** the two-ring tuple DPU path (Part 3.5) reusing this same relay with
-consumer-side EOS ordinal sourcing (deform: RDMA landing ring → DMA source ring → host). Not started —
-it is a new build with design decisions and a different validation workload (Citus backend-to-backend
-COPY), scoped as its own effort, not part of this cleanup.
+**Remaining follow-up:** the two-ring tuple DPU path (Part 3.5 below) reusing this relay with a deform
+between two byte rings. Its own effort, not part of this cleanup.
+
+## Part 3.5 — two-ring tuple DPU path for pgbench: PLANNED; Stages A/B/C.1 done (July 7, 2026)
+
+Full plan: `/home/jasonhu/.claude/plans/here-s-a-snippet-on-linked-papert.md`. The going-forward
+DPU-offloaded tuple **result-sink**, offloading the receive-side per-tuple **decode** onto the DPU.
+Shape: server backend produces packed tuple-view → farnet1 sender DPU mirror → RDMA → farnet0 receiver
+DPU landing ring → **deform** → DMA source ring → DMA → client → borrow.
+
+**Direction change that reshaped the plan (record for posterity):** the receive/consumer side was first
+mis-modeled as the **Citus tuple COPY** worker backend (coordinator → socketless worker, service-passive
+receive). That path is OUTDATED and not the focus. The real workload is **pgbench**: `pgbench --homer`
+(a `src/bin/homer_client.c` client, NO libpq in the data path — `pgbench.c:8580`) is the CLIENT, talking
+to a PostgreSQL **server backend** (`remote_execution_backend_bridge.c`, the producer) over the Homer
+stack. The `citus_remote_exec_pgbench_transaction` SQL wrapper (`remote_exec_pgbench_transaction.c:324`)
+is a mistaken indirection — a farnet0 backend that consumes in-process and returns a scalar over libpq —
+to be RETIRED (Stage G); its TPC-B body already lives in pgbench's own Homer state machine. The two
+paths' consumers differ: the Citus worker decodes to Datums via `BorrowNextRemoteTupleView`
+(`homer_frontend.c:1510`, backend-only); the standalone `pgbench --homer` client currently only counts
+rows (`homer_client.c:5619`) and has no DPU SQL-result consumer (only basebackup does, `:2893`).
+
+**Deform design DECIDED (the crux):** Homer's internal/on-wire formats are Homer's own — need NOT be
+PG-compatible; only the frontend `borrow` interface hands the PG user a PG-compatible tuple. TWO
+Homer-owned formats: (1) **packed tuple-view** (`CitusTupleSinkBatchHeader` + MAXALIGN'd null-bitmap
+rows) — the server→DPU wire + within-backend sink form (packed because varlena pointers can't be DMA'd;
+the producer's `TryAppendTupleViewToCitusTupleSinkBatch` packs — minimal send-side work). (2) **decoded
+delivery image** — the DPU→client payload. The deform DECODES (1)→(2) on the DPU: per tuple `nulls[]` +
+`values[]` (fixed-by-value inline Datums; varlena = byte OFFSETS into a co-located per-batch varlena blob
+carrying real PG varlena headers), driven purely by the on-wire `CitusTupleViewContract`
+(`homer_tuple_abi.h:94-104`) so it needs no `TupleDesc`/`MemoryContext`. The client `borrow` only
+FINALIZES: varlena offset → client-local pointer. Net: per-tuple decode offloaded host→DPU (the goal
+itself). The decoded record is a plain variable-sized byte-ring record — fits the shared sink core +
+geometry-only wrap-gap unchanged; both ends are LE 64-bit so `Datum` is byte-identical across the hop,
+only pointers are non-portable (hence offsets). NOTE: the deprecated `TupleSinkServiceDecodeIncomingTuple
+ViewBatch` is a same-layout re-pack (validated rebuild), NOT a decode — a reference for the attribute
+walk, not the function to lift. INVARIANT: the sink must carry detoasted varlena (DPU can't detoast).
+
+**Committed (survive the topology correction — all on send/service infra, topology-agnostic):**
+- Stage A `86ac9b418` — DMA engine tuple source ring + WRITE_BODY source selector (basebackup byte-identical).
+- Stage B `442e1710b` — send-side EOS byte-position mark (eosByteTail/eosRecordOrdinal, aliased in both
+  control views; backend publishes at EOS; mirror egress flips payloadEosPosted). Producer = server backend.
+- Stage C.1 `e1eeb07f3` — DPU tuple receive backed by the engine landing region (retire the alias model).
+  Compile-clean; NOT yet runtime-validated (folds into the Part 3.5 pgbench validation).
+
+**Remaining (net-new, receive/client side):** C.2 client-side role-7 DPU SQL-result consumer in
+`homer_client.c` (adapt basebackup `:2893`); D service two-ring relay + deform (branch at TUPLE_VIEW_BATCH
+receive `tuple_sink_service_process.c:31027`, parallel to basebackup `:30992`); E close/EOS (deform detects
+EOS → terminal); F client borrow finalize + wire `pgbench --homer` to consume `abalance`; G retire Path B.
+Validation: `pgbench --homer` remote-RDMA DPU-enabled, `abalance` correctness + intended-path proof. Large,
+multi-session; committed A/B/C.1 + the plan + this note make it resumable.
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
