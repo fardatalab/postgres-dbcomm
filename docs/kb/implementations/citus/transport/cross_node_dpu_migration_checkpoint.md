@@ -825,6 +825,34 @@ stamp-and-cached onto the stream). Two concurrent `--homer-dpu` clients now each
 two concurrent clients each bind their own ring with no WARN / cross-delivery); then retire Path B
 (`citus_remote_exec_pgbench_transaction`).
 
+## Part 3.5.2 — kill the throwaway session + the pending-binding registry (July 8, 2026; IN PROGRESS)
+
+Part 3.5.1 left basebackup delivering its `sessionUID` via the base-compat `(sessionKey → sessionUID)`
+pending-binding registry, and the farnet0 relay stream owned by a *throwaway* base-compat session created by the far
+sender's peer-open. A design review + a **feasibility spike** reframed the fix. The full model, spike evidence, and
+the decision live in the canonical design note
+[`../../../future-directions/citus/transport/session_identity_and_pairing.md`](../../../future-directions/citus/transport/session_identity_and_pairing.md);
+summary of what changed and why:
+
+- **Originally-planned fix (dropped):** an automatic cross-node handshake — the receiver drives a stripped
+  `OP_COMMAND_SESSION` open to farnet1 so the sender adopts the receiver's `sessionUID`, then delete the registry.
+- **Spike finding that killed it:** in the DPU-basebackup deployment the sender's SEND session is owned by the
+  farnet1 **DPU** service (not a host service), so the linkage would have to travel **DPU↔DPU** — a net-new
+  DPU-control-slot command-session opener + 3 service-side `opKind`-gate relaxations (`COMMAND_CREATE:34872`,
+  `REGISTER_MEMORY:34936`), *not* "reuse SQL's host↔host spine." And even the handshake still performs one
+  base-compat+tag rendezvous (relocated to farnet1), so its uniformity gain was small.
+- **Decision (adopted, user-chosen):** **receiver-session base-compat+tag scan, no handshake.** Add a
+  `launchDiscriminatorTag` (externally coordinated: receiver `--homer-tag N`, sender `tag=N`), create/own the relay
+  by a real receiver session `R` found by base-compat+tag across both orderings, resolve the relay uid from the
+  owning session/stream, and **delete `ActivePendingBindingTable`**. Same end-state (no throwaway, no registry), same
+  one-rendezvous correctness guarantee, far less machinery, no new cross-node channel/ABI beyond the tag.
+- **Deferred (KB-only):** session-spawned basebackup receiver (like SQL/COPY) removes even the tag + the farnet0
+  rendezvous; see the design note.
+
+Sequencing (each independently buildable; registry deleted only after the scan validates): (1) this KB note + code
+comments; (2) `launchDiscriminatorTag` ABI + pg_basebackup plumbing (inert); (3) service scan owns the relay by `R`,
+registry kept as belt-and-suspenders, 3-machine validate; (4) delete the registry, re-validate.
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the

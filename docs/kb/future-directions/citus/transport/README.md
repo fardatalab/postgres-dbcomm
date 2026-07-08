@@ -30,6 +30,7 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 - [rdma_publication_visibility_and_doorbells.md](rdma_publication_visibility_and_doorbells.md) - RDMA publication/visibility rules, including why the tuple-sink prototype now uses WRITE_WITH_IMM doorbells rather than trusting memory polling alone as the responder-visible publish event.
 - [rdma_transport_control_plane_abstraction.md](rdma_transport_control_plane_abstraction.md) - TODO
 - [service_progress_control_data_plane_scheduler.md](service_progress_control_data_plane_scheduler.md) - Current state-machine service-progress scheduler design, default `machine-baseline` policy, validation gate, known caveats, and future adaptive-policy directions.
+- [session_identity_and_pairing.md](session_identity_and_pairing.md) - Cross-node session identity model (sessionKey vs node-local serviceSessionId vs cross-node sessionUID), the basebackup throwaway-session/registry warts, the DPU-instance spike that killed the handshake plan, and the adopted receiver-session base-compat+tag scan (no handshake).
 <!-- kb-docs:end -->
 
 ## Related
