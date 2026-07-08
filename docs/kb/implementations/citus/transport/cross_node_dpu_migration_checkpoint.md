@@ -880,8 +880,30 @@ registry kept as belt-and-suspenders, 3-machine validate; (4) delete the registr
 - **Fix (citus `bf428df29`):** pair basebackup on `(destinationNodeId, launchDiscriminatorTag)` via new
   `HomerServiceBaseBackupSessionKeysPairable` (protocolVersion + destinationNodeId + executionLane, NOT
   databaseId/effectiveUserId); `TupleSinkServiceFindBaseBackupOwnerSession` uses it. Full write-up:
-  `../../../future-directions/citus/transport/session_identity_and_pairing.md` ("Validation correction"). Re-run of
-  the 3-machine validation with the rebuilt DPU services is the next step.
+  `../../../future-directions/citus/transport/session_identity_and_pairing.md` ("Validation correction").
+
+**Stage-3 validation attempt #2 (July 8, 2026): pairing fix CONFIRMED; then hit + fixed a pre-existing crash.**
+
+- **The `(node,tag)` pairing fix works** (validated in isolation): the farnet0 DPU log showed NO `(sender-first)`
+  line and NO registry `WARN` -- the SEND peer-open found the receiver's real session and the owner-session path
+  resolved the relay uid. So the Part 3.5.2 throwaway-elimination + registry-independence is proven on the real DPUs.
+- **But e2e still FAILED** on a SECOND, pre-existing bug (NOT Part 3.5.2): the farnet1 DPU service **SIGSEGV'd** on
+  every basebackup DPU-mirror egress pump pass, resetting the DPU<->DPU transport before any byte moved. gdb
+  backtrace (correct v2 binary `~/dbcomm/citus-dbcomm`): NULL deref of
+  `streamEntry->stream.sendQueue.queueControl->eosByteTail` in `HomerServicePumpOutgoingDpuMirrorByteRingPayload`
+  (faulting addr `0x30` == the field offset, proving `queueControl` NULL). Introduced by Part 3.5 Stage B
+  (`442e1710b`): the two-ring tuple send-EOS block reads the source control block unconditionally, but only the
+  two-ring tuple path owns one; the basebackup producer-owned SINGLE byte-ring has `queueControl == NULL`. The
+  block's own comment ("inert for basebackup, eosByteTail stays 0") wrongly assumed a valid-but-unwritten pointer.
+  Latent because Part 3.5's two-ring work was never DPU-validated for basebackup (run #2 predates it).
+- **Fix (citus `1aad53451`):** guard the EOS-mark read on `sendQueue.queueControl != NULL`; basebackup skips it
+  (batch* keep defaults -> no EOS, frozen-tail-driven close, the intended behavior), two-ring tuple/pgbench path
+  unchanged. Re-run of the 3-machine validation with this fix is the next step.
+
+**DPU tree note (July 8, 2026):** the farnet1 DPU has TWO citus trees. `~/dbcomm/citus-dbcomm` is the CURRENT one
+(non-git rsync dir at farnet1 HEAD, COMCH v2, has the Part 3.5.2 fixes) -- use it, symmetric with the farnet0 DPU.
+`~/citus-dbcomm` is a STALE legacy git tree (HEAD `3fb0e7749` July 2, COMCH v1); running its binary fails the sender
+DPU-setup handshake with `BAD_PROTOCOL status=1`. Do not use it.
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
