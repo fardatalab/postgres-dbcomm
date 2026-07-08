@@ -151,6 +151,16 @@ no cross-node channel.
 
 ## Decision — receiver-session base-compat+tag scan (no handshake)
 
+> **Implementation status (landed + validated July 8, 2026):** all of this is implemented (citus
+> `77f4ca62d`→`cf34196c9`→`bf428df29`→`1aad53451`→`a3cdd5f3c`) and validated end-to-end on the real DPUs
+> — single-backup cross-node DPU basebackup PASSes with byte conservation, no throwaway session, and the
+> registry deleted (never consulted). The pairing key was corrected to `(node, tag)` (see "Validation
+> correction" below), and the concurrency tag is proven to discriminate two same-node backups into distinct
+> owner sessions (though concurrent *data* movement is blocked by a separate pre-existing peer-transport limit —
+> see the implementation checkpoint). Full status:
+> [`../../../implementations/citus/transport/cross_node_dpu_migration_checkpoint.md`](../../../implementations/citus/transport/cross_node_dpu_migration_checkpoint.md)
+> (Part 3.5.2).
+
 Adopted 2026-07-08 (user chose "session-scan, no handshake" over the planned
 handshake after the spike). Same end-state as the plan — **no throwaway, no
 registry** — with far less machinery and the **same** correctness guarantee (one

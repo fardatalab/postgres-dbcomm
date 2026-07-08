@@ -911,6 +911,28 @@ Both DPUs at HEAD `1aad53451` (`~/dbcomm/citus-dbcomm`, COMCH v2). Two warmed ba
   on both DPUs. Sender exited cleanly, NO hang (the pre-existing DPU-pull-interrupt bug is peer-reset-triggered only,
   and no reset occurred). Logs: `/tmp/homer_service_farnet{0,1}_dpu_fix2.log`, `/tmp/homer_receive_e2e_run{1,2}.log`.
 
+**Stage 4 (registry delete) DONE + validated (July 8, 2026; citus `a3cdd5f3c`).** Deleted `ActivePendingBinding
+Table` + Register/Lookup/Unregister + all call sites (RECEIVE-open register, resolver step-3 fallback + its WARN,
+close unregister). `HomerServiceResolveRelayResultSessionUID` now terminates at the owner-session step (returns
+0-for-retry if R's sessionUID is not yet stamped; no base-compat fallback). Full build+install both trees + smoke
+ALL PASS; installed service confirmed registry-free (`strings | grep -c pending-binding` == 0); ABI lockstep OK.
+Re-validated 3-machine: 3 clean single-backup runs, byte conservation within +0.017%, `sender-first`/`WARN` absent
+(registry never consulted -> deletion is a runtime no-op), no SIGSEGV/DISCONNECT, clean close. **This completes the
+Part 3.5.2 goal: no throwaway session, no registry.** Commit chain: `77f4ca62d` (tag ABI) -> `cf34196c9` (owner
+scan) -> `bf428df29` (node+tag pairing fix) -> `1aad53451` (send-EOS NULL-guard) -> `a3cdd5f3c` (registry delete).
+
+**Stage 5 concurrency-tag validation (July 8, 2026): the `(node,tag)` pairing is PROVEN correct; concurrent DATA
+transport blocked by a pre-existing limit (INCONCLUSIVE, follow-up).** Two same-node backups with distinct tags
+(tag=1, tag=2), reduced geometry (`bytes=524288`, retried `262144`): each receiver created its OWN distinct owner
+session (tag=1 -> sessionUID A, tag=2 -> sessionUID B), NO cross-delivery, NO `sender-first`, NO `WARN` -- so the
+tag discriminator works. BUT immediately after both reached `peer-provisioned receive sink`, the shared DPU<->DPU
+peer RDMA connection reset (`CM event=DISCONNECTED status=0`) before any byte moved; the smaller geometry did not
+change it (NOT a landing-region limit). This is a **pre-existing peer-transport-concurrency gap** -- provisioning a
+SECOND concurrent payload stream on one already-established DPU<->DPU connection resets it (consistent with
+CLAUDE.md's documented shared RDMA command/completion multi-client bottleneck), ORTHOGONAL to the Part 3.5.2
+tag-pairing logic. Follow-up: the peer-transport layer's handling of a second concurrent OpenSession/payload-stream
+on an established connection. (Also both concurrent aborts hit the pre-existing reserve-loop-ignores-SIGTERM bug.)
+
 **DPU tree note (July 8, 2026):** the farnet1 DPU has TWO citus trees. `~/dbcomm/citus-dbcomm` is the CURRENT one
 (non-git rsync dir at farnet1 HEAD, COMCH v2, has the Part 3.5.2 fixes) -- use it, symmetric with the farnet0 DPU.
 `~/citus-dbcomm` is a STALE legacy git tree (HEAD `3fb0e7749` July 2, COMCH v1); running its binary fails the sender
