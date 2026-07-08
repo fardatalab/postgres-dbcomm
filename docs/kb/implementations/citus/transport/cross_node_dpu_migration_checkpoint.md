@@ -703,6 +703,31 @@ to avoid double-arming the role-7 import or hanging — the relay pump self-arms
 bind's job may just be "return OK, do not create a placeholder stream"; being traced before writing). Then step 6
 pgbench `--homer-dpu` flag + drain routing + read abalance; step 7 the 3-machine validation; step 8 retire Path B.
 
+**ALL CODE STEPS DONE + committed + building/installing clean on farnet1 (July 7, 2026). Only validation (step 7)
++ Path-B removal (step 8) remain.**
+- Step 5 `99a9e04d3` — the planned RECEIVE-bind extension was WRONG; a consumer-first lifecycle trace showed the pgbench
+  role-7 open is ALWAYS consumer-first (opens before the first result), so a relay-bind never fires, AND the existing
+  clientSqlResultOpen path can't accept the DPU open at all (it validates+installs a per-command tuple contract the
+  consumer lacks at open). Correct code: `TupleSinkServiceHandleOpenSession` detects the DPU consumer open
+  (clientSqlResultDpuRelay && direction==RECEIVE) after the protocol checks and returns a **benign OK** naming the
+  parent session, skipping contract/slot/stream machinery. The REAL relay runs on the peer-bound result stream (flagged
+  via the flow, self-arming on the role-7 import in the relay pump). Client accepts serviceSessionId/SinkId=0 + zeroed
+  queue descriptor (drives its own ring). LESSON: the plan's "reuse basebackup RECEIVE-bind" was the OPPOSITE of correct.
+- Step 6 `75138f75c54` (postgres tree) — pgbench `--homer-dpu`: openHomerSession sets clientSqlResultDpuRelay=1 + opens
+  the role-7 stream once; HomerApplyCommandCompletion captures the per-command contract from the completion view and
+  drives HomerDrainPendingDpuResultRelay (EOS-delimited poll loop mirroring the shm drain control-flow contract);
+  reads + logs the decoded abalance; `transport: homer-dpu` printed for intended-path proof. Requires --homer + remote peer.
+- farnet1 install: citus service/client/extension + pgbench all build+install clean; installed pgbench has --homer-dpu.
+
+**Step 7 (validation) is the next phase — a large iterative 3-machine operation:** sync artifacts to farnet0 + BOTH DPU
+native-aarch64 trees (`~/dbcomm/citus-dbcomm`, rebuild `service-bin` there), bring up DPU DOCA-DMA services on farnet0 +
+farnet1 DPUs (HOMER_SERVICE_ENABLE_DPU_DMA=1 etc.), start pg + Homer services on both hosts, run
+`pgbench --homer-dpu` farnet0->farnet1, and confirm abalance correctness + intended-path from DPU logs (deform ran,
+source ring used, role-7 targeted). Expect first-run bugs (first ever exercise of the two-ring tuple relay + deform +
+client role-7 consumer over real RDMA/DMA) needing debug+fix iteration; the receiver-DPU DOCA cold-start flakiness
+(~50%, restart to recover) applies. Step 8 (delete citus_remote_exec_pgbench_transaction + its UDF/extern/build refs)
+comes AFTER validation confirms the new path.
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the
