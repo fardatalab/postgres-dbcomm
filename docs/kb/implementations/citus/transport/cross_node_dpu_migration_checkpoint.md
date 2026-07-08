@@ -927,11 +927,32 @@ transport blocked by a pre-existing limit (INCONCLUSIVE, follow-up).** Two same-
 session (tag=1 -> sessionUID A, tag=2 -> sessionUID B), NO cross-delivery, NO `sender-first`, NO `WARN` -- so the
 tag discriminator works. BUT immediately after both reached `peer-provisioned receive sink`, the shared DPU<->DPU
 peer RDMA connection reset (`CM event=DISCONNECTED status=0`) before any byte moved; the smaller geometry did not
-change it (NOT a landing-region limit). This is a **pre-existing peer-transport-concurrency gap** -- provisioning a
-SECOND concurrent payload stream on one already-established DPU<->DPU connection resets it (consistent with
-CLAUDE.md's documented shared RDMA command/completion multi-client bottleneck), ORTHOGONAL to the Part 3.5.2
-tag-pairing logic. Follow-up: the peer-transport layer's handling of a second concurrent OpenSession/payload-stream
-on an established connection. (Also both concurrent aborts hit the pre-existing reserve-loop-ignores-SIGTERM bug.)
+change it (NOT a landing-region limit). ORTHOGONAL to the Part 3.5.2 tag-pairing logic.
+
+**ROOT-CAUSED July 8, 2026 (clean re-run — the concurrent limit is REAL, not contamination).** The first concurrent
+run above was partly contaminated (a stale DPU service held port 9727: `DPU TCP setup server: Address already in
+use`). A verifiably-clean re-run (both DPU services confirmed `listening ... port=9727`, no port conflict; a
+single-backup CONTROL on the same services PASSed with byte conservation) reproduced the SAME reset, so it is a real
+concurrent-session limitation. Precise mechanism:
+- The `(node,tag)` pairing worked perfectly under concurrency: farnet0 DPU created TWO distinct owner sessions (tag=1
+  sessionUID A, tag=2 sessionUID B), no cross-delivery, no sender-first, no WARN.
+- The **SENDER DPU (farnet1) initiated** the reset (reason=2 = `HOMER_PEER_RESET_RECV_CQ_FAILURE`); the receiver DPU
+  only saw the resulting `CM event=DISCONNECTED` (reason=1). Raw: `requesting peer connection reset after recv-CQ
+  drain failure ... detail=payload sender credit advanced beyond posted tail token=4098 observed=31458176 posted=0`.
+- Assertion site: `HomerServiceApplyPayloadSenderCreditDoorbell` (`tuple_sink_service_process.c:27215`,
+  `observedHead > postedTail`). The doorbell token (4098) decodes to a VALID active peer-bound stream and passes ALL
+  binding checks in `TupleSinkServiceDispatchPeerPayloadDoorbell` (`:27245-27308`) -- so it is NOT a token-decode or
+  binding mismatch. Each stream's `localSenderHeadMirror` is a per-stream `calloc`+MR (`:16497-16559`). Yet the
+  checked stream's mirror holds ~30 MB consumed-head while it posted 0 bytes: under 2-stream multiplexing on one
+  shared connection/recv-CQ, one stream's receiver-issued consumed-head credit is being ATTRIBUTED to the other
+  stream's sender-head mirror. The `observed > posted` invariant is a DEFENSIVE check -- it catches the cross-stream
+  mis-accounting and safely resets (no data corruption) rather than crediting bytes never sent.
+- **Fix direction (follow-up):** audit the receiver-side per-stream consumed-head credit path (how farnet0 computes
+  each RECEIVE stream's consumed-head and RDMA-writes it to the sender's per-stream mirror descriptor + posts the
+  WIMM) so each stream's credit lands in/applies to ITS OWN mirror. The sender-side token->stream resolution + mirror
+  MR are already per-stream and correct; the collision is in the credit VALUE/addressing under multiplexing (the same
+  shared-connection multi-stream bottleneck CLAUDE.md flags for c4 pgbench, now with an exact trigger + assertion).
+- (Both concurrent aborts also hit the pre-existing reserve-loop-ignores-SIGTERM bug + the no-abort-notification gap.)
 
 **DPU tree note (July 8, 2026):** the farnet1 DPU has TWO citus trees. `~/dbcomm/citus-dbcomm` is the CURRENT one
 (non-git rsync dir at farnet1 HEAD, COMCH v2, has the Part 3.5.2 fixes) -- use it, symmetric with the farnet0 DPU.
