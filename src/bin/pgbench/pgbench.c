@@ -9512,7 +9512,24 @@ openHomerSession(TState *thread, CState *st)
 	 * provisions the relay.
 	 */
 	if (homer_dpu_mode)
+	{
 		sessionOptions.clientSqlResultDpuRelay = 1;
+
+		/*
+		 * Binding: mint this session's UNIQUE sessionUID ONCE here, BEFORE the command
+		 * session is opened, into the shared sessionOptions so BOTH the command-session
+		 * open (threaded to the service and back onto stream B) AND the role-7 result
+		 * opener bind on the SAME value.  The DPU->host relay resolves the target host
+		 * role-7 ring by this sessionUID.  Uniqueness among concurrently live sessions
+		 * comes from the distinct per-client CState pointer (st); pid/time add
+		 * cross-process/cross-run entropy.  This is NOT the connection sessionKey, which
+		 * is deliberately non-unique (four clients on one db/user/node share one).
+		 */
+		sessionOptions.sessionUID =
+			(((uint64_t) getpid()) << 32) ^ (uint64_t) pg_time_now() ^ (uint64_t) (uintptr_t) st;
+		if (sessionOptions.sessionUID == 0)
+			sessionOptions.sessionUID = 1;
+	}
 
 	if (!HomerClientOpenSqlSession(&thread->homer_control,
 								   &sessionOptions,

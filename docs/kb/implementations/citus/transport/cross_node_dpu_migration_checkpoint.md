@@ -728,6 +728,55 @@ client role-7 consumer over real RDMA/DMA) needing debug+fix iteration; the rece
 (~50%, restart to recover) applies. Step 8 (delete citus_remote_exec_pgbench_transaction + its UDF/extern/build refs)
 comes AFTER validation confirms the new path.
 
+## Part 3.5.1 — explicit session↔ring binding via a unique `sessionUID` (July 8, 2026; supersedes step-5 single-active)
+
+Full plan: `/home/jasonhu/.claude/plans/here-s-a-snippet-on-linked-papert.md`. Design review of step 5's
+"benign-OK" rendezvous surfaced that the DPU→host relay resolves its target host role-7 ring by ROLE ONLY
+(`HomerDpuDmaFindDpuToHostByteRingRef` kept-first + WARN on >1). That is a real bug the moment two sessions each
+want a role-7 ring (two concurrent `--homer-dpu` clients would cross-deliver / race a single-active guess). This
+milestone replaces the role-only lookup with an EXPLICIT binding keyed on a **unique per-session id**, for BOTH
+pgbench and basebackup. Runtime validation (old step 7) + Path-B removal (old step 8) resume AFTER this lands.
+
+**`sessionKey` (NON-unique) vs `sessionUID` (UNIQUE) — the load-bearing distinction (stated in code + here):**
+- `CitusRemoteExecSessionKey` (`homer_control_abi.h`) is a **NON-unique** base-compatibility/reuse key: 13
+  connection/policy fields, NO instance discriminator, so several concurrently live sessions with the same
+  connection identity (e.g. 4 pgbench clients on one db/user/node) deliberately SHARE one sessionKey (used by
+  `TupleSinkServiceFindReusableSession`). It must NEVER bind a ring.
+- `sessionUID` (NEW, `uint64`) is the **UNIQUE** per-session id a ring binds to. Client-minted, one per live
+  session. It — not sessionKey, not role — is what the relay resolves on. In pgbench the uniqueness comes from the
+  per-client `CState *` pointer (pid/time add cross-process entropy). The role-7 opener consumes it as its
+  `dpuBridgeGeneration`, so `serviceSessionId == sessionUID` (one unique id per session, not two).
+
+**Design principles (locked with the user):** bind on `sessionUID` never `sessionKey`; **NO role-only fallback**
+anywhere once complete (an unresolvable role-7 relay is an ERROR/mis-wire, not single-active); general to any
+session; **grow the descriptor** (`HomerDpuBridgeRingDescriptor.sessionUID`, bridge ABI v1→v2, assert 120→128) — do
+NOT overload `serviceSessionId`.
+
+**Steps 1-2 DONE + committed + building clean (svc + client + citus.so + postgres backend + pgbench + pg_basebackup):**
+- Step 1 (ABI, inert): `sessionUID` on `HomerDpuBridgeRingDescriptor` (+comch v1→v2); SQL 5-hop carrier fields
+  `sessionUID` on `HomerClientSessionOptions`, `CitusRemoteExecOpenSessionRequest` (CONTROL v29→v30),
+  `TupleSinkServiceSessionState`, `CitusRemoteExecPeerOpenRequest` + `...CommandSessionRequest` (PEER v17→v18);
+  `dpuRelayResultSessionUID` on `HomerServicePayloadStreamEntry`; the NON-unique comment on `CitusRemoteExecSessionKey`.
+- Step 2 (SQL resolves by sessionUID): the 3 receiver DMA fns
+  (`HomerDpuDmaFindDpuToHostByteRingRef` / `...HoldImportForReceiverClose` / `...MarkImportReceiverCloseReleased`)
+  take a required `uint64_t sessionUID`; SQL bridge threads it client→command-session peer-open→farnet1 session
+  state→result SEND peer-open→stamped on stream B (`HomerServiceCreatePayloadStreamEntry` new param); pgbench mints
+  it once in `openHomerSession` into the shared `sessionOptions`; the role-7 descriptor + `dpuBridgeGeneration`
+  consume it. Both relay pumps resolve via `HomerServiceResolveRelayResultSessionUID(streamEntry)`.
+- **DESIGN DECISION (dual-mode migration bridge, plan-faithful):** the resolver is `sessionUID != 0` → STRICT
+  unique-binding match (`matchCount>1` = hard ERROR; `matchCount==0` stays transient-retry so the role-7-open /
+  relay-arm race still resolves); `sessionUID == 0` → the TEMPORARY legacy role-only scan that ONLY basebackup
+  still hits until step 3 threads its sessionUID (via the pending-binding registry). The plan's own step-3 wording
+  "*remove the last role-only path*" confirms role-only is meant to survive through step 2 and die in step 3 —
+  this keeps every step independently buildable and never breaks basebackup mid-migration. `HomerServiceResolve
+  RelayResultSessionUID` currently returns `streamEntry->dpuRelayResultSessionUID`; step 3 augments ONLY that
+  helper body with `if (uid==0) uid = registryLookup(sessionKey)` and deletes the resolver's `==0` branch.
+
+**Remaining:** step 3 basebackup `(sessionKey→sessionUID)` pending registry + basebackup descriptor fill +
+bind/unbind register + remove the last role-only path; step 4 `BindRing`/`UnbindRing` frontend API + rendezvous
+sessionUID-record + `stream.sessionUID == session.sessionUID` consistency assertion; step 5 full build + tuple-
+deform-smoke + then resume the 3-machine validation.
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the
