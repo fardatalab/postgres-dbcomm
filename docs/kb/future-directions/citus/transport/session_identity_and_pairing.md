@@ -187,6 +187,48 @@ registry** — with far less machinery and the **same** correctness guarantee (o
   and call sites; the resolver reads the owning session's `sessionUID` (via the
   stream cache, or `FindSessionById(parentServiceSessionId)->sessionUID`).
 
+### Validation correction (2026-07-08): pairing is (node, tag), NOT base-compat
+
+The first cross-node DPU validation of the base-compat pairing **failed
+deterministically** and corrected the pairing key. What the "base-compat + tag"
+framing above got wrong (kept here as the correction, since it is easy to
+re-introduce):
+
+- **The basebackup sender is a PHYSICAL-REPLICATION walsender**, so its session
+  key has `databaseId == MyDatabaseId == InvalidOid (0)` (`basebackup_homer.c`
+  sets `options.databaseOid = MyDatabaseId`) and a replication-role user. It can
+  **never** equal the receiver's real `--homer-database-oid` / `--homer-user-oid`.
+- `HomerServiceSessionKeysBaseCompatible` requires `databaseId` **and**
+  `effectiveUserId` equality (part of its 5-field set), so the two independent
+  endpoints were **never base-compatible**. The SEND peer-open therefore fell
+  through to its *sender-first* branch (created a fresh owner instead of finding
+  `R`), the relay never armed, and the DPU↔DPU transport reset with **zero bytes
+  moved** (farnet0 DPU log: `created basebackup owner session=... (sender-first)`
+  → `CM event=DISCONNECTED status=0` → `reclaiming ... payload-failure-reclaim`).
+- This was a **latent Part 3.5.1-era bug**, not new to 3.5.2: the pending-binding
+  registry uses the same base-compat and was equally broken. It was never caught
+  because the only prior DPU basebackup PASS (run #2) predates Part 3.5.1 and
+  resolved *role-only*, not by base-compat.
+
+**Fix (implemented): pair basebackup on `(destinationNodeId, launchDiscriminator
+Tag)`, not full base-compat.** `HomerServiceBaseBackupSessionKeysPairable`
+(`tuple_sink_service_process.c`) matches only the fields the two endpoints
+actually share — `protocolVersion` + `destinationNodeId` + `executionLane` —
+deliberately **excluding** `databaseId`/`effectiveUserId`.
+`TupleSinkServiceFindBaseBackupOwnerSession` uses it (+ `opKind == OP_BASE_BACKUP`
++ the tag). So everywhere above that says "base-compat + tag" for **basebackup**,
+read "(node, tag)": base-compat is the DB-semantic SQL-session reuse key and was
+the wrong tool for pairing a DB-less replication walsender with a DB'd consumer.
+The tag is still the concurrency discriminator; `node` is the directed pair. (SQL
+is unaffected — it threads `sessionUID` via the command-session bridge and its
+endpoints *do* share db/user.)
+
+- **Second, independent bug observed (pre-existing, out of scope):** on the peer
+  reset the sender backend hung, ignoring `SIGTERM` and `pg_terminate_backend()`
+  (needs `SIGKILL` + crash recovery). This is the missing `CHECK_FOR_INTERRUPTS`
+  in the DPU pull/reserve loop already documented in the implementation
+  checkpoint; it is not caused by this work.
+
 ### Honest tradeoff vs. the handshake
 
 The scan does **not** give basebackup the "authoritative `sessionUID` exchanged

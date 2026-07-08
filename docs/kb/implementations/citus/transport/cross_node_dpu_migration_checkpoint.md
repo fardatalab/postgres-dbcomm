@@ -853,6 +853,36 @@ Sequencing (each independently buildable; registry deleted only after the scan v
 comments; (2) `launchDiscriminatorTag` ABI + pg_basebackup plumbing (inert); (3) service scan owns the relay by `R`,
 registry kept as belt-and-suspenders, 3-machine validate; (4) delete the registry, re-validate.
 
+**Commits:** stage 1 (docs) postgres `5d5c8cb4ed9`; stage 2 (inert tag ABI) citus `77f4ca62d` + postgres
+`0721910518e`; stage 3 (owner-session scan) citus `cf34196c9`; stage-3 fix (node+tag pairing, below) citus
+`bf428df29`.
+
+**Stage-3 validation attempt #1 (July 8, 2026): FAIL → root-caused → fixed (re-validation pending).**
+
+- **DPU infrastructure gap resolved en route:** both DPU-native (aarch64) service trees were **14 commits behind**
+  farnet1 HEAD (baseline `8f9963d33`), missing the whole Part 3.5 decode-offload split (new `homer_tuple_deform.c/.h`,
+  `homer_decoded_tuple_abi.h`), Part 3.5.1, and 3.5.2 — so a 5-file sync could not build (`fatal error:
+  homer_decoded_tuple_abi.h: No such file`). Fixed by a full Homer-source resync (whole `.../utils/homer/` +
+  `.../include/homer/` dirs + the 3 changed `src/bin` files + the 2 source-controlled Makefiles, verified as clean
+  farnet1 ancestors, `Makefile.global` untouched) to farnet1 HEAD on both DPUs + ARM rebuild. Both DPU services now
+  track farnet1 HEAD and build clean (`tuple-deform-smoke` ALL PASS on the farnet1 DPU). This also brings the DPUs
+  current for Part 3.5/3.5.1, which had never themselves been DPU-validated.
+- **Deterministic FAIL (2× identical):** DPU↔DPU RDMA established and the stage-3 code ran, but the SEND peer-open
+  took the *sender-first* branch (`created basebackup owner session=... (sender-first)`) and never paired with the
+  receiver's session `R`; the relay never armed and the transport reset (`CM event=DISCONNECTED status=0` →
+  `payload-failure-reclaim`), zero bytes moved. The farnet1 DPU service also exited on its own; the sender backend
+  hung ignoring `SIGTERM`/`pg_terminate_backend()` (the pre-existing missing-`CHECK_FOR_INTERRUPTS` DPU-pull bug at
+  `:421-429`, not caused by this work).
+- **Root cause:** base-compat is the wrong pairing key for basebackup — the sender is a physical-replication walsender
+  with `databaseId == InvalidOid (0)` and a replication-role user, which can never equal the receiver's real
+  db/user oids, and `HomerServiceSessionKeysBaseCompatible` requires both. Latent since Part 3.5.1 (its registry uses
+  the same base-compat); never caught because run #2 predates 3.5.1 and resolved role-only.
+- **Fix (citus `bf428df29`):** pair basebackup on `(destinationNodeId, launchDiscriminatorTag)` via new
+  `HomerServiceBaseBackupSessionKeysPairable` (protocolVersion + destinationNodeId + executionLane, NOT
+  databaseId/effectiveUserId); `TupleSinkServiceFindBaseBackupOwnerSession` uses it. Full write-up:
+  `../../../future-directions/citus/transport/session_identity_and_pairing.md` ("Validation correction"). Re-run of
+  the 3-machine validation with the rebuilt DPU services is the next step.
+
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
 The DPU ARM tree `/home/ubuntu/citus-dbcomm` drifts behind farnet1 and holds the
