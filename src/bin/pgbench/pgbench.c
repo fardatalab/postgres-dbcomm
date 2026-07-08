@@ -301,6 +301,15 @@ static uint32 homer_user_oid = 0;
 static char homer_peer_host[CITUS_REMOTE_EXEC_CONTROL_HOST_BYTES] = "";
 static uint32 homer_peer_port = 0;
 static int32 homer_peer_node = 1;
+
+/*
+ * Part 3.5 (step 6): --homer-dpu opts the measured SQL RESULT path off the
+ * passive host-shm result sink and onto the DPU two-ring deform relay. The
+ * command/completion control path is unchanged; only result-tuple delivery
+ * differs (a client-exported role-7 DPU->host ring drained per command to its
+ * in-band EOS). It requires --homer, a remote peer, and -M simple.
+ */
+static bool homer_dpu_mode = false;
 static int	client_cpu = -1;
 static int	client_cpus[CPU_SETSIZE];
 static int	client_cpu_count = 0;
@@ -666,6 +675,20 @@ typedef struct
 	const char *homer_pending_operation_name;
 	bool homer_stable_result_binding_valid;
 	uint64 homer_stable_result_drained_tail;
+	/*
+	 * --homer-dpu result relay state. When homer_dpu_mode is on, the measured
+	 * command's RESULT tuples arrive through the session's role-7 DPU->host ring
+	 * (session.sqlResultDpuStream) rather than a host-shm result sink. The
+	 * per-command tuple-view contract is captured from the command completion
+	 * (see HomerApplyCommandCompletion) so the DPU drain can finalize each
+	 * decoded tuple; homer_last_abalance holds the most recently decoded first
+	 * attribute (pgbench abalance) so the end-to-end decode is provably
+	 * exercised (logged under -d/debug).
+	 */
+	CitusTupleViewContract homer_pending_result_contract;
+	bool		homer_pending_result_contract_valid;
+	int32		homer_last_abalance;
+	bool		homer_last_abalance_valid;
 	int			id;				/* client No. */
 	ConnectionStateEnum state;	/* state machine's current state. */
 	ConditionalStack cstack;	/* enclosing conditionals state */
@@ -1121,6 +1144,7 @@ usage(void)
 		   "  --client-cpus=LIST       pin pgbench worker threads round-robin to CPU list\n"
 		   "  --latency-percentiles    report exact p50/p95/p99 transaction latency\n"
 		   "  --homer                  submit simple SQL through the Homer service\n"
+		   "  --homer-dpu              deliver --homer SQL results via the DPU deform relay\n"
 		   "  --homer-client-cpu=CPU   alias for --client-cpu\n"
 		   "  --homer-database-oid=OID database OID for --homer sessions\n"
 		   "  --homer-peer-host=HOST   remote Homer backend-node service host\n"
@@ -3487,6 +3511,12 @@ clearHomerPendingCommand(CState *st)
 	st->homer_pending_drained_rows = 0;
 	memset(&st->homer_pending_drain_target, 0, sizeof(st->homer_pending_drain_target));
 	st->homer_pending_operation_name = NULL;
+	/*
+	 * The tuple-view contract is a per-command fact (published in that command's
+	 * completion), so drop it here. homer_last_abalance is intentionally NOT
+	 * reset: it is a client-level "last decoded value" kept across commands.
+	 */
+	st->homer_pending_result_contract_valid = false;
 }
 
 /*
@@ -3670,6 +3700,102 @@ typedef enum HomerCompletionApplyResult
 } HomerCompletionApplyResult;
 
 /*
+ * HomerDrainPendingDpuResultRelay is the --homer-dpu counterpart of
+ * HomerDrainPendingResultSink. Instead of a host-shm result sink it advances the
+ * session's role-7 DPU->host result ring (session.sqlResultDpuStream): result
+ * tuples land as WHOLE decoded records that HomerClientPollSqlResultDpuReceive
+ * delivers once per call, finalizing each tuple against the per-command
+ * tuple-view contract (captured in HomerApplyCommandCompletion) and reporting
+ * the first attribute (abalance) of the last delivered tuple, this pass's row
+ * count, and whether the in-band EOS flag was seen this pass.
+ *
+ * The control-flow contract deliberately mirrors the shm drain so the pgbench
+ * state machine is unchanged:
+ *   - A non-terminal (STARTED) completion does one best-effort poll pass and
+ *     returns CONTINUE (data may still be arriving on the ring).
+ *   - A terminal (COMPLETED) completion spins a bounded number of poll passes
+ *     until the command's in-band EOS (or the stream terminal) is observed and
+ *     returns CONTINUE; if EOS has not arrived within the bound it returns
+ *     NOT_APPLIED_RETRY so the caller keeps the completion leased/unacked and
+ *     re-enters from the normal state-machine loop (the peek is idempotent while
+ *     a lease is active).
+ *   - A genuine transport failure returns APPLY_FATAL.
+ * Rows are accumulated into homer_pending_drained_rows across passes, matching
+ * the shm drain's cumulative out-param semantics.
+ */
+static HomerCompletionApplyResult
+HomerDrainPendingDpuResultRelay(CState *st, const char *operationName, bool terminalCompletion)
+{
+	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
+	const CitusTupleViewContract *contract = &st->homer_pending_result_contract;
+	uint32		spins;
+
+	/*
+	 * No result contract means this command published no tuple result (e.g. a
+	 * lifecycle BEGIN/COMMIT, or a row-producing command whose completion did not
+	 * carry TUPLE_SINK_READY). Nothing to drain from the DPU relay.
+	 */
+	if (!st->homer_pending_result_contract_valid)
+		return HOMER_COMPLETION_APPLIED_CONTINUE;
+
+	for (spins = 0;; spins++)
+	{
+		int32		value = 0;
+		uint64		rows = 0;
+		bool		sawEos = false;
+		bool		streamComplete = false;
+
+		if (!HomerClientPollSqlResultDpuReceive(&st->homer_session, contract, &value, &rows, &sawEos, &streamComplete,
+												errorMessage, sizeof(errorMessage)))
+		{
+			pg_log_error("client %d failed to drain Homer DPU result relay for %s: %s", st->id, operationName,
+						 errorMessage);
+			st->estatus = ESTATUS_OTHER_SQL_ERROR;
+			HomerInvalidateStableResultBinding(st);
+			clearHomerPendingCommand(st);
+			return HOMER_COMPLETION_APPLY_FATAL;
+		}
+
+		st->homer_pending_drained_rows += rows;
+		if (rows > 0)
+		{
+			/*
+			 * Capture the decoded abalance so the end-to-end DPU deform path is
+			 * provably exercised. Kept in per-client state and logged under debug;
+			 * TPC-B script semantics are unchanged (the value is not fed back).
+			 */
+			st->homer_last_abalance = value;
+			st->homer_last_abalance_valid = true;
+		}
+
+		if (sawEos || streamComplete)
+		{
+			pg_log_debug("client %d Homer DPU result relay for %s reached EOS: rows=%llu abalance=%d", st->id,
+						 operationName, (unsigned long long) st->homer_pending_drained_rows,
+						 st->homer_last_abalance_valid ? st->homer_last_abalance : 0);
+			return HOMER_COMPLETION_APPLIED_CONTINUE;
+		}
+
+		/*
+		 * Non-terminal completion: one best-effort pass, mirroring the shm STARTED
+		 * drain which returns CONTINUE without waiting for EOS.
+		 */
+		if (!terminalCompletion)
+			return HOMER_COMPLETION_APPLIED_CONTINUE;
+
+		/*
+		 * Terminal completion: keep polling for the command EOS, but only for a
+		 * bounded spin so one pgbench thread multiplexing sessions is not starved.
+		 * On exhaustion hand control back to the state machine (RETRY).
+		 */
+		if (spins >= HOMER_PGBENCH_COMPLETION_SPINS)
+			return HOMER_COMPLETION_NOT_APPLIED_RETRY;
+
+		HomerPgbenchCpuRelax();
+	}
+}
+
+/*
  * HomerDrainPendingResultSink advances the command-local result sink without
  * spinning inside the client library. For terminal completions, NOT_READY or
  * VISIBILITY_PENDING means pgbench must keep the leased completion unacked and
@@ -3682,6 +3808,14 @@ static HomerCompletionApplyResult HomerDrainPendingResultSink(CState *st, const 
 	HomerClientResultDrainStatus drainStatus = HOMER_RESULT_DRAIN_NOT_READY;
 	HomerClientResultDrainTarget drainTarget;
 	HomerClientResultDrainBudget drainBudget;
+
+	/*
+	 * --homer-dpu delivers RESULT tuples through the DPU two-ring relay, not the
+	 * host-shm result sink. Divert to the DPU relay drain, which keeps the same
+	 * apply-result control-flow contract the caller expects.
+	 */
+	if (homer_dpu_mode)
+		return HomerDrainPendingDpuResultRelay(st, operationName, terminalCompletion);
 
 	memset(&drainBudget, 0, sizeof(drainBudget));
 	if (terminalCompletion)
@@ -3749,6 +3883,51 @@ static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
 	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED ||
 		completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED)
 	{
+		if (homer_dpu_mode)
+		{
+			/*
+			 * --homer-dpu: the RESULT tuples for this command are relayed through
+			 * the session's role-7 DPU->host ring, NOT a host-shm result sink. So
+			 * do not open/rebind/pre-arm a shm sink here. Instead, when this
+			 * command's completion first exposes a tuple result (TUPLE_SINK_READY),
+			 * capture the per-command tuple-view contract -- the same contract the
+			 * shm path reads via HomerClientOpenResultSinkFromCompletionView, i.e.
+			 * completionView->descriptor->tupleViewContract. The DPU drain needs it
+			 * to finalize each decoded tuple. On the immediate START_COMMAND response
+			 * completionView is NULL, so fall back to the equivalent field carried in
+			 * the full completion (resultTupleViewContract).
+			 *
+			 * homer_pending_result_sink_bound is reused here purely as the generic
+			 * "a result stream is bound for this command, keep draining it" gate that
+			 * receiveHomerCommand() already honors for interim (not-yet-ready) drain
+			 * passes; in DPU mode no shm sink is ever mapped.
+			 */
+			if (!st->homer_pending_result_contract_valid &&
+				(completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
+			{
+				if (completionView != NULL && completionView->descriptor != NULL)
+					st->homer_pending_result_contract = completionView->descriptor->tupleViewContract;
+				else
+					st->homer_pending_result_contract = completion->resultTupleViewContract;
+				st->homer_pending_result_contract_valid = true;
+				st->homer_pending_result_sink_bound = true;
+			}
+
+			if (st->homer_pending_result_contract_valid)
+			{
+				bool		requireEos =
+					(completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED);
+				HomerCompletionApplyResult drainResult =
+					HomerDrainPendingResultSink(st, operationName, requireEos);
+
+				if (drainResult == HOMER_COMPLETION_NOT_APPLIED_RETRY)
+					return HOMER_COMPLETION_NOT_APPLIED_RETRY;
+				if (drainResult == HOMER_COMPLETION_APPLY_FATAL)
+					return HOMER_COMPLETION_APPLY_FATAL;
+			}
+		}
+		else
+		{
 		if (completionView == NULL && (completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0 &&
 			!HomerPrearmedResultBindingMatchesCompletion(st, completion))
 		{
@@ -3822,6 +4001,7 @@ static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
 				return HOMER_COMPLETION_APPLY_FATAL;
 			}
 		}
+		}						/* end non-DPU (host-shm result sink) path */
 	}
 
 	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED ||
@@ -7713,7 +7893,8 @@ printResults(StatsData *total,
 	if (partition_method != PART_NONE)
 		printf("partition method: %s\npartitions: %d\n",
 			   PARTITION_METHOD[partition_method], partitions);
-	printf("transport: %s\n", homer_mode ? "homer" : "libpq");
+	printf("transport: %s\n",
+		   homer_mode ? (homer_dpu_mode ? "homer-dpu" : "homer") : "libpq");
 	printf("query mode: %s\n", QUERYMODE[querymode]);
 	printf("number of clients: %d\n", nclients);
 	printf("number of threads: %d\n", nthreads);
@@ -8017,6 +8198,7 @@ main(int argc, char **argv)
 			{"homer-peer-host", required_argument, NULL, 25},
 			{"homer-peer-port", required_argument, NULL, 26},
 			{"homer-peer-node", required_argument, NULL, 27},
+			{"homer-dpu", no_argument, NULL, 28},
 			{NULL, 0, NULL, 0}
 	};
 
@@ -8407,6 +8589,10 @@ main(int argc, char **argv)
 					if (homer_peer_node <= 0)
 						pg_fatal("--homer-peer-node must be positive");
 					break;
+				case 28:			/* homer-dpu */
+					benchmarking_option_set = true;
+					homer_dpu_mode = true;
+					break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -8561,6 +8747,16 @@ main(int argc, char **argv)
 			pg_fatal("an unlimited number of transaction tries can only be used with --latency-limit or a duration (-T)");
 	}
 
+	/*
+	 * --homer-dpu is a delivery variant layered on top of --homer: it only
+	 * changes how RESULT tuples come back (DPU deform relay -> client role-7 ring
+	 * instead of the host-shm result sink). It therefore requires --homer itself.
+	 * The remote-peer and -M simple requirements are enforced inside the --homer
+	 * block below.
+	 */
+	if (homer_dpu_mode && !homer_mode)
+		pg_fatal("--homer-dpu requires --homer");
+
 	if (homer_mode)
 	{
 		if (querymode != QUERY_SIMPLE)
@@ -8578,6 +8774,16 @@ main(int argc, char **argv)
 			pg_fatal("--homer-peer-host requires --homer-peer-port");
 		if (homer_peer_host[0] != '\0' && !is_no_vacuum)
 			pg_fatal("remote --homer currently requires -n/--no-vacuum because setup libpq is intentionally skipped");
+		if (homer_dpu_mode)
+		{
+			/*
+			 * The DPU result relay is a cross-node (host<->DPU) data plane; it is
+			 * only meaningful for a remote Homer session. -M simple is already
+			 * enforced just above for every --homer run.
+			 */
+			if (homer_peer_host[0] == '\0')
+				pg_fatal("--homer-dpu requires a remote peer (--homer-peer-host and --homer-peer-port and --homer-peer-node)");
+		}
 		if (!validateHomerScriptSupport())
 			exit(1);
 	}
@@ -9247,6 +9453,23 @@ finishHomerSession(CState *st)
 		HomerInvalidateStableResultBinding(st);
 	}
 
+	/*
+	 * --homer-dpu: tear down the role-7 DPU->host result receive stream before
+	 * closing the command session (the relay is a child of this session). This is
+	 * the sender's counterpart of the basebackup receiver close: it releases the
+	 * DPU-side ring and the exported host memory region. HomerClientCloseSession
+	 * does not know about this stream, so it is closed explicitly here.
+	 */
+	if (st->homer_session.sqlResultDpuStreamOpen)
+	{
+		if (!HomerClientCloseBaseBackupStream(&st->homer_session.sqlResultDpuStream,
+											  errorMessage,
+											  sizeof(errorMessage)))
+			pg_log_error("client %d could not close Homer DPU SQL result receive stream: %s",
+						 st->id, errorMessage);
+		st->homer_session.sqlResultDpuStreamOpen = false;
+	}
+
 	if (!HomerClientCloseSession(&st->homer_session,
 								 errorMessage,
 								 sizeof(errorMessage)))
@@ -9281,6 +9504,16 @@ openHomerSession(TState *thread, CState *st)
 				sizeof(sessionOptions.peerHost));
 	}
 
+	/*
+	 * --homer-dpu: tell the service (via the OpenSession request) that this SQL
+	 * session's result tuples must be relayed through the DPU two-ring deform
+	 * path into our client-exported role-7 ring, not the passive host-shm result
+	 * sink. This flag must be set BEFORE the session is opened so the peer
+	 * provisions the relay.
+	 */
+	if (homer_dpu_mode)
+		sessionOptions.clientSqlResultDpuRelay = 1;
+
 	if (!HomerClientOpenSqlSession(&thread->homer_control,
 								   &sessionOptions,
 								   &st->homer_session,
@@ -9293,6 +9526,29 @@ openHomerSession(TState *thread, CState *st)
 	}
 
 	st->homer_session_open = true;
+
+	/*
+	 * With the command session established, open the session-scoped role-7 result
+	 * receive stream (DPU->host ring) exactly once. It reuses the basebackup
+	 * RECEIVE opener and the HOMER_FRONTEND_DPU_SETUP_* env vars for the DPU TCP
+	 * setup handshake, and writes its state into st->homer_session.sqlResultDpuStream
+	 * (also setting session.sqlResultDpuStreamOpen). On failure the whole session
+	 * is torn down so pgbench does not run half-wired.
+	 */
+	if (homer_dpu_mode)
+	{
+		if (!HomerClientOpenSqlResultReceiveStreamSelectedDpu(&st->homer_session,
+															  &sessionOptions,
+															  &st->homer_session.sqlResultDpuStream,
+															  errorMessage,
+															  sizeof(errorMessage)))
+		{
+			pg_log_error("client %d could not open Homer DPU SQL result receive stream: %s",
+						 st->id, errorMessage);
+			finishHomerSession(st);
+			return false;
+		}
+	}
 	memset(&st->homer_result_sink, 0, sizeof(st->homer_result_sink));
 	st->homer_result_sink.fileDescriptor = -1;
 	st->homer_result_sink_open = false;
