@@ -808,7 +808,22 @@ binds by sessionUID with **no role-only fallback anywhere**.
   `CitusRemoteExecSessionKey` struct, the descriptor field, `HomerServiceSessionKeysBaseCompatible`, each resolver,
   and this KB subsection.
 
-**Remaining:** step 5 full build (svc+client+ext+pgbench) + tuple-deform-smoke; then resume the 3-machine validation.
+**Step 5 DONE (July 8, 2026): ALL binding steps 1-5 code-complete + building/installing/smoke-clean on farnet1.**
+Full clean build+install of svc + client + citus.so + postgres backend + pgbench + pg_basebackup, all clean; the
+`tuple-deform-smoke` prints ALL PASS (deform + finalize byte-layout agreement intact — the sessionUID work does not
+touch the decoded-tuple layout); ABI-lockstep sanity (`strings ... | grep citus_remote_execution_control`) agrees
+across pgbench and the service. Commits: citus `656005dfc` (step 2), `e8577eea0` (step 3), `e514d3c58` (step 4);
+postgres `e15b37aaf34` (step 2), `869f364607b` (step 3), `4cb853e83af` (step 4).
+
+**Net state of the single-active bug fix:** the DPU→host relay now binds strictly on the UNIQUE per-session
+sessionUID with NO role-only fallback anywhere — SQL threads it onto stream B via the command-session bridge;
+basebackup delivers it via the `(sessionKey → sessionUID)` pending-binding registry (base-compat matched,
+stamp-and-cached onto the stream). Two concurrent `--homer-dpu` clients now each resolve to their own role-7 ring.
+
+**Remaining (the ORIGINAL Part 3.5 step 7/8, unblocked by this fix):** resume the 3-machine validation of
+`pgbench --homer-dpu` farnet0→farnet1 (abalance correctness + intended-path from DPU logs; and specifically verify
+two concurrent clients each bind their own ring with no WARN / cross-delivery); then retire Path B
+(`citus_remote_exec_pgbench_transaction`).
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
