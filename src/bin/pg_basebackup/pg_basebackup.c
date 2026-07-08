@@ -2377,7 +2377,8 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
  * DOCA_DEV_PCI (point these at the LOCAL farnet0 DPU).
  */
 static void
-RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots, uint32 payloadBytes)
+RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots, uint32 payloadBytes,
+					   uint32 launchDiscriminatorTag)
 {
 	HomerClientBaseBackupStreamOptions options;
 	HomerClientBaseBackupStream stream;
@@ -2392,13 +2393,19 @@ RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots,
 	options.userOid = userOid;
 	options.slotCount = slots;
 	options.payloadCapacityBytes = payloadBytes;
+	/*
+	 * Part 3.5.2: the caller-coordinated pairing tag (from --homer-tag). The
+	 * farnet0 service stamps it on the receiver session so the far sender's SEND
+	 * peer-open (carrying the same tag) finds this session by base-compat + tag.
+	 */
+	options.launchDiscriminatorTag = launchDiscriminatorTag;
 
 	error[0] = '\0';
 	if (!HomerClientOpenBaseBackupReceiveStreamSelectedDpu(&options, &stream, error, sizeof(error)))
 		pg_fatal("homer receive: could not open receive-consume session: %s", error);
 
-	pg_log_info("homer receive: consuming basebackup stream node=%d db=%u user=%u slots=%u bytes=%u",
-				nodeId, dbOid, userOid, slots, payloadBytes);
+	pg_log_info("homer receive: consuming basebackup stream node=%d db=%u user=%u slots=%u bytes=%u tag=%u",
+				nodeId, dbOid, userOid, slots, payloadBytes, launchDiscriminatorTag);
 
 	/*
 	 * Blackhole consume loop: HomerClientPollBaseBackupReceive drains the DPU-produced
@@ -2476,6 +2483,7 @@ main(int argc, char **argv)
 		{"homer-user-oid", required_argument, NULL, 12},
 		{"homer-slots", required_argument, NULL, 13},
 		{"homer-bytes", required_argument, NULL, 14},
+		{"homer-tag", required_argument, NULL, 15},
 		{NULL, 0, NULL, 0}
 	};
 	int			c;
@@ -2491,6 +2499,14 @@ main(int argc, char **argv)
 	uint32		homer_user_oid = 0;
 	uint32		homer_slots = 8;
 	uint32		homer_bytes = 8388608;
+	/*
+	 * Part 3.5.2: caller-coordinated pairing tag. Must equal the sender's
+	 * TARGET 'homer:mode=rdma,...,tag=N' so the farnet0 service pairs this
+	 * --homer-receive consumer with that backup by base-compat + tag. 0 = single
+	 * backup (default), which is unambiguous with no concurrent same-base-compat
+	 * backup running.
+	 */
+	uint32		homer_tag = 0;
 
 	int			option_index;
 	char	   *compression_algorithm = "none";
@@ -2685,6 +2701,9 @@ main(int argc, char **argv)
 			case 14:
 				homer_bytes = (uint32) strtoul(optarg, NULL, 10);
 				break;
+			case 15:
+				homer_tag = (uint32) strtoul(optarg, NULL, 10);
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -2717,7 +2736,7 @@ main(int argc, char **argv)
 		if (homer_slots == 0 || homer_bytes == 0)
 			pg_fatal("--homer-receive requires nonzero --homer-slots and --homer-bytes matching the sender geometry");
 
-		RunHomerReceiveConsume(homer_node, homer_database_oid, homer_user_oid, homer_slots, homer_bytes);
+		RunHomerReceiveConsume(homer_node, homer_database_oid, homer_user_oid, homer_slots, homer_bytes, homer_tag);
 		exit(0);
 	}
 

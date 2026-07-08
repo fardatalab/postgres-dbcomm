@@ -156,6 +156,14 @@ bbsink_homer_apply_detail(HomerClientBaseBackupStreamOptions *options,
 			options->databaseOid = pg_strtoint32(value);
 		else if (strcmp(key, "useroid") == 0)
 			options->userOid = pg_strtoint32(value);
+		else if (strcmp(key, "tag") == 0)
+			/*
+			 * Part 3.5.2: caller-coordinated pairing tag. Must match the
+			 * --homer-receive consumer's --homer-tag so the farnet0 service pairs
+			 * this backup with that consumer by base-compat + tag. 0 (default,
+			 * absent) = single backup.
+			 */
+			options->launchDiscriminatorTag = pg_strtoint32(value);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
