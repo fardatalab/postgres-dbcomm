@@ -793,9 +793,22 @@ binds by sessionUID with **no role-only fallback anywhere**.
   twins) now require a nonzero sessionUID; a 0 matches NOTHING (unresolved → retry), `matchCount>1` is always a hard
   ERROR. No single-active guessing remains.
 
-**Remaining:** step 4 `BindRing`/`UnbindRing` frontend API framing + the SQL rendezvous sessionUID-record +
-`stream.sessionUID == session.sessionUID` consistency assertion + the full KB/code doc-clarity pass; step 5 full
-build + tuple-deform-smoke + then resume the 3-machine validation.
+**Step 4 DONE + building clean:** the bind/unbind API framing + rendezvous record/assert + doc clarity.
+- **Bind/Unbind reframe** (thin, naming-clarity only; the full pooled-ring vision stays future work):
+  `HomerClientBindResultRing` reframes `HomerClientOpenSqlResultReceiveStreamSelectedDpu` (the ring's
+  OpenSession(RECEIVE) IS the session→ring bind, carrying `options->sessionUID`); `HomerClientUnbindRing` reframes
+  `HomerClientCloseBaseBackupStream` (serves both SQL + basebackup role-7 rings). pgbench `openHomerSession` /
+  `finishHomerSession` now read as bind/unbind.
+- **Rendezvous record + consistency assertion** (diagnostic, NOT load-bearing): the farnet0 command session now
+  records `sessionUID` from the client OpenSession (`TupleSinkServiceHandleOpenCommandSession`), so it is
+  self-describing on BOTH nodes. The SQL role-7 benign-OK rendezvous asserts the ring's `request->sessionUID`
+  matches the parent session's and logs loudly on a nonzero mismatch (a client mis-wire). Dormant by construction
+  today (pgbench mints one sessionUID for both opens) but guards a future multi-mint bug.
+- **Doc clarity (work item E):** the sessionKey(NON-unique)/sessionUID(UNIQUE) distinction is stated on the
+  `CitusRemoteExecSessionKey` struct, the descriptor field, `HomerServiceSessionKeysBaseCompatible`, each resolver,
+  and this KB subsection.
+
+**Remaining:** step 5 full build (svc+client+ext+pgbench) + tuple-deform-smoke; then resume the 3-machine validation.
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 

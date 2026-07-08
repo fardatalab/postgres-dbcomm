@@ -9462,10 +9462,11 @@ finishHomerSession(CState *st)
 	 */
 	if (st->homer_session.sqlResultDpuStreamOpen)
 	{
-		if (!HomerClientCloseBaseBackupStream(&st->homer_session.sqlResultDpuStream,
-											  errorMessage,
-											  sizeof(errorMessage)))
-			pg_log_error("client %d could not close Homer DPU SQL result receive stream: %s",
+		/* Unbind the role-7 result ring from this session (reframe of the selected-DPU close). */
+		if (!HomerClientUnbindRing(&st->homer_session.sqlResultDpuStream,
+								   errorMessage,
+								   sizeof(errorMessage)))
+			pg_log_error("client %d could not unbind Homer DPU SQL result receive ring: %s",
 						 st->id, errorMessage);
 		st->homer_session.sqlResultDpuStreamOpen = false;
 	}
@@ -9554,13 +9555,14 @@ openHomerSession(TState *thread, CState *st)
 	 */
 	if (homer_dpu_mode)
 	{
-		if (!HomerClientOpenSqlResultReceiveStreamSelectedDpu(&st->homer_session,
-															  &sessionOptions,
-															  &st->homer_session.sqlResultDpuStream,
-															  errorMessage,
-															  sizeof(errorMessage)))
+		/* Bind the role-7 result ring to this session (reframe of the selected-DPU RECEIVE open). */
+		if (!HomerClientBindResultRing(&st->homer_session,
+									   &sessionOptions,
+									   &st->homer_session.sqlResultDpuStream,
+									   errorMessage,
+									   sizeof(errorMessage)))
 		{
-			pg_log_error("client %d could not open Homer DPU SQL result receive stream: %s",
+			pg_log_error("client %d could not bind Homer DPU SQL result receive ring: %s",
 						 st->id, errorMessage);
 			finishHomerSession(st);
 			return false;
