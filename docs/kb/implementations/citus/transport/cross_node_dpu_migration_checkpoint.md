@@ -898,7 +898,18 @@ registry kept as belt-and-suspenders, 3-machine validate; (4) delete the registr
   Latent because Part 3.5's two-ring work was never DPU-validated for basebackup (run #2 predates it).
 - **Fix (citus `1aad53451`):** guard the EOS-mark read on `sendQueue.queueControl != NULL`; basebackup skips it
   (batch* keep defaults -> no EOS, frozen-tail-driven close, the intended behavior), two-ring tuple/pgbench path
-  unchanged. Re-run of the 3-machine validation with this fix is the next step.
+  unchanged.
+
+**Stage-3 validation attempt #3 (July 8, 2026): e2e PASS — first cross-node DPU↔DPU basebackup on the Part 3.5.2 path.**
+Both DPUs at HEAD `1aad53451` (`~/dbcomm/citus-dbcomm`, COMCH v2). Two warmed back-to-back runs, no service restart:
+- farnet1 DPU service stayed alive both runs (**no SIGSEGV**); **no `CM event=DISCONNECTED`**; **no `(sender-first)`**;
+  **no `WARN relay uid resolved via pending-binding registry`** on either DPU. So the pairing + owner-session path
+  resolve the relay uid with the registry NEVER consulted -- stage 4 (delete the registry) is fully de-risked.
+- Byte conservation: `delivered_bytes` `23,271,679,034` (run1, 13.16s cold) / `23,271,701,562` (run2, 5.86s warm);
+  matches `du -sb data` minus `pg_wal` (`-X none`) within `+0.017%`, runs agree to `0.0001%`. Clean close sequence:
+  `published_tail == consumed_head == final_tail` -> `CLOSE_ACK` -> `host-detached`/`reclaiming host-detached import`
+  on both DPUs. Sender exited cleanly, NO hang (the pre-existing DPU-pull-interrupt bug is peer-reset-triggered only,
+  and no reset occurred). Logs: `/tmp/homer_service_farnet{0,1}_dpu_fix2.log`, `/tmp/homer_receive_e2e_run{1,2}.log`.
 
 **DPU tree note (July 8, 2026):** the farnet1 DPU has TWO citus trees. `~/dbcomm/citus-dbcomm` is the CURRENT one
 (non-git rsync dir at farnet1 HEAD, COMCH v2, has the Part 3.5.2 fixes) -- use it, symmetric with the farnet0 DPU.
