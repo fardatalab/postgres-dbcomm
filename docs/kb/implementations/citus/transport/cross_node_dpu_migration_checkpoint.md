@@ -673,9 +673,35 @@ MAXALIGN(8) + store_att_byval), runs the real deform then the real finalize, and
 single int4 (negatives + NULL), int4/int8/int2 alignment + middle NULL, 0-row EOS batch, and the upper bound —
 **ALL PASS**. This validates the byte-layout agreement (the highest-risk novelty) on CPU before any 3-machine
 run. Build wiring: deform added to `HOMER_SERVICE_OBJS` (kept out of citus.so) + the service-bin recipe.
-**Next: the full pgbench session integration (the C.2/F fork above) — architecture still to lock (Option 1
-session-scoped role-7 vs Option 2 separate receive session); a large client+service+ABI+gating feature best
-started with fresh context.**
+**pgbench --homer-dpu integration IN PROGRESS (July 7, 2026; plan approved, Option 1 session-scoped role-7).**
+Design refinements locked with the user during planning: (a) basebackup and SQL results are the SAME
+session-attached consumer pattern — no ownership move (the sink/landing/source rings are service-owned and
+DPU-resident; the client only provides the host role-7 ring the DMA lands in, attaching at open / detaching at
+close); (b) **no per-command rebind** — the result ring is a continuous decoded byte stream, delimited per
+command by the EOS flag; (c) **unified EOS protocol** — in-band FLAG_EOS on the last record, race-free
+(stamp-before-publish on a fresh record; the producer already piggybacks it for row-producing commands, so no
+separate EOS record on pgbench's hot path), detector always checks the flag; the credit-line terminal is a
+SEPARATE transport-teardown layer. Basebackup piggyback conformance is a noted follow-up (it currently uses
+terminal-only). Implementation steps, each committed + building clean:
+- Steps 1-3 `2b2dc2ae1` — gating flag `clientSqlResultDpuRelay` end-to-end (3 request structs + CONTROL v29 /
+  PEER v17 bumps; per-stream `dpuRelayResultStream` bool ANDed into `HomerServicePayloadStreamUsesDpuMirrorSource`
+  so ONLY a flagged pgbench SQL result stream relays — also closes a global-toggle footgun that would have stalled
+  COPY / non-DPU pgbench tuple streams whenever the DPU scheduler was on). Flow: client OpenSqlSession -> farnet1
+  session bool -> per-command result SEND peer-open -> farnet0 receive stream.
+- Step 4a `f79a908b2` — relay passes recordKind==ERROR through verbatim (its body is a CitusTupleSinkErrorRecord,
+  not a batch header; deforming it mismatched the contract and reset the peer).
+- Step 4b `25f562ab1` — client role-7 SQL consumer in homer_client.c (adapted from the basebackup selected-DPU
+  RECEIVE template): `HomerClientOpenSqlResultReceiveStreamSelectedDpu` (exports role-7 ring + OpenSession(RECEIVE)
+  with the SQL command-session base-compat identity + parentServiceSessionId + clientSqlResultDpuRelay=1,
+  consumer-first ids=0), `HomerClientSqlResultDeliverDecoded` (finalize via HomerDecodedTupleCursor, capture attr-0
+  = abalance, EOS via flag, ERROR captured), `HomerClientPollSqlResultDpuReceive` (credit-line frontier + sink core
+  + terminal). Smoke extended (TestByteRingReceiveFinalize) — value round-trips through the real sink core.
+Remaining: **step 5** service RECEIVE-bind extension for `clientSqlResultOpen` — DELICATE consumer-first
+rendezvous (the pgbench role-7 open ALWAYS precedes the first command's result peer-open, so
+`HomerServiceFindPeerBoundReceiveRelayStream` returns NULL; must mirror basebackup's exact consumer-first behavior
+to avoid double-arming the role-7 import or hanging — the relay pump self-arms via role-7 lookup, so the OpenSession
+bind's job may just be "return OK, do not create a placeholder stream"; being traced before writing). Then step 6
+pgbench `--homer-dpu` flag + drain routing + read abalance; step 7 the 3-machine validation; step 8 retire Path B.
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
