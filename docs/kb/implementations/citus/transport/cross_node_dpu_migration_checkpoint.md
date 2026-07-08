@@ -772,10 +772,30 @@ NOT overload `serviceSessionId`.
   RelayResultSessionUID` currently returns `streamEntry->dpuRelayResultSessionUID`; step 3 augments ONLY that
   helper body with `if (uid==0) uid = registryLookup(sessionKey)` and deletes the resolver's `==0` branch.
 
-**Remaining:** step 3 basebackup `(sessionKey→sessionUID)` pending registry + basebackup descriptor fill +
-bind/unbind register + remove the last role-only path; step 4 `BindRing`/`UnbindRing` frontend API + rendezvous
-sessionUID-record + `stream.sessionUID == session.sessionUID` consistency assertion; step 5 full build + tuple-
-deform-smoke + then resume the 3-machine validation.
+**Step 3 DONE + building clean (svc + client + citus.so + backend + pg_basebackup + pgbench):** basebackup now
+binds by sessionUID with **no role-only fallback anywhere**.
+- Basebackup receiver mints its own UNIQUE sessionUID = its `dpuBridgeGeneration` (already unique, == serviceSessionId)
+  in `HomerClientOpenBaseBackupReceiveStreamSelectedDpu` (`homer_client.c`), stamping `descriptor[1].sessionUID` and
+  `request->sessionUID` on the RECEIVE-bind open.
+- **Pending-binding registry** `(sessionKey → sessionUID)` on the service: a small file-scope BSS table
+  `ActivePendingBindingTable[MAX_LOCAL_SESSIONS]` with `HomerServiceRegisterPendingBindingSessionUID` /
+  `...Lookup...` / `...Unregister...`. Matching is **base-compatibility** (extracted into
+  `HomerServiceSessionKeysBaseCompatible`, now the single base-compat definition, also used by
+  `TupleSinkServiceSessionMatchesBaseCompatibility`), inheriting basebackup's pre-existing one-backup-per-base-compat
+  rendezvous assumption (same as `HomerServiceFindPeerBoundReceiveRelayStream`). Registered UNCONDITIONALLY at the
+  basebackup RECEIVE-bind (covers consumer-first), unregistered at the basebackup receive-handle close.
+- **Resolver** `HomerServiceResolveRelayResultSessionUID(streamEntry, sessionStates)` now: stream's uid if set (SQL,
+  or already-cached basebackup) → else registry lookup by the parent-session sessionKey → CACHE onto the stream → else
+  0. `sessionStates` may be NULL at the close-time release (`HomerServiceClearPayloadStreamPeerBinding`, which has no
+  session table): safe because the relay already resolved+cached before drain/close. Sender-first fast path also
+  direct-stamps stream B at the RECEIVE-bind.
+- **Removed the last role-only path**: the 3 DMA fns (`HomerDpuDmaFindDpuToHostByteRingRef` + the two receiver-close
+  twins) now require a nonzero sessionUID; a 0 matches NOTHING (unresolved → retry), `matchCount>1` is always a hard
+  ERROR. No single-active guessing remains.
+
+**Remaining:** step 4 `BindRing`/`UnbindRing` frontend API framing + the SQL rendezvous sessionUID-record +
+`stream.sessionUID == session.sessionUID` consistency assertion + the full KB/code doc-clarity pass; step 5 full
+build + tuple-deform-smoke + then resume the 3-machine validation.
 
 ## Operational note — DPU native build tree drift (July 4, 2026)
 
