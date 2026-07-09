@@ -613,38 +613,65 @@ completes "no engine-owned data-carrying byte-rings". Relocate, do not delete, t
 plus `-c 1` regression and a basebackup regression (shared bind/unbind code). Build the smoke
 targets too, not just `service-bin`.
 
-### Stage 3 — retire the server-side DPU frontend COMMAND channel + UDF harness
+### Stage 3 — RE-SCOPED (July 9, 2026): promote the DPU command channel, do NOT retire it
 
-Scoped deliberately AFTER Stage 2 so two unrelated risks are never in one validation.
+**The original framing was backwards.** Stage 3 originally proposed retiring the server-side DPU
+frontend command channel. A read-only trace (verified independently) shows that code is the closest
+existing implementation of the command spine the DPU migration needs.
 
-**HARD PRECONDITION — do not start this until `pgbench --homer-dpu` is validated end-to-end.**
-Stage 3 is the checkpoint's "step 8", whose own text says removal *"comes AFTER validation confirms
-the new path."* `citus_remote_exec_pgbench_transaction` + the DPU frontend channel are the only
-currently-functioning DPU command path; `--homer-dpu` (the intended replacement) has never run.
-Retiring them first would leave nothing behind them.
+**Verified findings**
+- `HomerFrontendDmaOpenCommandSession` (`homer_frontend_dma.c:1039`) is NOT a stub in DOCA builds. It
+  opens a DOCA control channel, exports bridge/backend mailboxes, imports them into the DPU service,
+  submits a HOST socketless-backend spawn (`HomerFrontendDmaSubmitBackendSpawn`, `:1352` →
+  `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest`, `homer_frontend_dma_lifecycle.c:192/283`), and
+  supports START/POLL (`HomerFrontendDmaStartCommand`, `:1093`).
+- **The GUC's help text is STALE.** `shared_library_init.c:2596` still claims the path "stops after
+  bridge-memory setup with an explicit not-implemented error". DOCA builds go well beyond that.
+- The reject gate and the open gate are DIFFERENT paths, not a contradiction:
+  `RemoteExecutionRejectDpuFrontendChannelIfSelected` rejects unsupported *tuple-sink/fallback* ops
+  (`homer_frontend_control.c:644`, `:721`, `:1099`), while **command-session open bypasses it** and
+  calls the real opener (`homer_frontend_control.c:803`, verified: it calls and `return`s).
+- **Basebackup does NOT use `backendChannelMode = SELECTED_DPU_DMA`.** Its selected-DPU open emits
+  `CITUS_REMOTE_EXEC_CONTROL_OP_TUPLE_SINK` with `sessionKey.opKind = OP_BASE_BACKUP`
+  (`homer_client.c:2795`, `:2809`) — a tuple-sink open, not a command session. So the DPU backend-spawn
+  spine is live ONLY behind the experimental frontend command path and `homer_frontend_dma_smoke.c:118`.
+  It is *working* code with *no validated consumer* — which is exactly why it read as dead.
+- The DPU service does not put selected-DPU sessions in `sessionStates[]`. Ordinary command sessions
+  are created by `TupleSinkServiceHandleOpenCommandSession` (`:33635`); selected-DPU semantic state is
+  created lazily by `HomerServiceDpuFindOrCreateSelectedSession` (`:38653`, called `:39099`) in a
+  SEPARATE table. This independently confirms the removed role-7 parent lookup could never have
+  resolved on the DPU, regardless of deployment.
 
-**Retire:** `citus.enable_experimental_homer_dpu_frontend` (GUC, `shared_library_init.c:2594`,
-default off, help text stale — still says "during Stage 2 ... not-implemented error"), its two live
-gates in `homer_frontend_control.c` (`:649` inside `RemoteExecutionRejectDpuFrontendChannelIfSelected`
-which *rejects*; `:804` which opens a real `HomerFrontendDmaOpenCommandSession`), and the
-`citus_remote_exec_pgbench_transaction` UDF harness
-(`src/backend/distributed/worker/homer/remote_exec_pgbench_transaction.c` — a prototype driver where
-a PG *backend* drives TX_BEGIN_ATTACH / SQL_EXECUTE / TX_COMMIT, i.e. exactly the extra backend
-`--homer` exists to avoid). Audit `backendChannelMode = SELECTED_DPU_DMA`
-(`homer_frontend_dma_lifecycle.c:283`, honored at `remote_execution_backend_bridge.c:2567/2574/
-2997/3005`; callers `HomerFrontendDmaSubmitBackendSpawn` `homer_frontend_dma.c:1352` and the
-frontend-DMA smoke).
+**Corrected per-item verdicts**
+| Item | Verdict |
+|---|---|
+| GUC `citus.enable_experimental_homer_dpu_frontend` + its two gates | **KEEP; fix the stale help text.** The reject gate still guards unsupported non-command paths; the open gate IS the command path. |
+| `HomerFrontendDmaOpenCommandSession` + frontend DMA lifecycle | **KEEP AND PROMOTE.** This is the selected-DPU command opener and the HOST backend-spawn leg. |
+| `citus_remote_exec_pgbench_transaction` UDF | **KEEP AS-IS; retire later**, per checkpoint step 8 — only after `--homer-dpu` is validated. No source caller besides UDF invocation. |
 
-**MUST NOT touch:** the client `*SelectedDpu` family in `src/bin/homer_client.c` —
-`HomerClientOpenBaseBackupStreamSelectedDpu` (`:2551`),
-`HomerClientOpenBaseBackupReceiveStreamSelectedDpu` (`:2922`),
-`HomerClientOpenSqlResultReceiveStreamSelectedDpu` (`:3522`, returned `:3925`). Basebackup calls the
-first UNCONDITIONALLY and `--homer-dpu` result delivery rides the third. "Selected DPU" names two
-different things; only the server-side frontend command channel is the retirement candidate.
+**MUST NOT touch** (basebackup calls the first unconditionally; `--homer-dpu` result delivery rides the
+third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_client.c:2551`, called from
+`basebackup_homer.c:289`), `HomerClientOpenBaseBackupReceiveStreamSelectedDpu` (`:2922`),
+`HomerClientOpenSqlResultReceiveStreamSelectedDpu` (`:3522`, via `:3925`, `pgbench.c:9559`).
 
-**Also in scope:** clean up every comment and KB passage that still describes the retired channel as
-the way to reach the DPU, including this document's own Stage-2 note above and
-`dpu-native-build-tree-and-selected-dpu-validation` operational notes.
+**The real remaining delta (bounded, not net-new).** The DPU command spine is *mostly built below the
+client API*: bridge import, frontend control-slot pull, backend mailbox publication, selected-DPU
+backend spawn, and the frontend completion path all exist. What is missing:
+1. A client-side `HomerClientOpenSqlSessionSelectedDpu` — combine the SQL command-session request
+   fields (`homer_client.c:1558-1575`) with the selected-DPU export/control-slot machinery basebackup
+   already uses (`:2644`, `:2675`, `:2727`, `:2783`). Today `--homer-dpu` still opens its command
+   session through host-service SHM (`HomerClientOpenSqlSession`, `:1518`, from `pgbench.c:9559`).
+2. Preserve the HOST backend-spawn leg — the socketless backend is a PostgreSQL process and must run on
+   the host (`homer_frontend_dma_lifecycle.c:192`).
+3. Three-ish service-side gate relaxations, all small: async routing admits only SQL/client-SQL opens
+   (`TupleSinkServiceOpenRequestNeedsAsyncLocalControl`, `:34817`); async command-create rejects
+   non-SQL/client-SQL (`TupleSinkServiceProgressCommandOpenAsyncOp`, `:35172`); REGISTER_MEMORY
+   unconditionally requires `sessionState->commandMailbox.mailbox` (`:35238`). The peer command-session
+   open has the same opKind rejection plus mailbox checks (`:37385`, `:37395`, `:37406`).
+
+**Note on ordering.** None of this is a prerequisite for `--homer-dpu`; it is the path toward unified
+session ownership (the OPEN question recorded above). Do not start it before `--homer-dpu -c 1` is
+validated.
 
 ## Safety, gates, and caveats (strict)
 
