@@ -988,6 +988,15 @@ exact mechanism is now pinned:
   protocol, extracted into a new `homer_dpu_byte_ring_pool.c/.h`), staged 0a refactor → 0b pool → 1 basebackup
   (mirror+landing+resolver; the concurrent-2-session acceptance gate) → 2 tuple-source. The connection-binding
   fix is now orthogonal hardening, kept but re-evaluated after Stage 1.
+- **RESOLVED July 9, 2026 — the Stage-5 concurrent limit is FIXED.** Stages 0a/0b/1a-landing/1a-mirror/1b landed
+  + validated (citus commits `f81312fc2` → `ccc5f6207` → `a5f5ec3e0` → `eb51ac0d5` → resolver). The concurrent
+  2-session acceptance gate PASSED: two concurrent cross-node DPU basebackups (tags 1 & 2) both complete with
+  byte conservation (~23.28 GB each, agree to <0.0001%), each session binding its OWN landing + mirror byte-ring
+  slots (sender DPU two `purpose=0` binds slot 0/1; receiver DPU two `purpose=1` binds slot 0/1), with NO
+  `RECV_CQ_FAILURE` / `observed>posted` / `CM DISCONNECTED` / `ambiguous receive-relay resolve`. A singleton→
+  per-session ordering DEADLOCK was found + fixed en route (mirror bound lazily at egress but the pull needs it
+  first → 98% CPU spin; fixed by binding at stream open). Detail + remaining work (Stage 2 tuple-source, cleanup,
+  connection-binding disposition) in [dpu_byte_ring_pool_per_session_plan.md](dpu_byte_ring_pool_per_session_plan.md).
 - Evidence: sender DPU `/tmp/homer_svc_farnet1dpu_persessfix.log` (two distinct `payload connection allocate`
   slots then the reset on slot 1); receiver DPU `/tmp/homer_svc_farnet0dpu_persessfix.log` (two incoming accepts,
   `connection_index` 0/1); Test-1 PASS band `delivered_bytes ~23.28 GB` across 3 back-to-back single backups.

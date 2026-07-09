@@ -10,9 +10,16 @@
   stream" caveat in [dpu_payload_byte_ring.md](dpu_payload_byte_ring.md) and the
   Stage-5 concurrency block in
   [cross_node_dpu_migration_checkpoint.md](cross_node_dpu_migration_checkpoint.md).
-- **Status:** approved plan, implementation in progress (staged). The mirror plan
-  file lived at `~/.claude/plans/here-s-a-snippet-on-linked-papert.md`; this doc is
-  the canonical KB copy — keep it in sync as stages land.
+- **Status:** **Stage 1 COMPLETE — concurrent cross-node DPU basebackup VALIDATED
+  (July 9, 2026).** The acceptance gate passed: two concurrent 2-session backups
+  (tags 1 & 2) both complete with byte conservation (~23.28 GB each, agree to
+  <0.0001%), each session binding its OWN landing + mirror byte-ring slots (sender
+  DPU: two `purpose=0` binds slot 0 / slot 1; receiver DPU: two `purpose=1` binds
+  slot 0 / slot 1), with NO `RECV_CQ_FAILURE` / `observed>posted` / `DISCONNECT` /
+  `ambiguous receive-relay resolve`. The original reset-before-any-byte-moved bug is
+  fixed. Remaining: the deferred mirror-cache cleanup, Stage 2 (tuple-source for
+  concurrent `--homer-dpu`), and the connection-binding-fix disposition. Plan mirror
+  file was `~/.claude/plans/here-s-a-snippet-on-linked-papert.md`; this doc is canonical.
 - **Progress:**
   - **Stage 0a — DONE + validated (single-session, byte-identical).** New module
     `homer_dpu_byte_ring_pool.c/.h` created; wired into the engine (pool on
@@ -72,7 +79,17 @@
     write them; since re-resolving is cheap (O(8 slots)) and actually safer against stale
     bindings, drop the cache fields + `ClearMirrorSlotCache` and make the resolver a pure
     non-caching `Find` (removes the const-casts).
-  - Stage 1b (resolver + concurrent acceptance), Stage 2: pending.
+  - **Stage 1b — DONE + validated (CONCURRENT ACCEPTANCE GATE PASSED).** Resolver fix:
+    `HomerServiceFindPeerBoundReceiveRelayStream` gained a `launchDiscriminatorTag` param;
+    it now requires `sessionState->launchDiscriminatorTag == tag` in addition to base
+    compatibility, and uses strict-unique-match (count all matches; return the sole match;
+    return NULL and log `ambiguous receive-relay resolve` on >1 rather than guessing;
+    NULL-retry on 0). Caller passes `request->launchDiscriminatorTag`. Validation: the
+    concurrent 2-session basebackup completed with byte conservation on both, distinct
+    per-session landing+mirror slots, no reset, no ambiguous-resolve. This closes the
+    concurrent-basebackup goal.
+  - Stage 2 (tuple-source for concurrent `--homer-dpu`): pending. Deferred cleanup: the
+    mirror-slot cache + const-casts (see Stage 1a-mirror note).
 - **Doc type:** implementation plan / in-flight.
 - **Source:** `src/backend/distributed/utils/homer/homer_service_dpu_dma.c` (+`.h`),
   `.../tuple_sink_service_process.c`, and the new module
