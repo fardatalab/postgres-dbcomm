@@ -2,8 +2,8 @@
 
 This project uses two source trees:
 
-- PostgreSQL fork: `/data/dbcomm/postgres-citus-separate-comm-stack`
-- Citus/Homer fork: `/data/dbcomm/citus-dbcomm-separate-comm-stack`
+- PostgreSQL fork: `/data/dbcomm/postgres-citus`
+- Citus/Homer fork: `/data/dbcomm/citus-dbcomm`
 
 The installed runtime prefix is `/data/dbcomm/pg-citus`. The runtime user is
 `dbcomm`. The intended steady state is that build directories, installed
@@ -19,6 +19,17 @@ efficiency and offload. New Homer code should live under an appropriate
 `homer/` subdirectory in the Postgres or Citus tree.
 
 ## Farnet topology
+
+> Fast path vs. diagnostics: the addresses, ports, OIDs, link facts, and queue
+> geometry recorded in this file are the source of truth — in steady state,
+> trust them and go straight to the process preflight and the workload. The
+> `ip -br addr` / `ip route` / `ethtool` / `ibdev2netdev` / `show_gids` / ping
+> and cross-lane routing commands in this section are a DIAGNOSTIC battery, not a
+> routine precondition: run them only after a reboot/renumber, when a run
+> actually fails, or when making a fresh absolute (e.g. line-rate) performance
+> claim. The always-on guards that must never be skipped are the process
+> preflight, the correctness anchors, and intended-path confirmation (that the
+> intended Homer path ran, not a silent libpq/built-in fallback).
 
 `farnet1` is the primary development and benchmark driver host. `farnet0` is the
 peer host. Both machines have the same broad `/data/dbcomm` layout and the same
@@ -308,6 +319,15 @@ performance runs. After a compile-only diagnostic check with stats switches,
 rebuild the service/client binaries again with only `CPPFLAGS='-D_GNU_SOURCE'`
 and reinstall.
 
+After rsyncing sources to a DPU tree (`~/dbcomm/citus-dbcomm`, a plain non-git
+rsync dir on BOTH DPUs), you must re-run configure before `make` — the copied
+`Makefile.global` pins `/data/dbcomm` paths that do not exist there:
+
+```sh
+ssh dpu "cd ~/dbcomm/citus-dbcomm && PG_CONFIG=/usr/bin/pg_config ./configure --without-libcurl \
+  && make -j8 service-bin CPPFLAGS='-D_GNU_SOURCE'"
+```
+
 The normal ownership invariant is:
 
 - `/data/dbcomm/postgres-citus*/build` is owned by `dbcomm:dbcomm`.
@@ -358,6 +378,44 @@ After changing shared Homer protocol headers or client/service control-region
 names, verify the installed binaries agree before running pgbench. A stale
 `pgbench` or `libhomer_client.a` can silently map an old control shared-memory
 name while the service uses the new one.
+
+### clangd / compile_commands.json
+
+C/C++ code intelligence (clangd, via the editor/agent `LSP` tools) needs a
+`compile_commands.json` discoverable from each active tree's root. The two trees
+produce it differently:
+
+- **postgres-citus (Meson):** Meson regenerates `build/compile_commands.json` on
+  every (re)configure/build, so it stays current with the normal
+  `ninja -C build` / `meson install` cycle — nothing extra to run. clangd only
+  needs it at the repo root, so create the symlink once per tree, then keep it out
+  of git via `.git/info/exclude` (the tracked `.gitignore` is reserved for shared
+  ignores):
+
+  ```sh
+  ln -sfn build/compile_commands.json /data/dbcomm/postgres-citus/compile_commands.json
+  ```
+
+- **citus-dbcomm (autotools/make):** `make` does not emit a compile DB, so generate
+  it with `bear`. `/compile_commands.json` is already gitignored. Regenerate it
+  when the build graph or flags change (new source files, new `-D`/`-I`, Makefile
+  edits) — NOT for ordinary code edits:
+
+  ```sh
+  cd /data/dbcomm/citus-dbcomm   # or the active worktree
+  sudo -n -u dbcomm bash -c 'CCACHE_DISABLE=1 bear --output compile_commands.json -- make -B -j8 all'
+  ```
+
+  `-B` forces a full recompile so bear captures every TU (bear only records
+  compiler commands that actually run — a no-op build yields an empty DB).
+  `CCACHE_DISABLE=1` keeps entries as plain `gcc ...` (clangd-parseable; bear may
+  skip `ccache`-wrapped commands). To add a few targets to an existing DB without
+  rebuilding everything, use `bear --append -- make -B <targets>`.
+
+Caveat: clangd indexes only the **active build configuration** — code under
+inactive `#ifdef` / build variants (non-DOCA, stats-macro builds, etc.) is not
+indexed; cross-check those with textual search. The background index updates
+incrementally as files change, so no manual refresh is needed after ordinary edits.
 
 ```sh
 strings /data/dbcomm/pg-citus/bin/pgbench | grep citus_remote_execution_control
@@ -694,6 +752,26 @@ but scaling is poor, around `4.8k TPS` with p95 around `4 ms`; treat that as a
 known shared RDMA command/completion transport bottleneck, not as the final
 multi-client result.
 
+### `pgbench --homer-dpu` (NOT YET VALIDATED — gate in progress)
+
+`--homer-dpu` layers on `--homer` and moves only RESULT-tuple delivery onto the DPU
+two-ring deform relay (the command/completion path is unchanged). It requires
+`--homer`, a remote peer, and `-M simple`. As of July 9, 2026 it has never completed
+end to end; see `docs/kb/implementations/citus/transport/byte_ring_slot_capacity_regression.md`.
+
+Two facts that each cost a validation cycle:
+
+- **`-d` is `--dbname`, not `--debug`.** Use `--debug` to get the decoded
+  `homer_last_abalance` line, which is the end-to-end decode proof.
+- **Each host's frontend must point at its OWN local DPU.** A farnet0-resident
+  pgbench needs `HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.200`, NOT the `10.10.1.201`
+  default (that is farnet1's DPU). `HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0` is
+  correct on both hosts (symmetric hardware).
+
+Do NOT confuse `--homer-dpu` with `citus_remote_exec_pgbench_transaction` +
+`citus.enable_experimental_homer_dpu_frontend`. Those are the backend COMMAND channel
+through the DPU — a different axis entirely.
+
 Libpq baseline with the same pgbench worker placement:
 
 ```sh
@@ -712,7 +790,30 @@ Current basebackup constraints:
 - `TARGET 'homer:mode=blackhole,...'` exercises Homer locally and discards in
   the service.
 - PostgreSQL's built-in `TARGET 'blackhole'` is not a Homer path.
-- For remote RDMA blackhole, use `TARGET 'homer:mode=rdma,host=...,port=...'`.
+- For remote RDMA, the `host=` in the target selects the RECEIVER, and **this
+  choice decides whether the run works at all**:
+  - `host=10.10.1.200` (farnet0 **DPU**) + a `--homer-receive` consumer on the
+    farnet0 host = **the validated topology.** Use this. See "Validated 4-role
+    DPU-relay basebackup" below.
+  - `host=10.10.1.100` (farnet0 **host service**) = **BROKEN** for any database
+    larger than ~8 MiB. `pg_basebackup` is now mandatorily a selected-DPU
+    producer; on byte-ring wrap it writes a pre-wrap transport header whose
+    advertised length deliberately EXCEEDS the trailer, as its wrap signal to the
+    DPU relay. The host service's receiver reads that identical condition as
+    corruption and aborts at the first wrap with `byte-ring record unexpectedly
+    crossed ring boundary`, then the client HANGS with no error. Tracked as
+    "Problem 3" in
+    `docs/kb/implementations/citus/transport/byte_ring_slot_capacity_regression.md`.
+- MANDATORY DPU dependency on the current branch: every Homer basebackup target
+  (including plain `mode=rdma`) now goes through the selected-DPU client path.
+  `bbsink_homer_begin_backup` (`src/backend/backup/basebackup_homer.c`) calls
+  `HomerClientOpenBaseBackupStreamSelectedDpu` unconditionally, so `pg_basebackup`
+  fails with `could not connect to DPU setup listener 10.10.1.201:9727` unless the
+  farnet1 DPU `citus_tuple_sink_service` is running with
+  `HOMER_SERVICE_ENABLE_DPU_DMA=1 HOMER_SERVICE_ENABLE_DOCA_DMA=1`
+  `HOMER_SERVICE_DPU_SETUP_PORT=9727 HOMER_SERVICE_DOCA_DEV_PCI=0000:03:00.0`. The
+  DPU is a mandatory build/deploy role for basebackup validation, not optional.
+  Override the frontend setup target with `HOMER_FRONTEND_DPU_SETUP_HOST`/`_PORT`.
 
 Performance measurement rule:
 
@@ -729,6 +830,44 @@ Performance measurement rule:
   paths separately before comparing. Local blackhole is the producer/service
   baseline; remote RDMA adds the peer transport path.
 
+### Validated 4-role DPU-relay basebackup (USE THIS)
+
+The only basebackup topology that is actually validated. RDMA lands in farnet0 DPU
+memory and is relayed to a `--homer-receive` consumer on the farnet0 host. Note the
+receiver is the farnet0 **DPU** (`10.10.1.200`), not the farnet0 host service.
+
+Roles:
+- **farnet1 host** — PostgreSQL (data source) + `pg_basebackup` SENDER.
+- **farnet1 DPU** (`ssh dpu`) — sender-side Homer service (aarch64 native binary,
+  run directly as `ubuntu`: `~/dbcomm/citus-dbcomm/build/homer/citus_tuple_sink_service`).
+- **farnet0 DPU** (`ssh farnet0` then `ssh dpu`) — receiver-side Homer service.
+- **farnet0 host** — `pg_basebackup --homer-receive` CONSUMER. PostgreSQL is NOT
+  needed here; the consumer talks straight to the farnet0 DPU.
+
+Peer RDMA is farnet1 DPU `10.10.1.201` -> farnet0 DPU `10.10.1.200` on `enp3s0f0s0`.
+Frontend<->DPU setup is TCP on 9727. Geometry `slots=4,bytes=524288` — sender and
+consumer MUST match. Start receivers first.
+
+```sh
+# Sender (farnet1 host), tag N
+/usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
+  -h /tmp -p 5432 -U dbcomm -X none -c fast \
+  -t 'homer:mode=rdma,host=10.10.1.200,port=9717,node=2,slots=4,bytes=524288,tag=N' \
+  -v
+
+# Consumer (farnet0 host), tag N — frontend env points at its LOCAL farnet0 DPU
+ssh farnet0 "sudo -n -u dbcomm sh -c 'env \
+  HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.200 HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
+  HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
+  /data/dbcomm/pg-citus/bin/pg_basebackup --homer-receive \
+    --homer-node 2 --homer-database-oid \$DBOID --homer-user-oid \$USEROID \
+    --homer-slots 4 --homer-bytes 524288 --homer-tag N'"
+```
+
+Each host's frontend must point at its OWN local DPU: farnet1 -> `10.10.1.201`,
+farnet0 -> `10.10.1.200`. Pointing a farnet0-resident client at `10.10.1.201`
+fails with `DPU setup rejected basebackup export status=5`.
+
 Local Homer blackhole smoke on `farnet1`:
 
 ```sh
@@ -739,7 +878,12 @@ Local Homer blackhole smoke on `farnet1`:
   -v
 ```
 
-Remote RDMA blackhole from `farnet1` to the `farnet0` service:
+> **BROKEN — do not use this command.** Its `host=10.10.1.100` targets the farnet0
+> HOST service, which aborts at the first byte-ring wrap (~8 MiB). Confirmed July 9,
+> 2026 on both the current and the reverted tree. Use the 4-role DPU-relay topology
+> below. Kept here only so the broken shape is recognisable.
+
+Remote RDMA blackhole from `farnet1` to the `farnet0` service (BROKEN, see above):
 
 ```sh
 /usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
@@ -749,7 +893,14 @@ Remote RDMA blackhole from `farnet1` to the `farnet0` service:
   -v
 ```
 
-Optional explicit queue geometry for sensitivity runs:
+> **BROKEN — `bytes=8388608` cannot work.** Since citus `7a2eaed53` (July 6, 2026)
+> the byte ring is a fixed 8 MiB and a 2x-headroom guard rejects any record footprint
+> above half of it. `bytes=8388608` yields a footprint of `8388848` (payload + 240,
+> where 240 = 56-byte transport header + 184-byte max basebackup header) and fails
+> with `basebackup record footprint 8388848 too large for byte ring storage 8388608`.
+> Use `bytes=524288` (the validated value) or omit `bytes=` for the 1 MiB default.
+
+Optional explicit queue geometry for sensitivity runs (see the warning above):
 
 ```sh
 /usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
@@ -895,6 +1046,16 @@ baseline from the previous section.
 
 ## Run Citus backend-to-backend COPY through Homer
 
+> **BROKEN AT HEAD (July 9, 2026).** This workload HANGS: both service logs go
+> silent right after peer-transport setup, no `remote exec backend` is ever spawned
+> on farnet0, and the COPY backend survives `pg_ctl stop -m fast`. Confirmed on
+> binaries built after citus `7a2eaed53`. Cause not yet bisected; leading suspect is
+> `a3cdd5f3c` ("delete the pending-binding registry"), a session-pairing change
+> validated only against basebackup. Tracked as "Problem 2" in
+> `docs/kb/implementations/citus/transport/byte_ring_slot_capacity_regression.md`.
+> The baseline numbers below are from **June 6, 2026**, a month BEFORE that commit,
+> and must not be cited as evidence that COPY works today.
+
 This workload exercises the Citus coordinator backend on `farnet1`, the
 standalone Homer services on both hosts, and a socketless Citus worker backend on
 `farnet0`. It is the current service-to-service tuple payload path. The normal
@@ -974,7 +1135,8 @@ for f in "$OUT"/run_*.log; do
 done
 ```
 
-Current post-peer-push baseline captured on June 6, 2026:
+Historical baseline captured on June 6, 2026 (**STALE — see the BROKEN banner
+above; this predates citus `7a2eaed53` and does not reproduce today**):
 
 - Input: `/tmp/homer_tuple_sink_copy_10m.csv`, 10,000,000 rows, about 323 MB.
 - Correctness check: `count=10000000`, `min=1`, `max=10000000`,
@@ -1012,6 +1174,25 @@ Current post-peer-push baseline captured on June 6, 2026:
 Discard the run if a timeout, interrupted client, or failed COPY leaves a stale
 `postgres: remote exec backend`. Return to the clean runtime baseline and rerun
 the process preflight before measuring again.
+
+## Regression sweep (do this before and after any transport change)
+
+Three regressions landed July 6-8, 2026 and went unnoticed for days because each
+validation built ONE target and ran ONE workload. Cheap insurance:
+
+- **Build every target, not just `service-bin`:** `make -j8 all service-bin
+  client-bin dpu-tcp-transport-smoke-bin`. The DPU TCP transport smoke silently
+  failed to compile for three days.
+- **Run all three workloads:** basebackup (4-role DPU relay), `pgbench --homer`,
+  and backend-to-backend COPY. Two of the three are currently broken — fix or
+  re-check them before trusting a "no regression" claim.
+- **Stamp every recorded baseline with a commit SHA, not just a date.** A dated
+  baseline reads like a standing fact; it is a timestamped observation. The June-6
+  COPY baseline above was cited as evidence against a correct diagnosis. With a SHA,
+  `git merge-base --is-ancestor <sha> HEAD` answers "does this still hold?".
+- **Verify a deployment through the installed HEADER, not by grepping a binary for a
+  `#define`.** `strings <binary> | grep CITUS_TUPLE_SINK_PROTOCOL_VERSION` always
+  returns nothing and looks like a pass in both directions.
 
 ## Quick validation checklist
 
