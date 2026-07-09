@@ -528,6 +528,26 @@ this point). Build all targets, including the smokes.
 (`HomerDpuDmaImportHostMmapDescriptorForSetup`) — the exact thing whose absence caused the three-run
 hang.
 
+#### S2/S3 hook points — located (July 9, 2026)
+
+- **The postmaster already creates AND maps the spawn region before any fork.**
+  `CitusInstallRemoteExecutionBackendHooks` (`remote_execution_backend_bridge.c:3108`) runs from citus
+  `_PG_init` under `shared_preload_libraries`, and its `if (!IsUnderPostmaster)` branch (`:3120`) calls
+  `EnsureSpawnRegionMapped()` (`:1699`). Region `/citus_remote_exec_backend_spawn_v14`, 32 slots
+  (`remote_execution_backend_protocol.h:28`, `:30`).
+  → **S2.1/S2.2 and S3.1 attach here.** Extend that `!IsUnderPostmaster` branch to allocate the arena
+  alongside the spawn region, DOCA-export it with the S1b API, and send the setup message. Children
+  inherit the mapping through `fork()` for free, which is D4's entire point.
+- **The wait-set registration cannot happen there.** `_PG_init` runs *before* `ServerLoop`, and
+  `pm_wait_set` is built inside it (`ConfigurePostmasterWaitSet(true)`, `postmaster.c:1635`). So the
+  postgres fork needs a small **hook that lets an extension contribute fds to `pm_wait_set`**, called
+  from `ConfigurePostmasterWaitSet`. This is the one genuinely new postgres-side seam.
+- **Connect direction / timing.** Under D2 the postmaster is the TCP *client* of the DPU's doorbell
+  listener. At `_PG_init` the local DPU service may not be running yet, so the connect must be lazy and
+  retried with bounded backoff from the main loop rather than attempted once at preload. A failed or
+  absent doorbell must degrade to "no DPU-triggered spawn", never to a postmaster failure — the normal
+  path must not break when the DPU is down.
+
 ### S3 — spawn trigger (D2)
 - **S3.1** Postmaster: at startup, DOCA-mmap its own spawn region and export it over the setup TCP;
   keep the socket.
