@@ -658,29 +658,64 @@ delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_
 
 ### The bug, and why it was worse than "a client hangs"
 
-`HomerDpuDmaCopyNextStagedCommand` takes a **`const` engine**: it **PEEKS**, and always returns the
-**first** ring (import order, then ring order) whose `stagedCommandSlotValid` is set. The
-staged-command queue is therefore strictly **head-of-line across the whole engine**. Only
-`HomerDpuDmaReleaseStagedCommandSlot` pops, and the service has exactly **two** release sites:
+#### The staging pipeline (needed to understand the bug)
 
-| Release site | Reached for |
-|---|---|
-| `HomerServiceDpuStageOneBackendCommandForPublish` (`:39264`) | `START_COMMAND` only |
-| `HomerServiceDpuStageOneCommandForDispatch` (`:39623`) | only *after* skipping **both** `START` and `POLL` |
+Not a ring of staged commands. The chain is **single-slot** most of the way:
+
+```
+host role-1 control slot (slotCount = 1)
+  --DMA pull--> one of commandPullBufferCount (=64) engine pull buffers
+  --accept-->   ONE staged slot per (import, ring):  ringRuntime->stagedCommandSlotValid (a bool)
+  --stager-->   a SERVICE-owned queue (copy out, then release the engine pull buffer)
+  --action-->   DMA the command / run the semantic dispatcher
+```
+
+While a ring's staged slot is set, the pull scheduler issues **no further pull for that ring**
+(`homer_service_dpu_dma.c:1154`: skip if `commandPullInFlight || stagedCommandSlotValid`). The 64 pull
+buffers are the scarce resource, which is *why* both stagers copy out and release immediately: an
+`OPEN_SESSION` can sit in the async peer-open state machine for many scheduler passes, and holding a
+pull buffer across that would stall command pulls.
+
+**Two stagers, two destination queues** — both copy out and release, they differ in downstream work:
+
+| Kind | Staged-slot owner | Service queue | Then |
+|---|---|---|---|
+| `START_COMMAND` | `...StageOneBackendCommandForPublish` (releases at `:39264`) | `backendCommandPublishSlots[]` | DMA the command record into the backend's role-2 mailbox |
+| everything else | `...StageOneCommandForDispatch` (releases at `:39623`) | `stagedCommandDispatchSlots[]` | run `TupleSinkServiceDispatchLocalControlSlot` |
+
+#### The bug
+
+`HomerDpuDmaCopyNextStagedCommand` takes a **`const` engine**: it **PEEKS**, scanning
+(`importIndex`, then `ringIndex`) in **index order** and returning the first ring whose
+`stagedCommandSlotValid` is set. Only `HomerDpuDmaReleaseStagedCommandSlot` pops, and the two release
+sites above are the only ones.
 
 The DMA layer accepts five kinds (`homer_service_dpu_dma.c:9825`): `OPEN_SESSION`, `CLOSE_SESSION`,
-`REPORT_POST_COMMAND_STATE`, `START_COMMAND`, `POLL_COMMAND_COMPLETION`. **Two exclusions, one
-alternate consumer.** The stagers normally unwedge each other — publish leaves the head if it is not
-START, dispatch leaves it if it is — *because every kind has exactly one owner*. A staged `POLL` had
-no owner: it sat at the head forever and **stalled control processing for every ring on that
-service**, not just its own session.
+`REPORT_POST_COMMAND_STATE`, `START_COMMAND`, `POLL_COMMAND_COMPLETION`. The dispatch stager excluded
+**both** `START` and `POLL`. **Two exclusions, one alternate owner.**
+
+The stagers normally unwedge each other — publish leaves the head if it is not START, dispatch leaves
+it if it is — *because every kind has exactly one staged-slot owner*. A staged `POLL` had none. It sat
+at the head forever, **starving every ring that sorts after it, permanently**. (Rings *before* it in
+scan order drain normally; a wedge on the first ring stalls the whole service, which is what the
+validation run saw — its only client was import 0, ring 0.)
+
+> **"No consumer" conflated two roles, and only one was missing.**
+> - **Staged-slot owner** — who releases the engine's pull buffer. `POLL` had **none**. *That was the bug.*
+> - **Semantic handler** — who answers the request. `POLL` **always had one**:
+>   `TupleSinkServiceHandlePollCommandCompletion` (`:37407`), reachable from the dispatcher the whole
+>   time. It looks the session up by id and, if `currentCommandSequence` matches and the state is
+>   `COMPLETED`/`FAILED`, fills the completion into the response.
+>
+> The request simply never arrived at its handler.
 
 The old comment claimed START/POLL were "owned by the explicit backend-command and backend-completion
-actions". The START half was true. **The POLL half described a consumer that was never written.**
+actions". The START half was true. **The POLL half described an action that was never written.**
 
-Latent, not live: nothing emits `POLL` over a DPU control slot today (sole producer is the deprecated
-host-SHM `homer_frontend_control.c:1271`). But the DMA layer *accepts* it — a contract — and S4/S6
-make the DPU control slot the primary command channel.
+Latent, not live — but **closer than "latent" suggests.** The deprecated
+`homer_frontend_control.c:1255` already branches on `useDpuControlChannel` before building its POLL
+request, and the Tier-2 `homer_frontend_dma.c:899` exports a role-1 `FRONTEND_CONTROL_SLOT`. **The
+wedge was one GUC away.** And S4/S6 make the DPU control slot the primary command channel.
 
 ### The fix: close the partition, don't special-case POLL
 
@@ -722,7 +757,26 @@ That path (`homer_frontend_control.c`) talks to the **host-SHM** control region 
 dispatcher via `TupleSinkServicePumpControlSlots`. This change touches only what the *DPU-staged* path
 forwards. If that backend is later moved onto a DPU control slot, its `POLL` will now be **dispatched
 instead of wedging the service**. The only cost is the one-line re-exclusion above, if a dedicated POLL
-consumer is ever written.
+staged-slot owner is ever written.
+
+**Will COPY want a dedicated POLL action, the way START has one? Almost certainly not.**
+
+The asymmetry is about *data movement*, not about importance:
+- `START_COMMAND` needs its own action because it must **DMA a command record into the backend's
+  role-2 mailbox** — it consumes a `backendCommandPublishSlots[]` entry, a DMA task, and a
+  `pendingResponseSlots[]` entry for the ack.
+- `POLL_COMMAND_COMPLETION` moves nothing. It reads local session state and fills a response; the
+  generic dispatch path already publishes that response. A dedicated action would buy nothing.
+
+The only justification would be POLL becoming **hot**, and the direction of travel is the opposite:
+pushed completions (the peer completion ring) *replaced* polling precisely because each poll costs a
+dispatch slot, a pending-response slot, and a response DMA. `TupleSinkServiceHandlePollCommandCompletion`
+says so itself — *"Normal pgbench client SQL waits on the pushed completion ring directly; this handler
+is retained for debug/legacy local-control callers."*
+
+**Recommendation for the COPY overhaul:** leave `POLL` on the generic dispatch path, or let it wither
+in favour of pushed completions. If it ever does go hot, write the dedicated action **and re-exclude
+`POLL` from the dispatch stager in the same commit**, per the invariant above.
 
 ### A liveness guard for the CLASS of bug (citus `584e01dcb`)
 
