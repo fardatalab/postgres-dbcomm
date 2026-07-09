@@ -954,6 +954,44 @@ concurrent-session limitation. Precise mechanism:
   shared-connection multi-stream bottleneck CLAUDE.md flags for c4 pgbench, now with an exact trigger + assertion).
 - (Both concurrent aborts also hit the pre-existing reserve-loop-ignores-SIGTERM bug + the no-abort-notification gap.)
 
+**Stage 5 RESOLVED-to-ROOT + fix planned (July 9, 2026): the concurrent reset is the DPU byte-rings being
+per-engine singletons, NOT the shared RDMA connection.** We first implemented a per-session binding of the
+outgoing PAYLOAD *RDMA connection* (`remote_execution_peer_transport_rdma.c`: `ownerServiceSessionId` on the
+64-slot `outgoingConnections[]` pool; `Find` prefer-own -> adopt-free -> create-new; release-to-free at
+`ResetSession`). It PASSED single-backup + sequential-reuse (Test 1) but the concurrent 2-session basebackup
+(Test 2) **FAILED identically**, which **falsified the "shared connection/recv-CQ" model**: the run logs prove
+both sessions got FULLY SEPARATE outgoing connections (sender slots 0/1) AND separate incoming connections
+(receiver `connection_index` 0/1, generations 1/2), yet the same `payload sender credit advanced beyond posted
+tail token=4098 observed=29360576 posted=0` reset occurred on session 2's own fresh connection. So the July-8
+"Fix direction" (receiver-side per-stream consumed-head credit VALUE/addressing) was directionally right; the
+exact mechanism is now pinned:
+- The receiver's per-stream consumed-head is read from `streamEntry->stream.localReceiveByteRing.control->consumedHead`
+  (`tuple_sink_service_process.c:12752`). For a DPU-relay stream that ring is backed by the **single per-engine
+  landing region** (`HomerServiceEnsureLocalReceiveByteRing` `:16401-16447` sets `mappingAddress = landingBase`;
+  `HomerDpuDmaGetLandingRegionMemory` returns the one `engine->landingRegion`). Two concurrent receive streams
+  alias the SAME control block, so session B reads session A's ~29 MB `consumedHead` and RDMA-writes it to B's own
+  (correct, per-stream) sender head-mirror -> `observed(29MB) > posted(0)` -> `RECV_CQ_FAILURE`. The credit
+  DISPATCH is correct (keys by token/connection, all binding checks pass — hence `Apply`'s error, not a
+  `Dispatch` "binding mismatch"); only the VALUE is cross-wired via the shared ring.
+- **Audit found 3 engine-singleton data rings** (`homer_service_dpu_dma.c:505-508`), all shared across sessions:
+  `mirrorRing` (sender egress source), `landingRegion` (receiver RDMA target + relay DMA source + control block),
+  `tupleSourceRing` (receiver two-ring post-deform; tuple/pgbench only). Basebackup aliases mirror (sender) +
+  landing (receiver). Plus a dispatch bug: `HomerServiceFindPeerBoundReceiveRelayStream` (`:23157`) is an explicit
+  "single-active-receive-stream" first-match scan (can attach relay work to the wrong session). Payload STORAGE is
+  already uniform (`mirrorRingBytes == tupleSourceRingBytes == HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`,
+  `:9931-9933`); only landing has an inline control block. Correctly-per-session already: producer `sendQueue`,
+  `localSenderHeadMirror` (per-stream calloc), and the DPU->host role-7 rings (keyed by unique `sessionUID` via
+  `HomerDpuDmaFindDpuToHostByteRingRef` `:4958` — the correct-resolver template).
+- **Approved fix — full design + staged plan + concrete API in
+  [dpu_byte_ring_pool_per_session_plan.md](dpu_byte_ring_pool_per_session_plan.md).** In brief: a per-session
+  **DPU byte-ring resource pool** (multi-region arena of homogeneous slots, one unified bind/unbind/reuse
+  protocol, extracted into a new `homer_dpu_byte_ring_pool.c/.h`), staged 0a refactor → 0b pool → 1 basebackup
+  (mirror+landing+resolver; the concurrent-2-session acceptance gate) → 2 tuple-source. The connection-binding
+  fix is now orthogonal hardening, kept but re-evaluated after Stage 1.
+- Evidence: sender DPU `/tmp/homer_svc_farnet1dpu_persessfix.log` (two distinct `payload connection allocate`
+  slots then the reset on slot 1); receiver DPU `/tmp/homer_svc_farnet0dpu_persessfix.log` (two incoming accepts,
+  `connection_index` 0/1); Test-1 PASS band `delivered_bytes ~23.28 GB` across 3 back-to-back single backups.
+
 **DPU tree note (July 8, 2026):** the farnet1 DPU has TWO citus trees. `~/dbcomm/citus-dbcomm` is the CURRENT one
 (non-git rsync dir at farnet1 HEAD, COMCH v2, has the Part 3.5.2 fixes) -- use it, symmetric with the farnet0 DPU.
 `~/citus-dbcomm` is a STALE legacy git tree (HEAD `3fb0e7749` July 2, COMCH v1); running its binary fails the sender

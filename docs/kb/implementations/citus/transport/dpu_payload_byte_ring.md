@@ -228,10 +228,24 @@ multiples. Do not trust power-of-two coincidence for wrap alignment.
 
 ## Other caveats
 
-- **Single active stream.** The mirror (and receiver landing ring) is addressed by
-  absolute offset `% ringBytes`, so concurrent sender byte-ring streams would
-  collide; the current model is one active stream. Partition per-stream before
-  supporting concurrency.
+- **Single active stream (BEING FIXED — per-session byte-ring pool).** The mirror,
+  the receiver landing ring, AND the two-ring tuple source ring are each a **single
+  per-engine buffer** addressed by absolute offset `% ringBytes`, so concurrent
+  streams alias the same storage + control block. This is the confirmed root cause of
+  the concurrent cross-node DPU basebackup reset (two receive streams share
+  `landingRegion.control->consumedHead`, so one session's credit is read as the
+  other's → `observed>posted` → `RECV_CQ_FAILURE`). The fix makes every byte-ring a
+  per-session/per-stream resource bound from a pool — see
+  [dpu_byte_ring_pool_per_session_plan.md](dpu_byte_ring_pool_per_session_plan.md).
+- **Homogeneous byte-ring slots (design assumption).** The pool relies on all
+  byte-ring slots being the SAME size + layout, so any slot serves any purpose
+  (mirror/landing/source). This is true for payload STORAGE today
+  (`mirrorRingBytes == tupleSourceRingBytes == HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`,
+  `homer_service_dpu_dma.c:9931-9933`) but NOT for the control block (only landing has
+  an inline one; mirror uses a separate `controlCells` pool, tuple-source has none). The
+  pool makes it uniform BY DESIGN — every slot gets the `landingPayloadOffset` control
+  prefix; landing uses it, mirror/source leave it unused. A future ring purpose needing
+  a different size/control layout must revisit this assumption.
 - **Control-line staging is a DMA source, not a payload slot.** Publishing a
   produced-tail / consumed-head credit word to a *remote* ring's control block is
   a DMA whose source must be DPU-registered memory; a small cache-line-sized
