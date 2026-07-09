@@ -4,7 +4,7 @@
 > data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
 > independently — cite them as "command-plane S1a", etc.
 
-**Status (July 9, 2026): PLANNED, agreed with the user, not started. This is a PREREQUISITE for
+**Status (July 9, 2026): IN PROGRESS. S0 ✅ done. S1a next. This is a PREREQUISITE for
 `pgbench --homer-dpu`, not a follow-on.**
 
 ---
@@ -252,10 +252,66 @@ the DPU forward it into the spawn request, or fall back to service policy. **Dec
 
 ## Stages
 
-### S0 — Spike (sanity, not a gate)
-Standalone test: a process `shm_open`s + `mmap`s a POSIX shm region **it created**, DOCA-exports the
-mapping to the DPU, the DPU DMA-writes into it, the host reads the value back. Confirms the export path
-for D2. Do it because it costs minutes, not because the design depends on the answer.
+### S0 — Spike ✅ **DONE (July 9, 2026, citus `4e91aaa63`+)**
+
+**Question.** Every validated DOCA export in this tree exports **anonymous `posix_memalign` heap**
+(`homer_client.c:2028`, `homer_dpu_tcp_transport_smoke.c:462`). The postmaster's spawn region is
+`shm_open` + `mmap(MAP_SHARED, fd)` — a **tmpfs file-backed** mapping
+(`remote_execution_backend_bridge.c:1709`-`:1745`). D2 needs the DPU to DMA into *that*. So the spike is
+NOT "can a process DOCA-export memory" (proven); it is **"can DOCA export *this kind* of memory."**
+Worth minutes because DOCA has surprised us before (the undocumented ~100 MB single-region ceiling).
+
+**Method.** Rather than a standalone program, added `--export-posix-shm` to the existing TCP transport
+smoke (`homer_dpu_tcp_transport_smoke.c`): the client's export buffer becomes `shm_open(O_CREAT|O_EXCL)`
++ `ftruncate` + `mmap(MAP_SHARED)` (unlinked right after mmap) instead of `posix_memalign`. Zero DPU-side
+change; reuses the whole harness and its existing DPU→host publication assertions as the proof.
+
+**Result: PASS — both directions, on tmpfs.**
+```
+client posix-shm export: name=/homer_tcp_smoke_export_3872836 bytes=3542200 addr=0x7f535c176000
+client received TCP setup ack generation=1 rings=6 imported_bytes=283
+client observed DMA backend command publication published_epoch=7001   <- DPU DMA-WROTE into tmpfs
+client observed DMA response publication state=4 command_seq=7001      <- second DPU->host write
+```
+- **DPU reads from tmpfs**: grouped-control reads, the role-1 command pull, and two byte-ring pulls all
+  completed (the run reaches the *later* write leg, so everything before it succeeded).
+- **DPU writes into tmpfs**: the two publications above, observed by the host.
+- **Control:** the server then failed at *byte-identical* the same point as the anonymous-heap run
+  (see "smoke defects" below), so the shm switch is not implicated in that failure.
+
+**Conclusion.** D2's export path is sound. `doca_mmap_set_memrange` + `doca_mmap_export_pci` pin and
+export a tmpfs `MAP_SHARED` mapping exactly as they do anonymous heap. The postmaster can export the
+spawn region it created. No `-lrt` needed (glibc ≥ 2.34 folds `shm_open` into libc).
+
+#### S0 side-finding: the TCP transport smoke was itself broken (Tier 1.5 → repaired)
+
+Running it — for the first time since it was fixed to *compile* — exposed that it had silently rotted
+through the byte-ring pool migration. **A smoke nobody runs is Tier 2, not a test.**
+
+1. **`HomerDpuDmaAcceptByteRingPull` rejected every smoke pull.** `HomerDpuDmaSubmitByteRingSmokePull`
+   (`homer_service_dpu_dma.c:2529`) receives the mirror base/bytes/mmap as *parameters* but never
+   populated `ringRuntime->dpuMirrorSlotResolved` — the cache that acceptance (`:9850`) demands and that
+   egress (`HomerDpuDmaFillMirroredByteRange`, `:4470`) later reads as authoritative. The **production**
+   caller `HomerDpuDmaSubmitMirroredByteRingPulls` (`:3553`) happened to resolve first at `:3670`
+   (it needs `dpuRingBytes` for its own wrap clamp); the **smoke-only** driver bound its MIRROR slot
+   directly and passed the handle in, so the cache stayed empty.
+   → **Not a production bug** (basebackup goes through the production scheduler). A *smoke-fidelity* bug.
+   **Fixed:** the submitter now resolves the slot itself — one resolution point, precondition true by
+   construction — and cross-checks the caller-supplied window against the pool-resolved one, turning a
+   silent mirror-aliasing bug into a loud submit-time rejection.
+2. **Six failure causes shared one message.** The acceptance check was a 6-term `||` behind
+   `"byte-ring pull owner does not match imported ring"`. Each cause has a different fix; the message
+   named none of them. **Split into six named failures.** This is what made (1) diagnosable at all.
+3. **STILL BROKEN (data plane, deferred):** the smoke's DPU→host write leg calls the retired
+   `HomerDpuDmaGetLandingRegionMemory` engine singleton (`:3976`) and passes `dpuRingBase=NULL` to
+   `HomerDpuDmaSubmitByteRingWrite` (`homer_dpu_tcp_transport_smoke.c:1741`), so it fails
+   `"byte-ring write ring exceeds bound landing slot source"` (`:3195`). It must bind a `LANDING` pool
+   slot per role-7 ref. Tracked as a follow-up — **not** on the command-plane critical path (the command/
+   completion legs pass, and production basebackup exercises the write path).
+
+**Trust reclassification.** The host↔DPU **command/completion DMA loop is now TIER 1** — genuinely
+exercised, both directions, including into tmpfs. This materially de-risks S4: its command plane is
+proven; what S4 adds is the real backend and the real client, not new DMA mechanics.
 
 ### S1a — client-side `HomerClientOpenSqlSessionSelectedDpu` (clone the Tier-1 template)
 - **S1a.1** New entry point in `src/bin/homer_client.c`. Export buffer carrying role 1 (frontend
@@ -375,6 +431,20 @@ delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_
 7. **Trust boundary.** After S3 the DPU DMA-writes `dbOid`/`userOid` into a spawn slot, so the DPU is
    now inside the trust boundary for backend spawn (previously a local host process was). Acceptable
    for a prototype; name it rather than discover it.
+8. ~~Can DOCA export a POSIX-shm (tmpfs) mapping?~~ **Answered by S0 — YES**, both DMA directions.
+
+## Follow-ups opened by S0
+
+- **Repair the smoke's DPU→host write leg** (S0 side-finding 3): bind a `LANDING` pool slot for each
+  role-7 descriptor ref instead of calling `HomerDpuDmaGetLandingRegionMemory`, and thread the handle
+  into `HomerDpuDmaSubmitByteRingWrite`. Both write legs (`--expect-dpu-to-host-payload`,
+  `--expect-loop2-backpressure`) use `SOURCE_LANDING`, so **this does NOT depend on byte-ring pool
+  Stage 2** (only `SOURCE_TUPLE_SOURCE` still reads `engine->tupleSourceRing`, `:3184`).
+- **`engine->landingRegion` singleton survived the pool migration** (`:3976` still returns it). Audit
+  whether anything besides the smoke reads it; if not, retire it with pool Stage 2.
+- The smoke's client exits 0 on legs it wasn't told to expect, so a **server-side** failure surfaces
+  only as `client TCP close exchange failed`. That is how this rotted unnoticed. Consider having the
+  server's failure reason travel back in the CLOSE_ACK.
 
 ## Standing risks
 
