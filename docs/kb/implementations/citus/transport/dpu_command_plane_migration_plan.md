@@ -314,18 +314,80 @@ exercised, both directions, including into tmpfs. This materially de-risks S4: i
 proven; what S4 adds is the real backend and the real client, not new DMA mechanics.
 
 ### S1a — client-side `HomerClientOpenSqlSessionSelectedDpu` (clone the Tier-1 template)
-- **S1a.1** New entry point in `src/bin/homer_client.c`. Export buffer carrying role 1 (frontend
-  control slot), role 6 (frontend completion event), role 7 (result ring). Emit an
-  `OP_COMMAND_SESSION` open into the control slot.
-- **S1a.2** Service: admit `OP_CLIENT_SQL_SESSION` arriving over the DPU control slot. Relax by
-  **allow-list**, not by deleting checks: `TupleSinkServiceOpenRequestNeedsAsyncLocalControl`
-  (`tuple_sink_service_process.c:34817`) and `TupleSinkServiceProgressCommandOpenAsyncOp` (`:35172`).
-- **S1a.3** `REGISTER_MEMORY` unconditionally requires `sessionState->commandMailbox.mailbox`
-  (`:35238`). Under D1 the backend supplies a real mailbox, so **prefer satisfying the check over
-  relaxing it** — a conditional check invites a second silent divergence.
-- **S1a.4** Resolve the `backendCpu` gap (D3).
-- **S1a.5** pgbench: select the new opener (fold into `--homer-dpu`, or a separate flag — decide once
-  S1a.1 exists).
+
+> ## ✅ PLAN CORRECTION (July 9, 2026) — S1a is CLIENT-SIDE ONLY
+>
+> S1a.2/.3/.4 were written against **drifted line numbers** and a false premise: that the DPU
+> control-slot path and the host-SHM control path are **two dispatchers**. They are **one**.
+> Verified in code (see below). The service already admits an `OP_COMMAND_SESSION` open arriving
+> over the role-1 DPU control slot and routes it into the async command-open state machine.
+> **Nothing to relax. S1a is the client opener plus pgbench wiring.**
+>
+> This is the second time reasoning from a remembered line number rather than the code produced a
+> wrong plan (cf. the "divisor's third job is tiling" retraction). Re-derive before planning.
+
+**Evidence for the correction:**
+- `TupleSinkServiceDispatchLocalControlSlot` (`tuple_sink_service_process.c:37840`) switches **only on
+  `requestKind`** — no op-kind allow-list, no transport check. Both callers use it:
+  the host-SHM slot pump at `:38058` and the DPU staged-command executor at `:39654`.
+- The DPU staged executor builds a `DPU_STAGED_COMMAND` response owner (`:39653`) and
+  `...ResponseOwnerCanRegisterAsync` accepts it (`:36240`-ish), so async continuations publish back
+  through the Stage-8 pending-response DMA queue.
+- `TupleSinkServiceHandleOpenSession` routes `opKind == OP_COMMAND_SESSION` straight to
+  `TupleSinkServiceHandleOpenCommandSession` (`:33888`), transport-agnostic.
+- `TupleSinkServiceOpenRequestNeedsAsyncLocalControl` (**now `:34904`**, not `:34817`) already returns
+  **true** for `OP_COMMAND_SESSION` + `sessionKey.opKind == OP_CLIENT_SQL_SESSION` +
+  `destinationNodeId > 0` (`:34918`). It is a *routing* predicate, never a rejection.
+- The DMA layer accepts `OPEN_SESSION`/`CLOSE_SESSION`/`REPORT_POST_COMMAND_STATE`/`START_COMMAND`/
+  `POLL_COMMAND_COMPLETION` request kinds off the control slot (`homer_service_dpu_dma.c:9825`).
+
+**Sub-step dispositions:**
+- **S1a.1** — **THE WORK.** New entry point in `src/bin/homer_client.c`. See "S1a.1 decisions" below.
+- **S1a.2** — ~~admit `OP_CLIENT_SQL_SESSION` over the DPU control slot~~ **NO-OP, already admitted.**
+- **S1a.3** — ~~`REGISTER_MEMORY` requires `commandMailbox.mailbox`~~ **NO-OP.**
+  `TupleSinkServiceCreateSession` calls `TupleSinkServiceEnsureSessionMailboxes` **unconditionally**
+  (`:22116`, fatal on failure) and `...EnsureClientCompletionMailbox` for `OP_CLIENT_SQL_SESSION`
+  (`:22127`). The mailbox is never NULL for a live session, so the `:35337` check passes by
+  construction. (What it is *used for* matters — see the S4 note below.)
+- **S1a.4** — **RESOLVED, open question 1 closed.** `backendCpu` is **service-chosen**, not carried by
+  the client: `reservedSlot->request.backendCpu = TupleSinkServiceChooseBackendCpu()`
+  (`:18907`; chooser at `:871`). It is absent from `CitusRemoteExecOpenSessionRequest`
+  (`homer_control_abi.h:297`) and lives only in the spawn struct
+  (`remote_execution_backend_protocol.h:112`). **Keep service policy. Do not add a client field.**
+- **S1a.5** — pgbench: select the new opener under `--homer-dpu`.
+
+#### S1a.1 decisions (made within the plan's direction; recorded per the "note your reasoning" rule)
+
+1. **Clone, do not extract.** `HomerClientDpuSubmitControlRequest` (`homer_client.c:2233`) and its
+   siblings are typed on `HomerClientBaseBackupStream *` but touch only a small control-channel
+   substruct. Extracting now would edit the Tier-1 basebackup path, our only regression net. **S1b
+   exists precisely to extract.** Duplication is temporary and deliberate.
+2. **Reuse `HomerClientBaseBackupStream` as the selected-DPU export carrier.** The name is a misnomer
+   — it is really "an exported host region + a role-1 control slot" — but the codebase *already*
+   reuses it that way for the SQL result ring (`HomerClientSession.sqlResultDpuStream`,
+   `remote_execution_client.h:257`). Adding a second carrier type would duplicate five helpers.
+   **S1b renames/extracts.**
+3. **Export role 1 only; leave role 7 to its existing opener.** `HomerClientOpenSqlResultReceiveStreamSelectedDpu`
+   **already exports a role-1 control slot AND the role-7 ring** (descriptors `[0]`/`[1]`). It is
+   Tier-1 and MUST NOT be touched. Two exports per client is fine: `hostMmapImportCapacity = 1024`
+   (`homer_service_dpu_dma.c:785`) — which also **softens open question 4** considerably.
+   Consolidating the two exports belongs in S1b/S2, not here.
+4. **Do NOT call `HomerClientOpenBackendMailboxes`.** Today's `HomerClientOpenSqlSession` `shm_open`s
+   the backend command mailbox **by name on its own host** (`homer_client.c:1627`), because the
+   client-side host service created it. That is precisely the node-local assumption the target
+   architecture destroys. The DPU-native client's commands ride the role-1 control slot
+   (`START_COMMAND`), which the smoke already proves the DPU pulls and answers.
+
+#### What S1a does NOT solve (deliberately deferred to S4/S5)
+
+`commandMailbox` is used at `REGISTER_MEMORY` as a **local RDMA scratch source**
+(`remoteWritable=false`, `:35346`). On a DPU-resident service its `shm_open` still succeeds — it
+simply becomes DPU-local staging memory nobody else maps. **It likely survives the move unchanged.**
+
+`clientCompletionMailbox` does **not**: it is registered **remote-writable** (`:35365`), the peer
+RDMA-writes completions into it, and today pgbench reads it directly out of shared memory
+(`HomerClientOpenCompletionMailbox`). Cross-node that must become a **DPU→host DMA into role 6**
+(`FRONTEND_COMPLETION_EVENT`). Nothing writes role 6 today. **This is the real S4/S5 work item.**
 
 **Gate:** compiles; the DPU service logs an `OP_COMMAND_SESSION` open arriving over the DPU control
 slot. No end-to-end claim yet.
@@ -412,10 +474,29 @@ delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_
 
 ---
 
+## Latent hazard found while mapping the DPU control path (record, do not fix yet)
+
+**`POLL_COMMAND_COMPLETION` is DMA-accepted off the DPU control slot but never dispatched.**
+`homer_service_dpu_dma.c:9825` accepts it as a valid staged request kind, but **both** staged
+consumers drop it:
+- `HomerServiceDpuStageOneBackendCommandForPublish` (`tuple_sink_service_process.c:39135`) takes only
+  `START_COMMAND`, returning at `:39185` for anything else;
+- `HomerServiceDpuStageOneCommandForDispatch` (`:39537`) explicitly **skips** both `START_COMMAND`
+  and `POLL_COMMAND_COMPLETION` at `:39569`.
+
+So a client that submits `POLL_COMMAND_COMPLETION` over the DPU control slot has its slot consumed and
+never answered — **a silent hang**, the same failure signature that has now cost four investigations.
+Benign today only because the peer completion ring superseded `POLL` as the normal completion path
+(the old `POLL_COMMAND_COMPLETION` peer path is retained as fallback/debug). **Before S4**, either
+reject it loudly at the DMA accept, or dispatch it. Do not leave a request kind that is accepted and
+then silently discarded.
+
 ## Open questions
 
-1. **`backendCpu`** (D3): carry it through the DPU control slot into the DPU-built spawn request, or use
-   service policy? Decide in S1a.
+1. ~~**`backendCpu`** (D3): carry it through the DPU control slot, or use service policy?~~
+   **CLOSED (S1a): service policy.** `TupleSinkServiceChooseBackendCpu()`
+   (`tuple_sink_service_process.c:871`) is called service-side at `:18907`; `backendCpu` is not a field
+   of `CitusRemoteExecOpenSessionRequest` at all. No client-side change.
 2. ~~Does the socketless backend need DOCA at startup?~~ **Dissolved by D4** — no. Only the postmaster
    does DOCA.
 3. ~~Result byte-ring ownership.~~ **Dissolved by D4** — the arena owns it; the backend binds a slot.
@@ -423,6 +504,9 @@ delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_
 4. **Arena sizing.** `ringCount` per import (`homer_dpu_bridge_abi.h:119`) and
    `hostMmapImportCapacity` (`homer_service_dpu_dma.h:57`) bound how many sessions one export can
    declare. Size for the target concurrency; fatal on exhaustion.
+   **Partly answered:** `hostMmapImportCapacity` defaults to **1024** (`homer_service_dpu_dma.c:785`),
+   so the *import* count is a non-issue at our concurrency — two exports per pgbench client is nothing.
+   What still needs sizing is `ringCount` per export and the arena's per-session descriptor sets.
 5. **Postmaster wait-set surgery** (S3.2) is a Postgres-fork change. Confirm where `ServerLoop` builds
    its fd set. The bar is "never fatally break the postmaster on the normal path"; upstream's stricter
    minimalism is not a constraint we adopt.

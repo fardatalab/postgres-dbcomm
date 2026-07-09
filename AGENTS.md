@@ -95,22 +95,46 @@ DPU command pull, DPU DMA backend-command body plus `readySeq`/`publishedEpoch`
 publication into the host backend mailbox, and DPU DMA response-body plus
 response-ready publication back into host frontend memory.
 
+Three things about this smoke that each cost a cycle (validated July 9, 2026, citus `b2c3471b6`):
+
+- **Leg flags gate BOTH ends.** The server checks `options->expectLoop2BackPressure` too. Passing
+  `--expect-loop2-backpressure` only to the client makes the client hang waiting for a leg the server
+  never runs. Pass every leg flag to both processes (the server ignores the ones it doesn't use).
+- **The client exits 0 on legs it wasn't told to expect.** A *server*-side failure surfaces only as
+  `client TCP close exchange failed`. Always read the server log; the exit code is not the verdict.
+  Both ends print `homer_dpu_tcp_transport_smoke: ok` on a real pass.
+- **Give the server a generous `--timeout-ms`.** It counts from process start, not from accept, so a
+  slow client launch eats the window and you get a bare `could not connect`.
+
 ```sh
-# On the DPU, after compiling/copying the smoke there.
+# On the DPU, after compiling/copying the smoke there. Run it under setsid + </dev/null
+# or ssh will tear it down; and do NOT `pkill -f transport_smoke` from an ssh one-liner --
+# the pattern matches the ssh command line itself and kills the session.
 ./homer_dpu_tcp_transport_smoke --server \
   --dev-pci 0000:03:00.0 \
   --port 9727 \
-  --timeout-ms 15000
+  --timeout-ms 45000 \
+  --expect-loop2-backpressure
 
-# On farnet1 host:
+# On farnet1 host: all six legs. --export-posix-shm additionally exports a tmpfs
+# MAP_SHARED region instead of anonymous heap (the shape the postmaster's spawn
+# region has); it is the S0 command-plane-migration proof and should stay green.
 ./build/homer/homer_dpu_tcp_transport_smoke --client \
   --host 10.10.1.201 \
   --dev-pci 0000:21:00.0 \
   --port 9727 \
-  --timeout-ms 15000 \
+  --timeout-ms 40000 \
   --expect-backend-command-publish \
-  --expect-response-publish
+  --expect-response-publish \
+  --expect-backend-completion-pull \
+  --expect-byte-ring-pull \
+  --expect-dpu-to-host-payload \
+  --expect-loop2-backpressure
 ```
+
+This smoke is the **only single-node host↔DPU DMA regression net**, and it silently rotted through
+the byte-ring pool migration (it compiled; nobody ran it). Run it before and after any DPU DMA,
+byte-ring, or bridge-ABI change.
 
 The second host fast-link addresses were also configured on June 17, 2026:
 
