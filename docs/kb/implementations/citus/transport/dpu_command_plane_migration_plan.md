@@ -257,6 +257,22 @@ Same trade the byte-ring pool already makes, and the same fatal-on-exhaustion po
 "the backend is literally a Homer frontend", but it pays DOCA init per session and burns an import per
 session. Revisit only if the arena's preallocation proves awkward.
 
+> **D4 re-examined (July 9, 2026) — it still stands, but for a DIFFERENT reason than it was decided
+> on.** D4 rested on two costs of per-backend export: (a) a DOCA context opened on the session-open
+> path, and (b) one `hostMmapImportCapacity` import burned per session. **(b) has evaporated:**
+> `hostMmapImportCapacity` defaults to **1024** (`homer_service_dpu_dma.c:785`), which is far above any
+> concurrency we will reach. Had that been the only argument, per-backend export would now win.
+>
+> But a **stronger** argument appeared once S3's shape was settled: under D2 the postmaster **must**
+> DOCA-export the spawn region anyway, and it **must** `mmap` it before any fork. Given it is already
+> holding a DOCA device and an export, folding the per-session {role-2, role-3, role-5} descriptor sets
+> into that same arena is nearly free — and it lets the socketless backend do **no DOCA at all**, which
+> is what actually keeps the session-open path short. One DOCA context per node, not per backend.
+>
+> Recorded because a decision whose stated rationale has quietly become false is a trap for the next
+> reader — and because it means the *cheap* thing to reconsider, if the arena's preallocation turns
+> awkward, is (b), not the whole design.
+
 ### D3 — the client opener is built on the Tier-1 basebackup template
 `HomerClientOpenSqlSessionSelectedDpu` in `homer_client.c`, cloned from the exercised selected-DPU
 setup: env/default parsing (`:2551`), buffer layout with host publish lines / DPU credit lines / control
@@ -475,6 +491,26 @@ and the postmaster (D2). Extract from the Tier-1 `homer_client.c` machinery — 
 Surface: "open a control channel to my local DPU; export these regions; submit this control slot;
 receive this response." Must be linkable into both `libhomer_client.a` and the PostgreSQL backend.
 
+**✅ Linkability confirmed — no new build plumbing needed.** The PostgreSQL *backend* already links
+`libhomer_client.a` (`src/backend/meson.build:48-50`), because `basebackup_homer.c:296` calls
+`HomerClientOpenBaseBackupStreamSelectedDpu`. `nm` on the installed `postgres` shows 38 `HomerClient*`
+symbols. So the postmaster can call the extracted API **directly**; nothing has to move files.
+
+#### S1b design decision — parameter extraction, NOT struct surgery
+
+The natural-looking extraction is to factor the twelve `dpu*` fields of `HomerClientBaseBackupStream`
+into a `HomerClientDpuExportChannel` substruct and retype the helpers on it. **Rejected.** The struct's
+layout is load-bearing (`remote_execution_client.h:153-157`: backend and frontend objects must agree on
+its size), it has ~50 field references across the Tier-1 basebackup paths, and basebackup is our only
+end-to-end regression net.
+
+**Chosen:** make the four `static` helpers public with **explicit parameters** and no carrier type —
+`HomerDpuFrontendExportRegion` / `...DestroyExport` / `...SendSetup` / `...SendClose` — and leave the
+existing `HomerClientDpu*` helpers in place as thin wrappers that pass the stream's fields. Zero struct
+change, zero call-site change, and the postmaster gets a surface that needs no client/session type.
+Raw `void *` for the DOCA handles, exactly as the struct already stores them, so the header does not
+drag DOCA into every translation unit that includes it.
+
 **Gate:** the selected-DPU basebackup regression still passes (the module's only validated consumer at
 this point). Build all targets, including the smokes.
 
@@ -585,9 +621,19 @@ then silently discarded.
    **Partly answered:** `hostMmapImportCapacity` defaults to **1024** (`homer_service_dpu_dma.c:785`),
    so the *import* count is a non-issue at our concurrency — two exports per pgbench client is nothing.
    What still needs sizing is `ringCount` per export and the arena's per-session descriptor sets.
-5. **Postmaster wait-set surgery** (S3.2) is a Postgres-fork change. Confirm where `ServerLoop` builds
-   its fd set. The bar is "never fatally break the postmaster on the normal path"; upstream's stricter
-   minimalism is not a constraint we adopt.
+5. ~~**Postmaster wait-set surgery** (S3.2): confirm where `ServerLoop` builds its fd set.~~
+   **ANSWERED.** `ServerLoop` (`src/backend/postmaster/postmaster.c:1628`) blocks in
+   `WaitEventSetWait(pm_wait_set, DetermineSleepTime(), events, lengthof(events), 0)` at `:1642`;
+   `pm_wait_set` is built by `ConfigurePostmasterWaitSet(bool accept_connections)` at `:1605` (called
+   at `:1635` and, on shutdown, `:3287`).
+   - Register the doorbell fd with **`WL_SOCKET_READABLE`**, not `WL_SOCKET_ACCEPT`. The loop's accept
+     branch (`:1673`) keys off `WL_SOCKET_ACCEPT`, so a readable-only fd cannot be mistaken for an
+     inbound client connection. No surgery on the accept path.
+   - **Grow `WaitEvent events[MAXLISTEN]` (`:1632`) by at least one.** It is sized for the listen
+     sockets alone; `WaitEventSetWait` returns at most `lengthof(events)` events, so an undersized
+     array does not overflow but can starve the doorbell behind a full complement of listen sockets.
+   - The bar is "never fatally break the postmaster on the normal path"; upstream's stricter
+     minimalism is not a constraint we adopt.
 6. **fd hygiene.** The postmaster's doorbell fd must be closed in every forked child, or a backend
    outliving the postmaster keeps the DPU's doorbell connection alive.
 7. **Trust boundary.** After S3 the DPU DMA-writes `dbOid`/`userOid` into a spawn slot, so the DPU is
