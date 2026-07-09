@@ -48,8 +48,31 @@
     no reset. NOTE: `dpuRingSource*` will be renamed to a neutral `dpuRingBase*` in
     Stage 1a-mirror (a task uses its DPU-local ring as source for landing OR dest for a
     mirror pull — one param, both uses).
-  - Stage 1a-mirror (mirror per-session: bind + pull dest + egress source), Stage 1b
-    (resolver + concurrent acceptance), Stage 2: pending.
+  - **Stage 1a-mirror — DONE + validated (single-session, no regression).** The sender
+    MIRROR ring (host→DPU DMA-pull DEST + RDMA-egress SOURCE) is now a per-session bound
+    slot instead of the engine singleton. `TupleSinkServiceEnsureDpuMirrorMemoryRegion`
+    binds a MIRROR slot + registers the slot's storage as the egress MR; the engine
+    resolves the mirror slot by `descriptor->serviceSinkId` (== the sender stream's
+    `serviceStreamId`) via `HomerDpuDmaResolveMirrorSlot` and threads it into the pull
+    dest (`SubmitByteRingSmokePull`→`SubmitOneByteRingTask`) + the egress source
+    (`HomerDpuDmaFillMirroredByteRange`); `dpuRingSource*`→`dpuRingBase*` neutral rename.
+    Stream reset unconditionally unbinds all of the stream's slots.
+    **DEADLOCK found + fixed:** the mirror was bound lazily at egress, but the pull loop
+    requires it bound first (it requeue-spins otherwise) and egress needs pull output →
+    circular deadlock (98% CPU spin, no `purpose=0` bind line). FIX: bind+register the
+    mirror slot at STREAM_REGISTER_MIRROR (stream open, connection already ensured), before
+    any pull; the egress `EnsureDpuMirrorMemoryRegion` is then idempotent. General lesson:
+    converting a singleton to a per-session bound resource can create an ordering
+    deadlock — hoist the bind upstream of every consumer. Validation: 3x single-session,
+    8-12s (no hang), byte conservation 0.00013% (~23.28 GB), `purpose=0` MIRROR bind on the
+    sender DPU + `purpose=1` LANDING on the receiver, no reset/mirror-slot error.
+    **CLEANUP TODO (fold into Stage 1b build):** `HomerDpuDmaResolveMirrorSlot` re-Finds
+    every call (the added `HomerDpuDmaRingRuntime` mirror-slot cache fields are written but
+    never read for short-circuit) and const-casts `engine`/`import` in the egress path to
+    write them; since re-resolving is cheap (O(8 slots)) and actually safer against stale
+    bindings, drop the cache fields + `ClearMirrorSlotCache` and make the resolver a pure
+    non-caching `Find` (removes the const-casts).
+  - Stage 1b (resolver + concurrent acceptance), Stage 2: pending.
 - **Doc type:** implementation plan / in-flight.
 - **Source:** `src/backend/distributed/utils/homer/homer_service_dpu_dma.c` (+`.h`),
   `.../tuple_sink_service_process.c`, and the new module
