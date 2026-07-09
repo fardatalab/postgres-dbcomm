@@ -414,11 +414,129 @@ resolver here is already per-sessionUID-correct (`:31521`). **Validation:** 2 co
 
 ## Connection-binding fix disposition
 
-The already-implemented per-session outgoing-connection binding
-(`remote_execution_peer_transport_rdma.c`) is now **orthogonal hardening, not correctness** for
-this bug (credit dispatch keys by token/sessionUID, not connection). Keep it (validated, prevents
-QP cross-talk); it stays UNCOMMITTED until Stage 1 validates, then commit together or re-evaluate
-simplifying its ownership. Do not remove it as part of this work.
+**Status: KEPT, committed with Stage 0a. Reclassified as fault-isolation hardening, not
+correctness for this bug.**
+
+### How it works
+`outgoingConnections[]` is a 64-slot pool keyed by `(peerNodeId, peerHost, peerControlPort,
+trafficClass)`. Before the fix `TupleSinkServiceFindOutgoingPeerConnection` returned the FIRST
+endpoint/class match regardless of user, so two concurrent sessions to the same peer shared one
+QP / send-CQ / recv-CQ. The fix added `ownerServiceSessionId`
+(`remote_execution_peer_transport_rdma.c:591`) and made the finder (`:6310`) a three-way scan,
+gated on `TupleSinkServiceTrafficClassRequiresSessionOwnership` (`:2482`):
+- **prefer-own** (`:6344`) — pins a session to the connection it is mid-way through establishing
+  across the multi-step async open.
+- **adopt-free** (`:6350`, stamp at `:6364`) — reuse a released, still-established sibling in one
+  step.
+- **skip owned-by-other** (`:6355`) — never co-own; fall through to NULL → create new.
+
+Release is `TupleSinkServiceReleaseOutgoingPeerConnectionsForSessionRdma` (`:8413`), called from
+the `ResetSession` funnel: it flips `owner → 0` but KEEPS the RDMA connection established (no
+teardown, no generation bump, no QP/CQ churn). It is a full pool scan, not a per-stream unbind,
+because a session may bind several payload streams to its one owned connection (`:8404`).
+`CRITICAL_CONTROL` intentionally stays shared (its `localMailbox` ring is a correlated,
+multiplex-safe shared ring). The predicate at `:2482` is a one-line scope toggle.
+
+### Why we originally thought we needed it, and what survived
+The **stated** motivation is written into `:2475-2477`: *"only PAYLOAD-class connections carry a
+per-session recv-CQ that must not be shared."* That was the HYPOTHESIS, and Test 2 **falsified**
+it — separate connections, separate recv-CQs, identical `RECV_CQ_FAILURE`.
+
+Root cause of the falsification: the credit doorbell dispatch keys off the **token** carried in
+the RDMA WRITE-WITH-IMMEDIATE's immediate data, not off the connection the completion arrived on.
+`TupleSinkServiceDispatchPeerPayloadDoorbell` (`tuple_sink_service_process.c:27385`) decodes it via
+`HomerDecodePayloadDoorbellToken` (`:27401`) → `(streamIndex, tokenGeneration)` → `streamEntries[
+streamIndex]`, then applies credit in `HomerServiceApplyPayloadSenderCreditDoorbell` (`:27330`).
+Credits therefore route to the right stream even on a shared connection. In the original bug the
+dispatcher's binding checks all PASSED; the error came from `Apply`'s `observed > postedTail`. The
+credit was delivered to the correct stream carrying the WRONG VALUE — the other session's
+`consumedHead`, read from the shared landing ring. Connection identity is a *transport-lane*
+property; the bug lived in *per-stream state*.
+
+Reasons that DO survive, and are why we keep it:
+1. **Fault isolation / blast radius.** The connection is the reset unit: one session's payload-
+   connection error → reset → `CM DISCONNECTED` → every session bound to it dies. Sharing means one
+   basebackup's fault kills its innocent neighbour. Holds regardless of credit-routing correctness.
+2. **Teardown safety.** Without an owner, session A's `ResetSession` tears down (or generation-
+   bumps) a connection session B is actively using. Owner + release-to-free makes teardown
+   well-defined.
+3. **Restored strength of the dispatcher's binding check.** The stream stores `peerConnectionHandle`
+   + connection generation and the dispatcher validates them; under sharing that check degenerates
+   to "yes, that's the one connection" and cannot discriminate.
+4. (Softer) Two concurrent multi-GB streams sharing a QP serialize their RDMA WRITEs and interleave
+   their credit WIMMs — head-of-line coupling.
+
+**Open item:** the comment at `:2475-2477` still states the falsified recv-CQ rationale. It must be
+rewritten to say *fault isolation + teardown safety*. Proving the binding is strictly unnecessary
+would require reverting it and re-running the concurrent test; keeping it is the safe default.
+
+## Follow-up cleanups after Stage 1 (mirror-slot / vestigial singleton)
+
+Done as a post-Stage-1 cleanup pass. Recorded here because it turned up a real defect, not just
+style.
+
+**What was actually wrong (an earlier read of this was mistaken).** The mirror-slot cache on
+`HomerDpuDmaRingRuntime` is NOT write-only: `HomerDpuDmaResolveMirrorSlot`
+(`homer_service_dpu_dma.c:4038`) does short-circuit on it, and two consumers read it as the
+AUTHORITATIVE geometry — `HomerDpuDmaMirroredByteRangeMatchesRingFill` (`:4497`, computes
+`releasedByteTail % dpuMirrorStorageBytes` and address-checks against `dpuMirrorStorageBase`) and
+the byte-ring pull-acceptance guard (`:9883`). Deleting the cache, as first proposed, would have
+broken both. Only `dpuMirrorSlotIndex` was genuinely dead. The `ClearMirrorSlotCache` comment
+claiming the cache is "advisory" was itself wrong and has been corrected.
+
+**The real defect the const-casts pointed at.** `HomerDpuDmaFillMirroredByteRange` declared a
+`const HomerDpuDmaEngine *` and then cast it away, because it genuinely mutates the cache. Chasing
+that lie surfaced:
+- `HomerDpuDmaCopyByteRingSmokeBuffer` still `memcpy`'d from the retired singleton
+  `engine->mirrorRing` — a buffer nothing writes since Stage 1a-mirror redirected PULL into the
+  per-session slot. Its byte-ring pull verification was silently reading stale zeros.
+- **`dpu-tcp-transport-smoke-bin` did not COMPILE at Stage-1 HEAD** (`too few arguments to
+  HomerDpuDmaSubmitByteRingSmokePull` — Stage 1a-mirror widened the signature but never updated the
+  two smoke call sites). Nobody noticed because every validation built only `service-bin`.
+  **Caveat for future stages: build the smoke targets too, not just `service-bin`.**
+
+**Changes applied:** removed the write-only `dpuMirrorSlotIndex`; corrected the cache comments;
+de-consted `HomerDpuDmaFillMirroredByteRange` + `HomerDpuDmaMirroredByteRangeReadyForServiceSink`
+and dropped the casts; repointed `HomerDpuDmaCopyByteRingSmokeBuffer` at the bound MIRROR slot; the
+standalone smoke now performs its own MIRROR bind (never unbound — engine teardown at process exit
+reclaims it; production MUST unbind); deleted the callerless
+`HomerDpuDmaGetByteStreamMirrorMemory`; removed the vestigial `mirrorRing` / `mirrorRingMmap` /
+`mirrorRingBytes` (buffer, DOCA mmap create/start/destroy, free).
+
+**Invariant relocated, not lost.** The 1:1 sizing invariant (a MIRROR slot's payload storage MUST
+equal the host source ring's storage so `absolute % slotStorageBytes` and `absolute %
+ringStorageBytes` coincide, carrying the host wrap-gap protocol over so no record's framing header
+straddles the mirror wrap; both from `HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`) was documented on the
+deleted `mirrorRingBytes`. It still holds — it now governs EVERY mirror slot — and has been moved to
+the `HomerDpuByteRingPoolInit` call site where `slotStorageBytes` is supplied.
+
+### Validation (July 9, 2026) — PASS
+Both DPUs rebuilt natively (aarch64 `service-bin`, `CPPFLAGS='-D_GNU_SOURCE'`); no host artifact
+changed. 4-role runbook; preflight clean before and after.
+
+- DOCA lifecycle survived the `mirrorRingMmap` removal — both DPUs logged
+  `byte-ring arena ready: regions=2 slots=8 slotStorage=8388608 slotBytes=8388672`.
+- **Slot recycling works:** the 3 sequential Test-1 runs each bound sender `purpose=0 slot=0`
+  (unbind → adopt-free reuse).
+- **Concurrent sessions take distinct slots:** sender `purpose=0 slot=0` + `slot=1`
+  (`offset=8388672`); receiver `purpose=1 slot=0` + `slot=1`.
+- Byte conservation: 23,293,876,218 / 23,293,880,826 B sequential; concurrent pair
+  23,293,894,138 B each. All 5 senders + 4 receivers rc=0.
+- No `RECV_CQ_FAILURE`, `observed>posted`, `ambiguous receive-relay`, or `pool exhausted`.
+
+**Log-reading caveat (cost us a false alarm).** Two `CM event=DISCONNECTED status=0` lines DO
+appear in the receiver-DPU log at shutdown (lines 179-180 of 183), after the last stream drained
+(`final_tail == final_head == 24831936232`), its sink+session+import were reclaimed, and just
+before `DOCA context state 2 -> 0`. `DISCONNECTED` is the SAME line in the catastrophic and the
+graceful case; what discriminates them is its position relative to drain/reclaim and whether
+`publishedTail == consumedHead` first. A bare grep for the bug's fingerprint matches normal
+shutdown. Read the surrounding lines, never the grep count.
+
+**Still UNVALIDATED at runtime:** the smoke fix itself. `HomerDpuDmaSubmitByteRingSmokePull` and
+`HomerDpuDmaCopyByteRingSmokeBuffer` are smoke-only entry points — production basebackup traffic
+does NOT exercise them, so the 4-role gate does not cover them (a validation report claiming
+otherwise was wrong). They are compile-verified only; running
+`homer_dpu_tcp_transport_smoke` per CLAUDE.md would close that gap.
 
 ## Verification (end-to-end)
 
