@@ -109,21 +109,73 @@ slots at `:3083`; waits on `slot->state == CITUS_REMOTE_EXEC_BACKEND_SPAWN_SLOT_
 `:18924`, `:18927`).
 
 **A DPU cannot signal a host process.** But the postmaster already blocks in a `select()`-style main
-loop, and the DPU **setup TCP socket is already open** between the postmaster (frontend) and its local
-DPU. So:
+loop, and it is already the TCP *client* of its local DPU's setup listener. So the DPU can wake it by
+making a watched fd readable.
 
-1. Postmaster calls a Homer frontend API at startup: DOCA-mmap its own spawn region and export it over
-   the setup TCP; keep that socket open.
-2. Add the setup socket fd to the postmaster's wait set.
-3. The DPU service DMA-writes the spawn request fields, then `REQUEST_READY` (**fields before the state
-   word, with a release barrier** — the existing submitters rely on that ordering), then writes one
-   doorbell byte on the setup socket.
-4. The postmaster wakes on the fd and runs the **existing** slot scan + `ProcessSpawnRequestSlot`.
+#### The doorbell needs a PROTOCOL, not "a byte"
+
+The setup socket already speaks a framed, typed protocol: `HomerDpuComchSetupHeader`
+(`homer_dpu_comch_abi.h:62`) = `{protocolVersion, messageKind, headerBytes, totalBytes, ...}` with
+`messageKind` in `{SETUP=1, SETUP_ACK=2, CLOSE=3, CLOSE_ACK=4}` (`:33-36`). Two problems with writing a
+raw byte onto it:
+
+1. **Framing.** TCP is a byte stream. An unframed byte injected between framed messages is a corruption
+   bug, not a notification.
+2. **Direction.** The protocol is strictly host-initiated request/response — the host sends `SETUP` /
+   `CLOSE`, the DPU only ever *replies* (`SETUP_ACK` / `CLOSE_ACK`). It never initiates. An unsolicited
+   doorbell could arrive while the host is blocked waiting for a `CLOSE_ACK`, and the host reader would
+   have to demultiplex an interleaved request/response + notification stream.
+
+**Chosen: a DEDICATED doorbell connection (Option B).**
+
+- The postmaster opens a SECOND TCP connection to the same DPU setup listener and sends
+  `HOMER_DPU_COMCH_MESSAGE_DOORBELL_ATTACH` carrying `bridgeGeneration` + `clientInstanceId` +
+  a `doorbellClass` (`SPAWN`). The DPU replies `DOORBELL_ATTACH_ACK`. Bump
+  `HOMER_DPU_COMCH_PROTOCOL_VERSION`.
+- Thereafter the connection carries **only** `HOMER_DPU_COMCH_MESSAGE_SPAWN_DOORBELL` frames,
+  DPU -> host, unsolicited, unacknowledged: a fixed 16-byte header, no payload.
+- **The receiver never parses.** On readable, the postmaster `recv()`s into a scratch buffer until
+  `EAGAIN`, discards the bytes, and rescans ALL spawn slots. Rescan is idempotent, so coalescing N
+  doorbells into one wake is correct by construction, and a framing bug cannot mis-drive the
+  postmaster — it cannot mis-parse what it does not parse. The frame is defined on the wire for
+  tooling and future extension, not for this receiver.
+- **Connection loss** => close, rescan unconditionally, reconnect with bounded backoff. A lost doorbell
+  is only possible if the connection dropped, and reconnect covers it.
+
+*Rejected (Option A): a new `messageKind` on the EXISTING setup socket.* One connection, but it forces
+the host reader to demultiplex notifications interleaved with request/response traffic, and it puts a
+protocol parser inside the postmaster.
+*Rejected (Option C): a bgworker or agent that owns the socket and raises SIGUSR1.* An extra process
+and a poll loop to solve what an already-watched fd solves.
+
+#### Two ordering invariants (correctness, not style)
+
+The slot fields travel over **PCIe DMA**; the doorbell travels over **TCP**. Nothing orders two
+different channels for you.
+
+1. **DPU side:** DMA the request fields, *wait for DMA completion*, DMA `state = REQUEST_READY` with a
+   release barrier, *wait for completion*, and only then send the doorbell. If the doorbell overtakes
+   the DMA, the postmaster scans a slot whose fields have not landed.
+2. **Host side:** read `slot->state` with acquire semantics before reading the fields — the same
+   contract today's submitters already rely on (`tuple_sink_service_process.c:18833`/`:18845` write
+   fields, then the state word, then signal).
+
+Assert the ordering with a debug check in S3.
+
+#### The sequence
+
+1. Postmaster: at startup, DOCA-mmap its own spawn region, export it over the setup TCP, and open the
+   dedicated doorbell connection.
+2. Postmaster: add the doorbell fd to its main-loop wait set.
+3. DPU: DMA the slot (fields, then `REQUEST_READY`, each awaited), then send one `SPAWN_DOORBELL`.
+4. Postmaster: wakes on the fd, drains it, runs the **existing** slot scan + `ProcessSpawnRequestSlot`.
 
 *No polling, no sleep, no background worker; the SIGUSR1 hop is replaced rather than emulated.*
-*Rejected:* a bgworker or standalone agent polling a doorbell word and raising SIGUSR1 — an extra
-process and a poll loop to solve what an already-open fd solves. *Rejected:* shortening the
-postmaster's `select()` timeout — polling by another name.
+
+**Open question (postmaster hygiene).** PostgreSQL keeps the postmaster deliberately minimal — no
+`palloc`, no `elog(ERROR)`, restricted shared-memory access. Even a parse-free `recv()` + rescan adds a
+persistent fd and a read to it. Confirm this is acceptable in `ServerLoop`, and that a failed `recv()`
+degrades to "close, rescan, reconnect" rather than anything that could fault the postmaster.
 
 ### D3 — the client opener is built on the Tier-1 basebackup template
 `HomerClientOpenSqlSessionSelectedDpu` in `homer_client.c`, cloned from the exercised selected-DPU
