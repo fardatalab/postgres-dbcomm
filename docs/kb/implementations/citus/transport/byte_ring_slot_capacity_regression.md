@@ -99,6 +99,50 @@ header where a *semantic* capacity was expected.
 ABI bump; no back-compat (prototyping rules). Validation gate: `--homer-dpu -c 1` must get past the
 abort. **COPY cannot validate anything until Problem 2 is fixed.**
 
+**Footprint subtlety (the trap for whoever touches this next).** `maxRecordBytes` INCLUDES
+`slotReservedPrefixBytes`: the service sets it to `sizeof(CitusTupleSinkTransportHeader) + negotiated`
+(`TupleSinkServiceLocalSendQueueSlotBytes`), the frontend subtracts the prefix back out, and the batch
+header carries exactly the negotiated value the validator compares. Setting it to the bare negotiated
+capacity silently reintroduces the abort, one transport header short.
+
+### Follow-up (DECIDED July 9, 2026, not yet done): finish the rename
+
+The split left `sinkHandle` carrying BOTH `localQueueSlotCapacityBytes` (= 1080, the footprint) and
+`slotCapacityBytes` (= 1024, the payload) — two fields, one name-stem, differing by exactly the
+transport prefix. **That is the same pattern as the bug this doc is about.** Renaming has direct
+defect-prevention value, not merely aesthetic value; an earlier note here claiming "no correctness
+benefit" was wrong.
+
+**But `slot` is NOT dead, and must not be swept out wholesale.** There is a genuine, live, indexed
+fixed-slot shm queue: `slotIndex = (slotSequence - 1) % queueControl->slotCount`, addressed at a stride
+of `queueControl->slotCapacityBytes` (`tuple_sink_service_process.c:16640-16642`). That is
+`CitusTupleSinkQueueControl`, the host-shm result sink used by plain `--homer` (non-DPU) pgbench — a
+working, validated path. **Homer has TWO coexisting local transports** (fixed-slot shm queue + byte
+ring), and the queue descriptor describes both. That shared vocabulary is the true origin of the
+double meaning: when the byte ring stopped being `slotCount * slotCapacityBytes`, the borrowed names
+stopped agreeing. The fix is to stop the byte-ring path borrowing the slot queue's words.
+
+Scoped rename, reusing vocabulary the code already has (`objectBytes`,
+`HomerServiceValidateOutgoingPayloadObject`):
+
+| Now | Becomes | Meaning |
+|---|---|---|
+| `stream.slotCapacityBytes`, `sinkHandle->slotCapacityBytes`, `batchHeader->slotCapacityBytes`, `requestedSlotCapacityBytes` | `maxObjectBytes` | payload a producer may fill |
+| `descriptor->maxRecordBytes`, `sinkHandle->localQueueSlotCapacityBytes` | `recordFootprintBytes` | prefix + object; what the ring reserves |
+| `slotReservedPrefixBytes` | `recordPrefixBytes` | the reserved prefix |
+| `stream.slotCount`, `requestedSlotCount` | **deleted** on the byte-ring path | vestigial since `7a2eaed53` |
+
+`maxRecordBytes` vs `maxObjectBytes` would sit one letter apart while differing by 56 bytes — a naming
+hazard introduced by the split itself. `recordFootprintBytes` removes it.
+
+**KEEP `slot` where a slot exists:** `CitusTupleSinkQueueControl`, control-region slots, DMA task slots,
+mailbox slots, backend-spawn slots, and the byte-ring POOL slots (an arena slot genuinely is a slot).
+
+Blast radius ≈ 200 occurrences (`slotCapacityBytes` 81, `slotReservedPrefixBytes` 49,
+`requestedSlotCount` 34, `requestedSlotCapacityBytes` 24, `localQueueSlotCapacityBytes` 10). Mechanical,
+compiler-verified, zero behavior change. Do it as its own commit AFTER the `--homer-dpu -c 1` gate
+passes, then re-run the same gate.
+
 Rejected alternatives:
 - *(i) descriptor carries the negotiated `payloadSlotBytes`* — **breaks** `frontend:1169`, which needs
   `slotCount * slotCapacityBytes == byteRingBytes`.
