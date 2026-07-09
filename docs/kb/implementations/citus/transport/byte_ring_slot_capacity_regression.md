@@ -246,15 +246,22 @@ Meanwhile the SHARED drain core has the correct geometric rule, which neither us
 gap iff `contiguousBytes < ops->maxRecordBytes && consumedHead + contiguousBytes <= producedTail`
 (`homer_byte_ring_sink.h:217-224`).
 
-**Consequence: the failing Test A used CLAUDE.md's plain `mode=rdma` shape, where the farnet0 HOST
-service is the receiver.** Every basebackup run we have actually validated (this morning's concurrent
-test; the mirror cleanup) used the 4-role runbook where the farnet0 **DPU** service relays. Different
-consumer, opposite interpretation. The explorer states the mechanism is *"visible in current code"* —
-i.e. in the REVERTED tree. **So the split is likely innocent of Test A's failure.** An A/B run of the
-identical command on the reverted tree is in flight to prove or refute this. Do not conclude either way
-until it reports.
+**A/B CONFIRMED (July 9, 2026): the split was INNOCENT.** The identical command on the REVERTED tree
+(citus `aadcab871`, postgres `495f94db95f`, farnet0 resynced, farnet1 DPU rebuilt) reproduces the
+failure verbatim:
+`byte-ring record unexpectedly crossed ring boundary session=1 sink=1 sequence=128
+record_bytes=1048688 contiguous=456286` — same numbers, same sequence. ~9.4 MB moved first
+(`aborted_source_tail=9437296`), i.e. it dies at **the first ring wrap**.
 
-(Whatever the A/B shows, the revert was still correct: basebackup was red and the cause was unknown.)
+The failing Test A used CLAUDE.md's plain `mode=rdma` shape, where the farnet0 **HOST** service is the
+receiver. Every basebackup run we have actually validated (the concurrent test; the mirror cleanup)
+used the 4-role runbook where the farnet0 **DPU** service relays. Different consumer, opposite
+interpretation of the same bytes.
+
+**Process lesson: the regression brief chose the wrong topology.** The correct basebackup regression is
+the 4-role DPU-relay runbook, not CLAUDE.md's `mode=rdma` example. We regression-tested a path that has
+never been validated and then blamed our own change for its failure. (The revert was still defensible —
+basebackup was red and the cause unknown — but the stated reason was wrong.)
 
 ### The naming table (this is what the pass was for)
 
@@ -377,6 +384,61 @@ or expect the bisect's "good" commits to fail for a different reason.
 
 ### Why nobody noticed
 Validation pivoted to basebackup on July 7 (checkpoint "Step 7"). No COPY run has happened since.
+
+---
+
+---
+
+## Problem 3 — the selected-DPU producer's wrap signal is FATAL to the host-service receiver (CONFIRMED)
+
+**Status: open. Pre-existing, not caused by any refactor. Confirmed by A/B on the reverted tree.**
+
+### Symptom
+Any remote-RDMA basebackup whose receiver is a **host** Homer service dies at the **first ring wrap**
+(~8 MiB in), with:
+```
+byte-ring record unexpectedly crossed ring boundary session=1 sink=1 sequence=128
+  record_bytes=1048688 contiguous=456286
+```
+Then a peer reset and `CM event=DISCONNECTED`. The `pg_basebackup` client **hangs with no error**
+(`rc=124` under `timeout`), requiring a manual kill.
+
+### Mechanism — two consumers, opposite readings of the same bytes
+`pg_basebackup` is now MANDATORILY a selected-DPU producer
+(`HomerClientOpenBaseBackupStreamSelectedDpu`, unconditional). On wrap it writes a **pre-wrap transport
+header whose advertised record length deliberately EXCEEDS the trailer**. Its own comment
+(`homer_client.c:4576-4583`):
+
+> *"The pre-wrap bytes carry the regular next-record transport header, not a padding record. The DPU
+> proves wrap when this header's advertised record length is larger than trailerBytes, then parses the
+> same record again at offset zero."*
+
+- **DPU relay:** `recordBytes > trailerBytes` ⇒ *wrap proven; re-parse at offset 0.* ✅
+- **Host service** `HomerServicePumpIncomingByteRingPayload`: `recordBytes > contiguousBytes` ⇒ **fatal**
+  (`tuple_sink_service_process.c:32357-32359`). It only takes the skip-trailer path when `!headerReady`
+  (`:32339-32346`), and the pre-wrap header makes `headerReady` TRUE. ❌
+- **Shared drain core** `HomerByteRingSinkDrain` has the CORRECT geometric rule, which neither uses:
+  gap iff `contiguousBytes < ops->maxRecordBytes && consumedHead + contiguousBytes <= producedTail`
+  (`homer_byte_ring_sink.h:217-224`). ✅
+
+### Consequence
+**CLAUDE.md's documented "Remote RDMA blackhole" command has been broken for any database larger than
+~8 MiB** since basebackup became mandatorily selected-DPU. It only ever worked with the DPU-relay
+receiver. This is the THIRD documented-but-broken path found today (with `slots=8,bytes=8388608` and
+b2b COPY).
+
+### Fix shape (not yet implemented)
+Make `HomerServicePumpIncomingByteRingPayload` use the shared geometric rule instead of its own check:
+treat `recordBytes > contiguousBytes` as *wrap proven* when
+`contiguousBytes < maxRecordBytes && consumedHead + contiguousBytes <= publishedTail`, skip the trailer,
+and re-parse at offset 0 — i.e. converge the host receiver onto `HomerByteRingSinkDrain`'s semantics.
+The receiver needs the stream's max record footprint to do this; it has the geometry.
+**Do NOT change the wrap-gap protocol or the producer.** Both are correct; the host receiver is the
+odd one out. Also: this is a strong argument for deleting the bespoke receiver loop and calling the
+shared drain core, which is presumably why the shared core exists.
+
+Secondary: the client hang on server-side abort (see the error-propagation gap) bit us a THIRD time here
+and cost a manual `kill -9`.
 
 ---
 
