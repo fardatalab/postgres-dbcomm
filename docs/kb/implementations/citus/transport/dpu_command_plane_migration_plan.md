@@ -66,20 +66,54 @@ not-implemented. Build on the Tier-1 client template instead.
 
 ## Target architecture — symmetric frontends
 
+**Every descriptor role this architecture needs ALREADY EXISTS** (`homer_dpu_bridge_abi.h:78-95`) —
+a strong sign the design was anticipated. Nothing new is needed in the bridge ABI:
+
+| Role | Meaning | Direction |
+|---|---|---|
+| 1 | `FRONTEND_CONTROL_SLOT` | DPU pulls the client's control/command requests |
+| 2 | `BACKEND_COMMAND_MAILBOX` | DPU writes commands into the backend |
+| 3 | `BACKEND_COMPLETION_MAILBOX` | DPU reads completions from the backend |
+| 5 | `SQL_RESULT_BYTE_RING` | host-produced; DPU pulls/mirrors the backend's result bytes |
+| 6 | `FRONTEND_COMPLETION_EVENT` | DPU writes completions back into client memory |
+| 7 | `PAYLOAD_BYTE_RING_DPU_TO_HOST` | DPU writes decoded tuples into the client's result ring |
+
 | Process | Exports to its LOCAL DPU |
 |---|---|
-| `pgbench` (node A) | command ring, completion ring, role-7 result ring |
-| socketless PG backend (node B) | command mailbox (role 2), completion mailbox (role 3), result byte-ring |
+| `pgbench` (node A) | role 1 (control slot), role 6 (completion events), role 7 (result ring) |
+| socketless PG backend (node B) | role 2 (command mailbox), role 3 (completion mailbox), role 5 (result byte-ring) |
 | postmaster (node B) | the backend-spawn region (once, at startup) |
 
 The two DPU services talk RDMA to each other. No host Homer service is in the `--homer-dpu` path.
 
-Bridge descriptor roles for the backend mailboxes **already exist** in the ABI: role 2 = backend
-command, role 3 = backend completion (`homer_dpu_bridge_abi.h:81-82`, shapes at `:290`, `:295`).
+> **CORRECTED on review.** An earlier draft said the client exports a "command ring" and a
+> "completion ring". **There is no such role.** The client's commands are pulled from its role-1
+> control slot; its completions are written back via role-6 completion events. Read the role enum,
+> not my summary of it.
 
 ---
 
 ## Design decisions
+
+> ## ⚠ INVARIANT — DMA BEFORE DOORBELL (correctness, not style)
+>
+> The spawn-slot fields travel over **PCIe DMA**. The doorbell travels over **TCP**. **Nothing orders
+> two different channels for you.** If the doorbell overtakes the DMA, the postmaster scans a slot
+> whose fields have not landed and forks a backend with garbage `dbOid`/`userOid`.
+>
+> **DPU side, in this exact order:**
+> 1. DMA the request fields → **await DMA completion**
+> 2. DMA `state = REQUEST_READY` (release) → **await DMA completion**
+> 3. *Only then* send the doorbell frame.
+>
+> **Host side:** read `slot->state` with **acquire** semantics before reading any field. This is the
+> same contract today's submitters already rely on (`tuple_sink_service_process.c:18833`/`:18845`
+> write fields, then the state word, then signal).
+>
+> Assert both halves with debug checks in S3. This is the single easiest thing to get wrong in the
+> whole plan, and it fails intermittently and unreproducibly.
+
+
 
 ### D1 — the spawned backend becomes a Homer frontend (INVERTS the Tier-2 arrangement)
 Under today's (Tier-2) `SELECTED_DPU_DMA`, the **frontend** creates and exports the mailboxes
@@ -126,12 +160,20 @@ raw byte onto it:
    doorbell could arrive while the host is blocked waiting for a `CLOSE_ACK`, and the host reader would
    have to demultiplex an interleaved request/response + notification stream.
 
-**Chosen: a DEDICATED doorbell connection (Option B).**
+**Chosen: a DEDICATED doorbell connection on its OWN LISTENER (Option B).**
 
-- The postmaster opens a SECOND TCP connection to the same DPU setup listener and sends
-  `HOMER_DPU_COMCH_MESSAGE_DOORBELL_ATTACH` carrying `bridgeGeneration` + `clientInstanceId` +
-  a `doorbellClass` (`SPAWN`). The DPU replies `DOORBELL_ATTACH_ACK`. Bump
-  `HOMER_DPU_COMCH_PROTOCOL_VERSION`.
+> **CORRECTED on review.** An earlier draft said "a second connection to the same setup listener".
+> **That would deadlock the DPU.** The setup server is a SERIAL state machine with a single
+> `clientFd` (`homer_service_dpu_setup_tcp.c:48`, accept guarded by `if (server->clientFd < 0)` at
+> `:223`): it accepts one client, reads, acks, closes, then accepts the next. Setup connections are
+> **transient** — which is exactly why two concurrent basebackup senders work: each connects,
+> exports, disconnects, and the *import* outlives the connection. A PERSISTENT doorbell connection
+> would occupy `clientFd` forever and starve every subsequent setup accept.
+
+- The DPU service opens a **separate doorbell listener** (its own port, default `9728`). The
+  postmaster connects to it and sends `HOMER_DPU_COMCH_MESSAGE_DOORBELL_ATTACH` carrying
+  `bridgeGeneration` + `clientInstanceId` + a `doorbellClass` (`SPAWN`). The DPU replies
+  `DOORBELL_ATTACH_ACK`. Bump `HOMER_DPU_COMCH_PROTOCOL_VERSION`.
 - Thereafter the connection carries **only** `HOMER_DPU_COMCH_MESSAGE_SPAWN_DOORBELL` frames,
   DPU -> host, unsolicited, unacknowledged: a fixed 16-byte header, no payload.
 - **The receiver never parses.** On readable, the postmaster `recv()`s into a scratch buffer until
@@ -142,25 +184,11 @@ raw byte onto it:
 - **Connection loss** => close, rescan unconditionally, reconnect with bounded backoff. A lost doorbell
   is only possible if the connection dropped, and reconnect covers it.
 
-*Rejected (Option A): a new `messageKind` on the EXISTING setup socket.* One connection, but it forces
-the host reader to demultiplex notifications interleaved with request/response traffic, and it puts a
-protocol parser inside the postmaster.
+*Rejected (Option A): a new `messageKind` on the EXISTING setup socket.* It forces the host reader to
+demultiplex notifications interleaved with request/response traffic, puts a protocol parser inside the
+postmaster, and — decisively — a persistent connection starves the serial setup server.
 *Rejected (Option C): a bgworker or agent that owns the socket and raises SIGUSR1.* An extra process
 and a poll loop to solve what an already-watched fd solves.
-
-#### Two ordering invariants (correctness, not style)
-
-The slot fields travel over **PCIe DMA**; the doorbell travels over **TCP**. Nothing orders two
-different channels for you.
-
-1. **DPU side:** DMA the request fields, *wait for DMA completion*, DMA `state = REQUEST_READY` with a
-   release barrier, *wait for completion*, and only then send the doorbell. If the doorbell overtakes
-   the DMA, the postmaster scans a slot whose fields have not landed.
-2. **Host side:** read `slot->state` with acquire semantics before reading the fields — the same
-   contract today's submitters already rely on (`tuple_sink_service_process.c:18833`/`:18845` write
-   fields, then the state word, then signal).
-
-Assert the ordering with a debug check in S3.
 
 #### The sequence
 
@@ -172,10 +200,38 @@ Assert the ordering with a debug check in S3.
 
 *No polling, no sleep, no background worker; the SIGUSR1 hop is replaced rather than emulated.*
 
-**Open question (postmaster hygiene).** PostgreSQL keeps the postmaster deliberately minimal — no
-`palloc`, no `elog(ERROR)`, restricted shared-memory access. Even a parse-free `recv()` + rescan adds a
-persistent fd and a read to it. Confirm this is acceptable in `ServerLoop`, and that a failed `recv()`
-degrades to "close, rescan, reconnect" rather than anything that could fault the postmaster.
+**Postmaster hygiene (decided, not open).** Upstream PostgreSQL keeps the postmaster minimal out of
+extreme engineering caution; we do not have to follow that strictly. **The bar is: the normal path must
+never fatally break the postmaster** — and if it does, that is our bug, not a reason to redesign. A
+failed `recv()` degrades to close / rescan / reconnect. Keep the receiver parse-free so there is no
+input a malformed stream can exploit.
+
+### D4 — the postmaster exports a per-node ARENA; backends inherit it by `fork()`
+
+Setup connections are **transient and serialised** (see D2), so a per-backend export *would* work
+mechanically: connect, export, disconnect; the import outlives the connection. But every socketless
+backend would then need its own DOCA device context, opened on the session-open path, and every
+concurrent session would consume one of the engine's `hostMmapImportCapacity` imports.
+
+**Better, and symmetric with the DPU byte-ring pool we already built:** the postmaster creates ONE
+arena at startup — the spawn region plus `N` preallocated sets of {command mailbox (role 2),
+completion mailbox (role 3), result byte-ring (role 5)} — DOCA-exports it once, and declares all the
+descriptors up front. Backends are `fork()`ed from the postmaster **after** the arena is `mmap`ed, so
+they inherit the mapping for free and simply **bind a slot index**. Fatal on exhaustion, exactly as
+`HomerDpuByteRingBind` does.
+
+- One DOCA context per node, not per backend. One export. One import. Zero per-backend setup cost.
+- **Dissolves open question 2** (does the backend need DOCA at startup? — no) **and open question 3**
+  (who owns the result byte-ring? — the arena; the backend binds a slot).
+- Session-open latency becomes just the fork.
+
+*Cost:* descriptors must be preallocated for a maximum concurrent-session count, so `ringCount` and
+`hostMmapImportCapacity` need sizing (`homer_dpu_bridge_abi.h:119`, `homer_service_dpu_dma.h:57`).
+Same trade the byte-ring pool already makes, and the same fatal-on-exhaustion policy.
+
+*Alternative (rejected for now):* per-backend export. Simpler conceptually, and it is closer to
+"the backend is literally a Homer frontend", but it pays DOCA init per session and burns an import per
+session. Revisit only if the arena's preallocation proves awkward.
 
 ### D3 — the client opener is built on the Tier-1 basebackup template
 `HomerClientOpenSqlSessionSelectedDpu` in `homer_client.c`, cloned from the exercised selected-DPU
@@ -202,9 +258,9 @@ mapping to the DPU, the DPU DMA-writes into it, the host reads the value back. C
 for D2. Do it because it costs minutes, not because the design depends on the answer.
 
 ### S1a — client-side `HomerClientOpenSqlSessionSelectedDpu` (clone the Tier-1 template)
-- **S1a.1** New entry point in `src/bin/homer_client.c`. Export buffer carrying: frontend control slot
-  (role 1), command ring, completion ring, role-7 result ring. Emit an `OP_COMMAND_SESSION` open into
-  the DPU control slot.
+- **S1a.1** New entry point in `src/bin/homer_client.c`. Export buffer carrying role 1 (frontend
+  control slot), role 6 (frontend completion event), role 7 (result ring). Emit an
+  `OP_COMMAND_SESSION` open into the control slot.
 - **S1a.2** Service: admit `OP_CLIENT_SQL_SESSION` arriving over the DPU control slot. Relax by
   **allow-list**, not by deleting checks: `TupleSinkServiceOpenRequestNeedsAsyncLocalControl`
   (`tuple_sink_service_process.c:34817`) and `TupleSinkServiceProgressCommandOpenAsyncOp` (`:35172`).
@@ -229,12 +285,14 @@ receive this response." Must be linkable into both `libhomer_client.a` and the P
 **Gate:** the selected-DPU basebackup regression still passes (the module's only validated consumer at
 this point). Build all targets, including the smokes.
 
-### S2 — backend becomes a Homer frontend (D1)
-- **S2.1** The spawned socketless backend CREATES its command mailbox, completion mailbox, and result
-  byte-ring (rather than `shm_open`ing frontend-created ones).
-- **S2.2** It exports all three to its LOCAL DPU via the S1b module, using bridge roles 2 and 3 for the
-  mailboxes and the existing host->DPU payload role for the result ring.
-- **S2.3** Retire the Tier-2 `SELECTED_DPU_DMA` mailbox-open path in
+### S2 — the node's Homer frontend is the postmaster; backends bind arena slots (D1 + D4)
+- **S2.1** Postmaster creates the arena at startup: spawn region + `N` x {role-2 command mailbox,
+  role-3 completion mailbox, role-5 result byte-ring}. `mmap` it BEFORE any fork.
+- **S2.2** Postmaster DOCA-exports the whole arena once via the S1b module, declaring every descriptor.
+- **S2.3** The spawned backend binds a slot index (prefer-own / adopt-free / fatal-on-exhaustion,
+  mirroring `HomerDpuByteRingBind`). It performs **no DOCA and no setup connection**; it inherited the
+  mapping through `fork()`.
+- **S2.4** Retire the Tier-2 `SELECTED_DPU_DMA` mailbox-open path in
   `remote_execution_backend_bridge.c` (`:2572`-`:2669`) — superseded, and never exercised.
 
 **Gate:** the DPU service's engine shows a host mmap import for the backend's result ring
@@ -302,13 +360,21 @@ delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_
 
 1. **`backendCpu`** (D3): carry it through the DPU control slot into the DPU-built spawn request, or use
    service policy? Decide in S1a.
-2. **Does the socketless backend need DOCA at startup?** Under D1 it must export its rings, so yes. That
-   adds a DOCA dependency to every Homer backend. Acceptable per the stated intent, but it means a
-   backend cannot start if DOCA init fails — decide the failure policy.
-3. **Result byte-ring ownership.** Today the service creates the producer `sendQueue`. Under D1 the
-   backend must own and export it. Audit what else reads `stream.sendQueue` on the service side.
-4. **Postmaster wait-set surgery** (S3.2) is a Postgres-fork change. Confirm where `ServerLoop` builds
-   its fd set, and that adding one fd is safe with respect to `DetermineSleepTime()`.
+2. ~~Does the socketless backend need DOCA at startup?~~ **Dissolved by D4** — no. Only the postmaster
+   does DOCA.
+3. ~~Result byte-ring ownership.~~ **Dissolved by D4** — the arena owns it; the backend binds a slot.
+   Still audit what reads `stream.sendQueue` on the service side.
+4. **Arena sizing.** `ringCount` per import (`homer_dpu_bridge_abi.h:119`) and
+   `hostMmapImportCapacity` (`homer_service_dpu_dma.h:57`) bound how many sessions one export can
+   declare. Size for the target concurrency; fatal on exhaustion.
+5. **Postmaster wait-set surgery** (S3.2) is a Postgres-fork change. Confirm where `ServerLoop` builds
+   its fd set. The bar is "never fatally break the postmaster on the normal path"; upstream's stricter
+   minimalism is not a constraint we adopt.
+6. **fd hygiene.** The postmaster's doorbell fd must be closed in every forked child, or a backend
+   outliving the postmaster keeps the DPU's doorbell connection alive.
+7. **Trust boundary.** After S3 the DPU DMA-writes `dbOid`/`userOid` into a spawn slot, so the DPU is
+   now inside the trust boundary for backend spawn (previously a local host process was). Acceptable
+   for a prototype; name it rather than discover it.
 
 ## Standing risks
 
