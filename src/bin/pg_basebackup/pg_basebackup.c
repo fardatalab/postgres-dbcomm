@@ -2369,12 +2369,14 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
  * the DPU publishes the EOS terminal (entryState=CLOSED, surfaced as *streamComplete),
  * then close so CLOSE_ACK detaches.  No libpq/replication flow is involved.
  *
- * Correlation (must match the far sender's session identity, or the DPU RECEIVE-bind
- * never arms): destinationNodeId == the sender target's node=N; databaseOid/userOid ==
- * the sender backend's MyDatabaseId/GetUserId; slotCount/payloadCapacityBytes == the
- * sender geometry (same-storage constraint for the position-preserving relay).  The DPU
- * setup endpoint/device come from HOMER_FRONTEND_DPU_SETUP_HOST/_PORT/HOMER_FRONTEND_
- * DOCA_DEV_PCI (point these at the LOCAL farnet0 DPU).
+ * Correlation (must match the far sender's session identity, or the DPU
+ * RECEIVE-bind never arms): destinationNodeId == the sender target's node=N;
+ * databaseOid/userOid == the sender backend's MyDatabaseId/GetUserId;
+ * payloadCapacityBytes == the sender object-capacity request. slotCount remains
+ * only the retained Homer OpenSession requestedSlotCount/reopen-check field and
+ * is a no-op for byte-ring geometry; byte-ring storage comes from descriptors.
+ * The DPU setup endpoint/device come from HOMER_FRONTEND_DPU_SETUP_HOST/_PORT/
+ * HOMER_FRONTEND_DOCA_DEV_PCI (point these at the LOCAL farnet0 DPU).
  */
 static void
 RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots, uint32 payloadBytes,
@@ -2404,7 +2406,7 @@ RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots,
 	if (!HomerClientOpenBaseBackupReceiveStreamSelectedDpu(&options, &stream, error, sizeof(error)))
 		pg_fatal("homer receive: could not open receive-consume session: %s", error);
 
-	pg_log_info("homer receive: consuming basebackup stream node=%d db=%u user=%u slots=%u bytes=%u tag=%u",
+	pg_log_info("homer receive: consuming basebackup stream node=%d db=%u user=%u requested_slots=%u bytes=%u tag=%u",
 				nodeId, dbOid, userOid, slots, payloadBytes, launchDiscriminatorTag);
 
 	/*
@@ -2489,9 +2491,11 @@ main(int argc, char **argv)
 	int			c;
 
 	/*
-	 * Homer receiver launcher state (--homer-receive and its correlation/geometry
-	 * arguments).  Defaults for slots/bytes match the DPU basebackup runbook geometry
-	 * (slots=8, bytes=8388608); node/db/user must be provided to match the far sender.
+	 * Homer receiver launcher state (--homer-receive and its correlation/capacity
+	 * arguments). --homer-slots is retained only for the Homer OpenSession
+	 * requestedSlotCount field and is a no-op for byte-ring geometry; --homer-bytes
+	 * is the basebackup object payload capacity. node/db/user must be provided to
+	 * match the far sender.
 	 */
 	bool		homer_receive = false;
 	int32		homer_node = 0;
@@ -2734,7 +2738,7 @@ main(int argc, char **argv)
 			pg_fatal("--homer-receive requires --homer-node, --homer-database-oid, and --homer-user-oid "
 					 "matching the far sender's session identity");
 		if (homer_slots == 0 || homer_bytes == 0)
-			pg_fatal("--homer-receive requires nonzero --homer-slots and --homer-bytes matching the sender geometry");
+			pg_fatal("--homer-receive requires nonzero --homer-slots and --homer-bytes matching the sender request");
 
 		RunHomerReceiveConsume(homer_node, homer_database_oid, homer_user_oid, homer_slots, homer_bytes, homer_tag);
 		exit(0);
