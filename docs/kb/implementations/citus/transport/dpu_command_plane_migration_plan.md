@@ -654,22 +654,111 @@ delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_
 
 ---
 
-## Latent hazard found while mapping the DPU control path (record, do not fix yet)
+## ✅ FIXED — the staged-command wedge (citus `0efd12c50`, `584e01dcb`)
 
-**`POLL_COMMAND_COMPLETION` is DMA-accepted off the DPU control slot but never dispatched.**
-`homer_service_dpu_dma.c:9825` accepts it as a valid staged request kind, but **both** staged
-consumers drop it:
-- `HomerServiceDpuStageOneBackendCommandForPublish` (`tuple_sink_service_process.c:39135`) takes only
-  `START_COMMAND`, returning at `:39185` for anything else;
-- `HomerServiceDpuStageOneCommandForDispatch` (`:39537`) explicitly **skips** both `START_COMMAND`
-  and `POLL_COMMAND_COMPLETION` at `:39569`.
+### The bug, and why it was worse than "a client hangs"
 
-So a client that submits `POLL_COMMAND_COMPLETION` over the DPU control slot has its slot consumed and
-never answered — **a silent hang**, the same failure signature that has now cost four investigations.
-Benign today only because the peer completion ring superseded `POLL` as the normal completion path
-(the old `POLL_COMMAND_COMPLETION` peer path is retained as fallback/debug). **Before S4**, either
-reject it loudly at the DMA accept, or dispatch it. Do not leave a request kind that is accepted and
-then silently discarded.
+`HomerDpuDmaCopyNextStagedCommand` takes a **`const` engine**: it **PEEKS**, and always returns the
+**first** ring (import order, then ring order) whose `stagedCommandSlotValid` is set. The
+staged-command queue is therefore strictly **head-of-line across the whole engine**. Only
+`HomerDpuDmaReleaseStagedCommandSlot` pops, and the service has exactly **two** release sites:
+
+| Release site | Reached for |
+|---|---|
+| `HomerServiceDpuStageOneBackendCommandForPublish` (`:39264`) | `START_COMMAND` only |
+| `HomerServiceDpuStageOneCommandForDispatch` (`:39623`) | only *after* skipping **both** `START` and `POLL` |
+
+The DMA layer accepts five kinds (`homer_service_dpu_dma.c:9825`): `OPEN_SESSION`, `CLOSE_SESSION`,
+`REPORT_POST_COMMAND_STATE`, `START_COMMAND`, `POLL_COMMAND_COMPLETION`. **Two exclusions, one
+alternate consumer.** The stagers normally unwedge each other — publish leaves the head if it is not
+START, dispatch leaves it if it is — *because every kind has exactly one owner*. A staged `POLL` had
+no owner: it sat at the head forever and **stalled control processing for every ring on that
+service**, not just its own session.
+
+The old comment claimed START/POLL were "owned by the explicit backend-command and backend-completion
+actions". The START half was true. **The POLL half described a consumer that was never written.**
+
+Latent, not live: nothing emits `POLL` over a DPU control slot today (sole producer is the deprecated
+host-SHM `homer_frontend_control.c:1271`). But the DMA layer *accepts* it — a contract — and S4/S6
+make the DPU control slot the primary command channel.
+
+### The fix: close the partition, don't special-case POLL
+
+The dispatch stager now skips **only `START`** and becomes the **catch-all**. Everything else falls
+through to `TupleSinkServiceDispatchLocalControlSlot`, which already handles `POLL`
+(`TupleSinkServiceHandlePollCommandCompletion`, `:37942`) and whose `default:` arm turns any *future*
+accepted-but-unhandled kind into an error response rather than a wedge.
+
+*Rejected:* rejecting `POLL` at the DMA accept sets `engine->fatalError` — kills the service for a
+request that is legal on the host-SHM path. *Rejected:* synthesizing an error response hard-codes
+"the DPU cannot POLL" when the dispatcher plainly can.
+
+> **⚠ STAGED-COMMAND OWNERSHIP INVARIANT.** The set of request kinds the DMA layer accepts must be
+> PARTITIONED, exactly one owner each: `START_COMMAND` → the backend-command publish action;
+> **everything else → the dispatch stager (catch-all)**. A kind skipped by both is never released and
+> stalls the engine-wide head. **If you ever add an explicit `POLL` consumer** (the "backend-completion
+> action" the old comment imagined), you MUST re-exclude `POLL` from the dispatch stager *in the same
+> commit*, or it will be dispatched twice. This is stated at both stagers in code.
+
+### Two clarifications worth keeping
+
+- **The dispatcher's `default:` is NOT an assertion.** `TupleSinkServicePumpControlSlots` CASes a
+  `REQUEST_READY` host-SHM slot and dispatches it **without validating `requestKind` first**, so a host
+  client writing garbage into its control slot reaches `default:` today. The layering is: the DMA
+  accept's own `default:` is the **hard** guard (`engine->fatalError`, an unrecognised kind never
+  stages); the dispatcher's `default:` is the **soft net** (error response, not a wedge). In a service
+  that must not die on bad input, "assert it never happens" would be the wrong shape.
+- **Why a stager AND a dispatcher.** The DMA engine pulls into a small fixed pool of command-pull
+  staging buffers (`commandPullBufferCount`) — scarce, engine-owned, transient. The **stager** copies
+  the request into the service's own `stagedCommandDispatchSlots[]` and **releases the engine buffer
+  immediately**, so a slow async dispatch (an `OPEN_SESSION` can sit in the peer-open state machine for
+  many scheduler passes) cannot hold a pull buffer hostage and stall all command pulls. The
+  **dispatcher** then runs the semantic handler against the durable copy. They are also separate
+  grantable scheduler actions with independent capacity checks.
+
+### Does this constrain the eventual Citus-backend COPY overhaul? No — it helps.
+
+That path (`homer_frontend_control.c`) talks to the **host-SHM** control region and reaches the
+dispatcher via `TupleSinkServicePumpControlSlots`. This change touches only what the *DPU-staged* path
+forwards. If that backend is later moved onto a DPU control slot, its `POLL` will now be **dispatched
+instead of wedging the service**. The only cost is the one-line re-exclusion above, if a dedicated POLL
+consumer is ever written.
+
+### A liveness guard for the CLASS of bug (citus `584e01dcb`)
+
+Nothing would have caught the *next* partition hole: a staged command with no consumer is accepted,
+valid, and immortal. So the stager now tracks the head's identity
+(`bridgeGeneration`, `importIndex`, `ringIndex`, `commandOrdinal`) across consecutive observations and
+**warns once**, naming the `requestKind`, if it survives
+`HOMER_SERVICE_DPU_STAGED_HEAD_STALL_WARN_OBSERVATIONS` (default 1,000,000). Diagnostic only — it never
+fails the service — and it counts only after a free dispatch slot is secured, i.e. only when it *could*
+have consumed the head.
+
+**Validated by manufacturing a real wedge, not by inspection.** A farnet0-DPU-only build whose dispatch
+stager also skipped `OPEN_SESSION` (a kind the S1a gate really sends), threshold lowered to 1000:
+
+```
+tuple-sink service: WARNING staged-command head has not been released after 1000 observations:
+  requestKind=1 import=0 ring=0 ordinal=0 bridge_generation=11224976018495102. ...
+```
+`requestKind=1` is `OPEN_SESSION` — the sabotaged kind. It warned once, and **before** the client's own
+timeout. Then the DPU source was restored and both regressions confirmed **zero** warnings (S1a gate;
+4-role basebackup `delivered_bytes=23233738650`, `CLOSE_ACK`, rc=0).
+
+**Evidence for the original bug**, from an A/B with a temporary client probe that emitted one `POLL`
+over a DPU control slot before the session open (probe reverted, not committed):
+
+```
+PRE-FIX   POLL-PROBE: no usable response: timed out waiting for ... probe response
+          pgbench: could not open ...: timed out waiting for ... open ... response
+          farnet0 DPU log: ZERO "dpu control slot" lines
+          -> the POLL never dispatched AND the OPEN behind it never dispatched.
+
+POST-FIX  POLL-PROBE: ... poll completion referenced an unknown compatibility session id
+          [homer-service] dpu control slot: POLL_COMMAND_COMPLETION session=999999 sequence=1
+          [homer-service] dpu control slot: OPEN_SESSION opKind=2 ...
+          -> a real semantic response, DMA'd back; the OPEN behind it proceeded.
+```
 
 ## Open questions
 
