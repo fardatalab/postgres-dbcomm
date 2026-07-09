@@ -310,6 +310,26 @@ static int32 homer_peer_node = 1;
  * in-band EOS). It requires --homer, a remote peer, and -M simple.
  */
 static bool homer_dpu_mode = false;
+
+/*
+ * Command-plane S1a: --homer-dpu-command opens the SQL COMMAND session against the
+ * client's LOCAL DPU (a role-1 control slot exported over the DPU setup TCP socket)
+ * instead of a mapped host-service control region. No host Homer service takes part in
+ * the command open.
+ *
+ * Deliberately a SEPARATE flag from --homer-dpu rather than folded into it. S1a's gate is
+ * only "the DPU service logs an OP_COMMAND_SESSION open arriving over the DPU control
+ * slot"; per-command execution still needs the host-shm command mailbox, which the
+ * DPU-native opener does not create (the backend lives on another node). Folding this into
+ * --homer-dpu would break that path immediately and destroy our ability to bisect. Once S4
+ * carries commands and completions over the DPU, this flag folds into --homer-dpu and
+ * disappears.
+ *
+ * Expect the run to fail at the first transaction with "invalid arguments while starting
+ * ..." (session->control is NULL by design). That is the intended S1a stopping point, not
+ * a regression.
+ */
+static bool homer_dpu_command_mode = false;
 static int	client_cpu = -1;
 static int	client_cpus[CPU_SETSIZE];
 static int	client_cpu_count = 0;
@@ -1145,6 +1165,7 @@ usage(void)
 		   "  --latency-percentiles    report exact p50/p95/p99 transaction latency\n"
 		   "  --homer                  submit simple SQL through the Homer service\n"
 		   "  --homer-dpu              deliver --homer SQL results via the DPU deform relay\n"
+		   "  --homer-dpu-command      open the --homer SQL command session on the local DPU\n"
 		   "  --homer-client-cpu=CPU   alias for --client-cpu\n"
 		   "  --homer-database-oid=OID database OID for --homer sessions\n"
 		   "  --homer-peer-host=HOST   remote Homer backend-node service host\n"
@@ -8199,6 +8220,7 @@ main(int argc, char **argv)
 			{"homer-peer-port", required_argument, NULL, 26},
 			{"homer-peer-node", required_argument, NULL, 27},
 			{"homer-dpu", no_argument, NULL, 28},
+			{"homer-dpu-command", no_argument, NULL, 29},
 			{NULL, 0, NULL, 0}
 	};
 
@@ -8593,6 +8615,10 @@ main(int argc, char **argv)
 					benchmarking_option_set = true;
 					homer_dpu_mode = true;
 					break;
+				case 29:			/* homer-dpu-command */
+					benchmarking_option_set = true;
+					homer_dpu_command_mode = true;
+					break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -8756,6 +8782,8 @@ main(int argc, char **argv)
 	 */
 	if (homer_dpu_mode && !homer_mode)
 		pg_fatal("--homer-dpu requires --homer");
+	if (homer_dpu_command_mode && !homer_mode)
+		pg_fatal("--homer-dpu-command requires --homer");
 
 	if (homer_mode)
 	{
@@ -8783,6 +8811,17 @@ main(int argc, char **argv)
 			 */
 			if (homer_peer_host[0] == '\0')
 				pg_fatal("--homer-dpu requires a remote peer (--homer-peer-host and --homer-peer-port and --homer-peer-node)");
+		}
+		if (homer_dpu_command_mode)
+		{
+			/*
+			 * Command-plane S1a. Same remote-peer requirement as --homer-dpu, for a
+			 * different reason: the service's async command-open state machine
+			 * (TupleSinkServiceProgressCommandOpenAsyncOp, COMMAND_CREATE) refuses a
+			 * command session that has no resolved positive peer endpoint.
+			 */
+			if (homer_peer_host[0] == '\0')
+				pg_fatal("--homer-dpu-command requires a remote peer (--homer-peer-host and --homer-peer-port and --homer-peer-node)");
 		}
 		if (!validateHomerScriptSupport())
 			exit(1);
@@ -9471,9 +9510,23 @@ finishHomerSession(CState *st)
 		st->homer_session.sqlResultDpuStreamOpen = false;
 	}
 
-	if (!HomerClientCloseSession(&st->homer_session,
-								 errorMessage,
-								 sizeof(errorMessage)))
+	/*
+	 * Command-plane S1a: a selected-DPU command session has no host-service control
+	 * region and no backend mailboxes, so HomerClientCloseSession's shared-memory close
+	 * path does not apply. Its own closer submits CLOSE_SESSION over the role-1 control
+	 * slot, then performs the DPU setup-close handshake and DOCA teardown.
+	 */
+	if (st->homer_session.commandDpuStreamOpen)
+	{
+		if (!HomerClientCloseSqlSessionSelectedDpu(&st->homer_session,
+												   errorMessage,
+												   sizeof(errorMessage)))
+			pg_log_error("client %d could not close selected-DPU Homer SQL session: %s",
+						 st->id, errorMessage);
+	}
+	else if (!HomerClientCloseSession(&st->homer_session,
+									  errorMessage,
+									  sizeof(errorMessage)))
 		pg_log_error("client %d could not close Homer session: %s",
 					 st->id, errorMessage);
 
@@ -9513,9 +9566,10 @@ openHomerSession(TState *thread, CState *st)
 	 * provisions the relay.
 	 */
 	if (homer_dpu_mode)
-	{
 		sessionOptions.clientSqlResultDpuRelay = 1;
 
+	if (homer_dpu_mode || homer_dpu_command_mode)
+	{
 		/*
 		 * Binding: mint this session's UNIQUE sessionUID ONCE here, BEFORE the command
 		 * session is opened, into the shared sessionOptions so BOTH the command-session
@@ -9525,6 +9579,10 @@ openHomerSession(TState *thread, CState *st)
 		 * comes from the distinct per-client CState pointer (st); pid/time add
 		 * cross-process/cross-run entropy.  This is NOT the connection sessionKey, which
 		 * is deliberately non-unique (four clients on one db/user/node share one).
+		 *
+		 * S1a: --homer-dpu-command also needs it. Its opener rejects a zero sessionUID
+		 * outright, because a zero would silently defeat the role-7 rendezvous later, far
+		 * from the open. The two flags are independent, so mint under either.
 		 */
 		sessionOptions.sessionUID =
 			(((uint64_t) getpid()) << 32) ^ (uint64_t) pg_time_now() ^ (uint64_t) (uintptr_t) st;
@@ -9532,11 +9590,34 @@ openHomerSession(TState *thread, CState *st)
 			sessionOptions.sessionUID = 1;
 	}
 
-	if (!HomerClientOpenSqlSession(&thread->homer_control,
-								   &sessionOptions,
-								   &st->homer_session,
-								   errorMessage,
-								   sizeof(errorMessage)))
+	/*
+	 * Command-plane S1a: --homer-dpu-command opens the command session against the
+	 * client's LOCAL DPU (role-1 control slot, exported over the DPU setup TCP socket)
+	 * rather than through the mapped host-service control region. No HomerClientControl
+	 * is passed, and no backend mailboxes are mapped -- see the flag's comment above for
+	 * why the run is expected to stop at the first transaction.
+	 */
+	if (homer_dpu_command_mode)
+	{
+		if (!HomerClientOpenSqlSessionSelectedDpu(&sessionOptions,
+												  &st->homer_session,
+												  errorMessage,
+												  sizeof(errorMessage)))
+		{
+			pg_log_error("client %d could not open selected-DPU Homer SQL session: %s",
+						 st->id, errorMessage);
+			return false;
+		}
+		pg_log_info("client %d opened selected-DPU Homer SQL command session id=%llu index=%u",
+					st->id,
+					(unsigned long long) st->homer_session.serviceSessionId,
+					st->homer_session.serviceSessionIndex);
+	}
+	else if (!HomerClientOpenSqlSession(&thread->homer_control,
+									   &sessionOptions,
+									   &st->homer_session,
+									   errorMessage,
+									   sizeof(errorMessage)))
 	{
 		pg_log_error("client %d could not open Homer SQL session: %s",
 					 st->id, errorMessage);
