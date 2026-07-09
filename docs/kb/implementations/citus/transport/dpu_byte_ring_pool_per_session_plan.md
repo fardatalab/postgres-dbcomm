@@ -464,9 +464,54 @@ would have to travel DPU↔DPU, not host↔host"*, and *"The DPU↔DPU command-s
 not reuse."* Part 3.5.1 therefore chose a stable unique id (`sessionUID`) as the cross-boundary
 binding key **so the two session tables never need to be shared** — a rendezvous, not a shared
 table: `HomerDpuDmaFindDpuToHostByteRingRef` (`homer_service_dpu_dma.c:5172`) requires nonzero,
-exact, UNIQUE sessionUID and treats multiple matches as a hard error. Unifying ownership (one
-sessionStates, one owner) is the eventual DPU end-state but requires that net-new DPU↔DPU command
-spine; it is NOT a prerequisite for `--homer-dpu`.
+exact, UNIQUE sessionUID and treats multiple matches as a hard error.
+
+**`sessionUID` is the FINAL binding design, not a stopgap.** `session_identity_and_pairing.md:37-45`:
+"the CROSS-NODE-STABLE binding id… the DPU relay pump resolves *which role-7 ring* to DMA landed bytes
+into by this value, not by role alone"; and "we kept `sessionUID` (the earlier confusion was missing
+docs, not the name)". It survives ANY ownership model because the boundary it spans is **host↔DPU
+across PCIe**: the role-7 ring is exported by a host process (pgbench) and imported by the DPU
+service, so something must say which imported ring belongs to which stream. Moving the command
+session onto the DPU would change *which table holds the session*, not this rendezvous.
+
+**CORRECTION.** An earlier revision of this note claimed "unifying ownership is the eventual DPU
+end-state". That was an unsupported inference and is retracted. The doc states no such roadmap; for
+the case it examined it *declined* to build a cross-node control channel ("at the cost of an entire
+cross-node control channel") and chose the receiver-session base-compat+tag scan instead, which landed
+and validated July 8. Whether SQL's command spine eventually moves DPU↔DPU is an OPEN question.
+
+**What "net-new DPU↔DPU command spine" actually means (it is narrower than it sounds).** Already
+built: DPU↔DPU RDMA peer transport + payload streams + credit doorbells; per-session ring
+bind/unbind (this pool); DPU→host role-7 rings + sessionUID rendezvous; a working client→DPU control
+channel (the DPU DMA-pulls a `FRONTEND_CONTROL_SLOT` from host memory,
+`homer_service_dpu_dma.c:8536`, dispatched into `TupleSinkServiceHandleOpenSession` — this is how the
+role-7 open already reaches the DPU); a backend-spawn path tagging
+`backendChannelMode = SELECTED_DPU_DMA`; and `HomerFrontendDmaOpenCommandSession`, which already
+carries a `sessionIntentSpec->opKind`. Genuinely missing per the doc (corroborated): the async
+command-open machine gates hard on `opKind == CLIENT_SQL_SESSION` (`tuple_sink_service_process.c:22108`,
+`:25472`), `REGISTER_MEMORY` unconditionally requires a `commandMailbox`, and there is no
+DPU-control-slot command-session *opener on the receiver* (it emits only `OP_TUPLE_SINK`) — "plus
+three service-side gate relaxations". Physical constraint: the socketless backend must run on the
+HOST (it is a PostgreSQL process), so even a DPU-owned spine needs the DPU to reach the host's
+backend-spawn region — which `SELECTED_DPU_DMA` + `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest`
+already do.
+
+**Stage 3 re-scope warning (third piece of evidence).** `HomerFrontendDmaOpenCommandSession` — the
+code Stage 3 proposed retiring — has now turned up three times as the closest existing thing to a
+piece we need (template for a client-side DPU command open; the existing opKind-carrying opener; half
+the backend-spawn spine). Stage 3's framing looks backwards: the retirement candidate may be the
+HOST-SHM command path, not the DPU one. Re-scope before starting it.
+
+**Follow-up decided (July 9, 2026): DROP the role-7 parent lookup entirely.** The `26b2e1994` fix made
+a local parent optional. It should be removed outright: its only purpose is to compare the ring-open's
+sessionUID against the parent command session's — but in the intended split topology the DPU service
+never holds that session, so the diagnostic **can never fire**; it fires only in the same-process
+workaround we do not intend to support. Keep `parentServiceSessionId` on the wire for log
+traceability only. **Replace it with a diagnostic that CAN fire:** if pgbench ever mints different
+sessionUIDs for the command open vs the ring open, `HomerDpuDmaFindDpuToHostByteRingRef` never
+resolves and the relay retries forever — a SILENT HANG, same failure class as the tuple corruption.
+Add a bounded-retry warning in the relay resolve naming the unresolved sessionUID and the role-7 rings
+actually imported.
 
 **Failure A = code gap. Minimal, design-consistent fix:** in the SQL role-7 rendezvous branch
 (`tuple_sink_service_process.c:33791`), stop *rejecting* when `parentServiceSessionId` does not
