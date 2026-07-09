@@ -890,7 +890,9 @@ ssh farnet0 "sudo -n -u dbcomm sh -c 'env \
 
 Each host's frontend must point at its OWN local DPU: farnet1 -> `10.10.1.201`,
 farnet0 -> `10.10.1.200`. Pointing a farnet0-resident client at `10.10.1.201`
-fails with `DPU setup rejected basebackup export status=5`.
+fails with `DPU setup rejected frontend export status=5`. (That message said
+`... basebackup export ...` before command-plane S1b made the export path shared
+between the client library, the postmaster, and socketless backends.)
 
 Local Homer blackhole smoke on `farnet1`:
 

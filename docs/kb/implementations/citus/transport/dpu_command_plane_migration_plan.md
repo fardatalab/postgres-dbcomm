@@ -435,14 +435,30 @@ simply becomes DPU-local memory nobody else maps. **It likely survives the move 
 > host, shared memory) and the service RDMAs out of those bytes. **Zero copies.**
 >
 > **The DPU migration spends that property.** Once the mailbox is DPU-local, a command must go
-> client control slot → DMA across PCIe into the DPU mailbox → RDMA out. That is a staging copy the
-> current design does not pay, and only *then* would "scratch" be an accurate name.
+> client control slot → **DMA pull across PCIe** into the DPU mailbox → RDMA out. That pull is work the
+> current design does not do, and only *then* would "scratch" be an accurate name.
 >
-> **This makes "direct PCI-source RDMA" a correctness-of-performance requirement, not an optimization.**
-> That design (register the *imported host mapping* as an MR and RDMA straight out of the client's
-> control slot, never landing the command in DPU memory) is already decided and validated but
-> unimplemented. **Reconsider it in S4**, which is the first stage that would pay the copy — not later,
-> because a measured S6 regression against the host-service path would otherwise be mysterious.
+> **The removal is "direct PCI-source RDMA"**: register the *imported host mapping* as an RDMA memory
+> region on the DPU so the local QP's send SGE points straight at host memory. The NIC then reads the
+> command over PCIe as part of the RDMA WRITE — no `doca_dma` task, no DPU-resident copy. Recorded as
+> decided but never mapped out. The reason it is unmapped is a **DOCA/verbs interop question, not a
+> Homer design one**: the DPU holds a `doca_mmap` reconstructed from the host's PCI export, and it is
+> not established that an `ibv_mr`/lkey usable by the posting QP can be derived from it.
+>
+> > **⚠ CORRECTED (July 9, 2026).** An earlier revision of this note called direct PCI-source RDMA "a
+> > correctness-of-performance requirement, not an optimization," and said to reconsider it **in S4**.
+> > **Both claims were wrong.**
+> > - **S4 is single-node — it contains no RDMA at all**, so direct PCI-source RDMA cannot apply there.
+> >   S4 does introduce a DMA pull, but nothing today runs a single-node command through a DPU, so there
+> >   is no baseline for it to regress against.
+> > - **The cost is small.** A PCIe DMA read is order 1–2 µs against a warmed c1 transaction of ~238 µs
+> >   (~4.2k TPS). Under 1%. It is not a parity threat per operation.
+> >
+> > What is actually true: the pull begins mechanically at **S5/S6**, and **S6** — cross-node DPU vs
+> > today's cross-node host-service `--homer` — is the first comparison against a real number. The risk
+> > it poses is to **scaling**, not per-op latency: DMA task slots and PE polling are shared on the DPU,
+> > and c4 already shows a shared-transport bottleneck. So: **measure at S6, do not pre-optimize.**
+> > This entry exists so that an S6 number below the host-service baseline is not mysterious.
 >
 > Two smaller notes: the MR covers the whole 64-slot mailbox, registered once per session (cheap). And
 > for commands ≤ `max_inline_data` (124 bytes on this fabric) the code takes `useInlineCommandPost` and
