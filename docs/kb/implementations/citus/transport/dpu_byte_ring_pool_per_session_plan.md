@@ -665,11 +665,15 @@ correct decoded values with DISTINCT `purpose=2` slot indices in the receiver-DP
 regression; (d) **basebackup regression** (shared bind/unbind + descriptor code); (e) build ALL targets,
 not just `service-bin` — the DPU TCP transport smoke silently failed to compile for three days.
 
-### Stage 3 — RE-SCOPED (July 9, 2026): promote the DPU command channel, do NOT retire it
+### Stage 3 — DISSOLVED (July 9, 2026); moved to the command-plane plan
 
-**The original framing was backwards.** Stage 3 originally proposed retiring the server-side DPU
-frontend command channel. A read-only trace (verified independently) shows that code is the closest
-existing implementation of the command spine the DPU migration needs.
+**Stage 3 is no longer a stage of THIS plan.** It originally proposed retiring the server-side DPU
+frontend command channel. A read-only trace (verified independently) showed that code is the closest
+existing implementation of the command spine the DPU migration needs — the framing was backwards. It is
+also a different subject: this plan owns data-plane *ring ownership*; that work owns the *command
+plane*. It now lives in
+[dpu_command_plane_migration_plan.md](dpu_command_plane_migration_plan.md) with its own stage numbering.
+The evidence that inverted it is kept below because it was gathered here.
 
 **Verified findings**
 - `HomerFrontendDmaOpenCommandSession` (`homer_frontend_dma.c:1039`) is NOT a stub in DOCA builds. It
