@@ -63,16 +63,50 @@ size by `slotCount` precisely to keep that invariant true. Removing the division
 synthetic value flows into the batch header where it is compared, with `==`, against a *semantic*
 per-record capacity.** Two different quantities wearing the same field name.
 
-### Fix direction (not yet chosen)
-- **(ii) preferred:** for byte-ring streams, reconcile `stream.slotCapacityBytes` to the
-  descriptor-derived value, so the validator compares like with like. Note basebackup **already** gets
-  special byte-ring geometry reconciliation (`:23516` and `:33543`); the SQL/COPY byte-ring case falls
-  to the `else` at `:23527` and never did. This fix is "give SQL what basebackup already has."
-- (i) make the descriptor carry the negotiated `payloadSlotBytes` — **breaks** `frontend:1169`.
-- (iii) relax the validator to `<=` — loses a real geometry check; also `objectBytes >
-  stream.slotCapacityBytes` at `:27569` would then still reject.
+### There are no slots left anywhere — `slotCount` is vestigial
+`HomerServicePayloadStreamUsesByteRing` (`:6309`) is true for `TUPLE_VIEW_BATCH` **and**
+`BASE_BACKUP_STREAM`. The only other family is `WAL_STREAM`, which is unimplemented (`-X none`).
+**Every live payload stream is a byte ring; no slot-queue payload path remains.** What the two names
+mean today:
 
-Rename the two concepts while fixing. One of them is not a "slot capacity".
+- **`slotCapacityBytes` = max single-record footprint.** Genuinely load-bearing: the 2x-headroom fit
+  guard (`:6291`) rejects a record larger than half the ring "instead of deadlocking the producer at
+  the first wrap." Real meaning, wrong name.
+- **`slotCount` = vestigial.** It sizes nothing since `7a2eaed53`. Its only remaining jobs: echo and
+  validate the requested value (`:25700`, `:34279`, `:35636`); be the divisor at `:33585`; and let the
+  frontend *reconstruct* the ring size by multiplying it back (`frontend:1169`, mapping size `:1092`).
+
+The ABI header already anticipates the cleanup: `homer_queue_abi.h:120-125` — *"Historical name kept
+until the Stage 4 descriptor split."*
+
+### Fix — the descriptor split (chosen July 9, 2026)
+The whole defect is ONE number round-tripped through a multiply/divide pair: the service knows
+`byteRingBytes` (8 MiB), divides by a vestigial `slotCount` to make `slotCapacityBytes`, and the
+frontend multiplies them back to verify it attached to the right ring. That divisor game is the only
+reason `slotCount` still exists, and it is what let a synthetic *geometry* number leak into the batch
+header where a *semantic* capacity was expected.
+
+1. Descriptor carries `byteRingBytes` (uint64) explicitly.
+2. `slotCapacityBytes` → **`maxRecordBytes`**: the negotiated per-record footprint, carried through
+   unchanged, never derived.
+3. Frontend attach compares `sharedState->byteRingBytes == descriptor->byteRingBytes` — no
+   reconstruction (`frontend:1169`, `:1092`).
+4. Producer stamps `maxRecordBytes` into the batch header (`frontend:1787`); the validator (`:27568`)
+   compares it to `stream.maxRecordBytes`. They agree BY CONSTRUCTION — the class of bug cannot recur.
+5. `slotCount` leaves the byte-ring descriptor. `slots=` in basebackup target details becomes
+   ignored/deprecated (it already does nothing).
+
+ABI bump; no back-compat (prototyping rules). Validation gate: `--homer-dpu -c 1` must get past the
+abort. **COPY cannot validate anything until Problem 2 is fixed.**
+
+Rejected alternatives:
+- *(i) descriptor carries the negotiated `payloadSlotBytes`* — **breaks** `frontend:1169`, which needs
+  `slotCount * slotCapacityBytes == byteRingBytes`.
+- *(ii) reconcile `stream.slotCapacityBytes` to the derived value* (i.e. give SQL/COPY the special-case
+  basebackup already has at `:23516`/`:33543`) — cures the symptom but **cements the double meaning**.
+  A patch, not a fix.
+- *(iii) relax the validator to `<=`* — loses a real geometry check, and `objectBytes >
+  stream.slotCapacityBytes` (`:27569`) would still reject.
 
 ---
 
@@ -115,6 +149,12 @@ path differs from SQL/COPY's.
 
 **Next step: bisect COPY across `7a2eaed53..a3cdd5f3c`.** Do not assume either commit. Two regressions
 in three days on paths nobody re-ran is entirely plausible.
+
+### COPY has BOTH bugs
+Problem 1 affects COPY too (it is a `TUPLE_VIEW_BATCH` byte-ring stream, `slotCount=8`,
+`slotCapacityBytes=524288` ⇒ derived `8388608/8 - 56 = 1048520 != 524288`). It simply never gets far
+enough to fire it. **Fixing the hang will walk COPY straight into Problem 1**, so fix Problem 1 first
+or expect the bisect's "good" commits to fail for a different reason.
 
 ### Why nobody noticed
 Validation pivoted to basebackup on July 7 (checkpoint "Step 7"). No COPY run has happened since.
