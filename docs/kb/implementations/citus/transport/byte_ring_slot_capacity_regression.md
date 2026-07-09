@@ -216,6 +216,65 @@ ALSO OUTSTANDING (unrelated to this doc's two problems):
 - COPY hang bisect across `7a2eaed53..a3cdd5f3c` (Problem 2).
 - Byte-ring pool slot budget: raise `SLOTS_PER_REGION` to 8 before any multi-client run (pool plan 2.6).
 
+### Semantics pass RESULTS (July 9, 2026) — tiling is dead, and the split may be INNOCENT
+
+**1. Tiling never held.** The default basebackup archive-chunk record is `56 (transport) + 56 (fixed
+basebackup header, name omitted) + 1,048,576 (payload) = 1,048,688` bytes, while `8 MiB / 8 =
+1,048,576`. **Records already do not tile in the WORKING code.** The "divisor's third job = tiling"
+claim is fully retracted, not merely doubted.
+
+**2. The 240-byte delta decomposed.** `240 = 56 + 184`, where `184 = sizeof(CitusRemoteBaseBackupMessageHeader)`
+(`homer_basebackup_abi.h:44`, dominated by `name[128]`). `HomerClientBaseBackupRecordPrefixBytes()`
+(`homer_client.c:1748`) returns transport header + MAX basebackup header, and the headroom guard uses
+`prefix + payloadCapacityBytes` (`homer_client.c:2623`). So the **max** prefix is 240 while the
+**actual** archive-chunk prefix is 112 (the 128-byte name is omitted for chunks,
+`homer_basebackup_abi.h:73`). That is why `bytes=8388608` reports footprint `8388848`.
+
+**3. THE LIKELY REAL BUG: two consumers read the same bytes oppositely.**
+`pg_basebackup` is now MANDATORILY a selected-DPU producer. On wrap it writes a **pre-wrap transport
+header** whose advertised record length deliberately EXCEEDS the trailer — that is its wrap signal.
+Its own comment (`homer_client.c:4576-4583`): *"The pre-wrap bytes carry the regular next-record
+transport header, not a padding record. The DPU proves wrap when this header's advertised record
+length is larger than trailerBytes, then parses the same record again at offset zero."*
+
+But the HOST service's receiver (`HomerServicePumpIncomingByteRingPayload`) treats exactly that
+condition as fatal: `recordBytes > contiguousBytes` ⇒ `"byte-ring record unexpectedly crossed ring
+boundary"` (`tuple_sink_service_process.c:32357-32359`). It only takes the skip-trailer path when
+`!headerReady` (`:32339-32346`) — and the pre-wrap header makes `headerReady` TRUE.
+
+Meanwhile the SHARED drain core has the correct geometric rule, which neither uses:
+gap iff `contiguousBytes < ops->maxRecordBytes && consumedHead + contiguousBytes <= producedTail`
+(`homer_byte_ring_sink.h:217-224`).
+
+**Consequence: the failing Test A used CLAUDE.md's plain `mode=rdma` shape, where the farnet0 HOST
+service is the receiver.** Every basebackup run we have actually validated (this morning's concurrent
+test; the mirror cleanup) used the 4-role runbook where the farnet0 **DPU** service relays. Different
+consumer, opposite interpretation. The explorer states the mechanism is *"visible in current code"* —
+i.e. in the REVERTED tree. **So the split is likely innocent of Test A's failure.** An A/B run of the
+identical command on the reverted tree is in flight to prove or refute this. Do not conclude either way
+until it reports.
+
+(Whatever the A/B shows, the revert was still correct: basebackup was red and the cause was unknown.)
+
+### The naming table (this is what the pass was for)
+
+| Quantity | Includes transport prefix? |
+|---|---|
+| `stream.slotCapacityBytes` | **NO.** Uniform meaning after all: it is the max **transport payload** — everything after the 56-byte transport header. SQL/COPY: the tuple object. Basebackup: basebackup semantic header + payload (`homer_client.c:2622`). ⇒ `maxTransportPayloadBytes` |
+| `descriptor.slotCapacityBytes` | **YES** for mapped byte-ring queues (record footprint). **BUT** the basebackup RECEIVE informational branch (`:33566`) sets it to `stream.slotCapacityBytes`, i.e. NO prefix — *the field is already self-inconsistent today.* ⇒ `recordFootprintBytes`, and fix that branch. |
+| `slotReservedPrefixBytes` | It IS the prefix: transport only for tuple; transport + max basebackup header for basebackup SEND. ⇒ `recordPrefixBytes` |
+| `producerRecordCapacityBytes` | YES. ⇒ footprint |
+| `batchHeader.slotCapacityBytes` | NO; tuple object capacity. ⇒ `maxObjectBytes` |
+| `sinkHandle->slotCapacityBytes` | NO; descriptor capacity minus prefix. |
+| `sinkHandle->localQueueSlotCapacityBytes` | YES; the record footprint. ⇒ `recordFootprintBytes` |
+| `CitusTupleSinkRegistryEntry.slotCapacityBytes` | **DEAD.** The registry is historical (`homer_queue_abi.h:242`) and its only frontend helpers are inside `#if 0` (`homer_tuple_queue_frontend.c:339`, `:350`). **Delete, do not rename.** |
+
+`byteRingBytes / slotCount` is load-bearing ONLY for mapping/attach compatibility
+(`homer_tuple_queue_frontend.c:390`, `:1091`, `:1169`; `homer_client.c:5955`, `:5995`). The byte-ring
+algorithm itself wraps on `contiguousBytes < recordCapacityBytes` using the real `ringBytes`
+(`homer_tuple_queue_frontend.c:1287`, `:1311`). So a re-done split may drop `slotCount` from the
+descriptor, provided every attach check switches to comparing `byteRingBytes` directly.
+
 ### DEPLOYMENT HAZARD (until the next validation run)
 The failed run installed and synced the **ABI v12** binaries to farnet0 and to BOTH DPU trees before
 Test A ran. farnet1 has been rebuilt/reinstalled at the reverted ABI, but **farnet0 and the two DPUs
