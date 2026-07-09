@@ -613,6 +613,58 @@ completes "no engine-owned data-carrying byte-rings". Relocate, do not delete, t
 plus `-c 1` regression and a basebackup regression (shared bind/unbind code). Build the smoke
 targets too, not just `service-bin`.
 
+
+### Stage 2 — detailed execution plan (sub-steps + gates)
+
+**Precondition (hard):** `--homer-dpu -c 1` PASSes with correct decoded `abalance`, after the
+descriptor split lands (see
+[byte_ring_slot_capacity_regression.md](byte_ring_slot_capacity_regression.md), Problem 1). Without a
+correct single-session baseline there is nothing to compare `-c 2` against.
+
+- **2.1 — Repro FIRST (expect a SILENT failure).** `pgbench --homer --homer-dpu ... -c 2 -j 2`.
+  **Assert on decoded tuple VALUES, not exit status** — the aliasing feeds only `memcpy` offsets, so
+  there is no invariant to trip. pgbench logs `homer_last_abalance` under `--debug` (NOT `-d`, which is
+  `--dbname`). Run it 3x: corruption may be timing-dependent. Record the failing evidence before fixing.
+- **2.2 — Bind a SOURCE slot.** At the tuple-source obtain
+  (`tuple_sink_service_process.c:31681`, inside `HomerServicePumpIncomingTupleViewDpuTwoRingRelay`),
+  replace `HomerDpuDmaGetTupleSourceRingMemory(engine, ...)` with
+  `HomerDpuByteRingBind(pool, parentServiceSessionId, serviceStreamId, HOMER_DPU_BYTE_RING_PURPOSE_SOURCE, &h)`.
+  Store the handle on the stream (`dpuSourceRingHandle`, mirroring `dpuMirrorRingHandle`). The deform
+  write (`:31804` → `HomerServiceTupleSourceRingProduceRecord`, `:31450`) takes
+  `h.storageAddr` / `h.storageBytes`; the DMA read takes `h.mmap`.
+  **Bind at stream open, not lazily** — Stage 1a-mirror deadlocked by binding lazily downstream of the
+  consumer that needed the binding. Same shape here; do not repeat it.
+- **2.3 — Collapse the addressing branch (this stage REMOVES a special case).** In
+  `HomerDpuDmaSubmitOneByteRingTask` (`homer_service_dpu_dma.c:9429-9443`), the `TUPLE_SOURCE` branch
+  computes `engine->tupleSourceRing + ringOffset`. Once SOURCE is a pool slot, `handle.storageAddr` is
+  already past the uniform control prefix, so this becomes IDENTICAL to the LANDING branch
+  (`dpuRingBase + ringOffset`) and the two merge. The `get_by_addr` mmap selection (`:9524`) then reduces
+  to plain `srcMmap`. **Check whether `writeSource` is still needed for anything other than addressing
+  before deleting the discriminator.**
+- **2.4 — Unbind: nothing new.** `HomerDpuByteRingUnbind(pool, serviceStreamId)` already frees ALL
+  purposes of a stream, and `HomerServiceResetPayloadStreamEntry` already calls it. Verify, do not add.
+- **2.5 — Retire the last singleton.** Delete `engine->tupleSourceRing`, `tupleSourceRingMmap`,
+  `tupleSourceRingBytes`, and `HomerDpuDmaGetTupleSourceRingMemory` (one caller), exactly as `mirrorRing`
+  was retired. **Relocate, do not delete, the geometry rationale:** the relay's
+  `hostRingStorageBytes == sourceStorage` invariant (`:31701`) — one `absoluteStart` addresses both the
+  source (DMA read) and the host role-7 ring (DMA write). It is satisfied by construction once SOURCE is a
+  pool slot, because `slotStorageBytes == HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`. Move the comment to the
+  `HomerDpuByteRingPoolInit` call site next to the mirror 1:1 invariant.
+  **After this, no engine-owned data-carrying byte-ring remains anywhere.** That is the invariant Stage 2 closes.
+- **2.6 — RAISE THE SLOT BUDGET before any multi-client run.** The pool is
+  `HOMER_DPU_BYTE_RING_POOL_REGIONS=2` x `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION=4` = **8 slots**
+  (`homer_service_dpu_dma.h:40-41`). A `--homer-dpu` session consumes **2 slots on the RECEIVER DPU**
+  (LANDING + SOURCE) and 1 on the sender (MIRROR). So `-c 4` exactly saturates the receiver pool, and
+  `-c 4` plus a single concurrent basebackup **exhausts it into the deliberate `exit(1)`**.
+  Raise `SLOTS_PER_REGION` to 8 (⇒ 16 slots; region = 8 x 8388672 ≈ 67 MB, still under the 96 MB
+  `HOMER_DPU_BYTE_RING_MAX_REGION_BYTES` ceiling). Do this BEFORE `-c 4` or any concurrent
+  basebackup + pgbench run, or the fatal-on-exhaustion policy will fire as designed and look like a bug.
+
+**Gates.** (a) the `-c 2` repro fails on decoded values BEFORE the fix; (b) after the fix, `-c 2` returns
+correct decoded values with DISTINCT `purpose=2` slot indices in the receiver-DPU log; (c) `-c 1`
+regression; (d) **basebackup regression** (shared bind/unbind + descriptor code); (e) build ALL targets,
+not just `service-bin` — the DPU TCP transport smoke silently failed to compile for three days.
+
 ### Stage 3 — RE-SCOPED (July 9, 2026): promote the DPU command channel, do NOT retire it
 
 **The original framing was backwards.** Stage 3 originally proposed retiring the server-side DPU
@@ -654,20 +706,13 @@ third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_client.c:2551`, cal
 `basebackup_homer.c:289`), `HomerClientOpenBaseBackupReceiveStreamSelectedDpu` (`:2922`),
 `HomerClientOpenSqlResultReceiveStreamSelectedDpu` (`:3522`, via `:3925`, `pgbench.c:9559`).
 
-**The real remaining delta (bounded, not net-new).** The DPU command spine is *mostly built below the
-client API*: bridge import, frontend control-slot pull, backend mailbox publication, selected-DPU
-backend spawn, and the frontend completion path all exist. What is missing:
-1. A client-side `HomerClientOpenSqlSessionSelectedDpu` — combine the SQL command-session request
-   fields (`homer_client.c:1558-1575`) with the selected-DPU export/control-slot machinery basebackup
-   already uses (`:2644`, `:2675`, `:2727`, `:2783`). Today `--homer-dpu` still opens its command
-   session through host-service SHM (`HomerClientOpenSqlSession`, `:1518`, from `pgbench.c:9559`).
-2. Preserve the HOST backend-spawn leg — the socketless backend is a PostgreSQL process and must run on
-   the host (`homer_frontend_dma_lifecycle.c:192`).
-3. Three-ish service-side gate relaxations, all small: async routing admits only SQL/client-SQL opens
-   (`TupleSinkServiceOpenRequestNeedsAsyncLocalControl`, `:34817`); async command-create rejects
-   non-SQL/client-SQL (`TupleSinkServiceProgressCommandOpenAsyncOp`, `:35172`); REGISTER_MEMORY
-   unconditionally requires `sessionState->commandMailbox.mailbox` (`:35238`). The peer command-session
-   open has the same opKind rejection plus mailbox checks (`:37385`, `:37395`, `:37406`).
+**The full plan for this work now lives in
+[dpu_command_plane_migration_plan.md](dpu_command_plane_migration_plan.md)** ("Stage B": B0 blocking
+investigation, B1 truth-in-comments, B2 client-side selected-DPU SQL opener, B3 DPU↔DPU peer command
+open, B4 collapse the split + retire the superseded paths). Two corrections recorded there:
+`HomerFrontendDmaOpenCommandSession` is the **host→local-DPU** opener (leg 1 of 3), NOT the DPU↔DPU
+spine; and the `citus_remote_exec_pgbench_transaction` UDF retires in **B4**, not after `--homer-dpu`
+validates — it is the only non-smoke caller of the code Stage B promotes.
 
 **Note on ordering.** None of this is a prerequisite for `--homer-dpu`; it is the path toward unified
 session ownership (the OPEN question recorded above). Do not start it before `--homer-dpu -c 1` is
