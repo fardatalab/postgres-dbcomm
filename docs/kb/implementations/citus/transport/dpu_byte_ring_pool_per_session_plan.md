@@ -24,7 +24,19 @@
     `[homer-service] byte-ring bind: ... purpose=1 slot=0 region=0` line present on
     the farnet0 DPU each run (pool path exercised), no `RECV_CQ_FAILURE` /
     `observed>posted` / `DISCONNECT`. Mirror + tuple-source rings untouched.
-  - Stages 0b / 1 / 2: pending.
+  - **Stage 0b — DONE + validated (single-session, byte-equivalent).** Multi-region
+    DOCA arena: region 0 IS `engine->landingRegion` (enlarged to N slots), extra
+    regions 1..R-1 are separate allocations + DOCA mmaps; `HomerDpuByteRingPool`
+    inited over all R regions (R=2, 4 slots/region = 8 slots), `slotStorageBytes =
+    HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`. Overflow + 96 MiB per-region ceiling
+    guards. Aliasing-free: no double-free/double-mmap-destroy (region 0 freed once as
+    landingRegion; extras in their own loops). DMA source deliberately UNCHANGED
+    (transitional) -> single-session always binds slot 0 == region-0 base. Validation:
+    3x single-session basebackup, byte conservation 0.00012% (~23.28 GB), bind line
+    `slot=0 region=0`, farnet0 DPU started cleanly with 2 arena mmaps, no reset.
+    TODO(Stage 1): add an explicit arena-geometry startup log line (validator noted
+    the allocation is only inferable from the absence of errors today).
+  - Stages 1 / 2: pending.
 - **Doc type:** implementation plan / in-flight.
 - **Source:** `src/backend/distributed/utils/homer/homer_service_dpu_dma.c` (+`.h`),
   `.../tuple_sink_service_process.c`, and the new module
@@ -244,16 +256,32 @@ Makefile/meson. **Validation:** rebuild DPU; single-session basebackup + single-
 `--homer-dpu` smoke are byte-identical (pure code motion — the N=1 identity is the
 correctness proof of the extraction).
 
-### Stage 0b — multi-region arena + homogeneous pool (behavior unchanged at 1 slot/stream)
-Replace the three engine ring buffers/mmaps with **R=2 regions** (2 DOCA mmaps), each
-under the ceiling, holding `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` slots
-(`homer_service_dpu_dma.c:9906-10108` for alloc + the mmap-create sites);
-`HomerDpuByteRingPoolInit` over them; make `Bind`/`Find`/`Unbind`/`UnbindSession` real
-(ownership + prefer-own/adopt-free/error). Add per-region ceiling checks. Keep each call
-site binding one slot per (stream,purpose) so single-session behavior is unchanged;
-concurrency not yet exercised. `PoolDestroy` + free the region bufs/mmaps in engine
-destroy (`~:10748`). **Validation:** rebuild DPU; single-session regression unchanged; log
-the bound slot index + region to confirm the pool is live.
+### Stage 0b — multi-region arena (DOCA-allocation de-risk; DMA source untouched)
+**Design decision (refinement of the original 0b/1 split, July 9):** the landing ring's
+address is consumed in two places — the RDMA-target advertisement (service-side, already
+handle-parameterized in Stage 0a) and the DMA relay SOURCE (engine-side,
+`engine->landingRegion + landingPayloadOffset + ringOffset` at `homer_service_dpu_dma.c:9298`,
+mmap `:9365`). Threading the DMA source per-slot is delicate DOCA-addressing work. To keep
+each stage small and independently validated, Stage 0b does ONLY the multi-region DOCA arena
+allocation + pool init, and keeps the DMA source path UNCHANGED by **transitionally aliasing**
+`engine->landingRegion`/`landingMmap`/`landingRegionBytes` to the arena's region-0 slot-0.
+Because single-session always binds slot 0 (first-free), this is byte-equivalent; it isolates
+"does the multi-region DOCA arena allocate + mmap + still work single-session" from the
+addressing plumbing. The aliasing is transitional and REMOVED in Stage 1 (when the DMA source
+threads the per-slot base+mmap). Rationale: smallest safe increment; isolates the flaky DOCA
+multi-mmap allocation; a whole-arena single-stage migration would be one large hard-to-debug
+change.
+
+Concretely: allocate **R=2 regions** (2 DOCA mmaps via the existing landingMmap
+create/set_memrange/set_permissions/add_dev/start pattern), each holding
+`HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` slots of `landingPayloadOffset +
+HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`; `HomerDpuByteRingPoolInit` over both; set
+`engine->landingRegion = region0.base`, `landingMmap = region0.mmap`, `landingRegionBytes =
+slotBytes` (so the unchanged DMA source bounds to slot 0). Per-region ceiling check. Free the
+region bufs + destroy the R mmaps in engine destroy. Mirror + tuple-source stay their own
+singletons (migrated in Stage 1/2). **Validation:** rebuild DPU; single-session basebackup
+byte-conservation unchanged; the byte-ring bind line now shows the arena geometry (region/slot
+from a >1-slot pool).
 
 ### Stage 1 — per-session binding for BASEBACKUP + resolver fix (ACCEPTANCE GATE)
 Basebackup uses a **mirror** slot (sender DPU) + a **single landing** slot (receiver DPU,
