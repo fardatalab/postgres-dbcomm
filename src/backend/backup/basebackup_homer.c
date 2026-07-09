@@ -137,29 +137,21 @@ bbsink_homer_apply_detail(HomerClientBaseBackupStreamOptions *options,
 		else if (strcmp(key, "node") == 0)
 			options->destinationNodeId = pg_strtoint32(value);
 		else if (strcmp(key, "slots") == 0)
-		{
-			/*
-			 * slots= is no longer a geometry knob. Keep parsing it into
-			 * requestedSlotCount because the Homer OpenSession ABI still echoes and
-			 * strictly rechecks the request field, but byte-ring storage now comes
-			 * from the queue descriptor's explicit byteRingBytes.
-			 */
 			options->slotCount = pg_strtoint32(value);
-		}
 		else if (strcmp(key, "bytes") == 0)
 			options->payloadCapacityBytes = pg_strtoint32(value);
 		else if (strcmp(key, "publish") == 0)
 		{
-			/*
-			 * publish= is retained as a diagnostics knob in target-detail
-			 * strings. The current byte-ring basebackup path publishes each
-			 * submitted record immediately to preserve pipeline overlap.
-			 */
-			if (strcmp(value, "auto") == 0)
-				options->publishBatchRecords = 0;
-			else
-				options->publishBatchRecords = pg_strtoint32(value);
-		}
+				/*
+				 * publish= is retained as a diagnostics knob in target-detail
+				 * strings. The current byte-ring basebackup path publishes each
+				 * submitted record immediately to preserve pipeline overlap.
+				 */
+				if (strcmp(value, "auto") == 0)
+					options->publishBatchRecords = 0;
+				else
+					options->publishBatchRecords = pg_strtoint32(value);
+			}
 		else if (strcmp(key, "dboid") == 0)
 			options->databaseOid = pg_strtoint32(value);
 		else if (strcmp(key, "useroid") == 0)
@@ -185,11 +177,12 @@ bbsink_homer_apply_detail(HomerClientBaseBackupStreamOptions *options,
 				 errdetail("payload_bytes=%u BLCKSZ=%u",
 						   options->payloadCapacityBytes, BLCKSZ)));
 
-	/*
-	 * publish= is no longer bounded by slots=. slots= is only the retained
-	 * requestedSlotCount identity/check field, and byte-ring geometry is explicit
-	 * in the queue descriptor.
-	 */
+	if (options->publishBatchRecords > options->slotCount)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Homer base backup publish batch cannot exceed slot count"),
+				 errdetail("publish=%u slots=%u",
+						   options->publishBatchRecords, options->slotCount)));
 
 	pfree(detail_copy);
 }

@@ -3539,7 +3539,7 @@ static bool HomerQueueDescriptorSamePhysicalSink(const CitusTupleSinkQueueDescri
 												 const CitusTupleSinkQueueDescriptor *right)
 {
 	return left != NULL && right != NULL && left->protocolVersion == right->protocolVersion &&
-		   left->byteRingBytes == right->byteRingBytes && left->maxRecordBytes == right->maxRecordBytes &&
+		   left->slotCount == right->slotCount && left->slotCapacityBytes == right->slotCapacityBytes &&
 		   left->slotReservedPrefixBytes == right->slotReservedPrefixBytes && left->direction == right->direction &&
 		   left->descriptorFlags == right->descriptorFlags &&
 		   memcmp(left->queueShmName, right->queueShmName, sizeof(left->queueShmName)) == 0;
@@ -3549,7 +3549,7 @@ static bool HomerQueueDescriptorSamePhysicalAttachment(const CitusTupleSinkQueue
 													   const CitusTupleSinkQueueAttachment *right)
 {
 	return left != NULL && right != NULL && left->protocolVersion == right->protocolVersion &&
-		   left->byteRingBytes == right->byteRingBytes && left->maxRecordBytes == right->maxRecordBytes &&
+		   left->slotCount == right->slotCount && left->slotCapacityBytes == right->slotCapacityBytes &&
 		   left->slotReservedPrefixBytes == right->slotReservedPrefixBytes && left->direction == right->direction &&
 		   left->descriptorFlags == right->descriptorFlags &&
 		   memcmp(left->queueShmName, right->queueShmName, sizeof(left->queueShmName)) == 0;
