@@ -155,6 +155,67 @@ that log line dates to `cfe564251` (May 31); it prints before the ring is create
    payload or the record footprint?).
 4. Gate on BOTH basebackup regression AND `--homer-dpu -c 1`, in that order.
 
+### "Tiling" — what it means, and why my first explanation was probably WRONG
+
+*Tiling* = the ring size is an exact multiple of a record's footprint (`prefix + object`). With
+`slotCount=8` and footprint `1048576`, `8 * 1048576 == 8388608` exactly: records land at 0, 1 MiB,
+2 MiB … and the eighth ends flush with the ring end, so none can straddle the wrap.
+`byteRingBytes / slotCount` yields such a number by construction.
+
+**But tiling should NOT be load-bearing, because the wrap-gap protocol exists to make it
+unnecessary:** when contiguous space to the ring end is smaller than the next record, the producer
+emits a gap, the absolute tail counts the gap bytes, and the record restarts at offset 0.
+
+Re-read the failure numbers: `record_bytes=1048688`, `contiguous=456286`. 456286 is nowhere near a
+tiling boundary — a CORRECT producer must gap there regardless of tiling. So the crossing is **not**
+"records stopped tiling". It is a **size disagreement**: the gap decision reads one number while the
+write path uses another (or the consumer failed to recognise a gap the producer did write).
+Changing `maxRecordBytes` moved one of those numbers.
+
+**Therefore: do NOT touch the wrap-gap protocol.** It is fundamental, validated by 23 GB transfers,
+and not implicated. Fix the number, not the protocol. (An earlier revision of this doc called tiling
+"the divisor's third job". That framing reached for the value's *arithmetic* property instead of
+asking *which code reads it*, and is retracted pending the read below.)
+
+### Immediate plan (post-revert)
+
+DONE:
+- [x] Revert citus `e379d2dbe` → `aadcab871`; postgres `36cd6ee2da5` → `495f94db95f`.
+- [x] farnet1 rebuilt + reinstalled at the pre-split ABI (`CITUS_TUPLE_SINK_PROTOCOL_VERSION 12U`
+      confirmed ABSENT from the installed service).
+- [x] Post-mortem recorded here.
+
+NEXT, in order:
+1. **Read-only semantics pass (moved AHEAD of the rename — you cannot name what you do not
+   understand).** Determine exactly: (a) which size the byte-ring producer's gap decision reads, and
+   which size the write path uses; (b) what `HomerPayloadStreamState.slotCapacityBytes` means on the
+   SQL path vs the basebackup path; (c) why `bytes=8388608` yields footprint `8388848` (delta 240,
+   which matches neither `sizeof(CitusTupleSinkTransportHeader)=56` nor `56 +
+   CITUS_REMOTE_BASEBACKUP_HEADER_MAX_BYTES`); (d) how the consumer detects a gap.
+2. **Scoped rename**, driven by clangd `findReferences` per struct field — **NOT sed.** Six distinct
+   `slotCapacityBytes` fields exist across five structs and one of them must not change:
+
+   | Field | Verdict |
+   |---|---|
+   | `CitusTupleSinkQueueControl.slotCapacityBytes` / `.slotCount` (`homer_queue_abi.h:67`) | **STAY** — the live indexed slot queue (`tuple_sink_service_process.c:16640-16642`) |
+   | `CitusTupleSinkBatchHeader.slotCapacityBytes` (`homer_tuple_abi.h:191`) | → `maxObjectBytes` |
+   | `CitusTupleSinkQueueDescriptor.slotCapacityBytes` (`homer_queue_abi.h:116`) | → `recordFootprintBytes` |
+   | `CitusTupleSinkQueueAttachment.slotCapacityBytes` (`:279`) | → `recordFootprintBytes` |
+   | `CitusTupleSinkRegistryEntry.slotCapacityBytes` (`:262`) | decide after step 1 |
+   | `HomerPayloadStreamState.slotCapacityBytes` (`tuple_sink_service_process.c:1566`) | **decide after step 1 — this is the ambiguous one that caused the failure** |
+
+   Plus `slotReservedPrefixBytes` → `recordPrefixBytes`. **Name AND comment AND assert:**
+   `recordFootprintBytes == recordPrefixBytes + maxObjectBytes`, checked at the descriptor fill and at
+   the frontend consume. Three instances of this bug class in one day is sufficient evidence that
+   comments do not hold the line.
+3. **Re-do the split** with basebackup's `bytes=` semantics explicit.
+4. **Gate:** resync ABI to farnet0 + BOTH DPUs first; then basebackup regression; then `--homer-dpu -c 1`.
+
+ALSO OUTSTANDING (unrelated to this doc's two problems):
+- CLAUDE.md's basebackup example `slots=8,bytes=8388608` has been broken since `7a2eaed53` (July 6).
+- COPY hang bisect across `7a2eaed53..a3cdd5f3c` (Problem 2).
+- Byte-ring pool slot budget: raise `SLOTS_PER_REGION` to 8 before any multi-client run (pool plan 2.6).
+
 ### DEPLOYMENT HAZARD (until the next validation run)
 The failed run installed and synced the **ABI v12** binaries to farnet0 and to BOTH DPU trees before
 Test A ran. farnet1 has been rebuilt/reinstalled at the reverted ABI, but **farnet0 and the two DPUs
