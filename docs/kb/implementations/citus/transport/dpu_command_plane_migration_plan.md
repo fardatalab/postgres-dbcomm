@@ -1,245 +1,279 @@
-# DPU command-plane migration — plan
+# DPU command-plane migration — detailed plan
 
-> **Naming.** This is a SEPARATE workstream from the byte-ring pool plan, not its "Stage 3".
-> The pool plan owns data-plane *ring ownership* (Stages 0a/0b/1/2). This doc owns the
-> *command plane*. Its stages are numbered independently — cite them as "command-plane Stage N".
-> The pool plan's old Stage 3 ("retire the DPU frontend command channel") was inverted by evidence
-> and dissolved into this doc.
+> **Naming.** A SEPARATE workstream from the byte-ring pool plan, not its "Stage 3". The pool plan owns
+> data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
+> independently — cite them as "command-plane S1a", etc.
 
-**Status (July 9, 2026): PLANNED, not started. REORDERED — this is now a PREREQUISITE, not a
-follow-on.**
-
-> **CORRECTION (July 9, 2026, evening).** An earlier revision of this doc said "Unifying ownership is
-> the migration's endgame, not a prerequisite for anything currently in flight." **That is wrong**, and
-> three `--homer-dpu` bring-up runs proved it.
->
-> The DPU DMA engine's mirrored ranges come ONLY from `engine->hostMmapImports`, populated solely by
-> `HomerDpuDmaImportHostMmapDescriptorForSetup` — i.e. by a HOST FRONTEND exporting its ring to the
-> engine over the DPU TCP setup socket. The engine exists to import HOST memory across PCIe. **A
-> host-resident service has nothing to import.**
->
-> Today `pgbench` opens its command session via `HomerClientOpenSqlSession(HomerClientControl *)`, a
-> mapped HOST-service control SHM, and payload/result streams are created by the service that owns the
-> session. So the `--homer-dpu` result stream is born in the HOST service, whose engine (if it even has
-> one) can never hold an import for it. Observed: farnet1 binds a `purpose=0` MIRROR slot, then silence
-> — `HomerDpuDmaMirroredByteRangeReadyForServiceSink` iterates an empty import table, egress never
-> fires, the receiver never sees a byte, and the client hangs.
->
-> **`--homer-dpu` therefore cannot work until the SQL command session lives in the DPU-native service.**
-> The client-side `HomerClientOpenSqlSessionSelectedDpu` (Stage 2 below) is not an architectural
-> nicety; it is what puts the session in the process that owns the engine.
->
-> Cascade: byte-ring pool Stage 2 (`tupleSourceRing` per-session) is gated on a `-c 2 --homer-dpu`
-> repro, so it is blocked behind this too.
-
-**Intended end state (stated by the user, July 9, 2026):** the client binary and the PostgreSQL server
-binary each use the Homer FRONTEND to send/receive commands, completions and tuple results. No libpq.
-Two nodes talk to each other **through their own DPUs**, which DMA to and from their local host. The
-Homer *service* is the DPU service. Host Homer services are a bring-up scaffold, not the target.
-
-**Goal.** Move the SQL command/completion plane onto the DPU, so a session's command spine and its
-result relay live in the SAME process. Today they do not: pgbench's `CLIENT_SQL_SESSION` is created in
-the HOST service's control SHM, while the role-7 result relay lives in the DPU-native service. That
-split is deliberate and currently correct — the two legs are bound by a unique `sessionUID`, a
-rendezvous rather than a shared table (see
-[session_identity_and_pairing.md](../../../future-directions/citus/transport/session_identity_and_pairing.md)).
-Unifying ownership is the migration's endgame, not a prerequisite for anything currently in flight.
-
-Related: [byte_ring_slot_capacity_regression.md](byte_ring_slot_capacity_regression.md),
-[cross_node_dpu_migration_checkpoint.md](cross_node_dpu_migration_checkpoint.md).
+**Status (July 9, 2026): PLANNED, agreed with the user, not started. This is a PREREQUISITE for
+`pgbench --homer-dpu`, not a follow-on.**
 
 ---
 
-## Correcting two premises before planning
+## Intent (stated by the user)
 
-### 1. `HomerFrontendDmaOpenCommandSession` is leg 1 of THREE, not "the DPU↔DPU spine"
-It is the **host-frontend → its LOCAL DPU** command opener, and it works (verified: opens a DOCA
-control channel, exports/imports bridge + backend mailboxes, submits a HOST socketless-backend spawn,
-supports START/POLL — `homer_frontend_dma.c:1039`, `:1352`, `:1093`;
-`homer_frontend_dma_lifecycle.c:192`, `:283`). The full spine needs three legs:
+> The client runs on a separate node from the PG server/backend. Both the client binary and the server
+> Postgres binary use the **Homer frontend** to send and receive commands / completions / tuple results.
+> No libpq. Two nodes talking to each other **through their own DPU**, which performs DMA to and from
+> the host (Homer frontend).
 
-| Leg | What | Status |
-|---|---|---|
-| **L1** host frontend → local DPU | command-session open over the DPU control slot | **exists**, but only for a *PG backend* (`homer_frontend_control.c:803`). The **client library has no equivalent** — `HomerClientOpenSqlSession` (`homer_client.c:1518`) maps a HOST service's control SHM. |
-| **L2** DPU → peer DPU | command-session peer-open | **net-new.** Gates: peer open rejects non-SQL/client-SQL opKind (`tuple_sink_service_process.c:37385`) + mailbox checks (`:37395`, `:37406`). |
-| **L3** remote DPU → remote HOST | spawn the socketless backend | **MISSING today (verified), but the mechanism class exists.** See below. |
+The Homer *service* IS the DPU-native service. **Host Homer services are bring-up scaffold, not the
+target** (plain `--homer`, the non-DPU path, keeps them).
 
-**L3, verified (July 9, 2026).** There is NO DPU→host backend-spawn path today:
-- `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest` reaches the spawn region by `shm_open` +
-  `mmap` of a **host-local POSIX shm** (`homer_frontend_dma_lifecycle.c:217`, `:225`) — not DMA.
-- **No DPU-side code references the spawn region at all** (grep of `homer_service_dpu_dma.c`,
-  `homer_service_dpu_setup_tcp.c`).
-- `backendChannelMode = SELECTED_DPU_DMA` does NOT mean "the DPU spawns". It tells a **host-spawned**
-  backend to use DPU DMA for its command/completion mailboxes. (An earlier note in this project
-  claimed these "already do" DPU→host spawn. **That was wrong**, and is corrected here.)
-- The service-side spawner `TupleSinkServiceSubmitBackendSpawnRequest`
-  (`tuple_sink_service_process.c:18814`) is called by whichever SERVICE handles the open — local
-  (`:33810`) or peer (`:37302`). On the host it works; on the DPU it would `shm_open` a region that
-  does not exist there.
+## The wall, and why it is architectural
 
-**But the capability already exists, and so does the vehicle.** The DPU routinely DMA-writes host
-memory (it publishes backend commands/completions into host mailboxes), and the DPU setup TCP socket
-already carries the **host PCI mmap export descriptor**. So the likely L3 design is the pattern already
-in use, not a new mechanism:
-1. the postmaster/bridge adds `citus_remote_exec_backend_spawn_v*` to its mmap export list;
-2. the DPU service DMA-writes a spawn slot and rings a doorbell;
-3. the postmaster consumes the slot exactly as it does today (it is the same physical shared memory).
+The DPU DMA engine's mirrored ranges come ONLY from `engine->hostMmapImports`, populated solely by
+`HomerDpuDmaImportHostMmapDescriptorForSetup` (`homer_service_dpu_dma.h:245`) — i.e. by a **host
+frontend exporting its ring to the engine over the DPU TCP setup socket**. The engine exists to import
+HOST memory across PCIe. **A host-resident service has nothing to import.**
 
-Stage 0.1 must CONFIRM this rather than assume it — in particular, whether the postmaster (not just a
-client) performs a DPU setup export, and whether a DMA'd write into that region is visible to the
-postmaster's poller without extra synchronisation. **The answer sizes Stages 1–4.**
+Today `pgbench` opens its command session via `HomerClientOpenSqlSession(HomerClientControl *)`
+(`pgbench.c:9535` -> `homer_client.c:1518`), a mapped HOST-service control SHM. Only the SQL *result*
+receive ring is selected-DPU, bound after the command open (`pgbench.c:9559`). Payload streams are
+created by the service that owns the session, so the `--homer-dpu` result stream is born in the HOST
+service, whose engine can never hold an import for it. Observed three times: farnet1 binds a
+`purpose=0` MIRROR slot, then silence — `HomerDpuDmaMirroredByteRangeReadyForServiceSink` iterates an
+empty import table, egress never fires, and the client hangs on its first `SELECT`.
 
-### 2. The UDF retires in the LAST stage, not after `--homer-dpu` validates
-The checkpoint's "step 8" says delete `citus_remote_exec_pgbench_transaction` once `--homer-dpu` is
-validated. **That precondition is wrong.** `--homer-dpu` opens its command session through host SHM,
-so validating it proves nothing about the frontend DPU command channel. And the UDF is the **only
-non-smoke caller** of `HomerFrontendDmaOpenCommandSession` — the very code this plan promotes. Deleting it
-early removes this plan's only working exercise of its own foundation. It goes in **command-plane Stage 4**.
+**A Homer frontend is, definitionally, the host process that exports its rings to the DPU beside it.**
+The host service was never a frontend. That is the whole bug.
+
+## Trust tiers — "compiles" is not "works"
+
+Classify every component before depending on it. (Fourth instance of this failure mode today, after the
+`mode=rdma` runbook example, the June-6 COPY baseline, and the "cache is advisory" comment: *a written
+artifact describing a path was trusted as evidence the path works*.)
+
+**TIER 1 — EXERCISED.** Some validated workload runs it today; breaking it would be noticed.
+- Client-library selected-DPU machinery in `homer_client.c` (`HomerClientOpenBaseBackupStreamSelectedDpu`,
+  `...ReceiveStreamSelectedDpu`, `HomerClientOpenSqlResultReceiveStreamSelectedDpu`) — cross-node DPU
+  basebackup moves ~23 GB through it.
+- The DPU service's setup-TCP + `HomerDpuDmaImportHostMmapDescriptorForSetup` import path.
+- The DPU<->DPU RDMA peer transport for payload, and the `CRITICAL_CONTROL` class its peer-opens ride.
+- The backend-spawn region and its postmaster hook (every `--homer` run forks socketless backends
+  through it).
+
+**TIER 2 — EXISTS, UNEXERCISED.** Reachable only from a smoke or the deprecated UDF. Documentation of a
+mechanism, not a component. `homer_frontend_dma.c`, `homer_frontend_dma_lifecycle.c`, the GUC-gated
+sites in `homer_frontend_control.c`, `citus_remote_exec_pgbench_transaction`, **and the
+`backendChannelMode = SELECTED_DPU_DMA` handling in `remote_execution_backend_bridge.c`**
+(`:2572`, `:2625`, `:2637`, `:2646`, `:2655`, `:2669`).
+
+An earlier revision of this doc said `HomerFrontendDmaOpenCommandSession` should be "kept and promoted".
+**Retracted.** It compiles; nothing validated drives it; its GUC help text still claims the path is
+not-implemented. Build on the Tier-1 client template instead.
+
+---
+
+## Target architecture — symmetric frontends
+
+| Process | Exports to its LOCAL DPU |
+|---|---|
+| `pgbench` (node A) | command ring, completion ring, role-7 result ring |
+| socketless PG backend (node B) | command mailbox (role 2), completion mailbox (role 3), result byte-ring |
+| postmaster (node B) | the backend-spawn region (once, at startup) |
+
+The two DPU services talk RDMA to each other. No host Homer service is in the `--homer-dpu` path.
+
+Bridge descriptor roles for the backend mailboxes **already exist** in the ABI: role 2 = backend
+command, role 3 = backend completion (`homer_dpu_bridge_abi.h:81-82`, shapes at `:290`, `:295`).
+
+---
+
+## Design decisions
+
+### D1 — the spawned backend becomes a Homer frontend (INVERTS the Tier-2 arrangement)
+Under today's (Tier-2) `SELECTED_DPU_DMA`, the **frontend** creates and exports the mailboxes
+(`homer_frontend_dma_lifecycle.c:103`, shm created at `:137`/`:146`/`:155`; exported at
+`homer_frontend_dma.c:1269`/`:1273`/`:1277`) and the **backend merely `shm_open`s them**
+(`remote_execution_backend_bridge.c:2637`-`:2669`).
+
+Cross-node that cannot work: the frontend is on node A, the backend on node B. So **invert it** — the
+backend CREATES its mailboxes and its result byte-ring, and EXPORTS them to its own local DPU. Since
+the Tier-2 code is unexercised, rewriting costs little and buys the symmetry above.
+
+*Rejected:* have node A's client create node B's mailboxes. Impossible — POSIX shm is node-local, and
+the backend must `shm_open` by name on its own host.
+
+### D2 — spawn trigger: postmaster exports the region; DPU DMA-writes the slot; doorbell over the existing setup socket
+**The postmaster OWNS the spawn region.** It creates it: `shm_open(O_CREAT|O_RDWR)`
+(`remote_execution_backend_bridge.c:1709`), `ftruncate` (`:1730`), `mmap` (`:1740`), initialises
+`slotCount`/`postmasterPid` (`:1758`). Region name `/citus_remote_exec_backend_spawn_v14`
+(`remote_execution_backend_protocol.h:28`), fixed slot count (`:30`), slot states (`:47`).
+**So there is no "DOCA-export a region you do not own" problem** — an earlier note claimed there was;
+corrected. The postmaster calls a Homer frontend API and exports its own region.
+
+**The poller is a SIGUSR1 hook, not a poll loop.** Installed at `:3111`; entered at `:3081`; scans
+slots at `:3083`; waits on `slot->state == CITUS_REMOTE_EXEC_BACKEND_SPAWN_SLOT_REQUEST_READY` at
+`:3091`; forks via `ProcessSpawnRequestSlot` at `:3097`. Today's submitters write the fields, store
+`REQUEST_READY`, then `kill(postmasterPid, SIGUSR1)` (`tuple_sink_service_process.c:18833`, `:18845`,
+`:18924`, `:18927`).
+
+**A DPU cannot signal a host process.** But the postmaster already blocks in a `select()`-style main
+loop, and the DPU **setup TCP socket is already open** between the postmaster (frontend) and its local
+DPU. So:
+
+1. Postmaster calls a Homer frontend API at startup: DOCA-mmap its own spawn region and export it over
+   the setup TCP; keep that socket open.
+2. Add the setup socket fd to the postmaster's wait set.
+3. The DPU service DMA-writes the spawn request fields, then `REQUEST_READY` (**fields before the state
+   word, with a release barrier** — the existing submitters rely on that ordering), then writes one
+   doorbell byte on the setup socket.
+4. The postmaster wakes on the fd and runs the **existing** slot scan + `ProcessSpawnRequestSlot`.
+
+*No polling, no sleep, no background worker; the SIGUSR1 hop is replaced rather than emulated.*
+*Rejected:* a bgworker or standalone agent polling a doorbell word and raising SIGUSR1 — an extra
+process and a poll loop to solve what an already-open fd solves. *Rejected:* shortening the
+postmaster's `select()` timeout — polling by another name.
+
+### D3 — the client opener is built on the Tier-1 basebackup template
+`HomerClientOpenSqlSessionSelectedDpu` in `homer_client.c`, cloned from the exercised selected-DPU
+setup: env/default parsing (`:2551`), buffer layout with host publish lines / DPU credit lines / control
+slot (`:2560`), aligned export buffer (`:2647`), bridge header (`:2670`), DOCA mmap export (`:2690`,
+via `:2011`/`:2028`/`:2044`), descriptors (`:2716`, role-1 frontend control at `:2724`, `:2736`), setup
+TCP (`:2145`, `:2782`), control-slot submit (`HomerClientDpuSubmitControlRequest`, `:2233`).
+
+Add the SQL command-session request fields currently built only for host SHM:
+`CITUS_REMOTE_EXEC_CONTROL_OP_COMMAND_SESSION` (`:1558`), `clientSqlResultDpuRelay` (`:1560`),
+`sessionUID` (`:1567`), db/user/opKind (`:1573`-`:1575`), peer endpoint (`:1584`).
+
+**`backendCpu` gap:** it is not part of `HomerClientOpenSqlSession` today; it appears only in spawn
+requests (`remote_execution_backend_protocol.h:112`). The DPU-native open must either carry it and have
+the DPU forward it into the spawn request, or fall back to service policy. **Decide in S1a.**
 
 ---
 
 ## Stages
 
-### Stage 0 — Blocking investigation (read-only, cheap). Do this FIRST.
-Answer with code, not assumption. Each answer changes the plan below.
+### S0 — Spike (sanity, not a gate)
+Standalone test: a process `shm_open`s + `mmap`s a POSIX shm region **it created**, DOCA-exports the
+mapping to the DPU, the DPU DMA-writes into it, the host reads the value back. Confirms the export path
+for D2. Do it because it costs minutes, not because the design depends on the answer.
 
-- **S0.1 (decides this plan's size).** Can a DPU-native service submit a backend-spawn request into the HOST's
-  `citus_remote_exec_backend_spawn_v*` region? Trace `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest`
-  (`homer_frontend_dma_lifecycle.c:192`) and `TupleSinkServiceSubmitBackendSpawnRequest`. Is the region
-  reachable over the DMA bridge (is it exported in any mmap descriptor?), or is it strictly host-local
-  shm? If strictly local: design the DPU→host spawn submission (new descriptor role + a host-side
-  consumer) and size it before committing to Stages 1–4.
-- **S0.2.** Does the peer transport (9717) support a command-session peer-open at all today, or only
-  tuple-sink/payload opens? Read the peer open handler around `:37385` and enumerate exactly what
-  `OP_CLIENT_SQL_SESSION` would need.
-- **S0.3.** What does `HomerServiceDpuFindOrCreateSelectedSession` (`:38653`, called `:39099`) track? Can
-  it host a full `CLIENT_SQL_SESSION` lifecycle (open / START / POLL / close), or is it
-  command-staging-only? If it can, the DPU already has most of a session table and command-plane Stage 2 gets smaller.
-- **S0.4.** Which mailboxes does a DPU-opened command session need, and where do they live? `REGISTER_MEMORY`
-  unconditionally requires `sessionState->commandMailbox.mailbox` (`:35238`). Is a DMA'd mailbox the
-  right answer, or is the check simply wrong for DPU-opened sessions?
+### S1a — client-side `HomerClientOpenSqlSessionSelectedDpu` (clone the Tier-1 template)
+- **S1a.1** New entry point in `src/bin/homer_client.c`. Export buffer carrying: frontend control slot
+  (role 1), command ring, completion ring, role-7 result ring. Emit an `OP_COMMAND_SESSION` open into
+  the DPU control slot.
+- **S1a.2** Service: admit `OP_CLIENT_SQL_SESSION` arriving over the DPU control slot. Relax by
+  **allow-list**, not by deleting checks: `TupleSinkServiceOpenRequestNeedsAsyncLocalControl`
+  (`tuple_sink_service_process.c:34817`) and `TupleSinkServiceProgressCommandOpenAsyncOp` (`:35172`).
+- **S1a.3** `REGISTER_MEMORY` unconditionally requires `sessionState->commandMailbox.mailbox`
+  (`:35238`). Under D1 the backend supplies a real mailbox, so **prefer satisfying the check over
+  relaxing it** — a conditional check invites a second silent divergence.
+- **S1a.4** Resolve the `backendCpu` gap (D3).
+- **S1a.5** pgbench: select the new opener (fold into `--homer-dpu`, or a separate flag — decide once
+  S1a.1 exists).
 
-**Deliverable:** a written answer per question with `file:line`, and a revised size estimate for Stages 1–4.
-**Gate:** none (read-only). **Do not start Stage 1 before Stage 0 lands.**
+**Gate:** compiles; the DPU service logs an `OP_COMMAND_SESSION` open arriving over the DPU control
+slot. No end-to-end claim yet.
 
-### Stage 1 — Truth-in-comments (trivial, unblocks everyone reading this code)
-- Fix the stale GUC help text (`shared_library_init.c:2596`) — it claims the path "stops after
-  bridge-memory setup with an explicit not-implemented error", which is false in DOCA builds.
-- Document that `RemoteExecutionRejectDpuFrontendChannelIfSelected` (`homer_frontend_control.c:644`,
-  `:721`, `:1099`) guards *unsupported tuple-sink/fallback ops*, while command-session open **bypasses
-  it** (`:803`). These are different paths, not a contradiction — say so in both places.
-- Comment `HomerFrontendDmaOpenCommandSession` as the L1 opener and name the missing L2/L3 legs.
+### S1b — extract the shared Homer-frontend export module
+Now load-bearing, because **three** processes need it: the client library, the socketless backend (D1),
+and the postmaster (D2). Extract from the Tier-1 `homer_client.c` machinery — **not** from the Tier-2
+`homer_frontend_dma.c`.
 
-**Gate:** compiles; no behavior change.
+Surface: "open a control channel to my local DPU; export these regions; submit this control slot;
+receive this response." Must be linkable into both `libhomer_client.a` and the PostgreSQL backend.
 
-### Stage 2 — Client-side `HomerClientOpenSqlSessionSelectedDpu` (single-node)
-Give the client library the L1 opener the PG backend already has. **Single node only, no peer leg** —
-this is the smallest change that proves a client can own a command session on a DPU.
+**Gate:** the selected-DPU basebackup regression still passes (the module's only validated consumer at
+this point). Build all targets, including the smokes.
 
-- **S2.1** New client entry point in `src/bin/homer_client.c`: combine the SQL command-session request
-  fields (`:1558`–`:1575`: `sessionKey.opKind = OP_CLIENT_SQL_SESSION`, `clientSqlResultDpuRelay`,
-  `sessionUID`) with the selected-DPU export / control-slot machinery basebackup already uses
-  (`:2644`, `:2675`, `:2727`, `:2783`). Emit the open into the DPU control slot, not host SHM.
-- **S2.2** Service: admit `OP_CLIENT_SQL_SESSION` arriving over the DPU control slot. Relax
-  `TupleSinkServiceOpenRequestNeedsAsyncLocalControl` (`:34817`) and
-  `TupleSinkServiceProgressCommandOpenAsyncOp` (`:35172`). Keep the rejection for genuinely unsupported
-  opKinds — relax by *allow-list*, not by deleting the check.
-- **S2.3** `REGISTER_MEMORY` mailbox requirement (`:35238`): per Stage 0.4, either give the DPU-opened session
-  a DMA'd `commandMailbox` or make the requirement conditional. Prefer giving it a real mailbox;
-  a conditional check invites a second silent divergence.
-- **S2.4** Backend spawn: reuse the existing HOST-side leg unchanged (single-node ⇒ the client and the
-  backend are on the same host, so `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest` still applies).
-- **S2.5** pgbench: add `--homer-dpu-command` (or fold into `--homer-dpu`; decide once B2.1 exists) to
-  select the new opener.
+### S2 — backend becomes a Homer frontend (D1)
+- **S2.1** The spawned socketless backend CREATES its command mailbox, completion mailbox, and result
+  byte-ring (rather than `shm_open`ing frontend-created ones).
+- **S2.2** It exports all three to its LOCAL DPU via the S1b module, using bridge roles 2 and 3 for the
+  mailboxes and the existing host->DPU payload role for the result ring.
+- **S2.3** Retire the Tier-2 `SELECTED_DPU_DMA` mailbox-open path in
+  `remote_execution_backend_bridge.c` (`:2572`-`:2669`) — superseded, and never exercised.
 
-**Gate:** single-node pgbench opens its command session on the LOCAL DPU service, drives a socketless
-backend on the same host, and executes the standard TPC-B script correctly at `-c 1`. Verify from the
-DPU service log that the command session was created there, and that **no host Homer service is in the
-command path**. Basebackup + `--homer-dpu` result relay regressions must both still pass.
+**Gate:** the DPU service's engine shows a host mmap import for the backend's result ring
+(`HomerDpuDmaImportHostMmapDescriptorForSetup`) — the exact thing whose absence caused the three-run
+hang.
 
-### Stage 3 — DPU↔DPU peer command-session open (the net-new leg)
-- **S3.1** Relax the peer command-open gates: opKind rejection (`:37385`) and the following mailbox
-  checks (`:37395`, `:37406`). Allow-list, as in B2.2.
-- **S3.2** The receiving DPU must spawn a socketless backend on ITS host. **This is Stage 0.1.** If no path
-  exists, build it: a spawn-request descriptor DMA'd into the host spawn region + a host-side consumer.
-  Treat this as its own sub-stage with its own smoke.
-- **S3.3** Thread `sessionUID` through the DPU↔DPU command open exactly as the host↔host path does today
-  (`session_identity_and_pairing.md:58-62`), so the result relay's existing rendezvous keeps working
-  unchanged.
+### S3 — spawn trigger (D2)
+- **S3.1** Postmaster: at startup, DOCA-mmap its own spawn region and export it over the setup TCP;
+  keep the socket.
+- **S3.2** Postmaster: add the setup socket fd to its main-loop wait set; on readable, run the existing
+  slot scan.
+- **S3.3** DPU service: replace `TupleSinkServiceSubmitBackendSpawnRequest`'s `shm_open`
+  (`tuple_sink_service_process.c:18833`+) with a DMA write into the imported spawn region — **fields
+  first, then `REQUEST_READY` with a release barrier** — then one doorbell byte on the setup socket.
+- **S3.4** Keep the host-service `shm_open` submitter intact for the non-DPU `--homer` path.
 
-**Gate:** cross-node `pgbench --homer --homer-dpu` from farnet0 to farnet1 with the command session
-owned by the DPU services and **no host Homer service running at all**. Correct decoded results at
-`-c 1`, then `-c 2`. Basebackup regression.
+**Gate:** a DPU service causes a socketless backend to be forked on its own host. Assert the ordering
+(fields before state word) with a debug check.
 
-### Stage 4 — Collapse the split; retire the superseded paths
-Only after Stage 3's gate passes.
+### S4 — SINGLE-NODE end-to-end (the de-risking gate)
+Client, PostgreSQL, and ONE DPU on the same host. **No peer leg, no RDMA, no second DPU.** The client
+opens its session on the local DPU; the DPU triggers the spawn; the backend exports its mailboxes to the
+same DPU; commands, completions and tuple results all flow host<->DPU by DMA.
 
-- **S4.1** The `CLIENT_SQL_SESSION` now lives in the DPU service beside the relay. Re-examine whether the
-  `sessionUID` rendezvous is still needed for the role-7 ring. **Expectation: YES, keep it** — the ring is
-  still exported by a host process and imported across PCIe, so the rendezvous spans a boundary that does
-  not disappear. Do not remove it; confirm in code and record the reasoning.
-- **S4.2** Retire `HomerClientOpenSqlSession` (host-SHM command path) for pgbench.
-- **S4.3** Retire `citus_remote_exec_pgbench_transaction` + its UDF/extern/build refs (checkpoint "step 8").
-  **Now**, not earlier: until command-plane Stage 2 lands, it is the only non-smoke caller of the code this plan promotes.
-- **S4.4** The GUC becomes the only path ⇒ remove `citus.enable_experimental_homer_dpu_frontend` and its
-  gates, or flip its default and keep it as a kill switch. Decide with a measurement, not a preference.
+**Gate:** a `SELECT` returns correct decoded values. Validates D1+D2+D3 together with the smallest
+possible blast radius, and is the first proof the architecture works at all.
+
+### S5 — DPU<->DPU command peer-open
+Smaller than feared: `CRITICAL_CONTROL` is already the class basebackup's DPU<->DPU peer-opens ride
+(`remote_execution_peer_transport_rdma.h:73-75`; validation at `.c:2459`; command peer-open uses it at
+`tuple_sink_service_process.c:35316`, `:35427`, `:35430`). The transport is Tier-1; what is unvalidated
+is an `OP_COMMAND_SESSION` over it.
+
+- **S5.1** Relax the peer command-open gates by allow-list: opKind rejection (`:37385`) and the
+  following mailbox checks (`:37395`, `:37406`).
+- **S5.2** Thread `sessionUID` through the DPU<->DPU command open exactly as the host<->host path does,
+  so the result relay's existing rendezvous keeps working unchanged.
+- **S5.3** The receiving DPU triggers the spawn on ITS host via S3.
+
+**Gate:** a cross-node `OP_COMMAND_SESSION` reaches the remote DPU, spawns a backend, and a completion
+comes back.
+
+### S6 — `pgbench --homer --homer-dpu -c 1`, cross-node
+**Gate:** 200 transactions, zero failures, sane / non-constant decoded `abalance`, and no host Homer
+service anywhere in the command path. Then `-c 2`, which unblocks byte-ring pool Stage 2
+(`tupleSourceRing` per-session).
+
+### S7 — retire the superseded paths
+Only after S6.
+- **S7.1** `HomerClientOpenSqlSession` (host-SHM command path) for pgbench.
+- **S7.2** `citus_remote_exec_pgbench_transaction` + its UDF/extern/build refs (checkpoint "step 8").
+- **S7.3** The Tier-2 `homer_frontend_dma*` path and its GUC, now genuinely superseded by S1b.
+- **S7.4** Re-examine whether the `sessionUID` rendezvous is still needed. **Expectation: YES, keep it**
+  — the role-7 ring is still exported by a host process and imported across PCIe, a boundary that does
+  not disappear when the session table moves. Confirm in code; record the reasoning.
 
 **MUST NOT touch, at any stage** (basebackup calls the first unconditionally; `--homer-dpu` result
 delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_client.c:2551`, from
 `basebackup_homer.c:289`), `HomerClientOpenBaseBackupReceiveStreamSelectedDpu` (`:2922`),
-`HomerClientOpenSqlResultReceiveStreamSelectedDpu` (`:3522`, via `:3925`, `pgbench.c:9559`).
+`HomerClientOpenSqlResultReceiveStreamSelectedDpu` (`:3522`).
 
 ---
 
-## Trust tiers — "compiles" is not "works" (added July 9, 2026, after a third instance)
+## Open questions
 
-The project owner's guidance: **the Citus-backend-as-frontend path is most likely outdated. Do not
-assume it is correct.** Earlier today a read-only trace concluded `HomerFrontendDmaOpenCommandSession`
-is "not a stub" and should be KEPT AND PROMOTED. That conclusion is **retracted**. "Not a stub" only
-ever established that the code exists and compiles. Its only consumers are `homer_frontend_dma_smoke.c`
-and the deprecated `citus_remote_exec_pgbench_transaction` UDF. Its GUC help text still claims the path
-stops with a not-implemented error — which is as easily read as "nobody has looked at either in a
-while" as it is "the code is newer than the docs".
-
-Classify every component before depending on it:
-
-**TIER 1 — EXERCISED.** Some validated workload runs this today; changes to it are regression-testable.
-- client-library selected-DPU machinery in `homer_client.c`
-  (`HomerClientOpenBaseBackupStreamSelectedDpu`, `...ReceiveStreamSelectedDpu`,
-  `HomerClientOpenSqlResultReceiveStreamSelectedDpu`) — cross-node DPU basebackup moves ~23 GB
-  through it;
-- the DPU service's setup-TCP + `HomerDpuDmaImportHostMmapDescriptorForSetup` import path;
-- the DPU↔DPU RDMA peer transport for payload;
-- the backend-spawn region and its poller (every `--homer` pgbench run forks socketless backends
-  through it).
-
-**TIER 2 — EXISTS, UNEXERCISED.** Reachable only from a smoke or the UDF. Treat as documentation of a
-mechanism, not as a component. Includes `homer_frontend_dma.c`, `homer_frontend_dma_lifecycle.c`, the
-GUC-gated sites in `homer_frontend_control.c`, `citus_remote_exec_pgbench_transaction`, **and the
-`backendChannelMode = SELECTED_DPU_DMA` handling inside `remote_execution_backend_bridge.c`.**
-
-**Consequence for this plan.** The client-side `HomerClientOpenSqlSessionSelectedDpu` must be built on
-the **Tier-1 basebackup template**, not by extracting or promoting the Tier-2 server-side opener. And an
-earlier claim in this project — "the receiving half [SELECTED_DPU_DMA] is already implemented and
-honored" — is an overclaim: the branch exists; nothing validated drives it. If it is stale, Leg 2 grows
-by however much of the backend-side mailbox handling must be rewritten rather than reused.
-
-This is the same failure mode as the `mode=rdma` runbook example, the June-6 COPY baseline, and the
-"advisory" cache comment: **a written artifact (code, doc, or comment) that describes a path was
-trusted as evidence the path works.** Nothing executes documentation, and nothing executes an
-unexercised branch either.
+1. **`backendCpu`** (D3): carry it through the DPU control slot into the DPU-built spawn request, or use
+   service policy? Decide in S1a.
+2. **Does the socketless backend need DOCA at startup?** Under D1 it must export its rings, so yes. That
+   adds a DOCA dependency to every Homer backend. Acceptable per the stated intent, but it means a
+   backend cannot start if DOCA init fails — decide the failure policy.
+3. **Result byte-ring ownership.** Today the service creates the producer `sendQueue`. Under D1 the
+   backend must own and export it. Audit what else reads `stream.sendQueue` on the service side.
+4. **Postmaster wait-set surgery** (S3.2) is a Postgres-fork change. Confirm where `ServerLoop` builds
+   its fd set, and that adding one fd is safe with respect to `DetermineSleepTime()`.
 
 ## Standing risks
 
-1. **"Working code with no validated consumer" is not dead code.** The selected-DPU backend-spawn spine
-   compiles, is exercised only by `homer_frontend_dma_smoke.c:118`, and looks exactly like scaffolding.
-   Basebackup does NOT use it (its selected-DPU open is `OP_TUPLE_SINK` / `sessionKey.opKind =
-   OP_BASE_BACKUP`, `homer_client.c:2795`/`:2809`). Audit by "what would call this when the migration
-   finishes", not by "what calls this today".
-2. **Regression sweep.** Three regressions landed July 6–8 unnoticed because each validation built one
-   target and ran one workload. Before and after every stage here: build ALL targets (`service-bin`,
-   `client-bin`, every smoke) and run basebackup + `--homer-dpu` + COPY.
-3. **Baselines need a commit SHA**, not a date. A June-6 COPY baseline was cited as evidence that COPY
-   works today; it does not (see the regression doc).
+1. **"Working code with no validated consumer" is not dead code, and it is not trustworthy either.**
+   Audit by "what would call this when the migration finishes", then check whether anything calls it
+   *today*. Both answers matter.
+2. **Regression sweep.** Three regressions landed July 6-8 unnoticed because each validation built one
+   target and ran one workload. Before and after every stage: build ALL targets (`service-bin`,
+   `client-bin`, every smoke) and run basebackup + `--homer` + COPY.
+3. **Baselines need a commit SHA**, not a date.
 4. **Error propagation is a debuggability tax.** An aborted byte-ring stream hangs the client with no
-   error. Every fault on this path arrives as a hang. Fix before the next hard bug, not during one.
+   error; it has now cost three separate investigations. Fix before the next hard bug.
+
+## Related
+- [byte_ring_slot_capacity_regression.md](byte_ring_slot_capacity_regression.md) — the descriptor split,
+  and the three `--homer-dpu` bring-up runs that exposed the wall.
+- [dpu_byte_ring_pool_per_session_plan.md](dpu_byte_ring_pool_per_session_plan.md) — pool Stage 2 is
+  blocked behind S6.
+- [session_identity_and_pairing.md](../../../future-directions/citus/transport/session_identity_and_pairing.md)
+  — `sessionUID` as the cross-boundary binding key; survives this migration.
