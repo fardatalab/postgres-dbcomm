@@ -6,8 +6,36 @@
 > The pool plan's old Stage 3 ("retire the DPU frontend command channel") was inverted by evidence
 > and dissolved into this doc.
 
-**Status (July 9, 2026): PLANNED, not started. Stages 1–4 are blocked on the byte-ring pool plan's
-Stage 2 (`--homer-dpu -c 2`). Stage 0 is read-only and may run in PARALLEL with it.**
+**Status (July 9, 2026): PLANNED, not started. REORDERED — this is now a PREREQUISITE, not a
+follow-on.**
+
+> **CORRECTION (July 9, 2026, evening).** An earlier revision of this doc said "Unifying ownership is
+> the migration's endgame, not a prerequisite for anything currently in flight." **That is wrong**, and
+> three `--homer-dpu` bring-up runs proved it.
+>
+> The DPU DMA engine's mirrored ranges come ONLY from `engine->hostMmapImports`, populated solely by
+> `HomerDpuDmaImportHostMmapDescriptorForSetup` — i.e. by a HOST FRONTEND exporting its ring to the
+> engine over the DPU TCP setup socket. The engine exists to import HOST memory across PCIe. **A
+> host-resident service has nothing to import.**
+>
+> Today `pgbench` opens its command session via `HomerClientOpenSqlSession(HomerClientControl *)`, a
+> mapped HOST-service control SHM, and payload/result streams are created by the service that owns the
+> session. So the `--homer-dpu` result stream is born in the HOST service, whose engine (if it even has
+> one) can never hold an import for it. Observed: farnet1 binds a `purpose=0` MIRROR slot, then silence
+> — `HomerDpuDmaMirroredByteRangeReadyForServiceSink` iterates an empty import table, egress never
+> fires, the receiver never sees a byte, and the client hangs.
+>
+> **`--homer-dpu` therefore cannot work until the SQL command session lives in the DPU-native service.**
+> The client-side `HomerClientOpenSqlSessionSelectedDpu` (Stage 2 below) is not an architectural
+> nicety; it is what puts the session in the process that owns the engine.
+>
+> Cascade: byte-ring pool Stage 2 (`tupleSourceRing` per-session) is gated on a `-c 2 --homer-dpu`
+> repro, so it is blocked behind this too.
+
+**Intended end state (stated by the user, July 9, 2026):** the client binary and the PostgreSQL server
+binary each use the Homer FRONTEND to send/receive commands, completions and tuple results. No libpq.
+Two nodes talk to each other **through their own DPUs**, which DMA to and from their local host. The
+Homer *service* is the DPU service. Host Homer services are a bring-up scaffold, not the target.
 
 **Goal.** Move the SQL command/completion plane onto the DPU, so a session's command spine and its
 result relay live in the SAME process. Today they do not: pgbench's `CLIENT_SQL_SESSION` is created in

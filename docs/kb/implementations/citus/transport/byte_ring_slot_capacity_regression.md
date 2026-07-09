@@ -151,6 +151,34 @@ would have printed the answer instead of costing an 18-minute hang.
 **Runbook note:** `timeout` does not reach `pgbench` through the `sudo` → `sh -c` chain; the run had to
 be killed with `kill -9` on the process tree.
 
+### Test B, attempts 2 and 3 — the wall is ARCHITECTURAL, not configuration
+
+**Attempt 2** (farnet0 host service given an engine, client frontend pointed at it): the `ae17d2216`
+warning fired — on **farnet1**, the result PRODUCER. That falsified two of our claims: the code comment
+saying only the RECEIVE stream is flagged (`clientSqlResultDpuRelay` is threaded into the peer
+protocol's command-session AND result peer-open requests, v17), and the assertion that the SEND side
+"legitimately has no engine" (`HomerServicePayloadStreamUsesDpuMirrorSource` is the SEND-side EGRESS
+predicate). Fixed in citus `4e91aaa63`. **Both ends need an engine**, for different reasons.
+
+**Attempt 3** (engines on BOTH host services, postmaster exporting to farnet1's host service): warning
+gone, both DOCA contexts up, farnet1 bound `purpose=0 slot=0` (MIRROR), farnet0 provisioned the receive
+sink — then **silence**. `BEGIN` and `UPDATE ... rows=1` completed (neither returns a tuple); the first
+`SELECT` never returned. No relay activity, and the `relay target unresolved` counter never fired — so
+the relay pump never ran, so **no bytes ever landed**. The stall is on the SENDER's egress.
+
+**Root cause (mechanism).** `HomerDpuDmaMirroredByteRangeReadyForServiceSink` iterates
+`engine->hostMmapImports`, and those are populated ONLY by
+`HomerDpuDmaImportHostMmapDescriptorForSetup` — by a HOST FRONTEND exporting its ring to the engine
+over the DPU TCP setup socket. The engine exists to import HOST memory across PCIe.
+**A host-resident service has nothing to import.** farnet1's host service had an engine and an empty
+import table, so it bound a mirror slot and then had no mirrored range to egress. The topology we were
+iterating toward cannot exist.
+
+**Consequence.** `--homer-dpu` cannot work while the SQL command session lives in a host service,
+because the result stream inherits that owner. See
+[dpu_command_plane_migration_plan.md](dpu_command_plane_migration_plan.md) — the command-plane
+migration is now a **PREREQUISITE**, not a follow-on, and byte-ring pool Stage 2 is blocked behind it.
+
 ### ATTEMPT 1 FAILED AND WAS REVERTED (July 9, 2026) — superseded by the above
 
 Implemented as citus `e379d2dbe` + postgres `36cd6ee2da5`; **both reverted** (`aadcab871`,
