@@ -454,6 +454,52 @@ Two failures block the bring-up, in order:
   sender reported `tuple-view batch header mismatch ... batch_slot_capacity=32712 publish_bytes=56
   expected_slot_capacity=1024` — a result-queue geometry disagreement on the SEND side.
 
+#### Classification (read-only trace, July 9, 2026) — BOTH are code gaps, not misconfiguration
+
+**The host/DPU `sessionStates` split is DELIBERATE, not an accident.**
+`session_identity_and_pairing.md:112-120` states it outright: *"There are two 9717 peer legs, same
+binary, different instances… the sender's SEND session is owned by the farnet1 DPU service… SQL's
+cross-node command spine, by contrast, lives entirely in the host service on both ends… The linkage
+would have to travel DPU↔DPU, not host↔host"*, and *"The DPU↔DPU command-session path is net-new,
+not reuse."* Part 3.5.1 therefore chose a stable unique id (`sessionUID`) as the cross-boundary
+binding key **so the two session tables never need to be shared** — a rendezvous, not a shared
+table: `HomerDpuDmaFindDpuToHostByteRingRef` (`homer_service_dpu_dma.c:5172`) requires nonzero,
+exact, UNIQUE sessionUID and treats multiple matches as a hard error. Unifying ownership (one
+sessionStates, one owner) is the eventual DPU end-state but requires that net-new DPU↔DPU command
+spine; it is NOT a prerequisite for `--homer-dpu`.
+
+**Failure A = code gap. Minimal, design-consistent fix:** in the SQL role-7 rendezvous branch
+(`tuple_sink_service_process.c:33791`), stop *rejecting* when `parentServiceSessionId` does not
+resolve in the LOCAL `sessionStates` (`:33794` -> `:33797`). The DPU service legitimately cannot see
+a host-service-created command session. Keep the lookup as a DIAGNOSTIC (it still catches client
+mis-wires in same-process deployments), and let the load-bearing bind be the `sessionUID` match the
+relay pump already performs (`:31646-31654`). The handler's own comments already say this open
+"only has to succeed and name the parent command session" (`:33788`) and that the sessionUID check
+is "diagnostic, NOT load-bearing for resolve" (`:33802`) — the rejection contradicts its own docs.
+Basebackup escapes this because its selected-DPU RECEIVE mints a self-contained session from the
+bridge generation (`homer_client.c:3028`) and never names a parent; `parentServiceSessionId` appears
+ONLY in the SQL-result path (`homer_client.c:3518/3590/3797/3817`). pg_basebackup has no command
+plane at all — walsender produces bytes in-process — so it has nothing to reconcile.
+
+**Failure B = code gap (queue geometry), independent of A.** The sender validator requires
+`batchHeader->slotCapacityBytes == streamEntry->stream.slotCapacityBytes`
+(`tuple_sink_service_process.c:27568`). `stream.slotCapacityBytes` holds the NEGOTIATED semantic
+value (`REMOTE_EXEC_SQL_RESULT_SINK_SLOT_CAPACITY_BYTES = 1024`,
+`remote_execution_backend_bridge.c:77`, stored at `:23513`). But for a byte-ring-backed stream the
+queue descriptor handed to the PG backend recomputes capacity from PHYSICAL ring storage:
+`queueDescriptor->slotCapacityBytes = queueMapping->byteRingBytes / slotCount` (`:33539`), and the
+frontend subtracts the transport prefix (`homer_tuple_queue_frontend.c:952`, stored `:959`) before
+stamping it into the batch header (`:1787`). Arithmetic confirms: `8388608 / 256 = 32768`, minus
+`sizeof(CitusTupleSinkTransportHeader) = 56` -> **32712**, exactly as observed.
+The tell: `:33543` is a `direction == SEND && IsBaseBackup` special case, and `:23516` similarly
+reconciles basebackup's byte-ring geometry — the SQL byte-ring case falls to the `else` at `:23527`
+and keeps the negotiated 1024. **Basebackup's byte-ring geometry was reconciled; the SQL DPU-relay
+stream's never was.**
+OPEN DESIGN QUESTION for the B fix: which capacity is authoritative — the negotiated semantic 1024,
+or the byte-ring-derived 32712? A byte ring has no slots, so "slot capacity" degenerates to a max
+object size; forcing 1024 would silently cap batching. Do NOT fix B blind: it was observed under the
+*workaround* topology, so re-observe it under the intended split topology once A is fixed.
+
 **Change.**
 
 **Change.** Two-ring stream binds a SECOND handle (`SOURCE`). Bind at the tuple-source obtain

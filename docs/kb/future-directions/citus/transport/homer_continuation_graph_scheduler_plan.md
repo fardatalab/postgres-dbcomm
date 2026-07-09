@@ -3,9 +3,25 @@
 ## Scope
 
 - **What this doc explains**: the proposed continuation-graph scheduler model for Homer service work after the Slice 4B scheduler-priority hang. It defines the top-level objects, the boundary between workflow logic and scheduling policy, dependency/gate handling, ready-catalog semantics, and a staged migration path from the current guarded-action scheduler.
-- **What this doc does not cover**: DPU offload, multi-threaded service execution, a generic workflow DSL, or replacing the RDMA transport ownership fixes already landed in the v27 recovery work.
+- **What this doc does not cover**: multi-threaded service execution, a generic workflow DSL, or replacing the RDMA transport ownership fixes already landed in the v27 recovery work.
 - **Primary directory**: `docs/kb/future-directions/citus/transport/`
 - **Doc type**: `future-direction`
+
+> **Grounding note (updated after the DPU-selected migration).** The original
+> version of this plan predates the DPU-offloaded (selected-DPU) transport and
+> explicitly excluded DPU offload from scope. That is now stale: the primary
+> target is the **DPU-offloaded path** (host backends are CPU producers into
+> host memory; the DPU-resident Homer service pulls records with DOCA DMA into a
+> DPU-local mirror and RDMA-egresses from that mirror), and the legacy
+> host-process/non-DPU path is being removed. The design objects below are
+> unchanged in spirit, but the **workflows, resolvers, and lifecycle they must
+> model are now the DPU-offloaded ones** — see the new
+> [DPU-offloaded grounding](#dpu-offloaded-grounding-current-reality) section,
+> the added **DOCA DMA collector** in the external resolvers and runtime-loop
+> mermaid, and the rewritten payload-send/close and basebackup workflows. The
+> mermaid diagrams are illustrative of the design evolution, not exhaustive
+> contracts; where they conflict with the current code, the code (and the
+> grounding section's file references) win.
 
 This plan complements [`homer_completion_publication_v27_recovery_plan.md`](homer_completion_publication_v27_recovery_plan.md). The v27 recovery work fixed publication, CQ ownership, reset, close, and failure-lifetime contracts. This plan addresses the remaining scheduler modeling issue: the current machine/action-mask scheduler can expose several semantically dependent action bits and then asks a global planner to infer the safe order.
 
@@ -31,6 +47,88 @@ Scheduler owns resource allocation and grant order among already-runnable contin
 ```
 
 A workflow may have several active strands. Each strand has one current continuation. Multiple continuations may be active concurrently when they are genuinely independent or pipelined. A downstream continuation becomes ready through explicit dependency resolution or a gate, not because the scheduler guessed a priority ordering.
+
+The DPU migration produced a second, sharper instance of the same failure class —
+the selected-DPU basebackup **close hang** (see checkpoint Stage 10.0). Its root
+cause is exactly what this plan targets: the close/reclaim step depended on a
+readiness fact (`sendSourceDrained`, derived from the DPU-mirror byte-ring
+frontier) that a *different* action (the background import full-free) destroyed
+before the close ran. The current mask scheduler had no way to say "the close
+continuation depends on the mirror frontier still existing," so it silently
+classified the close `CLOSE_OR_RECLAIM_BLOCKED`, never granted it, and the stream
+leaked. In the continuation model this is a typed `FRONTIER` / owner-lifetime
+dependency the reclaim continuation could not have severed while a waiter existed
+— the ordering would have been explicit, not inferred. This example, and the
+DPU-offloaded lifecycle it lives in, are described in the grounding section next.
+
+## DPU-offloaded grounding (current reality)
+
+The workflows this plan must model are now the **DPU-offloaded** ones. The legacy
+host-process producer/consumer path still exists in the code but is being
+removed; do not design around it. Concretely, for a selected-DPU byte-ring
+payload/basebackup stream the data and control lifecycle is:
+
+```text
+host backend (CPU producer)  --writes-->  host byte ring (exported via DOCA mmap)
+DPU Homer service            --DOCA DMA pull-->  DPU-local mirror buffer
+DPU Homer service            --ibverbs RDMA write from mirror-->  peer receiver ring
+DPU Homer service            --DOCA DMA write-->  host consumed-head credit (frontier)
+```
+
+Two facts change the scheduler model versus the pre-DPU design:
+
+1. **DOCA DMA is a first-class external event source.** The DPU DMA engine
+   (`homer_service_dpu_dma.c`) owns a single progress engine (`doca_pe`) with
+   per-workload-class contexts. Its task completions (byte-ring pull, backend
+   command/response/completion publish, grouped-control discovery, consumed-head
+   credit) are the resolvers for a whole family of dependencies that did not
+   exist in the SHM design: "host bytes pulled into the mirror to frontier F"
+   (`completedByteTail`), "a mirror range is ready for egress",
+   "consumed-head credit published". This plan therefore adds a **DOCA DMA
+   collector** to the external resolvers and the runtime-loop diagram. Ready-set
+   building may read maintained DPU-local facts only; actual DMA submit and
+   `doca_pe_progress()` happen inside the granted continuation, preserving the
+   nonblocking-drain invariant.
+
+2. **The payload close is two lifetimes, not one.** The selected-DPU close
+   separates a **host-export lifetime** (local, resource/owner only) from the
+   **semantic byte-stream close** (peer-dependent). They must be independent
+   strands with independent gates:
+   - *Host-export lifetime* → `CLOSE_ACK`: satisfied by local drain only —
+     in-flight DMA retired (`inflightTaskCount==0`) and all discovered host bytes
+     pulled (`acceptedPublishedTail==completedByteTail`) and local handles
+     released (`LocalHandleCount==0`). At `CLOSE_ACK` the host mmap is freed and
+     the import moves to `HOST_DETACHED`; the DPU-local mirror survives for
+     background egress. This is a `FRONTIER` + `OWNER_COUNT_ZERO` +
+     `LOCAL_HANDLE_ZERO` all-of gate. It must never wait on peer/egress/credit.
+   - *Semantic byte-stream close* → `CLOSE_SINK` round-trip + final receiver
+     credit (`senderVisibleRemoteConsumedHead >= finalPublishedTail`) + local
+     send-CQ retirement. This runs in the background and may reset without wedging
+     the host-visible close. Its terminal step releases the DPU-local mirror
+     (`senderCloseReleased`), which is the dependency that finally lets the
+     background import full-free run.
+
+   The Stage 10.0 bug was precisely the inversion of that dependency: the import
+   full-free (which should be the *last* consumer of the mirror frontier) ran
+   *before* the semantic close consumed it. In the continuation graph, the
+   full-free continuation has an explicit owner-lifetime dependency on the
+   semantic-close continuation having released the mirror; it cannot be granted
+   earlier.
+
+Mapping the current close/reclaim readiness inputs to the typed dependency kinds
+(`HomerDependencyKind`, defined later) grounds the abstract model on real code:
+
+| Current-code readiness input | Dependency kind | Owner |
+|---|---|---|
+| `completedByteTail >= F` (pull complete) | `FRONTIER` | DPU-mirror byte-ring frontier |
+| `releasedByteTail == completedByteTail` (egress drained) | `FRONTIER` | mirror frontier |
+| `inflightTaskCount == 0` | `OWNER_COUNT_ZERO` | DMA import task owners |
+| `payloadSendOwnerCount == 0` / send WRs retired | `OWNER_COUNT_ZERO` | payload send owners |
+| `LocalHandleCount == 0` | `LOCAL_HANDLE_ZERO` | sink local handles |
+| `senderVisibleRemoteConsumedHead >= finalPublishedTail` | `FRONTIER` | remote consumed-head credit |
+| `CLOSE_SINK` async op terminal | `CONTROL_OP` | peer control op |
+| `senderCloseReleased` (mirror released to reclaim) | `OWNER_COUNT_ZERO` / owner-lifetime | import ↔ owning stream |
+| peer connection state | `CONNECTION_STATE` | CM/peer connection |
 
 ## Top-level objects
 
@@ -224,11 +322,14 @@ SQL result workflow:
     all-of join to APPLY_TERMINAL
 
 Basebackup workflow:
-    PUMP_CHUNK_WINDOW continuation
-    physical WR owners are not scheduler continuations
+    PUMP_CHUNK_WINDOW continuation (DMA-pull host ring -> mirror -> RDMA egress)
+    physical WR owners and borrowed mirror ranges are not scheduler continuations
 
-Payload stream workflow:
-    PUMP_PAYLOAD -> POST_FINAL -> WAIT_RETIREMENT -> WAIT_REMOTE_DRAIN -> CLOSE -> RECLAIM
+Payload stream workflow (DPU-offloaded, two close strands joined by a reclaim gate):
+    egress strand:        DMA_PULL -> CLAIM_MIRROR -> RDMA_EGRESS (looped)
+    host-export strand:   WAIT(local drain all-of) -> CLOSE_ACK (free host mmap)
+    semantic-close strand: WAIT_SEND_RETIRED -> WAIT_REMOTE_DRAIN -> CLOSE_SINK -> RELEASE_MIRROR
+    reclaim gate:         all-of(HOST_DETACHED, egress drained, senderCloseReleased) -> RECLAIM
 ```
 
 ## Mermaid: high-level runtime/scheduler loop
@@ -238,6 +339,7 @@ flowchart TD
     subgraph ExternalCollectors[External collectors]
         RecvCQ[Recv-CQ collector]
         SendCQ[Send-CQ collector]
+        DMA[DOCA DMA PE collector]
         Bitmap[Command/backend bitmap collector]
         CM[CM/lifetime collector]
         Timer[Timer/deadline collector]
@@ -265,6 +367,7 @@ flowchart TD
 
     RecvCQ -->|resolve dependency| Waits
     SendCQ -->|resolve dependency| Waits
+    DMA -->|resolve dependency| Waits
     Bitmap -->|resolve dependency| Waits
     CM -->|resolve dependency| Waits
     Timer -->|resolve dependency| Waits
@@ -724,10 +827,23 @@ void HomerDependencyResolve(
 ```text
 recv-CQ collector: command, completion, payload, control arrival
 send-CQ collector: WR/source retirement and credit release
+DOCA DMA PE collector: byte-ring pull frontier reached (completedByteTail),
+    mirror range ready for egress, backend command/response/completion publish
+    retired, grouped-control discovery, consumed-head credit published,
+    import teardown drained / host-detached reclaim
 shared bitmap collector: frontend command/backend completion availability
 CM collector: connection state
 timer collector: deadline
 ```
+
+The DOCA DMA PE collector is the DPU-offloaded addition. It drains the single
+shared `doca_pe` inside the granted DMA continuation (never speculatively during
+ready-set building) and resolves the byte-ring/frontier/owner dependencies listed
+in the [grounding section](#dpu-offloaded-grounding-current-reality). It is the
+resolver whose racing full-free broke the Stage 10.0 close: the reclaim
+continuation must depend on the semantic-close continuation's mirror release, so
+the collector cannot retire the import frontier while a close waiter still reads
+it.
 
 ### Internal resolvers
 
@@ -814,38 +930,83 @@ flowchart LR
     ANY --> A
 ```
 
-## Mermaid: payload send/close workflow
+Under selected-DPU, the resolvers feeding this workflow are DMA-backed: the
+terminal-completion epoch (`T0`) is satisfied by the DOCA DMA collector retiring
+the backend-completion publish, and the result-payload strand's required frontier
+(`R1`) is the same DMA-pull-into-mirror + RDMA-egress pipeline as the payload
+workflow (the mirror byte-ring frontier is the `FRONTIER` owner). The join and
+close/reclaim structure are unchanged; only the resolver sources move to the DMA
+collector.
+
+## Mermaid: payload send/close workflow (DPU-offloaded)
+
+This is the grounded, DPU-offloaded shape. The single pre-DPU `PUMP_PAYLOAD ->
+POST_FINAL -> ... -> RECLAIM` chain is replaced by (a) a DMA-pull + mirror-egress
+pipeline and (b) **two independent close strands** joined by an all-of reclaim
+gate — the host-export lifetime and the semantic byte-stream close. The
+host-export strand must never depend on the semantic strand (that coupling was
+the design smell behind the Stage 10.0 hang).
 
 ```mermaid
 flowchart TD
-    P0[PUMP_PAYLOAD]
-    P1{More payload immediately postable?}
-    P2[POST_FINAL_PAYLOAD]
-    P3[WAIT_LOCAL_WR_RETIREMENT]
-    P4[WAIT_REMOTE_DRAIN]
-    P5[POST_CLOSE_REQUEST]
-    P6[WAIT_CLOSE_RESPONSE]
-    P7[RECLAIM]
+    subgraph Egress[Egress pipeline strand]
+        E0[PUMP: DOCA DMA-pull host ring to mirror]
+        E1[CLAIM mirror range]
+        E2[ibverbs RDMA-egress from mirror]
+        E3{More host bytes / mirror ranges within budget?}
+        E0 --> E1 --> E2 --> E3
+        E3 -->|yes| E0
+        E3 -->|host source empty, not terminal| WDATA[BLOCK: FRONTIER acceptedPublishedTail]
+        E3 -->|remote ring credit full| WCREDIT[BLOCK: FRONTIER remote consumed head]
+        E3 -->|producer terminal, all pulled and egressed| EGRESSDONE[egress complete]
+        WDATA -->|DMA collector: pull frontier| E0
+        WCREDIT -->|send-CQ + credit collector| E0
+    end
+
+    subgraph HostExport[Host-export lifetime strand → CLOSE_ACK]
+        H0[["ALL OF: inflightTaskCount==0, acceptedPublishedTail==completedByteTail, LocalHandle==0"]]
+        H1[CLOSE_ACK: free host mmap, import HOST_DETACHED]
+        H0 --> H1
+    end
+
+    subgraph Semantic[Semantic byte-stream close strand — may reset without wedging host]
+        S0[WAIT final send-CQ retired]
+        S1["WAIT remote consumed head >= final published tail"]
+        S2[POST CLOSE_SINK]
+        S3[WAIT quiesced response]
+        S4[RELEASE mirror: senderCloseReleased]
+        S0 --> S1 --> S2 --> S3 --> S4
+    end
+
+    R{{"ALL OF: HOST_DETACHED, releasedByteTail==completedByteTail, senderCloseReleased"}}
+    RECLAIM[RECLAIM import + sink + session]
     FAIL[ABORT_RESET_FAILURE]
 
-    P0 --> P1
-    P1 -->|yes, budget exhausted| P0
-    P1 -->|source empty| WDATA[BLOCK: producer data]
-    P1 -->|credit unavailable| WCREDIT[BLOCK: send CQ/source credit]
-    P1 -->|producer terminal| P2
-    P2 --> P3
-    P3 -->|owners retired| P4
-    P4 -->|remote consumed head final| P5
-    P5 --> P6
-    P6 -->|quiesced response| P7
+    EGRESSDONE --> H0
+    EGRESSDONE --> S0
+    H1 --> R
+    S4 --> R
+    R --> RECLAIM
 
-    WDATA -->|resolver: producer frontier| P0
-    WCREDIT -->|resolver: send CQ retirement| P0
-
-    P0 -.protocol/post failure.-> FAIL
-    P2 -.partial post.-> FAIL
-    P5 -.close protocol failure.-> FAIL
+    E2 -.post failure.-> FAIL
+    S2 -.close protocol failure.-> FAIL
+    FAIL -->|binding clear releases mirror| S4
 ```
+
+Notes grounding this on the code:
+
+- The egress pipeline is `HomerServicePumpOutgoingDpuMirrorByteRingPayload()` plus
+  the DMA engine's byte-ring pull; the mirror claim/release lifetime is
+  `HomerDpuDmaClaim/Release/UnclaimMirroredByteRange()`.
+- The host-export strand is `HomerServiceDpuPayloadStreamsDrainedForClosingSetup()`
+  (lifetime-only) → `HomerDpuDmaDetachHostMmapForClose()`. It is a pure all-of gate
+  over local owners; **no semantic edge feeds into it**.
+- The semantic strand is `TupleSinkServicePeerCloseSinkBestEffort()`; its terminal
+  `RELEASE mirror` is `HomerServiceClearPayloadStreamPeerBinding()` calling
+  `HomerDpuDmaMarkImportSenderCloseReleased()`.
+- The reclaim all-of gate is `HomerDpuDmaReclaimDetachedImports()`; its
+  `senderCloseReleased` term is the explicit owner-lifetime dependency that the
+  Stage 10.0 fix added so the full-free cannot precede the semantic close.
 
 ## Mermaid: basebackup bounded chunk window
 
@@ -862,8 +1023,8 @@ flowchart TD
 
     B0 --> B1 --> B2
     B2 -->|issued N WRs, more immediate work| B1
-    B2 -->|source empty| W1[BLOCK: producer data]
-    B2 -->|window or SQ credit full| W2[BLOCK: send CQ credit]
+    B2 -->|host byte-ring not yet pulled to frontier| W1[BLOCK: FRONTIER completedByteTail via DMA pull]
+    B2 -->|window or remote credit full| W2[BLOCK: FRONTIER remote consumed head]
     B2 -->|all object bytes submitted, WRs outstanding| B3
     B2 -->|all submitted and retired| B4
     B3 -->|WR owners zero| B4
@@ -871,13 +1032,135 @@ flowchart TD
     B5 -->|yes| B0
     B5 -->|no| B6 --> B7
 
-    W1 -->|producer frontier resolves| B1
-    W2 -->|send CQ resolves| B1
+    W1 -->|DOCA DMA collector: pull frontier resolves| B1
+    W2 -->|send-CQ + credit collector| B1
 ```
 
-For current basebackup, `PUMP_CHUNK_WINDOW` is one continuation that can issue N WRs per grant. The N WR owner records are physical lifetime records, not scheduler continuations.
+For the DPU-offloaded basebackup, `PUMP_CHUNK_WINDOW` is one continuation that,
+per grant, DOCA DMA-pulls host byte-ring bytes into the DPU-local mirror and
+issues N ibverbs RDMA WRs from the claimed mirror range. The N WR owner records
+and the borrowed mirror range are physical lifetime records, not scheduler
+continuations; the mirror prefix is released on send-CQ retirement
+(`HomerDpuDmaReleaseMirroredByteRangePrefix()`). Its stream close reuses the same
+two-strand host-export / semantic-close shape as the payload workflow above.
 
 Separate child continuations are justified only if chunks have independent semantic work, such as compression, independent disk reads, separate remote targets, independent retry policy, or multiple worker threads.
+
+## Mermaid: command/completion workflow (DPU-offloaded)
+
+This workflow did not exist in the pre-DPU plan; under selected-DPU it is the
+DOCA DMA command lifecycle that drives the pgbench transaction. All legs are DOCA
+DMA between host memory and the DPU (no RDMA — commands/completions are a *local*
+host↔DPU exchange). The controlling invariant is **one command in flight per
+selected-DPU session** (`HomerServiceDpuSelectedSessionState.inFlightCommandKind`):
+a new `START_COMMAND` is refused while a command is in flight or a terminal
+completion is unconsumed.
+
+```mermaid
+flowchart TD
+    C0[COMMAND_PULL: DMA-read frontend START_COMMAND from host command ring]
+    C1[STAGE + DISPATCH staged command]
+    C2[BACKEND_COMMAND_PUBLISH: DMA body OPTIMIZE_REPORTS + publishedEpoch FLUSH to host backend mailbox]
+    C3{{backend executes; produces completion and, for row commands, result tuples}}
+    C4[BACKEND_COMPLETION_PULL: DMA-read host completion mailbox, submit consumedEpoch credit, accept]
+    P0[POLL_COMMAND_COMPLETION pull]
+    C5{terminal completion ready?}
+    C6P[stage PENDING response]
+    C6T[stage terminal completion response]
+    C7[COMPLETION_PUSH: DMA-publish frontend completion event]
+
+    C0 --> C1 --> C2 --> C3 --> C4
+    P0 --> C5
+    C5 -->|no, command still in flight| C6P --> C7
+    C5 -->|yes| C6T --> C7
+    C4 -.resolves.-> C5
+    C7 -->|terminal completion carries resultQueueDescriptor| JOIN[[SQL result all-of join]]
+```
+
+Ground truth: the scheduler actions are `HOMER_PROGRESS_ACTION_DPU_COMMAND_PULL`,
+`..._STAGED_COMMAND_DISPATCH`/`_EXECUTE`, `..._BACKEND_COMMAND_STAGE`/`_PUBLISH`,
+`..._BACKEND_COMPLETION_PULL`, `..._COMPLETION_PUSH`, plus `..._CONSUMED_HEAD_PUBLISH`
+for credit; acceptance is `HomerServiceDpuAcceptOneBackendCompletion()` and the
+poll response is `HomerServiceDpuStageOnePollCompletionResponse()`. Completion
+acceptance is gated on the consumed-epoch DMA *submit* (not its later PE callback),
+and the frontend poll slot is never parked — a not-ready poll returns PENDING and
+the frontend re-polls.
+
+## SQL transaction workflow: two strands, one all-of join (grounded)
+
+A row-producing SQL command (pgbench `SELECT abalance`) is one **SQL session**
+workflow instance (long-lived domain state) whose per-command execution is two
+continuation strands meeting at an all-of gate. The schedulable unit is the
+**action** (a continuation node's executor, run by the runtime on a grant); the
+"command" is not itself a unit — it is this set of continuation nodes re-activated
+per command (bumping `activationGeneration`). This is the same all-of join the
+pre-DPU [SQL result workflow](#mermaid-sql-result-workflow) already draws; the
+grounding below is what each node actually is.
+
+Continuation nodes (each node's `actionKind` names the executor the runtime runs):
+
+```text
+command/completion strand:
+    COMMAND_PULL             DPU_COMMAND_PULL            (resolve: DMA collector, START_COMMAND staged)
+    STAGE_DISPATCH           DPU_STAGED_COMMAND_DISPATCH
+    BACKEND_COMMAND_PUBLISH  DPU_BACKEND_COMMAND_PUBLISH  -> WAIT_BACKEND
+    WAIT_BACKEND             BLOCK: EVENT_EPOCH (backend completion staged)
+    BACKEND_COMPLETION_PULL  DPU_BACKEND_COMPLETION_PULL (+ DPU_CONSUMED_HEAD_PUBLISH credit)
+    COMPLETION_PUSH          DPU_COMPLETION_PUSH          == terminal-completion continuation
+
+result strand (active only when the command produces rows):
+    RESULT_DRAIN             byte-ring-pull actionKind    (same executor as payload egress)
+    RESULT_FRONTIER_READY    BLOCK: FRONTIER (result byte-ring frontier)
+
+gate + apply:
+    G = ALL_OF(terminal-completion, result-frontier)      (HomerDependencyGate, all-of)
+    APPLY_TERMINAL           bind sink from completion.resultQueueDescriptor, borrow/read/release tuple
+    DONE
+
+session serialization (a dependency the session owns, not a scheduler band):
+    the next command's COMMAND_PULL BLOCKs until the prior command's DONE
+    (one command in flight; HomerServiceDpuSelectedSessionState.inFlightCommandKind)
+```
+
+Resolve points (which collector makes each BLOCKed continuation ready — the part
+worth getting exactly right):
+
+- `WAIT_BACKEND`: the DOCA DMA collector at the backend-completion pull's
+  *acceptance*, which is the consumed-epoch DMA **submit**, not its later PE
+  callback. The runtime must treat the submit as the resolve edge (repeated
+  observation of the same staged completion before the credit retires is a
+  duplicate, not a new event).
+- `RESULT_FRONTIER_READY`: the DOCA DMA collector at the result byte-ring pull
+  frontier (a `FRONTIER` owner). Same executor / `actionKind` as any payload
+  byte-ring drain — different owner.
+- `G`'s terminal arm is satisfied by `COMPLETION_PUSH` retiring, but the gate
+  carries the completion **descriptor** as its satisfaction payload (not a
+  boolean), because `APPLY_TERMINAL` needs `resultQueueDescriptor` as the binding
+  key.
+
+Why one instance, not two: `APPLY_TERMINAL` reads shared domain state produced by
+the completion strand (the result binding) to interpret the result strand's
+frontier. Keeping both strands' nodes in one session workflow instance lets the
+gate resolve against local domain state instead of validating a second instance's
+generation. Promote the result strand to its own workflow + a cross-workflow gate
+only if a result egress becomes genuinely independent (cross-host result to a
+different node, independent retry) — the documented escape hatch, not the default.
+
+Concurrency, not sequence: the backend produces result tuples into the byte ring
+*while it executes*, before it writes the terminal completion, and the DPU pulls
+that ring in parallel. So the two strands run concurrently and meet at the gate; a
+linear "complete then drain" chain would be wrong. The only asymmetry is in the
+data — the completion supplies the binding key, the result strand supplies the
+data, and `APPLY_TERMINAL` needs both.
+
+Evidence this is real and separable: Stage 8B.15 failed because the
+command/completion strand ran selected-DPU while the result-sink strand still
+opened the legacy host-service control region (`RemoteExecOpenServiceOwnedResultSink()`);
+Stage 8B.16 fixed it by carrying result metadata on the completion and binding a
+lifecycle-created result byte ring — i.e. by wiring the join. A pure DML/scalar
+command (`UPDATE`/`INSERT`) has no result binding, so the result strand is
+inactive and the join degenerates to the completion strand alone — same model,
+one strand dormant.
 
 ## Current-code migration mapping
 
@@ -893,6 +1176,15 @@ Separate child continuations are justified only if chunks have independent seman
 | payload/close state structs | Domain state inside payload workflow instances. |
 | send/ACK owner FIFOs | Physical dependency owners and resolvers. |
 | shared ready bitmaps | External event discovery, not workflow state. |
+| `HomerDpuDmaEngine` single `doca_pe` + per-class contexts | The DOCA DMA PE collector; its task completions are external resolvers. |
+| `HomerDpuDmaHostMmapImport` lifecycle (ACTIVE / CLOSING / HOST_DETACHED) | Host-export lifetime owner; drives the `CLOSE_ACK` all-of gate, distinct from the semantic close. |
+| byte-ring frontiers (`accepted` / `completed` / `releasedByteTail`) | `FRONTIER` dependency owners for pull / egress / credit. |
+| `senderCloseReleased` flag | Owner-lifetime dependency: the import full-free continuation waits on the semantic-close continuation's mirror release. |
+| `HomerServicePayloadStreamReasonMasks` `readyMask`/`blockedMask` (incl. `CLOSE_OR_RECLAIM_PENDING`/`_BLOCKED`) | Replaced by typed dependencies + gates. The Stage 10.0 `CLOSE_OR_RECLAIM_BLOCKED` misclassification is exactly the inference this model removes. |
+| `CanSubmit` / `CanDrainHostRing` / `CanEgressMirror` import gates | Per-action lifecycle predicates; become scheduling-class + dependency-kind constraints on the DMA continuations. |
+| `HomerServiceDpuSelectedSessionState` (`inFlightCommandKind`, staged completion) | Command-workflow domain state; the one-command-in-flight dependency the workflow owns. |
+| DPU command/completion actions (`DPU_COMMAND_PULL`, `DPU_BACKEND_COMMAND_STAGE`/`_PUBLISH`, `DPU_BACKEND_COMPLETION_PULL`, `DPU_COMPLETION_PUSH`, `DPU_CONSUMED_HEAD_PUBLISH`) | Command/completion workflow continuations; all DMA-collector-resolved. |
+| completion `resultQueueDescriptor` + `BindRemoteExecutionCommandResult()` | The join edge binding the command terminal completion to the result-payload sink (the pgbench transaction interplay). |
 
 ## Migration sequence
 
@@ -918,20 +1210,23 @@ Wrap one existing cold action first.
 
 ### Continuation-2 — Payload send/close workflow
 
-Migrate the payload/close path first because it directly replaces the bad Slice 4B payload-vs-close priority inference.
+Migrate the payload/close path first because it directly replaces the bad Slice 4B payload-vs-close priority inference, and because the DPU-offloaded close is the concrete case that already broke twice (Slice 4B, then Stage 10.0).
 
-Initial nodes:
+Initial nodes (DPU-offloaded shape — egress pipeline + two close strands + reclaim gate):
 
 ```text
-PUMP_PAYLOAD
-POST_FINAL_PAYLOAD
-WAIT_LOCAL_RETIREMENT
-WAIT_REMOTE_DRAIN
-POST_CLOSE_REQUEST
-WAIT_CLOSE_RESPONSE
-RECLAIM
-FAIL_RESET
+egress strand:         DMA_PULL, CLAIM_MIRROR, RDMA_EGRESS
+host-export strand:    WAIT_LOCAL_DRAIN (all-of), CLOSE_ACK
+semantic-close strand: WAIT_SEND_RETIRED, WAIT_REMOTE_DRAIN, POST_CLOSE_SINK,
+                       WAIT_CLOSE_RESPONSE, RELEASE_MIRROR
+reclaim:               RECLAIM (all-of gate: HOST_DETACHED, egress drained, senderCloseReleased)
+failure:               FAIL_RESET (routes through RELEASE_MIRROR)
 ```
+
+The load-bearing new edges versus the pre-DPU list: the host-export strand has
+**no** dependency on the semantic strand, and `RECLAIM`'s gate includes the
+`senderCloseReleased` owner-lifetime term. Getting those two right is the whole
+Stage 10.0 fix expressed declaratively.
 
 ### Continuation-3 — SQL result join
 
@@ -947,7 +1242,17 @@ to a two-strand all-of gate.
 
 ### Continuation-4 — Command lifecycle
 
-Migrate command reserve/publish/wait-terminal/apply/ack sequencing. Shared command/completion producer bitmaps resolve exact dependencies; they are not workflow state.
+Migrate the DPU-offloaded command/completion workflow: `COMMAND_PULL ->
+STAGE/DISPATCH -> BACKEND_COMMAND_PUBLISH -> WAIT_BACKEND -> BACKEND_COMPLETION_PULL
+(+ consumed-epoch credit) -> POLL_RESPONSE (PENDING or terminal) -> COMPLETION_PUSH`.
+The DOCA DMA collector resolves each step; the per-session `inFlightCommandKind`
+enforces one command in flight (a dependency the workflow owns, not a scheduler
+band). Do this together with Continuation-3, because for row-producing SQL the
+command/completion strand and the SQL-result strand are the two arms of one
+all-of join and share the result binding (`resultQueueDescriptor`) — migrating one
+without the other reproduces the Stage 8B.15 split-channel failure. Legacy shared
+command/completion producer bitmaps become external event discovery for the
+non-DPU path only, which is being removed.
 
 ### Continuation-5 — Basebackup bounded pump
 
@@ -993,6 +1298,24 @@ join target becomes ready at most once per gate generation
 payload close is never active before payload predecessor completes
 
 scheduler chooses only among READY continuations
+
+host-export lifetime (CLOSE_ACK / host mmap free) never depends on the semantic
+    byte-stream close (CLOSE_SINK, receiver credit); they are separate strands
+
+a frontier/owner a continuation waits on is never retired or freed while a
+    waiter still reads it (the reclaim/free continuation cannot outrun its
+    consumers) -- this is the Stage 10.0 close-hang invariant made explicit
+
+the DPU-mirror import full-free runs only after the semantic close releases the
+    mirror (senderCloseReleased); the host mmap free (CLOSE_ACK) runs earlier on
+    local drain only
+
+a selected-DPU session has at most one command in flight; a new START_COMMAND is
+    refused while inFlightCommandKind is set or a terminal completion is unconsumed
+
+a row-producing command completes only when BOTH its terminal completion and its
+    result-payload frontier are ready (all-of join); the terminal completion is
+    the binding key (resultQueueDescriptor) for the result-payload sink
 ```
 
 ## Immediate next step
