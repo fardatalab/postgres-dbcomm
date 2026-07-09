@@ -542,8 +542,51 @@ and keeps the negotiated 1024. **Basebackup's byte-ring geometry was reconciled;
 stream's never was.**
 OPEN DESIGN QUESTION for the B fix: which capacity is authoritative — the negotiated semantic 1024,
 or the byte-ring-derived 32712? A byte ring has no slots, so "slot capacity" degenerates to a max
-object size; forcing 1024 would silently cap batching. Do NOT fix B blind: it was observed under the
-*workaround* topology, so re-observe it under the intended split topology once A is fixed.
+object size; forcing 1024 would silently cap batching.
+
+#### Failure A FIXED, Failure B REPRODUCED under the intended topology (July 9, 2026)
+
+Bring-up run with `26b2e1994` deployed to both DPU trees, intended split topology (host services both
+ends + DPU-native relay services both ends), `pgbench --homer --homer-dpu -c 1 -j 1 -t 200`:
+- **Failure A is gone.** No "unknown parent session". The farnet0 DPU service accepted the role-7 open
+  and pgbench progressed through session warmup, `BEGIN`, and `UPDATE ... rows=1`.
+- **Failure B reproduced verbatim** on the farnet1 HOST service, on the first `SELECT abalance`:
+  `batch_slot_capacity=32712 publish_bytes=56 expected_slot_capacity=1024`
+  (`tuple_sink_service_process.c:27574`), then `payload stream marked ABORTING for peer reset`. So B is
+  NOT a workaround-topology artifact.
+
+**Root-cause suspect (strong, but see the unresolved question).** `TupleSinkServicePayloadRingBytes`
+(`:6246`) was changed by the mirror-1:1 work to return the CONSTANT
+`HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES` (8 MiB) instead of `slotCount * payloadSlotBytes`; its own
+comment (`:6234`) says *"slotCount (the count) no longer sizes the ring; slotCount is retained only in
+the signature for call-site stability and is intentionally unused here."* But
+`queueDescriptor->slotCapacityBytes = queueMapping->byteRingBytes / streamEntry->stream.slotCount`
+(`:33539`) still divides by `slotCount`. That division only recovers the negotiated per-record capacity
+when `slotCount * slotCapacityBytes == HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`. It no longer does.
+SQL result sink: `slotCount=256`, `slotCapacityBytes=1024` (`remote_execution_backend_bridge.c:69,77`)
+⇒ `8388608/256 = 32768`, minus `sizeof(CitusTupleSinkTransportHeader)=56` ⇒ **32712**, exactly as
+observed. The producer stamps that derived value into the batch header
+(`homer_tuple_queue_frontend.c:1787`, from `sinkHandle->slotCapacityBytes` set at `:959`), while the
+sender validator (`:27568`) compares it against the negotiated `stream.slotCapacityBytes` = 1024.
+
+**UNRESOLVED — resolve this BEFORE fixing.** By that arithmetic Citus COPY should fail too:
+`CITUS_TUPLE_SINK_DEFAULT_SLOT_COUNT=8`, `CITUS_TUPLE_SINK_DEFAULT_SLOT_CAPACITY_BYTES=524288`
+(`homer_abi_version.h:29,31`) ⇒ `8388608/8 - 56 = 1048520 != 524288`. But COPY demonstrably works.
+So either COPY's SEND descriptor does not take the `:33539` byte-ring branch, or its
+`stream.slotCapacityBytes` is reconciled elsewhere, or its producer is a slot queue rather than a
+byte-ring producer. **Which it is determines whether `:33539` is dead-wrong for every byte-ring stream
+or only for this one**, and therefore whether the fix is local or shared-path. Do not fix blind.
+
+Fix options once that is settled: (i) descriptor carries the negotiated `payloadSlotBytes` (caps batch
+size at 968B payload — safe, but may cost batching); (ii) `stream.slotCapacityBytes` adopts the
+byte-ring-derived value for byte-ring streams (better batching, matches "a byte ring has no slots");
+(iii) validator compares `<=` instead of `==` (loosest; loses a real geometry check).
+
+#### Secondary robustness gap found during the bring-up (record, do not fix yet)
+An ABORTED byte-ring stream leaves the pgbench client hung FOREVER with no client-visible error — the
+service marks the stream ABORTING and resets the peer, but no error/EOS ever reaches the client. Same
+"silent" failure class as the tupleSourceRing aliasing. Worth a dedicated error-propagation fix.
+(Also: `timeout` + `sudo` did not deliver SIGTERM to pgbench; use `pkill -9` in runbooks.)
 
 **Change.**
 
