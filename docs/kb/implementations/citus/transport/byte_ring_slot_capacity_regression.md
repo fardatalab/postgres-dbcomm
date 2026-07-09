@@ -105,7 +105,53 @@ abort. **COPY cannot validate anything until Problem 2 is fixed.**
 header carries exactly the negotiated value the validator compares. Setting it to the bare negotiated
 capacity silently reintroduces the abort, one transport header short.
 
-### ATTEMPT 1 FAILED AND WAS REVERTED (July 9, 2026)
+### RESOLVED (July 9, 2026): split re-applied and VALIDATED
+
+Re-applied as citus `dba47d27f` + postgres `541d0b96484` after the A/B exonerated it.
+
+**Test A — basebackup regression on the CORRECT (4-role DPU-relay) topology: PASS.**
+Three warmed runs: `23,233,371,960` / `23,233,390,904` / `23,233,401,144` bytes, rc=0 both sides;
+payload connection allocated once then reused (slot index stable, no growth); zero
+`RECV_CQ_FAILURE` / `DISCONNECTED` / mismatch lines. Wall times 19.30 / 18.99 / 18.43 s.
+
+**Problem 1 is FIXED.** `pgbench --homer-dpu` previously died on its FIRST `SELECT` with
+`batch_slot_capacity=32712 expected_slot_capacity=1024`. Now `BEGIN` and `UPDATE ... rows=1` both
+round-trip and the mismatch line appears in NONE of the five logs.
+
+**Test B — `--homer-dpu -c 1`: still blocked, but by a WIRING gap, not this bug.** The `SELECT` is
+sent and never answered; the socketless backend spins at 99.8% CPU; no error anywhere.
+
+Root cause: `HomerServicePayloadStreamUsesDpuMirrorSource` (`:6331`) returns true only when
+`HomerServiceDpuDmaSchedulerEnabled(dpuDmaState) && dpuDmaState->engine != NULL` (`:6350-6352`).
+The SQL command spine is **host↔host**, so the result stream is received by farnet0's **HOST**
+service — which was started WITHOUT DPU DMA. `engine == NULL` ⇒ the stream never becomes a
+DPU-relay stream ⇒ the two-ring relay never runs ⇒ pgbench polls a role-7 ring nothing writes.
+The predicate's own comment (`:6343-6344`) predicts precisely this: *"would take the landing branch
++ two-ring relay dispatch ... and then stall with no role-7 target."*
+
+**This is Failure A again, on the data plane.** The role-7 ring is exported to the farnet0 **DPU**
+service (`HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.200`); the result stream lands in the farnet0
+**HOST** service. Two processes; one holds the ring, the other holds the stream.
+
+**Implication: the earlier bring-up's "attempt 2" had the RIGHT topology.** Running farnet0's host
+service with `HOMER_SERVICE_ENABLE_DPU_DMA=1 HOMER_SERVICE_ENABLE_DOCA_DMA=1
+HOMER_SERVICE_DOCA_DEV_PCI=0000:21:00.0` and pointing the client's `HOMER_FRONTEND_DPU_SETUP_HOST`
+at that same process gives ONE process owning both the receive stream and the role-7 import. That
+attempt executed real transactions and then died on the geometry bug — which is now fixed.
+**Next step: re-run Test B with that topology.** (Whether the long-term answer is this, or moving the
+SQL command spine onto the DPU, is the open question in
+[dpu_command_plane_migration_plan.md](dpu_command_plane_migration_plan.md).)
+
+**Diagnostic gap of our own making.** The relay-resolve miss counter added in citus `00a2c7d1b`
+never fired, because the relay pump never RAN. It instruments "resolve loop cannot find the ring",
+not "this stream is not a relay stream at all". **Add a one-time warning when `dpuRelayResultStream`
+is set on a stream but `HomerServicePayloadStreamUsesDpuMirrorSource()` is false** — that single line
+would have printed the answer instead of costing an 18-minute hang.
+
+**Runbook note:** `timeout` does not reach `pgbench` through the `sudo` → `sh -c` chain; the run had to
+be killed with `kill -9` on the process tree.
+
+### ATTEMPT 1 FAILED AND WAS REVERTED (July 9, 2026) — superseded by the above
 
 Implemented as citus `e379d2dbe` + postgres `36cd6ee2da5`; **both reverted** (`aadcab871`,
 `495f94db95f`) after validation. Builds and installs were rolled back to the pre-split ABI.
