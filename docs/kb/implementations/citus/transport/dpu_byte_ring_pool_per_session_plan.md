@@ -373,12 +373,94 @@ landing == DMA source); no tuple-source.
   regression pass.
 
 ### Stage 2 — two-ring (tuple-source) for concurrent `--homer-dpu` tuple/pgbench
-Two-ring stream binds a SECOND handle (`SOURCE`). Bind at the tuple-source obtain (`:31551`);
-deform write `HomerServiceTupleSourceRingProduceRecord` (`:31319`) uses `sourceBase =
-sourceHandle.storageAddr` with `% slotStorageBytes`; DMA read reuses the `(slotStorageBase,
-slotMmap)` params (`:9270/:9265/:3098`). Unbind the source handle alongside landing. Receive
-resolver here is already per-sessionUID-correct (`:31521`). **Validation:** 2 concurrent
-`--homer-dpu` sessions → disjoint slot bases, correct decoded results; single regression.
+
+**Workload (corrected).** The Stage-2 workload IS `pgbench --homer --homer-dpu`, a real pgbench
+flag (`postgres-citus/src/bin/pgbench/pgbench.c:306-312`, gate `:8751-8790`). `--homer` is the
+direct pgbench-client → socketless-backend Homer path (no libpq, no extra backend on the measured
+path). `--homer-dpu` is a *delivery variant layered on it*: the command/completion control path is
+unchanged; only RESULT-tuple delivery moves off the passive host-shm result sink and onto the DPU
+two-ring deform relay, arriving in a client-exported role-7 DPU→host ring drained per command to
+its in-band EOS. Requires `--homer`, a remote peer, `-M simple`.
+Do NOT confuse this with `citus_remote_exec_pgbench_transaction` + `citus.enable_experimental_
+homer_dpu_frontend`, which are the *backend COMMAND channel* through the DPU (Stage 3 below).
+
+**Stage 1 already covers most of the pgbench path.** The MIRROR and LANDING binds are generic, not
+basebackup-specific: LANDING via `HomerServiceEnsureLocalReceiveByteRing`, whose single call site
+(`tuple_sink_service_process.c:25746`) is gated on `HomerServicePayloadStreamUsesByteRing()`; MIRROR
+at payload-stream open (`:29040`, `:35881`). So `--homer-dpu` already gets per-session MIRROR +
+LANDING. **`engine->tupleSourceRing` is the LAST aliased data ring in the system.**
+
+**The aliasing, confirmed.** `HomerServicePumpIncomingTupleViewDpuTwoRingRelay` (`:31564`) — per-
+stream code — calls `HomerDpuDmaGetTupleSourceRingMemory(engine, ...)` (`:31681`), which returns the
+single engine buffer (`homer_service_dpu_dma.c:4109`), and passes `(char *)sourceRingBase,
+sourceStorage` into the deform write at `:31804` → `HomerServiceTupleSourceRingProduceRecord`
+(`:31450`), which does `producedTail % sourceStorage` into that base. Two live streams ⇒ two writers,
+one buffer. Both ENDPOINTS are already per-session (client `st->homer_session.sqlResultDpuStream`
+in per-client `CState`; DPU→host target resolved by unique `sessionUID` via
+`HomerDpuDmaFindDpuToHostByteRingRef`) — only the intermediate staging ring is shared, which is why
+it looks correct from either end.
+
+**Expected symptom differs from Stage 1 — this one is SILENT.** Stage 1's shared landing ring fed a
+defensive invariant (`observed > postedTail`) and reset loudly. The tuple-source ring feeds nothing
+but `memcpy` offsets, so aliasing yields *corrupted/interleaved tuple bytes*, not a crash. **The
+repro must assert on decoded tuple VALUES, not exit status** (pgbench logs `homer_last_abalance`
+under `-d` precisely for this).
+
+**Repro is one command, not a two-process runbook.** Each pgbench client is its own Homer session
+with its own role-7 stream, so `pgbench --homer --homer-dpu ... -c 2 -j 2` already produces two live
+streams over the one shared ring. Corollary: `--homer-dpu` has almost certainly only ever been
+exercised at `-c 1`; CLAUDE.md's multi-client remote run uses plain `--homer`, whose results go
+through the host-shm sink and never touch `tupleSourceRing`.
+
+**Change.** Two-ring stream binds a SECOND handle (`SOURCE`). Bind at the tuple-source obtain
+(`:31681`); deform write uses `sourceBase = sourceHandle.storageAddr` with `% slotStorageBytes`; DMA
+read reuses the `(dpuRingBase, dpuRingBytes, dpuRingMmap)` params already threaded through
+`HomerDpuDmaSubmitByteRingWrite` in Stage 1a. Unbind the source handle alongside landing (the
+existing `HomerDpuByteRingUnbind(pool, serviceStreamId)` frees ALL purposes of the stream, so no new
+unbind call is needed). Receive resolver here is already per-`sessionUID`-correct.
+
+**Slot sizing is already correct by construction.** The relay enforces
+`hostRingStorageBytes == sourceStorage` (`:31701`) so one `absoluteStart` addresses both the source
+(DMA read) and the host role-7 ring (DMA write). Both are `HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`,
+which IS the pool's `slotStorageBytes` — so a bound SOURCE slot satisfies that check without
+touching it. The homogeneous-slot design assumption is load-bearing here, not merely convenient.
+
+**Finish the invariant in the same commit.** After the bind lands, delete `engine->tupleSourceRing`,
+`engine->tupleSourceRingMmap`, `engine->tupleSourceRingBytes`, and
+`HomerDpuDmaGetTupleSourceRingMemory` (one caller), exactly as `mirrorRing` was retired. That
+completes "no engine-owned data-carrying byte-rings". Relocate, do not delete, the geometry rationale.
+
+**Validation:** `-c 2 --homer-dpu` repro FIRST (must fail on decoded values); then after the fix,
+2 concurrent sessions → disjoint SOURCE slot indices in the DPU log, correct decoded results,
+plus `-c 1` regression and a basebackup regression (shared bind/unbind code). Build the smoke
+targets too, not just `service-bin`.
+
+### Stage 3 — retire the server-side DPU frontend COMMAND channel + UDF harness
+
+Scoped deliberately AFTER Stage 2 so two unrelated risks are never in one validation.
+
+**Retire:** `citus.enable_experimental_homer_dpu_frontend` (GUC, `shared_library_init.c:2594`,
+default off, help text stale — still says "during Stage 2 ... not-implemented error"), its two live
+gates in `homer_frontend_control.c` (`:649` inside `RemoteExecutionRejectDpuFrontendChannelIfSelected`
+which *rejects*; `:804` which opens a real `HomerFrontendDmaOpenCommandSession`), and the
+`citus_remote_exec_pgbench_transaction` UDF harness
+(`src/backend/distributed/worker/homer/remote_exec_pgbench_transaction.c` — a prototype driver where
+a PG *backend* drives TX_BEGIN_ATTACH / SQL_EXECUTE / TX_COMMIT, i.e. exactly the extra backend
+`--homer` exists to avoid). Audit `backendChannelMode = SELECTED_DPU_DMA`
+(`homer_frontend_dma_lifecycle.c:283`, honored at `remote_execution_backend_bridge.c:2567/2574/
+2997/3005`; callers `HomerFrontendDmaSubmitBackendSpawn` `homer_frontend_dma.c:1352` and the
+frontend-DMA smoke).
+
+**MUST NOT touch:** the client `*SelectedDpu` family in `src/bin/homer_client.c` —
+`HomerClientOpenBaseBackupStreamSelectedDpu` (`:2551`),
+`HomerClientOpenBaseBackupReceiveStreamSelectedDpu` (`:2922`),
+`HomerClientOpenSqlResultReceiveStreamSelectedDpu` (`:3522`, returned `:3925`). Basebackup calls the
+first UNCONDITIONALLY and `--homer-dpu` result delivery rides the third. "Selected DPU" names two
+different things; only the server-side frontend command channel is the retirement candidate.
+
+**Also in scope:** clean up every comment and KB passage that still describes the retired channel as
+the way to reach the DPU, including this document's own Stage-2 note above and
+`dpu-native-build-tree-and-selected-dpu-validation` operational notes.
 
 ## Safety, gates, and caveats (strict)
 
