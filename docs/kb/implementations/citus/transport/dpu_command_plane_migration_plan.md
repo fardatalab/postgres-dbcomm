@@ -473,7 +473,37 @@ simply becomes DPU-local memory nobody else maps. **It likely survives the move 
 `clientCompletionMailbox` does **not**: it is registered **remote-writable** (`:35365`), the peer
 RDMA-writes completions into it, and today pgbench reads it directly out of shared memory
 (`HomerClientOpenCompletionMailbox`). Cross-node that must become a **DPU→host DMA into role 6**
-(`FRONTEND_COMPLETION_EVENT`). Nothing writes role 6 today. **This is the real S4/S5 work item.**
+(`FRONTEND_COMPLETION_EVENT`).
+
+> **⚠ CORRECTED (July 9, 2026).** An earlier revision said *"Nothing writes role 6 today."*
+> **False, and it made S4 look bigger than it is.** The service already writes role 6, end to end,
+> in the **single-node** shape — which is exactly S4's shape:
+>
+> ```
+> backend writes its role-3 completion mailbox
+>   -> HomerServiceDpuAcceptOneBackendCompletion       (DMA-pulls it)      :39348
+>   -> HomerServiceDpuEnqueueSelectedCompletionEvent                        :39007
+>   -> HomerServiceDpuPublishOneSelectedCompletionEvent                     :39478
+>   -> HomerDpuDmaSubmitFrontendCompletionEventPublication  (DMA into role 6)
+> ```
+>
+> Two things are genuinely missing, and they split cleanly across the stages:
+> - **S4:** no **Tier-1 client exports role 6.** The only exporter is the deprecated
+>   `homer_frontend_dma.c:1617`. `HomerClientOpenSqlSessionSelectedDpu` must export it and drive
+>   `START_COMMAND` down its role-1 control slot; the service-side push then already works.
+> - **S5:** no **cross-node bridge.** A remote completion lands in `clientCompletionMailbox` via peer
+>   RDMA, and nothing turns it into a selected-session completion event. The role-6 publisher is fed
+>   only by *locally* DMA-pulled backend completions.
+>
+> So the push machinery is **TIER 2 — exists, unexercised by any production client**, not absent.
+> Classify before depending on it: it compiles and the smoke touches parts of it, which is exactly
+> the trust level that has bitten this project repeatedly.
+
+**Why the normal path never tripped the POLL wedge.** Exercised client SQL is *push*-based — it waits
+on the pushed completion, never polls (`TupleSinkServiceHandlePollCommandCompletion` says so itself:
+*"Normal pgbench client SQL waits on the pushed completion ring directly; this handler is retained for
+debug/legacy local-control callers."*). That is precisely why the wedge stayed latent, and why the fix
+was hygiene for the deprecated frontend plus the invariant, not a repair of the measured path.
 
 **Gate:** compiles; the DPU service logs an `OP_COMMAND_SESSION` open arriving over the DPU control
 slot. No end-to-end claim yet.
@@ -612,8 +642,26 @@ Client, PostgreSQL, and ONE DPU on the same host. **No peer leg, no RDMA, no sec
 opens its session on the local DPU; the DPU triggers the spawn; the backend exports its mailboxes to the
 same DPU; commands, completions and tuple results all flow host<->DPU by DMA.
 
+**Smaller than written.** The single-node command/completion loop **already exists in the service**:
+`START_COMMAND` off the role-1 control slot is DMA-published into the backend's role-2 mailbox by
+`HomerServiceDpuStageOneBackendCommandForPublish`, and the backend's role-3 completion mailbox is
+DMA-pulled and republished into the client's role-6 line by `...AcceptOneBackendCompletion` →
+`...EnqueueSelectedCompletionEvent` → `...PublishOneSelectedCompletionEvent`. The TCP transport smoke
+exercises both directions (`--expect-backend-command-publish`, `--expect-backend-completion-pull`),
+now including into a tmpfs mapping (S0).
+
+So S4's own work is:
+- **S4.1** Export **role 6** from `HomerClientOpenSqlSessionSelectedDpu` (today the only role-6 exporter
+  is the deprecated `homer_frontend_dma.c:1617`), alongside role 1.
+- **S4.2** Drive `START_COMMAND` down the control slot from the client, and consume role-6 completion
+  events instead of `HomerClientWaitCommandCompletion`'s shm mailbox.
+- **S4.3** Depends on S2+S3 for the backend to exist at all.
+
 **Gate:** a `SELECT` returns correct decoded values. Validates D1+D2+D3 together with the smallest
 possible blast radius, and is the first proof the architecture works at all.
+
+> The command/completion machinery it leans on is **TIER 2 → 1.5**: it exists, the smoke drives it, no
+> production client does. Expect bugs on first real contact — that is what this gate is for.
 
 ### S5 — DPU<->DPU command peer-open — **RE-SCOPED: mostly already done**
 
@@ -671,10 +719,30 @@ host role-1 control slot (slotCount = 1)
 ```
 
 While a ring's staged slot is set, the pull scheduler issues **no further pull for that ring**
-(`homer_service_dpu_dma.c:1154`: skip if `commandPullInFlight || stagedCommandSlotValid`). The 64 pull
-buffers are the scarce resource, which is *why* both stagers copy out and release immediately: an
-`OPEN_SESSION` can sit in the async peer-open state machine for many scheduler passes, and holding a
-pull buffer across that would stall command pulls.
+(`homer_service_dpu_dma.c:1154`: skip if `commandPullInFlight || stagedCommandSlotValid`).
+
+**Why 64 buffers when a session runs one command at a time?** Because *"one at a time" is per session,
+and the pool is global.* The buffers are a shared free list (`commandPullBufferInUse[]`, linear
+`HomerDpuDmaFindFreeCommandPullBuffer`), and a ring holds at most one. So
+`commandPullBufferCount = 64` is **how many sessions can have a control command in flight at once** —
+not a pipelining depth within a session. It is over-provisioned and harmlessly so: the service-side
+queues are tighter (`stagedCommandDispatchSlots[]` and `pendingResponseSlots[]` are **16** each), while
+`hostMmapImportCapacity` is **1024**. Nothing here is tuned; if 64 ever binds it is a one-constant
+change, and it produces backpressure rather than error.
+
+**Why copy out at all — this is the wedge, seen from the other side.** `CopyNextStagedCommand` peeks
+the *first valid ring in index order*. If a stager dispatched in place, session A's `OPEN_SESSION`
+— which sits in the async peer-open state machine across an RDMA CM connect and a peer
+request/response — would **remain the head for that whole time**, and session B's staged command would
+never be seen. **The copy-out-and-release is the act that advances the head.** A kind that no stager
+copies out is therefore a *permanent* head: the same mechanism, read in the other direction.
+
+Two further reasons, one of which the code states outright:
+- **Durability.** The async op carries a response owner (`importIndex`, `ringIndex`, generations,
+  `commandOrdinal`, `requestSequence`, `acceptedPublishedEpoch`). A client disconnect recycles engine
+  staging mid-async. Per the code: *"so later stages cannot accidentally depend on engine staging
+  storage for response-owner metadata."*
+- **Returning the scarce buffer** to the shared pool for other sessions.
 
 **Two stagers, two destination queues** — both copy out and release, they differ in downstream work:
 
