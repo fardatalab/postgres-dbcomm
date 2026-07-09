@@ -407,10 +407,54 @@ repro must assert on decoded tuple VALUES, not exit status** (pgbench logs `home
 under `-d` precisely for this).
 
 **Repro is one command, not a two-process runbook.** Each pgbench client is its own Homer session
-with its own role-7 stream, so `pgbench --homer --homer-dpu ... -c 2 -j 2` already produces two live
-streams over the one shared ring. Corollary: `--homer-dpu` has almost certainly only ever been
-exercised at `-c 1`; CLAUDE.md's multi-client remote run uses plain `--homer`, whose results go
-through the host-shm sink and never touch `tupleSourceRing`.
+with its own role-7 stream, so `pgbench --homer --homer-dpu ... -c 2 -j 2` would produce two live
+streams over the one shared ring — *if the path ran at all*. It does not (see STATUS below).
+
+### STATUS (July 9, 2026): Stage 2 is BLOCKED — its acceptance gate does not exist
+
+An attempted `-c 2` repro returned **INCONCLUSIVE**: `-c 1` never reached a working baseline.
+Investigation established that **`pgbench --homer-dpu` has NEVER run end-to-end — not at `-c 2`,
+not at `-c 1`, not ever.** (An earlier revision of this note guessed "probably only exercised at
+`-c 1`". That was wrong; corrected here.) The checkpoint doc says so in its own words: code steps
+1-6 landed, but *"step 7 the 3-machine validation"* was never performed — Part 3.5.1 (`sessionUID`)
+and then Stage 1 (basebackup) took priority. See `cross_node_dpu_migration_checkpoint.md`, "Step 7".
+
+Consequences:
+1. **The `tupleSourceRing` aliasing is real but currently UNREACHABLE.** The two-ring relay is gated
+   on the per-stream `dpuRelayResultStream` flag — only a flagged pgbench SQL-result stream relays.
+   Basebackup and non-DPU pgbench never touch `tupleSourceRing`. Stage 2 fixes a latent bug in a
+   path that has never executed.
+2. **Stage 2's gate ("2 concurrent sessions → correct decoded results") presupposes ONE session
+   producing correct decoded results.** It doesn't.
+3. **Stage 3's precondition is unmet.** Stage 3 == the checkpoint's "step 8", which states removal
+   of `citus_remote_exec_pgbench_transaction` *"comes AFTER validation confirms the new path."*
+   Retiring the UDF harness before `--homer-dpu` works would delete the only functioning DPU command
+   path and leave nothing behind it.
+
+**Resequenced (decided with the user, July 9, 2026):** do the checkpoint's **step 7 bring-up first**
+(get `--homer-dpu -c 1` correct end-to-end), THEN Stage 2 with a real before/after gate, THEN Stage 3.
+
+Two failures block the bring-up, in order:
+- **Failure A (blocking).** `client SQL result DPU receive referenced an unknown parent session`
+  (`tuple_sink_service_process.c:33797`), after
+  `TupleSinkServiceFindSessionById(sessionStates, request->parentServiceSessionId)` returns NULL at
+  `:33794`. Structural cause under investigation: `HomerClientOpenSqlSession`
+  (`homer_client.c:1518`) creates the `CLIENT_SQL_SESSION` in the **host** service's control SHM,
+  while `HomerClientOpenSqlResultReceiveStreamSelectedDpu` (`:3522`) places its OpenSession control
+  slot inside the buffer it exports to the **DPU** (`controlSlotOffset` ~`:3555`) and names that
+  host session as `parentServiceSessionId` (`:3817`). Two disjoint processes, two disjoint
+  `sessionStates`. Note the handler's own comments (`:33778-33790`, `:33801-33805`) say this open
+  "only has to succeed and name the parent command session" and call the sessionUID check
+  "diagnostic, NOT load-bearing for resolve" — the real relay self-arms on the role-7 import — so
+  the `sessionState == NULL` rejection may be an over-strict check that Part 3.5.1 made redundant.
+  Contrast basebackup's selected-DPU RECEIVE, which works and appears to create a self-contained
+  session rather than naming a parent.
+- **Failure B (behind A).** With a host-service-owns-DOCA workaround, transactions executed and then
+  hung on the first relay. Receiver looped `payload failure delivery failed without peer binding`;
+  sender reported `tuple-view batch header mismatch ... batch_slot_capacity=32712 publish_bytes=56
+  expected_slot_capacity=1024` — a result-queue geometry disagreement on the SEND side.
+
+**Change.**
 
 **Change.** Two-ring stream binds a SECOND handle (`SOURCE`). Bind at the tuple-source obtain
 (`:31681`); deform write uses `sourceBase = sourceHandle.storageAddr` with `% slotStorageBytes`; DMA
@@ -438,6 +482,12 @@ targets too, not just `service-bin`.
 ### Stage 3 — retire the server-side DPU frontend COMMAND channel + UDF harness
 
 Scoped deliberately AFTER Stage 2 so two unrelated risks are never in one validation.
+
+**HARD PRECONDITION — do not start this until `pgbench --homer-dpu` is validated end-to-end.**
+Stage 3 is the checkpoint's "step 8", whose own text says removal *"comes AFTER validation confirms
+the new path."* `citus_remote_exec_pgbench_transaction` + the DPU frontend channel are the only
+currently-functioning DPU command path; `--homer-dpu` (the intended replacement) has never run.
+Retiring them first would leave nothing behind them.
 
 **Retire:** `citus.enable_experimental_homer_dpu_frontend` (GUC, `shared_library_init.c:2594`,
 default off, help text stale — still says "during Stage 2 ... not-implemented error"), its two live
