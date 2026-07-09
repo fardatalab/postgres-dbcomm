@@ -4,8 +4,32 @@
 > data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
 > independently — cite them as "command-plane S1a", etc.
 
-**Status (July 9, 2026): IN PROGRESS. S0 ✅ done. S1a next. This is a PREREQUISITE for
-`pgbench --homer-dpu`, not a follow-on.**
+**Status (July 9, 2026): IN PROGRESS. S0 ✅, S1a ✅. S5 turned out to be already working — see
+"S5 IS ALREADY WORKING" below. The whole remaining critical path is S2 + S3 (postmaster arena +
+spawn trigger). This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
+
+**Runbook for the S1a gate** (all four roles, farnet0 as the client node):
+```sh
+# farnet0 DPU (client's local DPU) and farnet1 DPU (peer), each as `ubuntu`:
+setsid nohup env HOMER_SERVICE_ENABLE_DPU_DMA=1 HOMER_SERVICE_ENABLE_DOCA_DMA=1 \
+  HOMER_SERVICE_DPU_SETUP_PORT=9727 HOMER_SERVICE_DOCA_DEV_PCI=0000:03:00.0 \
+  HOMER_SERVICE_PEER_BIND_HOST=10.10.1.200 HOMER_SERVICE_PEER_PORT=9717 \
+  ~/dbcomm/citus-dbcomm/build/homer/citus_tuple_sink_service </dev/null > /tmp/svc.log 2>&1 &
+#   (farnet1 DPU: PEER_BIND_HOST=10.10.1.201)
+
+# farnet0 host: a host service must still run -- pgbench's HomerClientOpenControl maps its
+# control SHM at thread start. It handles ZERO sessions. S7.1 removes this dependency.
+
+# farnet0 host, the client:
+env HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.200 HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
+    HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
+  pgbench -h /tmp -p 5432 -U dbcomm --homer --homer-dpu-command \
+    --homer-database-oid 5 --homer-user-oid 10 \
+    --homer-peer-host 10.10.1.201 --homer-peer-port 9717 --homer-peer-node 1 \
+    --client-cpu=3 -n -M simple -c 1 -j 1 -t 1 postgres
+```
+The peer host is the **peer DPU** (`10.10.1.201`), not the peer host service — same rule as the
+validated 4-role basebackup topology. Each frontend points at its OWN local DPU.
 
 ---
 
@@ -392,6 +416,57 @@ RDMA-writes completions into it, and today pgbench reads it directly out of shar
 **Gate:** compiles; the DPU service logs an `OP_COMMAND_SESSION` open arriving over the DPU control
 slot. No end-to-end claim yet.
 
+### ✅ S1a DONE (July 9, 2026 — citus `3662f60f7`, postgres `1a81c6710ea`)
+
+Landed: `HomerClientOpenSqlSessionSelectedDpu` / `...CloseSqlSessionSelectedDpu` (`homer_client.c`),
+`HomerClientSession.commandDpuStream` (`remote_execution_client.h`), pgbench `--homer-dpu-command`,
+and a control-path-only gate instrument in `HomerServiceDpuStageOneCommandForDispatch`.
+**No service-side change was required**, exactly as the correction above predicted.
+
+**Topology:** pgbench on farnet0 → its LOCAL DPU `10.10.1.200` (setup TCP 9727) → RDMA → peer DPU
+`10.10.1.201:9717`. farnet0's HOST service handled **zero** sessions (it is mapped only so
+`HomerClientOpenControl` succeeds; S7.1 removes even that).
+
+```
+[homer-service] dpu control slot: OPEN_SESSION opKind=2 sessionKeyOpKind=5 destNode=1
+                peer=10.10.1.201:9717 sessionUID=11095041325112745 dpuRelay=0
+tuple-sink service: established persistent outgoing RDMA peer transport
+                host=10.10.1.201 port=9717 node=1 traffic_class=1
+tuple-sink service: async local open failed phase=5
+                detail=could not open backend spawn region /citus_remote_exec_backend_spawn_v14
+```
+(`opKind=2` = `OP_COMMAND_SESSION`, `homer_control_abi.h:45`; `sessionKeyOpKind=5` =
+`REMOTE_EXEC_OP_CLIENT_SQL_SESSION`, `homer_frontend.h:49`.)
+
+## 🔑 S5 IS ALREADY WORKING — the only blocker is S2+S3
+
+**`phase=5` is `TUPLE_SINK_SERVICE_LOCAL_CONTROL_ASYNC_COMMAND_WAIT_PEER_OPEN`**
+(`tuple_sink_service_process.c:34620`-`:34627`; `UNUSED=0` so `WAIT_PEER_OPEN=5`). The error text
+came back **from the peer**, over RDMA, and was then DMA'd into pgbench's control slot as readable
+text. **No hang.** So the farnet0 DPU had already completed, in order:
+
+| Phase | What it proved |
+|---|---|
+| `COMMAND_CREATE` | session allocated; `TupleSinkServiceCreateSession` created BOTH mailboxes on the DPU — S1a.3's dissolution confirmed **empirically** |
+| `ENSURE_CONNECTION` | DPU↔DPU `CRITICAL_CONTROL` RDMA connection established |
+| `REGISTER_MEMORY` | `commandMailbox` + `clientCompletionMailbox` RDMA-registered — they work as **DPU-local memory**, as predicted |
+| `START_PEER_OPEN` | peer `OPEN_COMMAND_SESSION` shipped over RDMA |
+| `WAIT_PEER_OPEN` | peer DPU **received and handled it**, reaching `TupleSinkServiceSubmitBackendSpawnRequest` (`:37623`) — i.e. it passed every peer command-open gate (`:37385`, `:37395`, `:37406`) |
+
+The peer failed **only** because `TupleSinkServiceSubmitBackendSpawnRequest` `shm_open`s
+`/citus_remote_exec_backend_spawn_v14` **on the DPU**, where no postmaster ever created it.
+
+**Consequences for the plan:**
+- **S5 needs no allow-list relaxation.** Its gates already pass; `sessionUID` already threads through
+  (`:35401`). What S5 still owes is S5.3 (the receiving DPU triggers the spawn on ITS host) — which
+  is S3. Re-scope S5 to "confirm a completion comes back", after S3.
+- **S2 + S3 are the whole remaining critical path.** Everything on either side of them is validated.
+- The DPU-native command open **propagates errors correctly**. The silent-hang failure mode does not
+  afflict this path; it afflicts the byte-ring data plane.
+
+**Next: S2 (postmaster arena, D1+D4) then S3 (spawn trigger, D2).** S0 already proved DOCA can export
+the tmpfs `MAP_SHARED` mapping the spawn region is made of.
+
 ### S1b — extract the shared Homer-frontend export module
 Now load-bearing, because **three** processes need it: the client library, the socketless backend (D1),
 and the postmaster (D2). Extract from the Tier-1 `homer_client.c` machinery — **not** from the Tier-2
@@ -438,20 +513,23 @@ same DPU; commands, completions and tuple results all flow host<->DPU by DMA.
 **Gate:** a `SELECT` returns correct decoded values. Validates D1+D2+D3 together with the smallest
 possible blast radius, and is the first proof the architecture works at all.
 
-### S5 — DPU<->DPU command peer-open
-Smaller than feared: `CRITICAL_CONTROL` is already the class basebackup's DPU<->DPU peer-opens ride
-(`remote_execution_peer_transport_rdma.h:73-75`; validation at `.c:2459`; command peer-open uses it at
-`tuple_sink_service_process.c:35316`, `:35427`, `:35430`). The transport is Tier-1; what is unvalidated
-is an `OP_COMMAND_SESSION` over it.
+### S5 — DPU<->DPU command peer-open — **RE-SCOPED: mostly already done**
 
-- **S5.1** Relax the peer command-open gates by allow-list: opKind rejection (`:37385`) and the
-  following mailbox checks (`:37395`, `:37406`).
-- **S5.2** Thread `sessionUID` through the DPU<->DPU command open exactly as the host<->host path does,
-  so the result relay's existing rendezvous keeps working unchanged.
-- **S5.3** The receiving DPU triggers the spawn on ITS host via S3.
+> **Observed working during the S1a gate run**, before any S5 work was attempted. The farnet0 DPU
+> established a `CRITICAL_CONTROL` RDMA connection to the farnet1 DPU and shipped an
+> `OP_COMMAND_SESSION` peer-open; the farnet1 DPU received it, passed every gate, and reached
+> `TupleSinkServiceSubmitBackendSpawnRequest` (`:37623`). Its error travelled back over RDMA and was
+> DMA'd into pgbench's control slot.
 
-**Gate:** a cross-node `OP_COMMAND_SESSION` reaches the remote DPU, spawns a backend, and a completion
-comes back.
+- **S5.1** ~~Relax the peer command-open gates by allow-list (`:37385`, `:37395`, `:37406`)~~
+  **NO-OP.** They already pass — the peer handler ran past them to the spawn call.
+- **S5.2** ~~Thread `sessionUID` through the DPU<->DPU command open~~ **ALREADY DONE**, at
+  `tuple_sink_service_process.c:35401` (`peerRequest.openCommandSessionRequest.sessionUID =
+  asyncOp->request.sessionUID`). `clientSqlResultDpuRelay` is carried alongside at `:35398`.
+- **S5.3** The receiving DPU triggers the spawn on ITS host. **This is S3, and it is the blocker.**
+
+**Remaining gate:** after S3, a cross-node `OP_COMMAND_SESSION` spawns a backend on the peer's host
+and a completion comes back. (The "reaches the remote DPU" half is already evidenced.)
 
 ### S6 — `pgbench --homer --homer-dpu -c 1`, cross-node
 **Gate:** 200 transactions, zero failures, sane / non-constant decoded `abalance`, and no host Homer
