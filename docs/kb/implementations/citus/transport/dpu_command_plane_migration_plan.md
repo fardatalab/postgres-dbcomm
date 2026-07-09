@@ -191,6 +191,44 @@ delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_
 
 ---
 
+## Trust tiers — "compiles" is not "works" (added July 9, 2026, after a third instance)
+
+The project owner's guidance: **the Citus-backend-as-frontend path is most likely outdated. Do not
+assume it is correct.** Earlier today a read-only trace concluded `HomerFrontendDmaOpenCommandSession`
+is "not a stub" and should be KEPT AND PROMOTED. That conclusion is **retracted**. "Not a stub" only
+ever established that the code exists and compiles. Its only consumers are `homer_frontend_dma_smoke.c`
+and the deprecated `citus_remote_exec_pgbench_transaction` UDF. Its GUC help text still claims the path
+stops with a not-implemented error — which is as easily read as "nobody has looked at either in a
+while" as it is "the code is newer than the docs".
+
+Classify every component before depending on it:
+
+**TIER 1 — EXERCISED.** Some validated workload runs this today; changes to it are regression-testable.
+- client-library selected-DPU machinery in `homer_client.c`
+  (`HomerClientOpenBaseBackupStreamSelectedDpu`, `...ReceiveStreamSelectedDpu`,
+  `HomerClientOpenSqlResultReceiveStreamSelectedDpu`) — cross-node DPU basebackup moves ~23 GB
+  through it;
+- the DPU service's setup-TCP + `HomerDpuDmaImportHostMmapDescriptorForSetup` import path;
+- the DPU↔DPU RDMA peer transport for payload;
+- the backend-spawn region and its poller (every `--homer` pgbench run forks socketless backends
+  through it).
+
+**TIER 2 — EXISTS, UNEXERCISED.** Reachable only from a smoke or the UDF. Treat as documentation of a
+mechanism, not as a component. Includes `homer_frontend_dma.c`, `homer_frontend_dma_lifecycle.c`, the
+GUC-gated sites in `homer_frontend_control.c`, `citus_remote_exec_pgbench_transaction`, **and the
+`backendChannelMode = SELECTED_DPU_DMA` handling inside `remote_execution_backend_bridge.c`.**
+
+**Consequence for this plan.** The client-side `HomerClientOpenSqlSessionSelectedDpu` must be built on
+the **Tier-1 basebackup template**, not by extracting or promoting the Tier-2 server-side opener. And an
+earlier claim in this project — "the receiving half [SELECTED_DPU_DMA] is already implemented and
+honored" — is an overclaim: the branch exists; nothing validated drives it. If it is stale, Leg 2 grows
+by however much of the backend-side mailbox handling must be rewritten rather than reused.
+
+This is the same failure mode as the `mode=rdma` runbook example, the June-6 COPY baseline, and the
+"advisory" cache comment: **a written artifact (code, doc, or comment) that describes a path was
+trusted as evidence the path works.** Nothing executes documentation, and nothing executes an
+unexercised branch either.
+
 ## Standing risks
 
 1. **"Working code with no validated consumer" is not dead code.** The selected-DPU backend-spawn spine
