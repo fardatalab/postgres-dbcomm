@@ -105,6 +105,61 @@ abort. **COPY cannot validate anything until Problem 2 is fixed.**
 header carries exactly the negotiated value the validator compares. Setting it to the bare negotiated
 capacity silently reintroduces the abort, one transport header short.
 
+### ATTEMPT 1 FAILED AND WAS REVERTED (July 9, 2026)
+
+Implemented as citus `e379d2dbe` + postgres `36cd6ee2da5`; **both reverted** (`aadcab871`,
+`495f94db95f`) after validation. Builds and installs were rolled back to the pre-split ABI.
+
+**What worked:** the original abort (`tuple-view batch header mismatch ... 32712 vs 1024`) did NOT
+reproduce anywhere. The split does fix Problem 1.
+
+**What broke: basebackup**, our only validated workload —
+`byte-ring record unexpectedly crossed ring boundary session=1 sink=1 sequence=128
+record_bytes=1048688 contiguous=456286` (receiver service log).
+
+**Root cause — the divisor had a THIRD job.** We knew `byteRingBytes / slotCount` (a) satisfied the
+frontend attach check and (b) was the source of the double meaning. What we missed:
+**it tiles the ring by construction.** `slotCount * (byteRingBytes / slotCount) == byteRingBytes`, so a
+record can never run off the end. The split replaced it with
+`HomerServiceBaseBackupProducerRecordBytes(stream.slotCapacityBytes)` = `56 + negotiated` — a number
+with NO arithmetic relationship to the ring size. Records stopped tiling and one walked off the
+boundary.
+
+**And it bit basebackup specifically because of the SAME disease, a third time.**
+`stream.slotCapacityBytes` means the PAYLOAD on the SQL path, but on the basebackup path it is sized
+against the RING (via the `bytes=` target detail). Adding a prefix on top therefore double-counts.
+A quantity we did NOT rename hid its own semantics from us.
+
+**Two failures in that run were NOT ours:**
+- `slots=8,bytes=8388608` → `basebackup record footprint 8388848 too large for byte ring storage
+  8388608 (need 2x headroom)`. That guard landed with `7a2eaed53` on **July 6**. **CLAUDE.md's own
+  documented basebackup example has been broken for three days.** Fix the doc (or the `bytes=`
+  handling); it is not a regression from the split.
+- `DPU setup socket exchange failed` (TCP connects, handshake never logs) — the known receiver-DPU
+  DOCA cold-start flakiness.
+
+**Correcting the validation report:** it blamed `payload_ring_slot_count=0 payload_ring_slot_bytes=0`
+at the receive sink. That is a red herring — the split never touched `localReceivePayloadRing`, and
+that log line dates to `cfe564251` (May 31); it prints before the ring is created.
+
+### REVISED ORDER (decided with the user): rename FIRST, then re-do the split
+
+1. **Scoped rename** (table below), which forces every quantity to declare whether it includes the
+   prefix. Add the invariant `recordFootprintBytes == recordPrefixBytes + maxObjectBytes` as an
+   **assertion at both ends** (descriptor fill + frontend consume), not merely a comment — three
+   instances of this bug class is enough evidence that comments do not hold the line.
+2. **Establish and document the tiling/wrap-gap relationship** between `recordFootprintBytes` and
+   `byteRingBytes` before changing either. Whether records must tile, or the wrap-gap protocol should
+   absorb a non-tiling footprint, is an OPEN question — read the producer's gap logic first.
+3. **Re-do the split** on top, with basebackup's `bytes=` semantics made explicit (does it size the
+   payload or the record footprint?).
+4. Gate on BOTH basebackup regression AND `--homer-dpu -c 1`, in that order.
+
+### DEPLOYMENT HAZARD (until the next validation run)
+The failed run installed and synced the **ABI v12** binaries to farnet0 and to BOTH DPU trees before
+Test A ran. farnet1 has been rebuilt/reinstalled at the reverted ABI, but **farnet0 and the two DPUs
+still carry v12**. Any run before a full resync + DPU rebuild is a mixed-ABI cluster. Resync first.
+
 ### Follow-up (DECIDED July 9, 2026, not yet done): finish the rename
 
 The split left `sinkHandle` carrying BOTH `localQueueSlotCapacityBytes` (= 1080, the footprint) and
