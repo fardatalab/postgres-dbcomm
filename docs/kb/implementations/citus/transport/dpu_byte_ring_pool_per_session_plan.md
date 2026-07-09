@@ -36,7 +36,20 @@
     `slot=0 region=0`, farnet0 DPU started cleanly with 2 arena mmaps, no reset.
     TODO(Stage 1): add an explicit arena-geometry startup log line (validator noted
     the allocation is only inferable from the absence of errors today).
-  - Stages 1 / 2: pending.
+  - **Stage 1a-landing — DONE + validated (single-session, no regression).** The LANDING
+    DMA relay-source now reads the bound slot's storage (threaded via the handle:
+    `storageAddr`/`storageBytes`/`mmap`) instead of `engine->landingRegion` — the
+    transitional aliasing is removed for landing. `HomerDpuByteRingHandle` gained
+    `storageBytes`; `HomerDpuDmaSubmitByteRingWrite`/`...SubmitOneByteRingTask` gained
+    `(dpuRingSourceBase, dpuRingSourceBytes, dpuRingSourceMmap)` (LANDING branch uses them;
+    PULL/TUPLE_SOURCE pass NULL). Relay passes the stream's stored landing handle. Added the
+    arena startup log. Validation: 3x single-session, byte conservation 0.00015% (~23.28 GB),
+    `byte-ring arena ready: regions=2 slots=8 slotStorage=8388608`, bind `slot=0 region=0`,
+    no reset. NOTE: `dpuRingSource*` will be renamed to a neutral `dpuRingBase*` in
+    Stage 1a-mirror (a task uses its DPU-local ring as source for landing OR dest for a
+    mirror pull — one param, both uses).
+  - Stage 1a-mirror (mirror per-session: bind + pull dest + egress source), Stage 1b
+    (resolver + concurrent acceptance), Stage 2: pending.
 - **Doc type:** implementation plan / in-flight.
 - **Source:** `src/backend/distributed/utils/homer/homer_service_dpu_dma.c` (+`.h`),
   `.../tuple_sink_service_process.c`, and the new module
