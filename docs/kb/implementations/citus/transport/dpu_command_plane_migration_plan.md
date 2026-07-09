@@ -420,9 +420,39 @@ proven; what S4 adds is the real backend and the real client, not new DMA mechan
 
 #### What S1a does NOT solve (deliberately deferred to S4/S5)
 
-`commandMailbox` is used at `REGISTER_MEMORY` as a **local RDMA scratch source**
+`commandMailbox` is registered at `REGISTER_MEMORY` as a **local RDMA send source**
 (`remoteWritable=false`, `:35346`). On a DPU-resident service its `shm_open` still succeeds — it
-simply becomes DPU-local staging memory nobody else maps. **It likely survives the move unchanged.**
+simply becomes DPU-local memory nobody else maps. **It likely survives the move unchanged.**
+
+> **"Scratch" is a misnomer — and the migration is what would make it true.** The field is called
+> `clientSqlCommandScratchRegionHandle` (`:1303`), but it is not a scratch buffer: it is the
+> `ibv_reg_mr` registration *of the command mailbox itself*. `sourceSlot = &mailbox->commandSlots[i]`
+> and `sourceRecord = &sourceSlot->record` (`:19801`); the RDMA WRITE posts **from that exact address**
+> (`:19895`-`:19898`) into the peer's mailbox. An RDMA source needs an lkey — that is all the handle is.
+> `remoteWritable=false` because nothing writes into it remotely.
+>
+> So today there is **no staging copy at all**: the client writes the command into the mailbox (same
+> host, shared memory) and the service RDMAs out of those bytes. **Zero copies.**
+>
+> **The DPU migration spends that property.** Once the mailbox is DPU-local, a command must go
+> client control slot → DMA across PCIe into the DPU mailbox → RDMA out. That is a staging copy the
+> current design does not pay, and only *then* would "scratch" be an accurate name.
+>
+> **This makes "direct PCI-source RDMA" a correctness-of-performance requirement, not an optimization.**
+> That design (register the *imported host mapping* as an MR and RDMA straight out of the client's
+> control slot, never landing the command in DPU memory) is already decided and validated but
+> unimplemented. **Reconsider it in S4**, which is the first stage that would pay the copy — not later,
+> because a measured S6 regression against the host-service path would otherwise be mysterious.
+>
+> Two smaller notes: the MR covers the whole 64-slot mailbox, registered once per session (cheap). And
+> for commands ≤ `max_inline_data` (124 bytes on this fabric) the code takes `useInlineCommandPost` and
+> `IBV_SEND_INLINE` (`:19883`-`:19894`), where the HCA copies the payload into the WQE and the MR is
+> nearly vestigial — but a pgbench `UPDATE`/`SELECT` record exceeds 124 bytes, so the normal path is the
+> registered one.
+>
+> **Rename** `clientSqlCommandScratchRegionHandle` → `clientSqlCommandMailboxRegionHandle` as part of
+> the pending scoped rename (see `byte_ring_slot_capacity_regression.md`). A name that describes a
+> design we do not have is worse than an unclear one.
 
 `clientCompletionMailbox` does **not**: it is registered **remote-writable** (`:35365`), the peer
 RDMA-writes completions into it, and today pgbench reads it directly out of shared memory
