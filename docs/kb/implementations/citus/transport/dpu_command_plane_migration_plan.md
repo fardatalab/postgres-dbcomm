@@ -4,9 +4,25 @@
 > data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
 > independently — cite them as "command-plane S1a", etc.
 
-**Status (July 9, 2026): IN PROGRESS. S0 ✅, S0b ✅, S1a ✅, S1b ✅. S5 turned out to be already working —
-see "S5 IS ALREADY WORKING" below. The remaining critical path is S2 → S3 (arena + frontend agent;
-spawn trigger). This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
+**Status (July 9, 2026): IN PROGRESS. S0 ✅, S0b ✅, S1a ✅, S1b ✅, S2 ✅ (citus `008f4f20b`),
+S3.1 ✅ (citus `c2ec17852`). S5 turned out to be already working — see "S5 IS ALREADY WORKING" below.
+The remaining critical path is S3.2 → S3.3 (doorbell; spawn DMA). This is a PREREQUISITE for
+`pgbench --homer-dpu`, not a follow-on.**
+
+> **Decisions layered on top of the original plan. Read these before implementing anything.**
+> - **D5** — `HomerDpuDmaRingRuntime.boundServiceSessionId`. The descriptor says what the host *declared*;
+>   the DPU records what it *bound*. Arena rings are declared before any session exists.
+> - **D6** — the forward index. A session caches refs to its own rings, built at bind. Supersedes D5's
+>   `continue`; kills survey findings 2, 6 and 7. Built in S3.3b, cashed in at S4.0.
+> - **D7** — spawn-slot producer partition. **TRANSITIONAL**; expires at S7.1 into **D7′** (exactly one
+>   claimant).
+> - **S3.5's discovery** — basebackup never spawns a socketless backend, so `pgbench --homer` is the *only*
+>   working regression net for the spawn path. Do not retire it before its replacement's gate passes.
+> - **The spawn wait** — bounded timed spin now; async responder at **S3.7**, a hard prerequisite before any
+>   concurrent-workload measurement.
+> - See also: [`dpu_scheduler_arm_execute_mismatch.md`](../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md)
+>   — the survey of *arm from exact demand, execute by linear scan*. Finding 1 sits on the basebackup egress
+>   path and is **unscheduled**.
 
 > **Two decisions supersede the original plan. Read both before implementing S2/S3.**
 > - **D2′ — the doorbell agent bgworker.** The doorbell socket *and* the DOCA export live in a
@@ -1299,9 +1315,24 @@ take the cached ref, or a sink binding is stamped. Decide it there, with the cod
 
 ---
 
-## D7 — spawn-slot ownership is PARTITIONED BY PRODUCER (contract, decided July 9, 2026)
+## D7 — spawn-slot ownership is PARTITIONED BY PRODUCER (**TRANSITIONAL** contract, decided July 9, 2026)
 
-> ### ⚠ CONTRACT — `slots[0..15]` are the HOST's. `slots[16..31]` are the DPU's.
+> ### ⚠ EXPIRY, read first.
+>
+> **This split is scaffolding for a window, not a standing invariant.** It exists solely because two
+> producer *classes* coexist between S3 and S7. The moment the host-service arm of
+> `TupleSinkServiceSubmitBackendSpawnRequest` is retired (**S7.1**), there is exactly one claimant and the
+> split becomes dead weight. Delete the range constants then and replace this section with:
+>
+> ### D7′ — the END STATE: exactly one claimant
+> > Only the DPU service claims spawn slots. It is single-threaded and reaches the spawn region **solely by
+> > DOCA DMA**, which offers no compare-and-swap on host memory. Correctness rests entirely on there being
+> > **no second claimant**. Any new claimant reintroduces a race that no DPU-side code is able to detect.
+>
+> The invariant survives its own mechanism: **"exactly one producer" is strictly stronger than "disjoint
+> ranges."** The partition disappears because it becomes redundant, not because the hazard went away.
+
+> ### ⚠ CONTRACT (while it lasts) — `slots[0..15]` are the HOST's. `slots[16..31]` are the DPU's.
 >
 > `CITUS_REMOTE_EXEC_BACKEND_SPAWN_SLOT_COUNT` is 32 (`remote_execution_backend_protocol.h:30`). The range
 > is split by **producer**:
@@ -1320,12 +1351,17 @@ take the cached ref, or a sink binding is stamped. Decide it there, with the cod
 > **Violating this split reintroduces a race that no code on the DPU side is able to detect.** Each
 > producer asserts that the slot it reserved lies in its own range.
 
-**Two pre-existing bugs, fixed in S3 while this contract lands:**
+**Three pre-existing bugs, fixed in S3. Note their lifetimes differ — that is the interesting part.**
 
 1. **Reservation is load-then-store, not CAS** (`tuple_sink_service_process.c:18909`-`:18921`). Two
    producers can both read `FREE` and both store `CLIENT_OWNED`. Fix: CAS `FREE → CLIENT_OWNED`, and on a
    lost CAS continue to the next slot rather than `break`. **Applies to the host range only** — the DPU
    cannot CAS, which is the whole reason for D7.
+
+   ⚠ **This fix has a one-stage lifetime and no durable home.** Once the host arm is retired the DPU is the
+   sole claimant, CAS is impossible *and unnecessary*, and this code is deleted with the arm. Fix it anyway
+   (five lines, and it makes the transition window provably safe), but do not mistake it for the thing that
+   protects us long-term. That is D7′.
 
 2. **The success path publishes `FREE` before it reads the response** (`:19004` stores `FREE`; `:19012` and
    `:19018` then read `reservedSlot->response.launchedPid`). This is **not a writer race — it is a
@@ -1352,7 +1388,14 @@ take the cached ref, or a sink binding is stamped. Decide it there, with the cod
    must DMA-read the response, **await it**, and only then DMA-write `FREE`. Same family as the
    ⚠ DMA-BEFORE-DOORBELL invariant — nothing orders two DMA tasks for you unless you await them.
 
-3. (Lesser) The response wait loop (`:18976`) spins with no timeout and no postmaster-liveness check.
+3. **The response wait loop (`:18976`) spins with no timeout.** Fix: a **generous** timeout and a loud
+   error if it ever expires. **No postmaster-liveness polling** — decided with the user: this is an
+   error path, and if it fires at all we have a bug elsewhere. A timeout that has never fired is the
+   correct amount of machinery here.
+
+   *(Unlike bugs 1 and 2, this one only matters once the DPU is the waiter: on a host service a hung
+   spin stalls one process, but on the DPU it stalls the single scheduler thread that also drives DMA and
+   RDMA for every other session. See "the spawn wait" under S3.3.)*
 
 ---
 
@@ -1390,13 +1433,86 @@ take the cached ref, or a sink binding is stamped. Decide it there, with the cod
   `uint32_t arenaSlotIndex` to `CitusRemoteExecBackendSpawnRequest` **and**
   `CitusRemoteExecBackendStartupData`, and copy it in `ProcessSpawnRequestSlot`. Host-service producers set
   it to `UINT32_MAX` (unused). Update `AGENTS.md`'s `/dev/shm` list for the `_v15` name.
+  ✅ **DONE — citus `c2ec17852`**, together with the doorbell ABI and a postmaster-side bounds check on
+  `arenaSlotIndex` (it crosses the trust boundary of open question 7 once the DPU DMA-writes it).
+
+#### ⚠ The spawn wait — a decision, not an oversight
+
+`TupleSinkServiceSubmitBackendSpawnRequest` **spins** on `RESPONSE_READY` with `TupleSinkServiceCpuRelax()`
+(`:18976`), and it is called **synchronously from inside a peer request handler**,
+`TupleSinkServiceHandlePeerOpenCommandSessionRequest` (`:37489`, spawn at `:37659`).
+
+On a host service that stalls one process. **On the DPU it stalls the single scheduler thread that also
+drives DMA and RDMA for every other session** — for a `fork()` plus `RemoteExecBackendInitializeConnection
+ByOid`, i.e. a full backend bootstrap with a database attach. Milliseconds, not microseconds. Our own
+concurrent workload (foreground pgbench + background basebackup through the same DPU) is precisely the
+shape that would notice.
+
+**Decided with the user:**
+- **Now (S3.3):** a **bounded, timed spin** with a *generous* timeout that errors loudly. Simplest thing
+  that makes the S3/S4/S5 gates a correctness question rather than a scheduling one. Accept the stall; it
+  happens once per session open.
+- **Later (S3.7, below):** decompose into async steps. This is the target shape, not a nice-to-have.
+
+*Rejected: a cooperative spin that pumps DMA/RDMA progress while waiting.* It removes the stall cheaply but
+re-enters the scheduler from inside a request handler. Re-entrancy there has not been reasoned about, and a
+scheduler that can recurse into itself is a worse problem than a millisecond stall.
+
+- **S3.7 (planned, after the S3 gate)** — **make the receiving DPU's spawn asynchronous.** The *initiator*
+  side is already a state machine (`TupleSinkServiceProgressCommandOpenAsyncOp`: `COMMAND_CREATE →
+  ENSURE_CONNECTION → REGISTER_MEMORY → START_PEER_OPEN → WAIT_PEER_OPEN`). The **responder** side is not:
+  `HandlePeerOpenCommandSessionRequest` handles the request and replies in one call. S3.7 gives the
+  responder the same treatment — mark the session "awaiting backend", reply to the peer when the fork
+  lands, and poll the spawn slot's state word by DMA read across scheduler passes instead of spinning.
+  **Hard prerequisite before any concurrent-workload measurement** (foreground pgbench + background
+  basebackup), because a millisecond-scale stall of the DPU scheduler is exactly what that workload
+  measures.
 - **S3.4** DPU service: on doorbell **EOF**, log loudly that the frontend agent for that
   `bridgeGeneration` is gone, and begin the existing import teardown
   (`HomerDpuDmaBeginHostMmapImportTeardown`, `homer_service_dpu_dma.c:6964` — the same path a graceful
   setup `CLOSE` drives). **Diagnostics and clean shutdown, not a recovery path**: a subsequent DMA
   against a dead export is *supposed* to be fatal (see D2′ correction). Do **not** reclassify
   `DOCA_ERROR_IO_FAILED` as recoverable.
-- **S3.5** Keep the host-service `shm_open` submitter intact for the non-DPU `--homer` path.
+- **S3.5** Keep the host-service `shm_open` arm intact and **functional** through S6. Add a one-shot
+  `LOG` on first use — *"host-service backend spawn is deprecated; retires at S7.1"* — and nothing more.
+  **Do not gut it early.** See the box below; this is not sentimentality about legacy code.
+
+> ### 🔑 DISCOVERY (July 9, 2026) — the spawn path has exactly ONE working regression net, and it is not basebackup
+>
+> **`pg_basebackup` never spawns a socketless backend.** The green 4-role DPU-relay basebackup regression —
+> 23 GB, the thing we lean on for every transport change — gives **zero coverage of the backend-spawn path**.
+> Verified: no `SubmitBackendSpawnRequest` reachable from `src/backend/backup/`.
+>
+> The only workload that exercises spawn end to end is **`pgbench --homer`** (the other one, backend-to-backend
+> COPY, is broken at HEAD — Problem 2). Confirmed working on the S3.1 binaries at citus `c2ec17852`:
+> ```
+> number of transactions actually processed: 1000/1000
+> number of failed transactions: 0 (0.000%)
+> tps = 3057.5   latency p50 = 0.308 ms   p99 = 0.477 ms
+> ```
+> (functional check, single cold run — not a performance claim.)
+>
+> **Three consequences.**
+> 1. Through S3–S5 the host arm is **the control for its own replacement.** If the DMA-then-doorbell
+>    sequence misbehaves, it is the only known-good arm to A/B against.
+> 2. There is no separate "host submitter" to delete. `TupleSinkServiceSubmitBackendSpawnRequest` is **one
+>    function with four call sites**, one of which (`:37659`) is the DPU's own peer command-open handler.
+>    S3.3 adds a DMA arm to that same function; the `shm_open` arm is an `else`. Keeping it costs nothing.
+> 3. **Gutting the arm retires plain `pgbench --homer` wholesale**, not just a branch — every `--homer`
+>    session needs a socketless backend. It finishes off backend-to-backend COPY too. Survivors would be:
+>    basebackup (never spawns), the seven smokes, and — only once the S3 gate passes —
+>    `pgbench --homer --homer-dpu-command`, which *becomes* the replacement spawn net.
+>
+> **So the retirement order is: S3 gate passes → the new net exists → only then gut.** That is S7.1, and it
+> is one stage of patience for a full A/B.
+
+> ### ⚠ CAPTURE THE BASELINE BEFORE S7.1 — it will not exist afterwards
+>
+> S6's gate is literally *"cross-node DPU vs today's cross-node host-service `--homer`"*. Retiring the host
+> arm destroys the number we are trying to beat. Before S7.1, capture the warmed cross-node `--homer` c1 and
+> c4 band and **stamp it with a commit SHA, not a date** (our own standing rule; the numbers currently in
+> `AGENTS.md` are dated, predate several transport changes, and cannot be checked with
+> `git merge-base --is-ancestor`).
 
 **Gate:** a DPU service causes a socketless backend to be forked on its own host. Assert the ordering
 (fields before state word) with a debug check.
@@ -1474,9 +1590,32 @@ service anywhere in the command path. Then `-c 2`, which unblocks byte-ring pool
 
 ### S7 — retire the superseded paths
 Only after S6.
-- **S7.1** `HomerClientOpenSqlSession` (host-SHM command path) for pgbench.
+
+> ### The retirement pattern (decided with the user, applies to every item below)
+>
+> **Gut the branch's body first; delete the branch later.** Replace the work with a loud, fatal assertion
+> — `elog(FATAL, "host-service backend spawn is retired (S7.1); use the DPU spawn path")` — and keep the
+> function, its signature, and its call sites for one cycle. Then delete.
+>
+> Why the two steps: a retired-but-present branch turns "some forgotten caller still relies on this" from a
+> silent behaviour change into an immediate, attributable crash with a name in it. Deleting first turns it
+> into a compile error at best and a subtly different code path at worst. The cost is one cycle.
+>
+> **Every gutting must be preceded by its replacement's gate passing**, never the other way round. See the
+> S3.5 box: a retired path is frequently the only regression net for the thing replacing it.
+
+- **S7.1** `HomerClientOpenSqlSession` (host-SHM command path) for pgbench, **and** the `shm_open` arm of
+  `TupleSinkServiceSubmitBackendSpawnRequest` (S3.5). Together these retire plain `pgbench --homer` and
+  backend-to-backend COPY. **Preconditions:** the S3 gate has passed (so `--homer-dpu-command` is the spawn
+  net), and the cross-node `--homer` baseline has been captured and SHA-stamped (see the box under S3.5).
+  Then: **dissolve D7** — delete the range constants, delete the host-arm CAS with the arm it protected, and
+  restate the contract as **D7′ (exactly one claimant)**.
 - **S7.2** `citus_remote_exec_pgbench_transaction` + its UDF/extern/build refs (checkpoint "step 8").
 - **S7.3** The Tier-2 `homer_frontend_dma*` path and its GUC, now genuinely superseded by S1b.
+  Includes `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest` (`homer_frontend_dma_lifecycle.c:188`) —
+  the *last* host-resident spawn claimant. **D7′ is only true once this is gone too.**
+  Also **S2.5**, moved here: the Tier-2 `SELECTED_DPU_DMA` mailbox-open path
+  (`remote_execution_backend_bridge.c:2572`-`:2669`). Read it before deleting it — see "Prior art" under S0b.
 - **S7.4** Re-examine whether the `sessionUID` rendezvous is still needed. **Expectation: YES, keep it**
   — the role-7 ring is still exported by a host process and imported across PCIe, a boundary that does
   not disappear when the session table moves. Confirm in code; record the reasoning.
