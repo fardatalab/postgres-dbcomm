@@ -444,6 +444,14 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
 - P3.2 **S4.2 client side**: remove the `session->control == NULL` START rejection
   (`homer_client.c:5944`); drive START into role 1; consume role-6 completions (replace
   `HomerClientWaitCommandCompletion`'s shm mailbox) and role-7 result tuples.
+  **Plus a second dependency found by P0 validation run 2 (July 10, 2026):** `pgbench --homer`
+  unconditionally opens the LOCAL host service's control shm region per thread
+  (`pgbench.c:9142` → `HomerClientOpenControl` → `shm_open(CITUS_REMOTE_EXEC_CONTROL_SHM_NAME)`,
+  `homer_client.c:402`) BEFORE any DPU logic — so a pure-DPU client currently still requires a local
+  host `citus_tuple_sink_service` just to boot. S4.2 must make that open conditional (skip for the
+  pure selected-DPU path) or the "no host services" cross-node topology can never run. Until then,
+  cross-node validations run with the CLIENT-side host service up (control-region hosting only) and
+  the BACKEND-side host service down (loud-failure guard).
 - **GATE:** cross-node `pgbench` selected-DPU SELECT returns correct decoded values.
 
 **Phase P4 — S4.0 (D6 refactor), LAST.**
