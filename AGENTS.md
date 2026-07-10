@@ -138,12 +138,18 @@ Three things about this smoke that each cost a cycle (validated July 9, 2026, ci
 # What actually works: resolve identity from `/proc/<pid>/exe`, which no shell can fake:
 #
 #   for d in /proc/[0-9]*; do
-#     exe=$(readlink -f "$d/exe" 2>/dev/null) || continue
+#     exe=$(readlink -f "$d/exe" 2>/dev/null) || exe=$(sudo -n readlink -f "$d/exe" 2>/dev/null)
 #     case "$exe" in */pg-citus/bin/citus_tuple_sink_service) sudo -n kill -9 "${d#/proc/}";; esac
 #   done
 #
-# Note `sudo -n` is required when the target runs as `dbcomm`; a plain kill/pkill reports "Operation
-# not permitted" and leaves the process alive.
+# ⚠ The `sudo -n readlink` fallback is NOT optional. `readlink /proc/<pid>/exe` on a process owned by
+# ANOTHER USER returns EACCES, and everything here runs as `dbcomm` while you are probably not. Without
+# it the preflight prints "clean" while the entire stack is up -- a FALSE NEGATIVE, which is strictly
+# worse than the `ps | grep` false positive it was written to replace. Count the pids you could not
+# identify and say so, rather than letting an unreadable /proc masquerade as an empty one.
+#
+# Note `sudo -n` is likewise required to kill a `dbcomm`-owned process; a plain kill/pkill reports
+# "Operation not permitted" and leaves it alive.
 ./homer_dpu_tcp_transport_smoke --server \
   --dev-pci 0000:03:00.0 \
   --port 9727 \
@@ -384,16 +390,30 @@ CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_SETUP_STARVE_DIAG=1'
 # [starve-diag] PE_DRAIN dropped: feedback-backoff (count=...)
 ```
 
-Read it like this (post-S3.1b, citus `84ac374ef`):
+Read it like this (post-S3.2, citus `52fd1ab3d`):
 
 - `listener_grants` must climb at **one grant per `HOMER_SERVICE_DPU_SETUP_TCP_IDLE_POLL_INTERVAL_PASSES`
   (512) passes** when idle, and keep roughly that cadence while `pedrain_grants` is climbing fast. A frozen
   `listener_grants` is the wedge.
-- `polls == listener_grants` exactly. Any drift means a grant retired the poll obligation without polling.
-- `SETUP_LISTENER dropped` must never print: the listener draws from the reserved lifecycle grant line.
+- `doorbell_grants` climbs at **one per 512 passes while unattached** and **one per 4096 while attached**
+  (`bell{attached=1}`). If it climbs every pass, someone copied the setup listener's interval rule into a
+  persistent connection — a silent per-pass `recv()`/EAGAIN on the hot loop.
+- `polls == grants` exactly, for BOTH listeners (`tcp{polls=…}` and `bell{polls=…}`). Any drift means a
+  grant retired a poll obligation without polling.
+- `SETUP_LISTENER dropped` and `DOORBELL dropped` must never print: both draw from the reserved lifecycle
+  grant line.
+- `bell{rej=N>0}` means an ATTACH named a bridge generation with no live ACTIVE import — normally a
+  restarted agent racing a stale import, which resolves on retry.
 - `pedrain_grants` **frozen while idle is now correct** — PE_DRAIN is armed only by in-flight DOCA tasks or
   a detached import awaiting reclaim. (Before S3.1b a frozen `pedrain_grants` was the bug, because the
   accept loop lived inside it. Do not read old notes with the new meaning.)
+
+The DPU service now binds **two** ports: `9727` (setup) and `9728` (spawn doorbell,
+`HOMER_SERVICE_DPU_DOORBELL_PORT`). The frontend agent connects the doorbell after its setup export; look
+for `homer frontend agent: attached DPU spawn doorbell …` in `postgres.log`. To exercise the whole
+notification chain before S3.3 lands a real producer, start the DPU service with
+`HOMER_SERVICE_DPU_DOORBELL_TEST_FIRE_GRANTS=200` and run PostgreSQL with `-c log_min_messages=debug1`;
+the agent then logs `doorbell wake N -> SIGUSR1` roughly every 2.7 s.
 
 See `docs/kb/future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md` §0/§0b/§0c.
 
@@ -1377,6 +1397,14 @@ validation built ONE target and ran ONE workload. Cheap insurance:
   and repeat for the other two enums. S3.1b found a live instance this way:
   `HomerServiceDefaultCpuClassForProgressSource` is the *only* thing that sets
   `sourceCore->cpuClass`, and its default arm is `HOMER_PROGRESS_CPU_CLASS_INVALID`.
+- **Never run a write-capable subagent concurrently with your own edits in the same tree.** On July 10,
+  2026 a worker was told "do NOT touch `tuple_sink_service_process.c`", saw it dirty, and *restored* it —
+  silently discarding ~30 hand-applied edits. The tell was `git status` reporting the file **unmodified**
+  while its mtime was seconds old: content matched HEAD, so a checkout, not a write. Either give the
+  worker `isolation: "worktree"`, or hold your own edits until it reports.
+- **Apply multi-site mechanical edits from a script FILE with per-hunk `assert count == 1`.** That is what
+  made recovering those 30 edits a one-minute replay instead of an afternoon. A heredoc inside `bash -c`
+  also leaks its body into the caller's argv — see the `pgrep` trap above.
 - **`HOMER_SERVICE_ENABLE_DPU_DMA=1` requires the machine-baseline progress policy.**
   No source-plan policy admits *any* DPU collector — `HomerServiceBuildCoarseProgressReadySet`
   never appends a DPU source — so under any other policy the DPU service starts, binds

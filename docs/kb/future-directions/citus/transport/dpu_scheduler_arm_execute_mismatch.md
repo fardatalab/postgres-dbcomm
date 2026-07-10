@@ -61,10 +61,11 @@ DPU collector's starvation clock, and the hatch never opens. The guard that exis
 indefinite suppression could not fire.
 
 **C. Two jobs with different readiness live in one action.**
-`HomerServiceDpuSetupTcpServerProgress` — which owns the listener's `accept()` — is called from
-**exactly one place**: inside `HOMER_PROGRESS_ACTION_DPU_PE_DRAIN`
-(`tuple_sink_service_process.c:41449`). A backoff policy that is *correct* for "don't poll an empty DOCA
-progress engine" is *fatal* for "don't stop listening". An `accept()` returning `EAGAIN` is, of course,
+Before S3.1b, `HomerServiceDpuSetupTcpServerProgress` — which owns the listener's `accept()` — was called
+from **exactly one place**, inside `HOMER_PROGRESS_ACTION_DPU_PE_DRAIN`; the current historical comment
+records that removed control flow at `tuple_sink_service_process.c:41975`-`:41980`. A backoff policy that
+is *correct* for "don't poll an empty DOCA progress engine" is *fatal* for "don't stop listening". An
+`accept()` returning `EAGAIN` is, of course,
 an empty poll — so "no arrivals so far" was being used to justify "stop looking", which for a listener is
 never valid: **a backlog is not observable without an accept attempt.**
 
@@ -133,10 +134,10 @@ raises the grant rate from ~50% to 100% of passes. §0's *"Fixed by (A) and (C)"
 > records what the temporary state actually cost and guards against overstating the landed scan saving.
 
 Three things, verified:
-- The listener calls **`accept()`**, not `accept4()` (`homer_service_dpu_setup_tcp.c:369`).
+- The listener calls **`accept()`**, not `accept4()` (`homer_service_dpu_setup_tcp.c:504`).
 - The same action then calls `HomerDpuDmaDrainPe` → `doca_pe_progress()` on an empty PE.
 - The same action then calls `HomerDpuDmaReclaimDetachedImports` **and** `HomerDpuDmaHasDetachedImports`
-  (`tuple_sink_service_process.c:41625`, `:41634`), each an **O(1024) import-table scan**.
+  (`tuple_sink_service_process.c:42015`, `:42028`), each an **O(1024) import-table scan**.
 
 So C′ buys, per pass while idle: one syscall + one empty PE progress + up to two 1024-slot scans. Not
 visible in the 23 GB basebackup band (see the cost note below), because during real work `inflight > 0`
@@ -144,7 +145,8 @@ already made `PE_DRAIN` non-blind. The cost is paid **only when idle** — which
 
 ### ❌ CORRECTION 3 — `knownExpectedWork = true` does **not** guarantee the collector executes.
 
-`HomerServiceMachineBaselineAppendCollectorAction` (`:9850`) reserves budget *after* the backoff gate.
+`HomerServiceMachineBaselineAppendCollectorAction` (`tuple_sink_service_process.c:10007`) reserves budget
+*after* the backoff gate (`:10037`-`:10049`).
 A non-blind collector still competes for the **total collector quota** and loses to **fixed collector
 ordering** (command send CQ and grouped control are appended before PE drain). So C′ made the wedge
 unlikely, not impossible. **By the same argument, fixing B does not guarantee it either.** The only
@@ -154,11 +156,12 @@ consume. *(Credit: Codex review. Neither the original diagnosis nor the first pr
 ### 🆕 DEFECT D — `runnableMachineWork` is *always* true, so backoff's idle-service guard is dead
 
 `HomerMachineBaselineCollectorFeedbackBackoffActive` short-circuits to `false` unless `runnableMachineWork`
-(`:9612`), and its comment promises *"keeps an otherwise idle service from suppressing unknown-arrival
-collectors indefinitely."*
+(`tuple_sink_service_process.c:9730`-`:9737`), and its comment promises *"keeps an otherwise idle service
+from suppressing unknown-arrival collectors indefinitely."*
 
-That promise is void. `HomerServiceBuildPeerAndMaintenanceMachineCandidates` (`:40803`) unconditionally
-appends a heartbeat machine with `readyActionMask = RUN_MAINTENANCE` (`:40827`) whenever the
+That promise is void. `HomerServiceBuildPeerAndMaintenanceMachineCandidates`
+(`tuple_sink_service_process.c:41075`) unconditionally appends a heartbeat machine with
+`readyActionMask = RUN_MAINTENANCE` (`:41094`-`:41102`) whenever the
 `HEARTBEAT_MAINTENANCE` collector is a candidate — which is always. Measured, per plan phase, on a service
 with **zero sessions, zero streams, zero in-flight DMA**:
 
@@ -183,20 +186,20 @@ Both directions of the feedback mapping collapse for the DPU family, and only fo
 
 | | mapper | DPU family |
 |---|---|---|
-| write | `HomerServiceUpdateProgressFeedbackAtTick` (`:13231`) resolves feedback from `sourceRef` | 11 collectors → `dpuDmaSource` (`:9758`) → `dpuDmaFeedback` (`:13219`) |
-| read | `HomerServiceProgressCollectorFeedbackForKind` (`:38182`) | 11 collectors → `dpuDmaFeedback` (`:38218`) |
+| write | `HomerServiceUpdateProgressFeedbackAtTick` (`:13429`-`:13445`) resolves through `HomerServiceProgressFeedbackForSource` (`:13377`) | 11 collectors → `dpuDmaSource` (`:9893`-`:9905`) → `dpuDmaFeedback` (`:13414`-`:13415`) |
+| read | `HomerServiceProgressCollectorFeedbackForKind` (`:38400`) | 11 collectors → `dpuDmaFeedback` (`:38425`-`:38436`) |
 
 Every other collector is 1:1 with its own source and its own feedback struct (`localControlSource`,
 `cqDrainSource`, `peerCmSetupSource`, `peerRecvCqSource`, `peerSendCqSource`, `peerCloseLifetimeSource`).
 **The per-source feedback machinery is correct under a 1:1 invariant. The DPU family broke the invariant.**
 
-And it is not only the tick. `HomerServicePopulateCollectorFeedbackFacts` (`:40159`) copies **all three**
+And it is not only the tick. `HomerServicePopulateCollectorFeedbackFacts` (`:40431`) copies **all three**
 backoff inputs from the shared struct:
 
 ```c
-collectorFacts->recentEmptyPolls      = sourceFeedback->consecutiveEmptyGrants;      /* :40174 */
-collectorFacts->recentProductivePolls = sourceFeedback->consecutiveProductiveGrants; /* :40175 */
-collectorFacts->lastCollectedTick     = sourceFeedback->lastTouchedTick;             /* :40176 */
+collectorFacts->recentEmptyPolls      = sourceFeedback->consecutiveEmptyGrants;      /* :40446 */
+collectorFacts->recentProductivePolls = sourceFeedback->consecutiveProductiveGrants; /* :40447 */
+collectorFacts->lastCollectedTick     = sourceFeedback->lastTouchedTick;             /* :40448 */
 ```
 
 So a productive grouped-control read can clear `DPU_PE_DRAIN`'s empty streak, and an empty PE drain can
@@ -267,9 +270,13 @@ Defect **A** merely pushed on a door that three separate latches had quietly sto
    ✅ **Validated for the setup listener in S3.1b (`84ac374ef`).** ⚠ **S3.2's doorbell listener must copy
    the mechanism from the start:** its own collector/action/source, a doorbell-specific
    `BeginSchedulerPass` + `ArmPoll`, the reserved lifecycle line, and membership in both named predicates.
-   Do not copy the setup listener's interval policy verbatim: the doorbell connection is persistent, so
-   `clientFd >= 0 ⇒ 1 pass` would poll and consume a reserved grant forever
-   (`homer_service_dpu_setup_tcp.c:219`-`:238`, clarified after S3.1b by `63b0df0a7`).
+   Its cadence is three-way: **interval 1 during attach**; a **bounded read-side EOF poll** while attached
+   and idle for S3.4 postmaster-death teardown; and an **exact maintained write-queue-depth fact** for a
+   queued outbound `SPAWN_DOORBELL`, independent of read-side `pollDue`. Do not copy the setup listener's
+   interval policy verbatim: because the doorbell connection is persistent, `clientFd >= 0 ⇒ 1 pass`
+   would silently spend one reserved grant plus one `recv()/EAGAIN` per pass forever — not hang — and
+   permanently consume one of the two lifecycle grants (`homer_service_dpu_setup_tcp.c:219`-`:238`,
+   clarified after S3.1b by `63b0df0a7`).
 3. **Do not measure performance on aliased scheduler feedback.** B corrupts the empty/productive streaks
    of all eleven DPU collectors, including the data-path ones (grouped control, command pull, payload
    pull, completion push). Fix B before any S6 number is recorded, or the number cannot be explained.
@@ -281,11 +288,13 @@ Defect **A** merely pushed on a door that three separate latches had quietly sto
    gone" silently (`homer_service_dpu_dma.h:147`-`:164`; fact computed at
    `homer_service_dpu_dma.c:1024`-`:1089`). A proxy can silently become load-bearing for work it has
    nothing to do with — the arm/execute mismatch with the arrow reversed.
-   🆕 A post-S3.1b, comment-only audit found a second instance: setup
-   `WAITING_CLOSE_DRAIN` (`homer_service_dpu_setup_tcp.c:592`-`:605`) drives
-   `HomerDpuDmaDrainPeForClose` on each listener poll (`:610`-`:646`), and had also relied on
-   `DPU_PE_DRAIN` being armed by `started`. It now rides on the listener's reserved poll obligation
-   (citus `63b0df0a7`).
+   🆕 A post-S3.1b, comment-only audit found a second instance: setup `WAITING_CLOSE_DRAIN` is reachable
+   at the current ternary `homer_service_dpu_setup_tcp.c:604` (`:586` was pre-`63b0df0a7`). There,
+   `clientFd >= 0 ⇒ interval 1` is load-bearing: each poll calls
+   `HomerServiceDpuSetupTcpProgressCloseDrain` → `HomerDpuDmaDrainPeForClose` (`:610`-`:646`). Before
+   S3.1b it too relied on `DPU_PE_DRAIN` being armed by the unrelated `started` fact; now private
+   `pollDue` plus reserved admission is strictly stronger. Reclaim and close drain are **two invisible
+   demands in one formerly fused action** — the direct evidence for this generalized proxy-arming rule.
 5. **Treat enum-switch coverage as a manual checklist.** Nearly every switch over
    `HomerProgressSourceKind`, `HomerProgressCollectorKind`, and `HomerProgressActionKind` has `default:`,
    so `-Wswitch` does not protect a new enum member. S3.1b found a live instance:
@@ -349,10 +358,11 @@ above preserve the diagnosis and corrections that led here.
 > transient: `HomerServiceDpuSetupTcpWriteAck` closes it immediately after the ack
 > (`homer_service_dpu_setup_tcp.c:739`-`:776`).
 > One longer active phase is real, however: `WAITING_CLOSE_DRAIN` (`:592`-`:605`) invokes
-> `HomerDpuDmaDrainPeForClose` on each poll (`:610`-`:646`). That close-drain obligation was a **second**
-> job hidden behind the old listener→PE-drain fusion. The landed listener cadence handles it correctly.
-> The same audit sharpened S3.2: its doorbell connection is persistent, so copy the poll-due and reserved
-> admission mechanics, **not** the setup-specific `clientFd >= 0 ⇒ interval 1` policy.
+> `HomerDpuDmaDrainPeForClose` on each poll (`:610`-`:646`); the ternary itself is currently at `:604`,
+> not its pre-audit `:586`. That close-drain obligation was a **second** job hidden behind the old
+> listener→PE-drain fusion. The landed private poll obligation plus reserved admission handles it with a
+> stronger guarantee. See revised rule 4 for the two-demand generalization, and revised rule 2 for S3.2's
+> distinct attach / idle-EOF / queued-write cadences.
 
 ### Direct evidence
 
