@@ -40,3 +40,4 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 - `../connection-management/remote_execution_session_control_plane.md`: Chosen higher-level control-plane abstraction that transport designs must serve.
 - `../data-movement/command_dispatch_completion_plane.md`: Typed command dispatch/completion plane that the unification plan keeps semantically separate from payload-stream open.
 - `../intermediate-results/intermediate_results_service_future_directions.md`: Broader tuple-service design space that depends on the transport/control-plane choice.
+- [dpu_scheduler_arm_execute_mismatch.md](dpu_scheduler_arm_execute_mismatch.md) — where the DPU scheduler arms work from exact per-entity demand and then executes it with a linear scan on a type tag; ranked map, ready-queue audit, and the forward-index fix.

@@ -1237,9 +1237,22 @@ the process preflight before measuring again.
 Three regressions landed July 6-8, 2026 and went unnoticed for days because each
 validation built ONE target and ran ONE workload. Cheap insurance:
 
-- **Build every target, not just `service-bin`:** `make -j8 all service-bin
-  client-bin dpu-tcp-transport-smoke-bin`. The DPU TCP transport smoke silently
-  failed to compile for three days.
+- **Build every target, not just `service-bin`.** "Every target" was unactionable
+  until July 9, 2026 because nobody had written the list down — there are **seven**
+  smoke targets, and the standing recipe named one. Copy this verbatim:
+
+  ```sh
+  sudo -n -u dbcomm make -j8 all service-bin client-bin \
+    dpu-comch-transport-smoke-bin dpu-tcp-transport-smoke-bin \
+    frontend-dma-smoke service-dpu-dma-smoke tuple-deform-smoke \
+    service-dpu-dma-doca-smoke service-dpu-comch-smoke-bin \
+    CPPFLAGS='-D_GNU_SOURCE'
+  ```
+
+  The DPU TCP transport smoke silently failed to compile for three days. Note
+  `service-dpu-dma-smoke` is the **only** caller of
+  `HomerDpuDmaClaimNextMirroredByteRange` — an engine API that looks dead if you
+  grep only the service sources.
 - **Run all three workloads:** basebackup (4-role DPU relay), `pgbench --homer`,
   and backend-to-backend COPY. Two of the three are currently broken — fix or
   re-check them before trusting a "no regression" claim.
