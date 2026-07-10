@@ -12,10 +12,10 @@ S5 turned out to be already working — see "S5 IS ALREADY WORKING" below.
 S3.2 ✅ (citus `52fd1ab3d`), S3.3 ✅ (citus `455c7a556`), **S3.3b + S3.2c ✅ VALIDATED (citus `30dfc9e9a`,
 July 10, 2026)** — the DPU allocates a frontend-arena slot, the spawned backend binds it and SURVIVES
 (the S3.3 gate ERROR is retired). **S3.2b ✅ (citus `f04f87715`)** — arena-slot reaper. **S3.4 ✅ (citus
-`81cb0ec45`)** — doorbell-EOF import teardown. **The S3 spawn-trigger stage is functionally COMPLETE**
-(only **S3.5**, the one-shot host-arm deprecation LOG, remains within S3). Remaining beyond S3: **fix B**
-and **refine A** per D10, then **S4** (single-node end-to-end: commands + completions + tuple results).
-This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
+`81cb0ec45`)** — doorbell-EOF import teardown. **S3.5 ✅ (citus `89820eb36`)** — host-arm deprecation LOG.
+**The S3 spawn-trigger stage is COMPLETE.** Remaining: **S4** (single-node end-to-end: commands +
+completions + tuple results) — recommended NEXT — then **fix B** / **refine A** (D10) before **S6**. See the
+"S4 vs fix B ordering" note under D10. This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
 
 > **Decisions layered on top of the original plan. Read these before implementing anything.**
 > - **D5** — `HomerDpuDmaRingRuntime.boundServiceSessionId`. The descriptor says what the host *declared*;
@@ -40,6 +40,20 @@ This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
 >   means *"a poll is due"* — true and maintained — rather than *"an item is ready"*, which a listener
 >   cannot know without a syscall. ✅ **VALIDATED in citus `84ac374ef`.** Ordering: **S3.2 → fix B →
 >   refine A.** ⚠ S3.2's doorbell must copy the now-working setup-listener implementation.
+> - **⏭ Ordering revisited after S3 completed (July 10, 2026) — do S4 BEFORE fix B / refine A.** D10's
+>   "S3.2 → fix B → refine A" ordering predates S3.3+. Re-examined now that S3 is done, the recommendation is
+>   **S4 → fix B → refine A → S6**, for three reasons: (1) **Fix B is a MEASUREMENT prerequisite, not a
+>   functional one** — its stated deadline is *"before any S6 number"* (it de-aliases the shared
+>   `dpuDmaFeedback` so per-collector cadence is attributable); nothing in S4's functional work (D6 forward
+>   index, arena credit lines, role-6 export, driving commands) depends on it, and S4's collectors are
+>   exact-work-armed, not blind-backoff, so the aliasing barely touches S4 debugging (and starve-diag
+>   counters cover cadence questions meanwhile). (2) **S4 restructures the DPU collectors** — S4.0 cashes in
+>   D6 and DELETES the completion-pull scan, changing the very collector set fix B must rework; doing fix B
+>   first would churn it, doing it after lets it target the final set. (3) **S4 is the functional payoff** —
+>   it makes `--homer-dpu-command` complete a `SELECT` (today it fails at `client_sql_tx_begin`), proving the
+>   architecture end to end; fix B/refine A are invisible scheduler plumbing that only gate S6 numbers, which
+>   come after S4 regardless. refine A (enrolled-ring bitset, roles 1/4/7) is orthogonal to S4's arena
+>   collectors and naturally pairs with fix B.
 > - **S3.5's discovery** — basebackup never spawns a socketless backend, so `pgbench --homer` is the *only*
 >   working regression net for the spawn path. Do not retire it before its replacement's gate passes.
 > - **D9 / the spawn wait — RETRACTED AND CORRECTED.** On the DPU the spin is **not a stall, it is a
@@ -2569,6 +2583,10 @@ store. **Where the body is immutable, do not rely on any of it — do the two-ph
 - **S3.5** Keep the host-service `shm_open` arm intact and **functional** through S6. Add a one-shot
   `LOG` on first use — *"host-service backend spawn is deprecated; retires at S7.1"* — and nothing more.
   **Do not gut it early.** See the box below; this is not sentimentality about legacy code.
+  ✅ **DONE — citus `89820eb36`** (July 10, 2026). One-shot `static bool` + `fprintf` in
+  `TupleSinkServiceSubmitBackendSpawnRequest`, after the DPU-arm refusal and the request fill, right before
+  the `shm_open`. Validated: a local `pgbench --homer` run (host arm) emitted the line EXACTLY once across
+  5/5 txns. **S3 is now fully complete.**
 
 > ### 🔑 DISCOVERY (July 9, 2026) — the spawn path has exactly ONE working regression net, and it is not basebackup
 >
