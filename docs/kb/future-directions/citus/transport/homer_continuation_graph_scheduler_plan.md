@@ -115,6 +115,49 @@ Two facts change the scheduler model versus the pre-DPU design:
    semantic-close continuation having released the mirror; it cannot be granted
    earlier.
 
+3. **The two graph edges this runtime needs do not exist in the engine yet, in either direction.**
+   Read [`dpu_readiness_collectors_and_continuation_edges.md`](dpu_readiness_collectors_and_continuation_edges.md)
+   before designing against this section — it is the grounding for everything below, written July 10, 2026.
+   In brief:
+
+   - The DPU service already contains a **hand-rolled, cookie-less completion queue**: the ready queue
+     (`homer_service_dpu_dma.c:238`, `:612`). Its entries carry the *source address* (`importIndex`,
+     `ringIndex`) and an `acceptedPublishedEpoch` that is, literally, immediate data — but **no `wr_id`**.
+     Every consumer therefore re-derives "who was waiting" by scanning. That single missing field is the
+     root cause of all ten sites mapped in
+     [`dpu_scheduler_arm_execute_mismatch.md`](dpu_scheduler_arm_execute_mismatch.md).
+   - **Forward edge** (waiter → resource), needed by *pushers*: `HomerDpuDmaFindDescriptorRef` scans imports
+     × rings **per `START_COMMAND`**. Fixed by caching descriptor refs on the selected session at bind time
+     (command-plane **D6**).
+   - **Reverse edge** (resource → waiter), needed by *collectors*: this is the cookie, and it is where
+     `HomerDependencyResolve()` lands. `HomerDpuDmaRingRuntime` **is** the frontier owner the
+     [dependency-resolution model](#dependency-resolution-model) prescribes ("payload frontier owner: usually
+     one required-frontier waiter") — it holds `acceptedPublishedTail`, `completedByteTail`,
+     `discoveredReady`, `readyRefQueued`, and **no waiter**. Adding
+     `HomerWaitRegistration waiter;` turns the grouped-control acceptance handler
+     (`homer_service_dpu_dma.c:9895`) into `HomerDependencyResolve(runtime, &ringRuntime->waiter)`. That is
+     the entire firing half of the observer pattern, at one site, with no global list.
+   - **The [shared bitmap collector](#external-resolvers) is a prerequisite, not an optimisation.** The ABI
+     was shaped for it — `bridgeHeader.hostPublishOffset` declares a contiguous publish-line array and
+     `HomerDpuDmaGroupedControlOwner` carries `{controlFirstIndex, controlCount}` — but
+     `groupedControlBufferBytes` is one cache line, `controlCount` is written as `1` and **never read**, so
+     discovery costs **one 64-byte DMA per enrolled ring per pass**. An event system layered on that has
+     moved the poll, not removed it. Wake latency for a host-published dependency is floored by the
+     discovery period; the only lever a scheduler has is what a discovery pass costs.
+   - **Everything is polled.** recv-CQ, `doca_pe`, and a memory word are all polls. What a completion queue
+     buys is *aggregation* and *a cookie slot*, nothing more. Homer already pays for both on the RDMA path
+     (`IBV_WR_RDMA_WRITE_WITH_IMM`, deliberately the slower opcode, so arrivals land in the recv-CQ) and on
+     the DOCA path (`taskUserData.ptr = slot`). A host CPU store into exported memory can have neither —
+     there is no `WRITE_WITH_IMM` across PCIe. **That is the only asymmetry.** Any wording in this plan
+     suggesting "events instead of scanning" is wrong and should be struck; the correct noun is *collector*,
+     and a collector is a poll that demultiplexes.
+
+   Consequence for `HomerDependencyKind` below: it does not currently encode **how a dependency gets
+   resolved**. A `FRONTIER` on a host publish line (a collector must poll for it, at a cost set by discovery
+   geometry) and a `FRONTIER` on `completedByteTail` (a DOCA PE completion raises it, with a cookie) are not
+   the same animal. The runtime should be able to **reject at registration time** a wait on state that no
+   collector observes — the five dead ready-queue kinds are what that missing check looks like in practice.
+
 Mapping the current close/reclaim readiness inputs to the typed dependency kinds
 (`HomerDependencyKind`, defined later) grounds the abstract model on real code:
 

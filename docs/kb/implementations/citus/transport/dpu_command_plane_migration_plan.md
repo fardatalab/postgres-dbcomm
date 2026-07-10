@@ -984,11 +984,24 @@ export becomes its **own** `hostMmapImports[]` slot with its own descriptor slic
 `.mmapExportBytes` (`homer_dpu_comch_abi.h:571`-`:572`) surface **only export [0]** — a convenience
 shortcut, not the import path. Do not mistake it for a one-export limit.
 
-**F2. The bridge control block's `hostPublishOffset`/`dpuCreditOffset` are host-side bookkeeping.**
-The DPU **never reads them.** All DPU addressing is per-descriptor:
+**F2. The bridge control block's `hostPublishOffset` is never read by the DPU.**
+All DPU addressing of *host-published* control lines is per-descriptor:
 `hostRingAddress + hostControlOffset` for the control line (`homer_service_dpu_dma.c:8472`, `:9047`,
 `:9189`) and `+ hostRingOffset` for the data. So two exports with completely different internal layouts
 coexist under one bridge header. This is what makes the arena and the spawn region exportable together.
+
+> **⚠ CORRECTED (July 10, 2026).** The original F2 said this of **both** `hostPublishOffset` *and*
+> `dpuCreditOffset`. Half wrong. **`dpuCreditOffset` IS read, and index-addressed:**
+> `creditOffset = dpuCreditOffset + ringIndex * sizeof(HomerDpuBridgeDpuCreditLine)`
+> (`homer_service_dpu_dma.c:9656`). The DPU-written credit lines are a contiguous array and the DPU treats
+> them as one. Only the host-written publish array — the one the DPU would have to *read*, and the one place
+> where batching the read would actually pay — goes unindexed.
+>
+> That asymmetry is not a curiosity; it is the reason grouped-control discovery costs one 64-byte DMA per
+> ring per pass. See
+> [`dpu_readiness_collectors_and_continuation_edges.md`](../../../future-directions/citus/transport/dpu_readiness_collectors_and_continuation_edges.md) §6.
+> The claim that *nothing* reads these offsets remains true only for `hostPublishOffset`, and that is the
+> bug, not the design.
 
 **F3. Roles 2/3/5 do NOT need bridge publish/credit lines.** The Tier-2 prior art proves it:
 `homer_frontend_dma.c:1640`/`:1661`/`:1682` all set `hostControlOffset = 0` and
@@ -1399,7 +1412,74 @@ take the cached ref, or a sink binding is stamped. Decide it there, with the cod
 
 ---
 
+## D8 — reserve the arena's host publish-line array NOW (decided July 10, 2026)
+
+> **⏳ This decision has a closing window.** The arena ABI is `v1` and only S2 has shipped against it.
+
+**What.** Add to `HomerFrontendArena`, at the head, immediately after the advisory bridge header:
+
+```c
+/* One HostPublishLine per arena ring, contiguous, index-addressed:
+ *     bridgeHeader.hostPublishOffset = offsetof(HomerFrontendArena, hostPublishLines)
+ *     line(ringIndex) = hostPublishOffset + ringIndex * 64
+ * 48 x 64 B = 3 KiB on a 57 MiB region.  NOTHING WRITES OR READS THESE YET. */
+HomerDpuBridgeHostPublishLine hostPublishLines[HOMER_FRONTEND_ARENA_RING_COUNT];
+```
+
+and set `bridgeHeader.hostPublishOffset` accordingly (it is `0` today).
+
+**Why now, and why this is not speculative generality.** Roles 2/3/5 are excluded from grouped-control
+discovery for a purely *typing* reason: a ring is enrolled iff its `hostControlOffset` points at a 64-byte
+`HomerDpuBridgeHostPublishLine`, and theirs point at a 24-byte mailbox header or a
+`CitusHomerPayloadByteRingControl` instead. They are not unschedulable — **they are unregistered.** Nobody
+allocated them a line.
+
+When we later want the DPU to discover backend completions and SQL-result frontiers with **one** DMA instead
+of one per ring, the backend will stamp its line beside the mailbox epoch (a discovery *hint*; correctness
+still comes from the mailbox's own epoch — precisely the split role 4 already has), and grouped-control will
+read the array. If the space is already there, that lands with **no arena ABI bump and no coordinated
+two-DPU redeploy.** If it is not, it costs both.
+
+**Cost today: one struct field and 3 KiB.** Cost after S4/S5/S6 have validated against `v1`: a version bump
+and a synchronised rebuild of the host and both DPUs. Buy the door while it is cheap.
+
+**Do NOT also implement the writers or grouping here.** D8 reserves address space and nothing else. Grouping
+(`controlCount`, `groupedControlBufferBytes`) and promotion of roles 2/3/5 are separate, later, and must be
+done in that order — promotion *before* grouping is a regression, because it makes discovery submit 48
+demand-independent DMAs per pass where D6's demand-driven poll submits one per waiting session.
+
+Full reasoning, code pointers, and the migration order:
+[`dpu_readiness_collectors_and_continuation_edges.md`](../../../future-directions/citus/transport/dpu_readiness_collectors_and_continuation_edges.md).
+
+**Also do, cheaply, alongside D8:**
+- **Make `controlCount` honest.** `HomerDpuDmaGroupedControlOwner.{controlFirstIndex, controlCount}` are
+  **written and never read**, by two writers that contradict each other: task-slot init computes
+  `controlCount = groupedControlBufferBytes / 64` and sets `ringIndex = INVALID` (the grouped design), and
+  submit overrides both with `controlCount = 1` and a scalar `ringIndex` (the shortcut). Assert and comment.
+  Five ready-queue kinds were born dead behind exactly this kind of silence.
+- **Name D5's `boundServiceSessionId` as the reverse cookie** (`resource → waiter`), so widening it to a
+  `HomerContinuationRef` is later a type change rather than a redesign.
+
+> ### D6, restated: it is continuation-graph edge #1
+>
+> D6 is not a local optimisation. The continuation runtime needs two edges, in opposite directions, and
+> **neither exists**:
+>
+> | Edge | Direction | Needed by | Today |
+> |---|---|---|---|
+> | forward index | waiter → resource | *pushers* — "I have a session; which ring do I DMA into?" | `FindDescriptorRef` scans, **per transaction** |
+> | reverse cookie | resource → waiter | *collectors* — "ring 37 advanced; who was waiting?" | `FindSelectedSession` scans 64 sessions |
+>
+> D6 builds the forward edge. The reverse edge is where `HomerDependencyResolve()` will land, on
+> `HomerDpuDmaRingRuntime`, which is already the dependency owner the continuation plan prescribes and which
+> already carries every frontier field and no waiter.
+
+---
+
 ### S3 — spawn trigger (D2′)
+- **S3.0** **D8**: reserve `hostPublishLines[48]` in the arena and point `bridgeHeader.hostPublishOffset` at
+  it; assert-and-comment `controlCount`; document `boundServiceSessionId` as the reverse cookie. No writers,
+  no readers, no behaviour change. Regression: arena import still accepted, basebackup + smoke green.
 - **S3.1** Doorbell protocol: add `DOORBELL_ATTACH` / `DOORBELL_ATTACH_ACK` / `SPAWN_DOORBELL` message
   kinds to `homer_dpu_comch_abi.h` (`:33`-`:36`) and bump `HOMER_DPU_COMCH_PROTOCOL_VERSION`. Default
   doorbell port **9728**, its own listener — *never* the setup listener, whose single `clientFd` serial
