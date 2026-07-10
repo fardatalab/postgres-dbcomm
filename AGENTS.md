@@ -435,6 +435,24 @@ chain is exercised by `pgbench --homer --homer-dpu-command` from farnet0; the DP
 `DPU backend spawn begin …` then `DPU backend spawn COMPLETED … launched_pid=N`, and `postgres.log` on
 farnet1 shows pid `N`.
 
+Since **S3.3b+S3.2c** (citus `30dfc9e9a`) the DPU-spawned backend no longer dies at the control region —
+it binds a frontend-arena slot and **SURVIVES, idling in its command loop** (commands are S4). Two
+operational consequences:
+
+- **A surviving `postgres: remote exec backend` does NOT respond to `pg_ctl stop -m fast` / SIGTERM.** It
+  busy-waits in the command loop, and socketless backends have no clean-shutdown path yet (S4's
+  `CLIENT_SQL_SESSION_CLOSE` / S3.4's doorbell-EOF teardown will add one). So after any `--homer-dpu-command`
+  run the clean baseline MUST reap it by `/proc/<pid>/exe` + `kill -9` (the `kill_by_exe` helper already
+  does; a plain `pg_ctl stop` leaves it alive and the NEXT preflight then trips on a stale backend). This is
+  new — pre-S3.2c the backend died instantly, so it never survived to need reaping.
+- **The positive `remote exec backend: bound frontend arena slot=<N>` confirmation line is compiled out at
+  the default `HOMER_REMOTE_EXEC_TRACE=0`.** Validate the arena arm by *absence* of the four FATALs
+  (`could not open Homer control region` / `could not bind|attach frontend arena` /
+  `invalid selected-DPU startup identity` / `invalid result queue descriptor`) **plus** the DPU's
+  `DPU backend spawn COMPLETED` **plus** a LIVE `remote exec backend` — a live selected-DPU backend cannot
+  exist without a successful bind (both attach and `BindArenaSlot` are FATAL-on-failure before the command
+  loop). To read the line DIRECTLY, rebuild farnet1-host citus with `CPPFLAGS='… -DHOMER_REMOTE_EXEC_TRACE=1'`.
+
 See `docs/kb/future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md` §0/§0b/§0c.
 
 For scheduler/action-grant diagnostics, include the service progress and peer

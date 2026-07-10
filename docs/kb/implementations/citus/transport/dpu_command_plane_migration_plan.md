@@ -9,7 +9,10 @@ S3.0 ✅ (citus `36a61a5a1`), S3.1 ✅ (citus `c2ec17852`), S3.1b ✅ (citus `84
 Post-S3.1b comment-only audit `63b0df0a7` records the second invisible demand and sharpens S3.2's
 cadence rule.
 S5 turned out to be already working — see "S5 IS ALREADY WORKING" below.
-S3.2 ✅ (citus `52fd1ab3d`). The remaining critical path is **S3.3** (spawn DMA), then **fix B** and **refine A** per D10.
+S3.2 ✅ (citus `52fd1ab3d`), S3.3 ✅ (citus `455c7a556`), **S3.3b + S3.2c ✅ VALIDATED (citus `30dfc9e9a`,
+July 10, 2026)** — the DPU allocates a frontend-arena slot, the spawned backend binds it and SURVIVES
+(the S3.3 gate ERROR is retired). Remaining: **S3.2b** (ownerPid reaper) → **S3.4** (doorbell-EOF teardown),
+then **fix B** and **refine A** per D10, then S4.
 This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
 
 > **Decisions layered on top of the original plan. Read these before implementing anything.**
@@ -2273,6 +2276,128 @@ the deferral machinery — record it, do not widen it.
   > `homer_service_dpu_spawn.c` (it already owns the `slots[16..31]` free list and the per-entry
   > `descriptorRef`; the arena-ring binding is the natural neighbour). Set `arenaSlotIndex` in
   > `TupleSinkServiceFillBackendSpawnRequest` **only on the DPU arm** — the host arm keeps `INVALID`.
+
+  ### ✅ S3.3b + S3.2c VALIDATED — citus `30dfc9e9a` (July 10, 2026). GATE PASSED, regression 3/3.
+
+  > **The gate.** `pgbench --homer --homer-dpu-command` from farnet0 → farnet1 (4 roles, frontend agent
+  > ON). farnet1 DPU log:
+  > ```
+  > DPU backend spawn COMPLETED handle=1 slot=16 session=1 launched_pid=687526 state_reads=4
+  > ```
+  > farnet1 `postgres.log` for the run (`[687024]`, 15:09): **`could not open Homer control region` is
+  > ABSENT** (the only occurrence is the stale pre-fix `[616897]` at 11:06), and none of
+  > `could not bind/attach frontend arena` / `invalid selected-DPU startup identity` /
+  > `invalid result queue descriptor` appear. `ps` shows `postgres: remote exec backend` pid **687526 alive
+  > and idling** long after the run. pgbench: `client 0 opened selected-DPU Homer SQL command session id=1`
+  > then failed at `client_sql_tx_begin` — the exact S4 boundary, expected, not a gate failure.
+  >
+  > **Why "backend alive" is airtight, not a soft signal.** A DPU-spawned backend gets `SELECTED_DPU_DMA`
+  > + a valid `arenaSlotIndex`, forcing `arenaBackend=true`, which MUST `AttachArena` + `BindArenaSlot`
+  > (both FATAL-on-failure, on the bootstrap path *before* the command loop) or die. A live, idling
+  > selected-DPU backend therefore cannot exist unless attach + checked bind + mailbox redirect + result
+  > skip all succeeded. The absence of all four arena-error strings corroborates.
+  >
+  > **Regression 3/3:** multi-client `--homer` c4 (agent ON) = 20000/20000, **0 failed**, 11.7k TPS
+  > (farnet1-LOCAL host-service path — no farnet0, no DPU, no RDMA; this is the host-arm no-regression
+  > check, NOT the DPU path); 4-role DPU basebackup 23.24 GB + `CLOSE_ACK` in 23.7 s; 6-leg TCP smoke `ok`
+  > both ends (S0b fork-reader proof intact).
+  >
+  > **Concurrent DPU-arena allocation — a SECOND, independent PASS** (`--homer-dpu-command -c 4` from
+  > farnet0). Sessions 1/2/3 were concurrently in flight (all three `spawn begin` before any `COMPLETED`),
+  > got **distinct spawn slots 16/17/18**, and — proven by **all 4 backends alive** (pids matching
+  > `launched_pid`) — **distinct arena slots**: a duplicate arena slot would have FATAL'd the second
+  > backend's `BindArenaSlot` CAS (`arena slot N is already bound`) and it would be dead. Zero
+  > `already bound`/`partially bound`/collision lines. Notably **session 4 REUSED spawn slot 16** (freed
+  > after session 1's spawn *completed*) yet got a distinct arena slot (session 1's arena binding still
+  > held, its backend alive) — a live proof of the **spawn-slot-vs-arena-slot lifetime distinction** the
+  > design rests on (spawn slot frees at spawn completion; arena slot frees only at SESSION close). Each of
+  > the 4 still failed at `client_sql_tx_begin` (S4).
+  >
+  > **Two honest follow-ups (neither a gate blocker):**
+  > - The positive `remote exec backend: bound frontend arena slot=<N>` line is compiled out at default
+  >   `HOMER_REMOTE_EXEC_TRACE=0`, so the pass is *inferred* (live selected-DPU backend + DPU spawn-complete
+  >   + no error strings) rather than read directly. A one-off `-DHOMER_REMOTE_EXEC_TRACE=1` farnet1-host
+  >   build would print `bound frontend arena slot=0` for belt-and-suspenders proof.
+  > - The idle socketless backend does not respond to `pg_ctl stop -m fast`/SIGTERM (had to be `kill -9`'d).
+  >   PRE-EXISTING socketless-backend gap that S3.3b merely EXPOSED — before, the backend died instantly at
+  >   the control region, so it never reached the idle loop. Normal shutdown is the `CLIENT_SQL_SESSION_CLOSE`
+  >   command (S4) or S3.4's doorbell-EOF teardown; abnormal-kill robustness is a separate future item.
+
+  ### (history) S3.3b + S3.2c IMPLEMENTED — built + farnet1-deployed
+
+  **Where the allocation state actually lives — a deviation from the box above, decided from the code.**
+  The box said "the DPU-side allocation lives in `homer_service_dpu_spawn.c`." On reading the code that is
+  the wrong home, for two reasons, and the allocation was placed elsewhere:
+  1. The arena-slot free/bound STATE is `HomerDpuDmaRingRuntime.boundServiceSessionId`, which is
+     **engine-private** (`homer_service_dpu_dma.c`); `homer_service_dpu_spawn.c` cannot reach it. So the
+     allocator MUST be an engine API. It is: **`HomerDpuDmaBindRingSession()` finds the lowest arena slot
+     whose three rings are all UNBOUND (`boundServiceSessionId == 0`), stamps them, and returns the slot
+     index + the three D6 refs**; `HomerDpuDmaUnbindRingSession()` clears them. A free list in spawn.c would
+     be a second source of truth and would drift. There is no separate "DPU-local table" — the free list
+     *is* `boundServiceSessionId`, exactly as the `homer_service_dpu_dma.c:427` comment always said.
+  2. The binding's LIFETIME is the **session**, not the spawn: the plan itself says "cache the refs on the
+     selected session… release at session close," but the spawn ENTRY is reaped at spawn completion, far
+     earlier. So the DRIVING lives in the **session-owning hub**, `TupleSinkServiceBeginDpuBackendSpawn`
+     (allocate + cache on `sessionState->dpuArena*` + stamp the request + undo on spawn-start failure) and
+     the release lives in `TupleSinkServiceResetSession` (the single teardown funnel), beside the existing
+     per-session peer-connection release, **before its final `memset`**. `homer_service_dpu_spawn.c` is
+     untouched — it stays the pure spawn-slot phase machine.
+
+  `FillBackendSpawnRequest` stays a pure builder: it takes `arenaSlotIndex` as a param (INVALID for the
+  host arm) and is the ONE place mapping a valid slot ⟺ `SELECTED_DPU_DMA` channel mode. The fallible
+  engine allocation + its release-on-failure sit in `BeginDpuBackendSpawn`, not in the builder.
+
+  **⚠ S3.2c was materially LARGER than the one-liner above, and this is the load-bearing correction.**
+  The one-liner assumed the selected-DPU backend bootstrap already worked and only needed a `BindArenaSlot`
+  call. It did not: the selected-DPU backend in `remote_execution_backend_bridge.c` was still the **old
+  Tier-2 per-session-shm shape** — it `shm_open`s named command/completion mailboxes AND a result queue by
+  `queueShmName`. A DPU-spawned backend has none of those, so flipping `backendChannelMode` alone just
+  moves the FATAL: control-region → **result-queue descriptor** (`resultServiceSinkId == 0`) → command
+  mailbox. Real S3.2c had to **migrate the backend's command/completion mailboxes to the arena slot**:
+  - New `arenaBackend = selectedDpuBackendChannel && arenaSlotIndex != INVALID` distinguishes the arena arm
+    from the legacy Tier-2 selected-DPU arm (which keeps per-session shm) — the legacy arm is preserved,
+    not gutted.
+  - Arena arm: `HomerFrontendAgentAttachArena` + checked `HomerFrontendAgentBindArenaSlot` (FATAL on
+    collision) + `on_proc_exit` release (via a file-scope wrapper — `ReleaseArenaSlot`'s 3-arg signature is
+    not the `(int,Datum)` callback shape), then point `commandMailbox`/`completionMailbox` straight at
+    `arena->slots[k].{commandMailbox,completionMailbox}`. The per-session `shm_open` becomes the `else`
+    (host + legacy). Exit-path `munmap`/`close` is already `!= NULL`/`>= 0`-guarded, so leaving the arena
+    arm's fds/addresses at their `-1`/`NULL` defaults makes teardown skip the agent-owned arena mapping;
+    the kernel reclaims it at `proc_exit`.
+  - **Result byte-ring (role 5) is DEFERRED to S4.0b** — the arena arm SKIPS the result-queue block
+    (`if (selectedDpuBackendChannel && !arenaBackend)`). This matches the plan's own S4 split ("required
+    before a backend can produce a single result byte through the arena"). No command executes until S4.2,
+    so `resultQueueReady == false` is harmless until then. The gate is "the backend SURVIVES session-open,"
+    proven by the backend binding its slot and then busy-waiting in the command loop
+    (`RemoteExecBackendReadStableCommandRecord` spins on `publishedEpoch`); pgbench still fails at the
+    transaction, which is S4, not a regression.
+
+  **One more required fix the plan did not name:** for the DPU arm, `FillBackendSpawnRequest` must set
+  `completionReadyBitmapEnabled = 0` and `serviceSessionIndex = INVALID`. The DPU discovers completions by
+  DMA-polling the role-3 mailbox, NOT via the host-service completion-ready bitmap (which lives in the
+  control region a selected-DPU backend never maps) — and the backend's own bootstrap FATALs
+  ("invalid selected-DPU startup identity") if a selected-DPU spawn carries either. In S3.3 this check was
+  dormant because the mode was `HOST_SERVICE_SHM`; the flip to `SELECTED_DPU_DMA` activates it.
+
+  **Safety of binding a slot before the backend claims it** (the race S3.3b introduces): confirmed safe by
+  the measured note at `homer_service_dpu_dma.c:1487` — a bound arena ring whose mailbox is still all-zeros
+  reads `publishedEpoch(0) != consumedEpoch+1`, so the completion-pull scan stages nothing and raises no
+  error; and the pull collector is not even granted until a selected session awaits a completion (S4). The
+  "FREE slots are always zeroed" invariant (agent CreateArena + `ReleaseArenaSlot` re-zero) is what makes
+  this hold across the whole window.
+
+  **No ABI bump.** The spawn request / startup structs are unchanged (arenaSlotIndex already shipped at
+  v15, S3.3c); only field VALUES change. The bridge protocol version is untouched, so the farnet0 DPU
+  (session initiator/relay, never a spawner) stays protocol-compatible on its existing binary. New shared
+  constant `CITUS_REMOTE_EXEC_BACKEND_ARENA_RINGS_PER_SLOT = 3` lives in the plain-C protocol header (the
+  DPU allocator needs it without postgres.h); `homer_frontend_agent.h` now references it and static-asserts
+  agreement — single source of truth for the 3-rings/{2,3,5}-roles layout.
+
+  **Files touched (citus):** `homer_service_dpu_dma.{c,h}` (+`BindRingSession`/`UnbindRingSession`
+  +`FindArenaImportIndex`), `tuple_sink_service_process.c` (`sessionState->dpuArena*` fields,
+  `ReleaseDpuArenaBinding`, `BeginDpuBackendSpawn` allocate+cache+undo, `FillBackendSpawnRequest` arm knob,
+  `ResetSession` release), `remote_execution_backend_bridge.c` (arena arm + on_proc_exit wrapper),
+  `remote_execution_backend_protocol.h` + `homer_frontend_agent.h` (shared RINGS_PER_SLOT).
 - **S3.3c** ABI: bump `CITUS_REMOTE_EXEC_BACKEND_PROTOCOL_VERSION` 14 → 15 (shm name `_v15`), add
   `uint32_t arenaSlotIndex` to `CitusRemoteExecBackendSpawnRequest` **and**
   `CitusRemoteExecBackendStartupData`, and copy it in `ProcessSpawnRequestSlot`. Host-service producers set
