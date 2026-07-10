@@ -952,6 +952,30 @@ pass `HomerDpuBridgeDescriptorRoleMatchesShape` (roles 1-7 only, `homer_dpu_brid
 `default:` arm errors with *"host mmap descriptor role is unknown"* (`homer_service_dpu_dma.c:5410`).
 Reusing role 2 would make the DPU treat the spawn region as a backend command mailbox. **Role 8 it is.**
 
+**F7. ⚠ THE PLAN HAD A HOLE — pre-exported arena descriptors are UNADDRESSABLE as written.**
+This is the finding that mattered. The DPU resolves a backend mailbox by the descriptor's *declared*
+session id:
+- **Role 2:** `HomerDpuDmaFindDescriptorRef` (`homer_service_dpu_dma.c:5079`) matches
+  `descriptor->serviceSessionId == serviceSessionId && descriptor->descriptorRole == role` (`:5123`),
+  under a matching `bridgeGeneration` (`:5114`). The key is
+  **`(bridgeGeneration, descriptor.serviceSessionId, descriptorRole)`** — not `serviceSinkId`, not
+  `sessionUID`, not `(importIndex, ringIndex)`. First match wins; duplicates are not detected (`:5142`).
+- **Role 3:** `HomerDpuDmaSubmitBackendCompletionPulls` (`:1205`) scans **every ring of every active
+  import** (`:1240`), filters **only by `descriptorRole`** (`:1257`), and submits a control-read DMA per
+  match. The session is recovered afterwards from `descriptorRef.serviceSessionId` (`:1284`) via
+  `HomerServiceDpuFindSelectedSession` (`tuple_sink_service_process.c:38761`).
+
+But the agent declares all 48 arena descriptors **at startup, before any session exists**, so they carry
+`serviceSessionId = 0`. Consequences:
+1. Role 2 is unresolvable: `FindDescriptorRef(gen, S, ROLE_2)` never matches a slot declared with 0.
+2. **Role 3 breaks the S2 gate itself, not just S4.** From the instant the arena is imported, the DPU
+   would submit **16** completion-mailbox control-read DMAs per scheduler pass — one per unbound arena
+   slot — each landing in `FindSelectedSession(0)`. Importing the arena is enough to trigger it; no
+   session required.
+
+There is no late-binding key in the descriptor ABI (no `arenaSlotIndex`, no opaque tag), and `ringIndex`
+is pinned to the descriptor's table position (`:5365`), so it cannot carry one.
+
 **F6. ⚠ LANDMINE — `EnsureSpawnRegionMapped()` unconditionally `memset`s the whole region.**
 `remote_execution_backend_bridge.c:1709` opens `O_CREAT|O_RDWR` **without `O_EXCL`**, `ftruncate`s to
 `sizeof(CitusRemoteExecBackendSpawnRegion)` if the size differs, and `memset`s at `:1756`. It is
@@ -1012,6 +1036,50 @@ be truncated back down by whichever process called `EnsureSpawnRegionMapped` fir
    block) and F1's multi-export composition both came straight out of it
    (`homer_frontend_dma.c:1261`-`:1304`, `:1590`-`:1697`, `:1704`-`:1735`).
 
+7. **D5 — the DPU BINDS a ring to a session; `HomerDpuDmaRingRuntime.boundServiceSessionId`.**
+   *Forced by F7. This is the one place S2 must add real DMA-engine surface.*
+
+   The descriptor says what the **host declared** at setup. A ring of a shared arena has no session at
+   that moment. So the DPU needs somewhere to record what it **bound** — and it already has exactly the
+   right home: `import->ringRuntime[]`, a DPU-private per-ring array `calloc`'d beside the descriptor
+   copy at `homer_service_dpu_dma.c:5593`-`:5594`.
+
+   Add `uint64_t boundServiceSessionId`, **initialised at import from `descriptor->serviceSessionId`**,
+   meaning *"the session this ring currently serves, as the DPU understands it."* Then:
+   - `HomerDpuDmaSubmitBackendCompletionPulls` skips a ring whose `boundServiceSessionId == 0`
+     (an unbound arena slot has no session; do not poll it). **This is the fix for F7's item 2.**
+   - `HomerDpuDmaFindDescriptorRef` matches on `boundServiceSessionId` rather than
+     `descriptor->serviceSessionId`. **Fix for F7's item 1.**
+   - **S3** adds `HomerDpuDmaBindRingSession()` / `...UnbindRingSession()`, called by the slot allocator
+     when it stamps `arenaSlotIndex` into the spawn request, and at session close.
+
+   Both changes are **behavioural no-ops today**: every existing exporter declares a nonzero
+   `serviceSessionId` (client role-1 at `homer_client.c:2875`; Tier-2 roles 2/3/5 at
+   `homer_frontend_dma.c:1647`/`:1668`/`:1694`). So the S2 basebackup + smoke regressions prove the
+   plumbing is inert before S3 gives it teeth.
+
+   *Rejected: mutate `import->descriptors[i].serviceSessionId` in place.* It is a DPU-private copy, so it
+   would work and needs zero resolver changes — but the descriptor is documented as "what the host sent
+   over the cold setup channel" (`homer_dpu_bridge_abi.h:191`-`:194`), and silently making it mean
+   something else is a trap for the next reader, and for any diagnostic that prints it.
+   *Rejected: add an `arenaSlotIndex` lookup key to the descriptor ABI.* Bigger ABI change, touches every
+   resolver, and does nothing about the role-3 polling storm — which is the half that actually breaks.
+   *Rejected: per-session export by the backend.* That is the D4 alternative; it reintroduces DOCA init on
+   the session-open path, which is the entire thing D4 exists to avoid.
+
+##### Two pre-existing bugs in `TupleSinkServiceSubmitBackendSpawnRequest`, found while tracing (fix in S3)
+
+Not on S2's path; do not fix them here. But S3 rewrites this submitter's DPU twin and keeps the host one
+(S3.5), so fix both then, in both:
+1. **Slot reservation is load-then-store, not CAS** (`tuple_sink_service_process.c:18913`). Two concurrent
+   submitters can claim one slot. Latent today only because one service is single-threaded — but a host
+   service and `homer_frontend_dma_lifecycle`'s own submitter can both be live.
+2. **The success path stores `state = FREE` before reading `response.launchedPid`**
+   (`:19003` then `:19018`). A racing producer may re-claim the slot between the two, and the postmaster
+   `memset`s `slot->response` when it processes the new request. Narrow, real, and it would present as an
+   impossible `launchedBackendPid`.
+3. (Lesser) The wait loop at `:18976` has no timeout and no postmaster-liveness check.
+
 ##### Arena region layout (`/citus_homer_frontend_arena_v1`)
 
 ```
@@ -1032,7 +1100,7 @@ descriptor slice (`:505`-`:529`).
 |---|---|
 | `homer_dpu_bridge_abi.h` | role 8 + shape arm; `PROTOCOL_VERSION` 2→3 |
 | `homer_dpu_comch_abi.h` | `PROTOCOL_VERSION` 2→3 |
-| `homer_service_dpu_dma.c` | **one** `case` arm in the `minControlBytes` switch (`~:5380`). The only DPU-side change in S2. |
+| `homer_service_dpu_dma.c` | one `case` arm in the `minControlBytes` switch (`~:5380`); **plus D5**: `HomerDpuDmaRingRuntime.boundServiceSessionId` (init at `:5594`), the `== 0` skip in `SubmitBackendCompletionPulls` (`:1257`), and `FindDescriptorRef` reading it (`:5123`) |
 | `homer_frontend_agent.{c,h}` | **new.** Arena ABI + create/attach/bind/release; the bgworker (register, export both regions, compose the 2-export setup message, send, log). |
 | `remote_execution_backend_bridge.c` | attach-only spawn-region helper (F6); call arena-create + bgworker-register from the `!IsUnderPostmaster` branch (`:3119`) |
 | `shared_library_init.c` | define the GUC |
