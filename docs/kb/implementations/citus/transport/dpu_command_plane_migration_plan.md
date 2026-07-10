@@ -2067,6 +2067,24 @@ the deferral machinery — record it, do not widen it.
   `ownerPid` is gone (`kill(pid, 0)` → `ESRCH`). Covers a hard-crashed backend and the crash-restart leak
   (`_PG_init` does not re-run, so `CreateArena`'s whole-arena `memset` does not either). A recycled pid can
   give a false positive; acceptable for a prototype, and the checked claim still catches disagreement.
+
+  > ### ✅ S3.2b DONE + VALIDATED — citus `f04f87715` (July 10, 2026)
+  > Implemented as `HomerFrontendAgentReapDeadArenaSlots(arena)` in `homer_frontend_agent.c`, called each
+  > iteration of the agent's steady-state loop (the 60 s idle tick, or sooner on a doorbell wake). It reads
+  > each `BOUND` slot's `ownerPid`, and only on `kill(pid,0) == ESRCH` releases it through the SAME checked
+  > `HomerFrontendAgentReleaseArenaSlot` the owner would have used (passing the slot's own recorded
+  > `ownerSessionId`), so a concurrent release+rebind makes the release a no-op. `EPERM` is NOT reaped.
+  >
+  > **Validated by fault injection, and the validation revealed the reaper's PRIMARY trigger.** `kill -9` on
+  > a socketless backend does NOT leave the agent alive to idle-tick: vanilla Postgres treats ANY
+  > signal-killed backend as a crash, terminates all server processes, and reinitializes. The arena is POSIX
+  > shm, so it SURVIVES the crash-restart with the dead backend's slot still `BOUND` — exactly the
+  > "crash-restart leak" this reaper exists for. The fresh agent instance re-attaches and reaps it:
+  > `LOG: homer frontend agent: reaped leaked arena slot 0 -- owner backend pid 710218 is gone` (pid an exact
+  > match to the killed backend), zero collateral errors. So the reaper's dominant real-world path is
+  > restart→re-attach→reap, not the quiet idle tick (which `kill -9` cannot isolate, since it always
+  > crash-restarts). Both paths are in the code; the 60 s tick remains a backstop for a dead owner that did
+  > NOT crash-restart the postmaster (e.g. recycled-pid cleanup).
 - **S3.2c** (now the SAME commit as S3.3b — see the revised order above) Backend: call
   `HomerFrontendAgentBindArenaSlot(arena, request.arenaSlotIndex, sessionId, ...)`
   in the `SELECTED_DPU_DMA` branch of the socketless backend bootstrap, and register
