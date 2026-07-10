@@ -2035,14 +2035,42 @@ the deferral machinery — record it, do not widen it.
   > consumes one of the two lifecycle grants (`homer_service_dpu_setup_tcp.c:219`-`:238`, post-S3.1b
   > audit `63b0df0a7`). Omitting the reserved poll-due machinery is the silent-hang failure. See
   > `dpu_scheduler_arm_execute_mismatch.md` §0c and revised rules 2/4.
-- **S3.2b** Agent idle loop: an **`ownerPid` reaper**. Walk the arena's `BOUND` slots and release any whose
+> ### 🔀 ORDER REVISED after S3.3 landed (July 10, 2026). Read this before S3.2b/S3.2c/S3.3b below.
+>
+> The plan wrote these as **S3.2b → S3.2c → S3.3 → S3.3b**, on the pre-S3.3 mental model that the arena
+> binding (S3.2c) came before the spawn trigger. S3.3 inverted that: **the DPU is the arena-slot
+> allocator.** It must choose the slot index *before* the backend exists — because it is what DMAs into
+> that slot's mailboxes and what stamps `arenaSlotIndex` into the spawn request. So the true dependency is:
+>
+>   **S3.3b (DPU allocates + stamps) must precede S3.2c (backend claims + checks).**
+>
+> And S3.2c's `backendChannelMode` flip to `SELECTED_DPU_DMA` is only safe *once* a slot is stamped, so the
+> stamp and the flip are the **same commit** or the backend boots into a mode with no slot — a silent
+> failure strictly worse than today's loud `ERROR` (see the gate box's ⚠ caveat). Hence:
+>
+> **Revised order:  S3.3b + S3.2c (one commit)  →  S3.2b (reaper)  →  S3.4 (doorbell-EOF teardown).**
+>
+> - **S3.3b+S3.2c together** is the commit that makes a DPU-spawned backend actually *survive*, and it is
+>   the one that retires the gate's `ERROR`. It is the immediate next step.
+> - **S3.2b** (the `ownerPid` reaper) is a robustness backstop, not on the critical path to a working
+>   session; it only matters once real backends bind slots, i.e. after S3.2c. Moved after.
+> - **S3.4** (doorbell EOF → import teardown) is diagnostics/clean-shutdown; it can follow.
+>
+> The two entries below keep their S3.2b/S3.2c numbers for traceability, but their *scheduling* is the
+> revised order above. S3.2c's body is folded into S3.3b.
+
+- **S3.2b** (now scheduled AFTER S3.2c — see the revised order above) Agent idle loop: an
+  **`ownerPid` reaper**. Walk the arena's `BOUND` slots and release any whose
   `ownerPid` is gone (`kill(pid, 0)` → `ESRCH`). Covers a hard-crashed backend and the crash-restart leak
   (`_PG_init` does not re-run, so `CreateArena`'s whole-arena `memset` does not either). A recycled pid can
   give a false positive; acceptable for a prototype, and the checked claim still catches disagreement.
-- **S3.2c** Backend: call `HomerFrontendAgentBindArenaSlot(arena, request.arenaSlotIndex, sessionId, ...)`
+- **S3.2c** (now the SAME commit as S3.3b — see the revised order above) Backend: call
+  `HomerFrontendAgentBindArenaSlot(arena, request.arenaSlotIndex, sessionId, ...)`
   in the `SELECTED_DPU_DMA` branch of the socketless backend bootstrap, and register
   `HomerFrontendAgentReleaseArenaSlot` with `on_proc_exit`. Fatal on a failed claim — a collision means the
-  DPU and the host disagree about allocation.
+  DPU and the host disagree about allocation. **This is also where `backendChannelMode` flips from
+  `HOST_SERVICE_SHM` (S3.3's deliberate placeholder) to `SELECTED_DPU_DMA`** — and that flip must not
+  precede the stamp, or the backend boots looking for a slot no one gave it.
 - **S3.3** DPU service: replace `TupleSinkServiceSubmitBackendSpawnRequest`'s `shm_open`
   (now `tuple_sink_service_process.c:19160`) with a DMA write into the imported spawn region — **fields
   first, then `REQUEST_READY`, each awaited** — then one `SPAWN_DOORBELL` frame.
@@ -2092,10 +2120,25 @@ the deferral machinery — record it, do not widen it.
   > — so the **deferred peer response was posted and consumed** (D11 end to end). pgbench then failed at
   > `client_sql_tx_begin`, which is S3.2c/S4 work, not a regression.
   >
-  > ⚠ **The spawned backend is EXPECTED to die**, with `could not open Homer control region`. S3.3 sets
-  > `backendChannelMode = HOST_SERVICE_SHM` deliberately (see the comment in
-  > `TupleSinkServiceFillBackendSpawnRequest`): an unbound arena slot is a *worse*, because silent,
-  > failure than a missing control region. S3.2c binds the slot; S3.3b/S4 flip the mode.
+  > ⚠ **The spawned backend dies with an `ERROR`, and that `ERROR` is a rough edge, not steady state.**
+  > It is *not* a bug in S3.3's code and *not* a regression — the fork is the feature, and it completed;
+  > the `ERROR` is downstream, in the pre-existing backend bootstrap. The backend was spawned with
+  > `backendChannelMode = HOST_SERVICE_SHM` (see the comment in `TupleSinkServiceFillBackendSpawnRequest`),
+  > so on boot it opens the host service's `/citus_remote_execution_control_v27` — which did not exist on
+  > farnet1 during the gate, and which is the *wrong* attachment for a DPU-spawned backend anyway (its
+  > session lives on the DPU). So the `ERROR` is the visible symptom of a **half-built path**: a missing
+  > control region is normally a genuine fault worth screaming about, and we deliberately spawned a backend
+  > into a config where that scream is guaranteed.
+  >
+  > It causes **no state corruption**: the DPU had already read `RESPONSE_READY`, written `FREE`, and
+  > released the spawn slot before the child booted; the child just exits and the postmaster reaps it. The
+  > only consequence is "the session has no working backend," which is exactly the S3.2c gap.
+  >
+  > **It vanishes with S3.3b+S3.2c** — the backend then boots `SELECTED_DPU_DMA`, binds its arena slot, and
+  > never touches a host control region. Do **not** paper over it with an interim clean-exit/LOG: that is
+  > throwaway code, and S3.3b+S3.2c is the very next commit. `HOST_SERVICE_SHM` is a placeholder chosen on
+  > purpose because an *unbound arena slot* would be a worse, because silent, failure than a loud missing
+  > region.
 
   > ### 🔥 The gate failed twice first, and both failures are worth more than the pass
   >
@@ -2212,13 +2255,24 @@ the deferral machinery — record it, do not widen it.
      `RESPONSE_READY` and our `FREE`, so no atomicity or ordering assumption is needed;
   3. then DMA-write `state = FREE`. **Bug 2 dissolves** — we hold a copy, so there is nothing left in the
      slot to read after publishing.
-- **S3.3b** DPU service: **allocate an arena slot and bind it** (this is where **D6**'s forward index is
-  built). Before submitting the spawn request, pick a free arena slot `k` from a DPU-local table, stamp
-  `arenaSlotIndex = k` into `CitusRemoteExecBackendSpawnRequest`, stamp
+- **S3.3b — 🎯 THE IMMEDIATE NEXT STEP, and the SAME commit as S3.2c.** DPU service: **allocate an arena
+  slot and bind it** (this is where **D6**'s forward index is built). Before submitting the spawn request,
+  pick a free arena slot `k` from a DPU-local table, stamp
+  `arenaSlotIndex = k` into `CitusRemoteExecBackendSpawnRequest` (S3.3 currently stamps
+  `CITUS_REMOTE_EXEC_BACKEND_ARENA_SLOT_INVALID` there — this replaces that), stamp
   `ringRuntime[3k+{0,1,2}].boundServiceSessionId = serviceSessionId` on the arena import, and cache the
   three resolved `HomerDpuDmaDescriptorRef`s on the selected session. Release both at session close.
   New engine API: `HomerDpuDmaBindRingSession()` / `...UnbindRingSession()`.
   **Consumers keep using the scans in S3** — the switch is S4.1, where a session exists to test it.
+
+  > **Why this is one commit with S3.2c, and why it is next.** The DPU is the allocator (it stamps the
+  > index); the backend is the claimant (it checks the index and binds). Split across commits, the middle
+  > state is a backend that boots `SELECTED_DPU_DMA` looking for a slot the DPU has not yet been taught to
+  > allocate — a silent failure. Together, they are the commit that makes a DPU-spawned backend *survive*
+  > and that retires the gate's loud `ERROR`. The DPU-side allocation lives in
+  > `homer_service_dpu_spawn.c` (it already owns the `slots[16..31]` free list and the per-entry
+  > `descriptorRef`; the arena-ring binding is the natural neighbour). Set `arenaSlotIndex` in
+  > `TupleSinkServiceFillBackendSpawnRequest` **only on the DPU arm** — the host arm keeps `INVALID`.
 - **S3.3c** ABI: bump `CITUS_REMOTE_EXEC_BACKEND_PROTOCOL_VERSION` 14 → 15 (shm name `_v15`), add
   `uint32_t arenaSlotIndex` to `CitusRemoteExecBackendSpawnRequest` **and**
   `CitusRemoteExecBackendStartupData`, and copy it in `ProcessSpawnRequestSlot`. Host-service producers set
