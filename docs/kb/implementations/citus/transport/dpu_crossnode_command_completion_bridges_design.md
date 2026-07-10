@@ -274,6 +274,20 @@ Order chosen so each step lights up a checkable signal before the next. Build wi
 cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
 
 **Phase P0 — surrounding endpoints (no RDMA yet).**
+
+> **⏺ P0 IMPLEMENTED (July 10, 2026): citus `68051ef88` (S4.1) + `ab850f892` (S4.0b).** All five S4.0b
+> parts landed as specified below, plus two implementation details worth knowing:
+> (1) the **sink gate** in grouped-control acceptance skips the ENTIRE discovered-ready block for a
+> host→DPU byte ring with bound sink 0 (not just the enqueue — setting `discoveredReady`/the class
+> counter without an enqueueable ref would permanently arm an idle pull collector, the S3.1b starvation
+> shape), and `HomerDpuDmaBindArenaResultSink` completes the deferred enqueue at stamp time because each
+> publication epoch is consumed exactly once; audited that every non-arena byte-ring export declares a
+> nonzero sink (basebackup self-mints `generation ^ 0x5a5a…`), so the gate hits exactly arena role-5.
+> (2) the **publish mirror** is generic tuple-sink infrastructure (`CitusTupleSinkAttachDpuPublishMirror`
+> + a two-store stamp at the three commit sites: batch submit, error record, empty EOS) with its arena
+> caller deferred to P3.1 (the sink handle doesn't exist until the first row-producing command).
+> Validation: TCP smoke + v4 arena import + selected-DPU spawn + 4-role basebackup listener check — see
+> the plan's P0 validation record.
 - **S4.1** Add role 6 to `HomerClientOpenSqlSessionSelectedDpu` (`homer_client.c:3062`): bump
   `HOMER_CLIENT_DPU_COMMAND_SETUP_RING_COUNT` 1→2, add a role-6 descriptor as a client-completion structure
   the node-A DPU DMAs into (carry `serviceSessionId` + `sessionUID` like role 1). Checkpoint: the DPU setup
@@ -408,11 +422,23 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
     peer-open path already reaches it at `:26540/:26570` for the receiver side; trace which side needs
     what before coding).
   - Bind the **mirror-pool slot** with `(serviceSessionId, serviceStreamId)` (`:17241`).
-  - **Stamp the ring's `boundServiceSinkId`** (P0's engine API) with that stream id — this is what turns
-    grouped-control discovery into enqueued ready references (P0's gate) and lets `ResolveMirrorSlot` join.
+  - **Stamp the ring's `boundServiceSinkId`** via P0's `HomerDpuDmaBindArenaResultSink` (idempotent;
+    also completes any sink-gate-DEFERRED ready enqueue — a one-shot producer that published before the
+    stamp must not stall, since acceptance consumes each publication epoch exactly once).
   - Pass the sink/stream id to the backend (spawn builder sets session identity but not
     `resultServiceSinkId` today, `:19322`) so `RemoteExecPrepareResultQueueGeneration` and the completion's
     `resultQueueDescriptor` carry real ids.
+  - **Backend sink-handle open over the arena mapping** (discovered during P0 implementation):
+    `OpenCitusTupleSink` maps its ring BY shm name from offset 0
+    (`CitusTupleSinkQueueDescriptor` has no offset field), but the arena ring is embedded at an offset
+    inside the arena object — so the lazy open at `remote_execution_backend_bridge.c` (the
+    `OpenCitusTupleSink` call in the result-receiver setup) needs an **adopt-mapping variant** that
+    binds the sink handle to the ALREADY-mapped `resultQueueControlMappingAddress` instead of
+    shm_open-by-name. (A descriptor offset field was rejected: it would bump the tuple-sink descriptor
+    ABI for one caller.) Immediately after that open, call `CitusTupleSinkAttachDpuPublishMirror`
+    (P0's API) with the arena publish line `hostPublishLines[slot*3+2]`, the arena
+    `bridgeHeader.bridgeGeneration`, and global ring index/id — that arms the producer-side discovery
+    stamps at the three commit sites.
   - Then verify node-B role-5 egress → node-A role-7 rides the existing (role-4-proven) pump + deform
     relay (`HomerServicePumpOutgoingDpuMirrorByteRingPayload` / `...TupleViewDpuTwoRingRelay`).
 - P3.2 **S4.2 client side**: remove the `session->control == NULL` START rejection
