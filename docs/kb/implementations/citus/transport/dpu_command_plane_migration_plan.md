@@ -23,8 +23,14 @@ This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
 >   window:** later it costs an ABI bump and a synchronised two-DPU redeploy.
 > - **S3.5's discovery** — basebackup never spawns a socketless backend, so `pgbench --homer` is the *only*
 >   working regression net for the spawn path. Do not retire it before its replacement's gate passes.
-> - **The spawn wait** — bounded timed spin now; async responder at **S3.7**, a hard prerequisite before any
->   concurrent-workload measurement.
+> - **D9 / the spawn wait — RETRACTED AND CORRECTED.** On the DPU the spin is **not a stall, it is a
+>   self-deadlock**: the DMA read that would deliver `RESPONSE_READY` completes only via
+>   `doca_pe_progress()`, which the spinning thread is the only one that can call. **S3.7's async responder
+>   is folded into S3.3** — there is no interim. Two-phase read (**D9b**): poll the aligned 4-byte `state`
+>   word alone; only after that completes, fetch `response`; then write `FREE`.
+> - **D9b's corollary, now written into the code** — `HomerDpuBridgeHostPublishLine`'s 64-byte DMA read rests
+>   on a **standing platform assumption: ascending-order source fetch**, not on line atomicity and not on
+>   per-field atomicity. Keeping the publication word at offset 0 is what makes tearing *conservative*.
 
 > ## 🧭 This plan feeds a much larger scheduler overhaul. Know that before you touch D5, D6, D8 or S4.0.
 >
@@ -1546,8 +1552,17 @@ Full reasoning, code pointers, and the migration order:
   first, then `REQUEST_READY` with a release barrier, each awaited** — then one `SPAWN_DOORBELL` frame.
   Body in `homer_service_dpu_doorbell.c`; the 43k-line hub keeps only the call.
   Per **D7** the DPU reserves from its own range `slots[16..31]` using a DPU-local free list; it never CASes
-  host memory (it cannot). Per **D7 bug 2**, it DMA-reads the response and **awaits it** before DMA-writing
-  `FREE`.
+  host memory (it cannot).
+
+  **It does NOT wait.** See D9 below — the spin cannot work on the DPU, so S3.7's async responder is folded
+  into S3.3. The DPU records `pendingSpawn{slotIndex, sessionId}` and returns "in progress". A demand-armed
+  progress action then does a **two-phase read** across scheduler passes:
+  1. DMA-read `state` **alone** (4 bytes, offset 0, naturally aligned — cannot tear);
+  2. only once that read has *completed* showing `RESPONSE_READY`, submit a **second** DMA read of
+     `response`. The completion of (1) is the happens-before; the body is immutable between
+     `RESPONSE_READY` and our `FREE`, so no atomicity or ordering assumption is needed;
+  3. then DMA-write `state = FREE`. **Bug 2 dissolves** — we hold a copy, so there is nothing left in the
+     slot to read after publishing.
 - **S3.3b** DPU service: **allocate an arena slot and bind it** (this is where **D6**'s forward index is
   built). Before submitting the spawn request, pick a free arena slot `k` from a DPU-local table, stamp
   `arenaSlotIndex = k` into `CitusRemoteExecBackendSpawnRequest`, stamp
@@ -1561,6 +1576,9 @@ Full reasoning, code pointers, and the migration order:
   it to `UINT32_MAX` (unused). Update `AGENTS.md`'s `/dev/shm` list for the `_v15` name.
   ✅ **DONE — citus `c2ec17852`**, together with the doorbell ABI and a postmaster-side bounds check on
   `arenaSlotIndex` (it crosses the trust boundary of open question 7 once the DPU DMA-writes it).
+  **No further slot-layout change is needed** (D9b): `state` is already at offset 0 and 4 bytes, which is
+  exactly what the two-phase read requires. Two `_Static_assert`s now pin that, with the immutability
+  invariant stated at the struct.
 
 #### ⚠ The spawn wait — a decision, not an oversight
 
@@ -1568,31 +1586,113 @@ Full reasoning, code pointers, and the migration order:
 (`:18976`), and it is called **synchronously from inside a peer request handler**,
 `TupleSinkServiceHandlePeerOpenCommandSessionRequest` (`:37489`, spawn at `:37659`).
 
-On a host service that stalls one process. **On the DPU it stalls the single scheduler thread that also
-drives DMA and RDMA for every other session** — for a `fork()` plus `RemoteExecBackendInitializeConnection
-ByOid`, i.e. a full backend bootstrap with a database attach. Milliseconds, not microseconds. Our own
-concurrent workload (foreground pgbench + background basebackup through the same DPU) is precisely the
-shape that would notice.
+On a host service that stalls one process, and it **works**: `reservedSlot` is a pointer into `mmap`'d
+`/dev/shm`, the postmaster stores `RESPONSE_READY` into the same physical memory, and cache coherence
+delivers it. No software is in the loop. The host arm can keep this forever.
 
-**Decided with the user:**
-- **Now (S3.3):** a **bounded, timed spin** with a *generous* timeout that errors loudly. Simplest thing
-  that makes the S3/S4/S5 gates a correctness question rather than a scheduling one. Accept the stall; it
-  happens once per session open.
-- **Later (S3.7, below):** decompose into async steps. This is the target shape, not a nice-to-have.
+> ## ⚠ D9 — ON THE DPU THE SPIN IS NOT A STALL. IT IS A SELF-DEADLOCK.
+> ### (corrected July 10, 2026; the earlier "bounded, timed spin" decision is RETRACTED)
+>
+> After S3.3 the DPU has **no mapping** of the spawn region — only a DOCA import. `RESPONSE_READY` lives in
+> host RAM across PCIe. There is no `reservedSlot` to load from. The only way to observe it is: submit a DMA
+> read → wait for its **completion callback** → read the copy that landed in DPU memory. And:
+>
+> 1. DOCA delivers completions **only** through `doca_pe_progress()`. The engine says so itself:
+>    *"`doca_pe_progress()` is the ONLY site that harvests DOCA completion/error callbacks"*
+>    (`homer_service_dpu_dma.c:4894`).
+> 2. `doca_pe_progress()` is called only by `HomerDpuDmaDrainPe`.
+> 3. The service calls `HomerDpuDmaDrainPe` at **exactly one site** — `tuple_sink_service_process.c:41470` —
+>    inside a *granted progress action*.
+> 4. The service is **single-threaded**: zero `pthread_create` in the Homer service sources.
+> 5. `SubmitBackendSpawnRequest` runs synchronously inside `HandlePeerOpenCommandSessionRequest` (`:37659`),
+>    a *different* granted action, in the same pass, on that same thread.
+>
+> **While the spin runs, nothing calls `doca_pe_progress()`. The DMA read never completes.**
+> A bounded spin times out every time, no matter how generous. An unbounded spin hangs forever.
+> The waiter is the only agent that can cause the event it is waiting for.
+>
+> **Therefore S3.7 is not a follow-on; it is the mechanism.** Folded into S3.3. There is no interim.
+>
+> Scope: this is **not only the peer responder.** The other three call sites (`:33873`, `:37361`, `:37804`)
+> also run inside the loop, so a DPU-resident service opening a command session *locally* — S4's single-node
+> shape — hits the identical wall. The initiator already has a phase machine
+> (`TupleSinkServiceProgressCommandOpenAsyncOp`: `COMMAND_CREATE → ENSURE_CONNECTION → REGISTER_MEMORY →
+> START_PEER_OPEN → WAIT_PEER_OPEN`); it wants a `WAIT_BACKEND_SPAWN` phase. The responder
+> (`HandlePeerOpenCommandSessionRequest`, which handles and replies in one call) needs the equivalent built.
+>
+> Bug 3's decision is unchanged and now attaches to the async wait: a **generous timeout with a loud error**,
+> no liveness polling. A timeout that has never fired is the correct amount of machinery.
+>
+> **Hard prerequisite before any concurrent-workload measurement** (foreground pgbench + background
+> basebackup) — which was already true of the stall, and is now true of a hang.
 
-*Rejected: a cooperative spin that pumps DMA/RDMA progress while waiting.* It removes the stall cheaply but
-re-enters the scheduler from inside a request handler. Re-entrancy there has not been reasoned about, and a
-scheduler that can recurse into itself is a worse problem than a millisecond stall.
+*Rejected: a cooperative spin that pumps DMA/RDMA progress while waiting.*
+Rejected — but **not for the reason first written.** `HomerDpuDmaTaskMemcpyComplete` touches only *engine*
+state (its task slot, `engine->fatalError`, counters) and never calls service code, so draining the PE from
+inside a handler is **not** C-level re-entrancy into the scheduler. The real hazard is narrower: an
+out-of-band drain mutates engine state — staged command slots, `discoveredReady`, ready-queue entries,
+`backendCompletionStagedValid` — underneath an outer pass whose facts snapshot was already taken. Stale
+facts, not recursion. Still reason enough to reject; a different reason.
 
-- **S3.7 (planned, after the S3 gate)** — **make the receiving DPU's spawn asynchronous.** The *initiator*
-  side is already a state machine (`TupleSinkServiceProgressCommandOpenAsyncOp`: `COMMAND_CREATE →
-  ENSURE_CONNECTION → REGISTER_MEMORY → START_PEER_OPEN → WAIT_PEER_OPEN`). The **responder** side is not:
-  `HandlePeerOpenCommandSessionRequest` handles the request and replies in one call. S3.7 gives the
-  responder the same treatment — mark the session "awaiting backend", reply to the peer when the fork
-  lands, and poll the spawn slot's state word by DMA read across scheduler passes instead of spinning.
-  **Hard prerequisite before any concurrent-workload measurement** (foreground pgbench + background
-  basebackup), because a millisecond-scale stall of the DPU scheduler is exactly what that workload
-  measures.
+*Rejected: send the spawn response back over the doorbell socket as a `SPAWN_RESPONSE` frame.*
+It is genuinely attractive — self-announcing, no poll, and it would make bug 2 unrepresentable rather than
+merely avoided. **It loses on failure semantics.** It inserts the agent between "the postmaster forked
+successfully" and "the DPU knows", so an agent stall produces a **forked-but-orphaned backend from a session
+the client saw fail** — a mode the DMA poll does not have, because the DPU reads the postmaster's word
+directly and the postmaster must be alive anyway. It also costs a wire format, a comch bump, a
+`kill(agentPid, SIGUSR1)` wake edge, and an `agentPid` arena field, to buy tens of microseconds on a path
+about to `fork()` and attach a database.
+> **And the reasoning that recommended it was a misapplication of our own KB.**
+> [`dpu_readiness_collectors_and_continuation_edges.md`](../../../future-directions/citus/transport/dpu_readiness_collectors_and_continuation_edges.md)
+> argues against polling **hot, high-fan-in** readiness (16 mailboxes, per transaction, forever) when a
+> channel exists. The spawn response is **one cold event, armed on demand** (`pendingSpawnCount` is 0 or 1).
+> Polling it *is* the D6 discipline — poll the waiter, not the world. **Do not generalise that doc to cold,
+> demand-armed events.**
+
+#### ⚠ D9b — the two-phase read, and the platform assumption it avoids
+
+`CitusRemoteExecBackendSpawnSlot` is **552 bytes across 9 cache lines**: `state` at offset 0 (written
+**last**), `response` at offset 264 (written **first**).
+
+PCIe guarantees **no atomicity for ordinary Memory Read TLPs** — it added dedicated AtomicOp TLPs precisely
+because reads and writes are not atomic — and DOCA documents `doca_dma` as a memcpy with no atomicity or
+ordering claim. Reliable single-copy atomicity extends only to **naturally-aligned ≤ 8-byte** accesses.
+So a single DMA read of the whole slot gives **no snapshot**.
+
+The slot has a property the publish line does not: **between `RESPONSE_READY` and our `FREE`, nothing writes
+it.** So a two-phase read assumes nothing (see S3.3 above), at a cost of one extra round trip, once per
+spawn, on a path immediately followed by `fork()`.
+
+*Rejected: hoist `statusCode`/`launchedPid` into the slot's first cache line so one read gets a consistent
+triple.* That trades a **guarantee** (aligned 4-byte atomicity) for a **platform assumption** (line-atomic
+DMA reads), to save one round trip on a millisecond-scale cold path.
+
+##### And the assumption the publish line *does* rest on — now stated, in code
+
+`HomerDpuBridgeHostPublishLine` is read as **one 64-byte DMA transfer** whose `publishedEpoch`,
+`publishedTail`, `generation` and `entryState` are then trusted *together*. That is sound only because:
+
+- `publishedEpoch` sits at **offset 0**, the lowest address, so an **ascending-order source fetch** reads it
+  before the body. A torn read can then only pair a **stale epoch with a fresh body** →
+  `epoch == acceptedPublishedEpoch` → early return → re-read next pass. Missing a publication is free;
+  discovery is a perpetual poll. *This is why "we'll pick it up later" is safe.*
+- The opposite pairing — **fresh epoch with stale tail** — would be **fatal and silent**.
+  `acceptedPublishedEpoch` is stored *unconditionally* (`homer_service_dpu_dma.c:9941`) before the tail is
+  examined, and every later pass early-returns on epoch equality (`:9882`). The tail would be dropped and
+  that ring would stall **forever**. And nothing catches it: `HomerDpuBridgeFrontierMonotonic` is
+  `observed >= previous`, and a one-publication-stale tail **equals** the accepted tail.
+
+**Per-field atomicity is necessary but not sufficient** — every field is an aligned ≤8-byte store, and that
+is symmetric with respect to the hazard, which is *cross-field* consistency. The load-bearing assumption is
+**ascending fetch order**, which is far weaker and far more plausible than line atomicity, and which has
+~23 GB per validated basebackup run behind it with the frontier check never firing. A trailing epoch echo
+would **not** remove it (under a descending fetch a matching head/tail pair can still bracket a body from the
+next publication). So: state it, do not engineer around it.
+
+Written down where it can be seen: the long note on `HomerDpuBridgeHostPublishLine`, the corrected
+`_Static_assert` message ("must stay at the lowest address so torn DMA reads are conservative" — the old
+message claimed "one-word polling", which the code does not do), and a warning at the unconditional epoch
+store. **Where the body is immutable, do not rely on any of it — do the two-phase read.**
 - **S3.4** DPU service: on doorbell **EOF**, log loudly that the frontend agent for that
   `bridgeGeneration` is gone, and begin the existing import teardown
   (`HomerDpuDmaBeginHostMmapImportTeardown`, `homer_service_dpu_dma.c:6964` — the same path a graceful

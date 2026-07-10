@@ -316,6 +316,66 @@ The DOCA PE row is the template. `doca_data` is the field that host memory does 
 
 ---
 
+## 8b. ⚠ Two things this doc does NOT say
+
+Both were learned by getting them wrong, on July 10, 2026, within an hour of writing the doc.
+
+### (i) "Prefer a channel over a poll" is about HOT, HIGH-FAN-IN readiness. It is not a general rule.
+
+The argument in §3–§7 is: *do not poll N sources every pass when an aggregating channel exists.* Its force
+comes entirely from **N × per-pass**. Applied to a **cold, demand-armed, single event**, it inverts into bad
+advice.
+
+Worked example — the backend-spawn response (command-plane S3.3). It is one event, once per session open,
+on a path immediately followed by `fork()` plus a database attach. `pendingSpawnCount` is 0 or 1. Polling it
+by DMA is **exactly the D6 discipline** — poll the waiter, not the world. Routing it over the doorbell
+socket instead would be "self-announcing", would remove a poll that costs nothing, and would **insert the
+frontend agent between "the postmaster forked successfully" and "the DPU knows"** — producing a
+forked-but-orphaned backend from a session the client saw fail. The poll has no such failure mode.
+
+**Rule of thumb:** the channel wins when the poll's cost scales with *sources*. The poll wins when it scales
+with *waiters* and the waiters are few. Check which one you have before quoting this doc.
+
+### (ii) A DMA read is a `memcpy`, not a snapshot — and the publish line depends on an unstated assumption
+
+PCIe guarantees **no atomicity for ordinary Memory Read/Write TLPs**; it added dedicated AtomicOp TLPs
+precisely because they are not atomic. DOCA documents `doca_dma` as a memcpy and claims nothing about
+atomicity or ordering of the source read. Reliable single-copy atomicity extends only to **naturally-aligned
+≤ 8-byte** accesses.
+
+Yet grouped-control discovery reads all 64 bytes of a `HomerDpuBridgeHostPublishLine` in one transfer
+(`homer_service_dpu_dma.c:8699`) and then trusts `publishedEpoch`, `publishedTail`, `generation` and
+`entryState` **together** (`:9971`).
+
+That is sound, but not for the reason the code's `_Static_assert` used to give:
+
+- `publishedEpoch` is at **offset 0**. Under an **ascending-order fetch** it is read *before* the body, so a
+  torn read can only pair a **stale epoch with a fresh body**. The accept path sees
+  `epoch == acceptedPublishedEpoch`, returns early, and re-reads next pass. Missing a publication is free —
+  discovery is a perpetual poll.
+- The opposite pairing (**fresh epoch, stale tail**) would be **fatal and silent**:
+  `acceptedPublishedEpoch` is stored *unconditionally* (`:9941`) before the tail is examined, and every later
+  pass early-returns on epoch equality (`:9882`), so the tail is dropped and the ring stalls forever.
+  `HomerDpuBridgeFrontierMonotonic` is `observed >= previous` and a one-publication-stale tail **equals** the
+  accepted tail — it does not fire.
+
+**Per-field atomicity is necessary but not sufficient** (every field is an aligned ≤8-byte store; the hazard
+is *cross-field*). The load-bearing assumption is **ascending fetch order**. It has ~23 GB per validated
+basebackup run behind it and the frontier check has never fired. A trailing epoch echo would not remove it:
+under a descending fetch a matching head/tail pair can still bracket a body from the next publication.
+
+Two consequences for this doc's programme:
+
+- **Grouping (§6) does not make this worse or better.** Reading N lines in one transfer still validates each
+  line independently by its own epoch — it relies on the same assumption, N times per transfer instead of
+  once. Say so when building it.
+- **Where the body is immutable after publication, assume nothing.** Poll the publication word *alone*, then
+  fetch the body in a **second, ordered** transfer. The backend-spawn slot does exactly that (command-plane
+  D9b). It is the read-side mirror of the discipline the DPU already uses when it *writes*: body DMA writes
+  first, then a **separate one-word publication write** on an ordered context
+  (see `HomerDpuBridgeDpuCreditLine`'s own comment). The write side has always been right; the read side
+  was never told.
+
 ## 9. Cost model (analytic, unmeasured)
 
 Constants: `hostMmapImportCapacity = 1024` (`homer_service_dpu_dma.c:841`); a frontend-agent arena import
