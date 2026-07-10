@@ -1225,6 +1225,136 @@ the arena by roughly 8×. Do not do it here.
 - **New `/dev/shm` object to clean:** `/dev/shm/citus_homer_frontend_arena_v1` (57 MiB). Neither it nor the
   spawn region is `shm_unlink`ed at shutdown, matching existing practice. Added to `AGENTS.md`.
 
+---
+
+## D6 — the forward index: a session holds handles to its rings (decided July 9, 2026)
+
+**Supersedes D5's `continue`. Keeps D5's field.**
+
+Both consumers of a session's rings perform a **reverse lookup by linear search**, because the forward map
+was never built:
+
+| consumer | has | needs | does |
+|---|---|---|---|
+| role-2 publish (`...StageOneBackendCommandForPublish`, `:39260`) | the session | its command mailbox ring | `HomerDpuDmaFindDescriptorRef` — scan all imports × rings comparing `descriptor->serviceSessionId` — **once per `START_COMMAND`, i.e. per transaction** |
+| role-3 pull (`HomerDpuDmaSubmitBackendCompletionPulls`, `:1205`) | nothing | any ring with a completion | scan all imports × rings filtering on `descriptorRole` (`:1250`, `:1257`), then reverse-map ring → session via `HomerServiceDpuFindSelectedSession` (`:39377`) |
+
+There is exactly one moment when both identities are in hand: **the bind**. So build the map there.
+
+**D6.** When the DPU hands arena slot `k` to session `S` (S3's allocator), it stamps
+`boundServiceSessionId = S` on rings `3k+0..2` **and** resolves and caches three
+`HomerDpuDmaDescriptorRef`s on `HomerServiceDpuSelectedSessionState`:
+`backendCommandMailboxRef`, `backendCompletionMailboxRef`, `resultByteRingRef`.
+
+Consequences:
+- role-2 publish becomes a struct field read instead of a per-transaction scan.
+- role-3 pull iterates **selected sessions awaiting a completion** — exactly the set that armed the grant
+  (`selectedBackendCompletionWaitCount`, `:39966`) — instead of every ring of every import.
+- `HomerDpuDmaFindDescriptorRef` survives at **one** call site: bind. A reverse lookup is legitimate
+  precisely where the binding is established, and it is then once per session open, not per transaction.
+- **D5's `continue` becomes unreachable**, because no ring enumeration remains. Demote it to a one-shot
+  loud diagnostic: *"a role-3 ring was enumerated with no binding — grant and iteration bookkeeping
+  disagree."* Same shape as the staged-head liveness guard (citus `584e01dcb`).
+- **D5's `boundServiceSessionId` field STAYS.** It is the map's key and it is what makes an unbound arena
+  ring unresolvable by `FindDescriptorRef`. D6 removes the scan, not the binding.
+
+**This is not an arena workaround.** Every selected session gains the same index — Tier-2, the S1a client,
+and the arena alike. The arena only made the missing index impossible to ignore.
+
+**Stale refs are safe by construction.** A `HomerDpuDmaDescriptorRef` carries `bridgeGeneration` and
+`ringGeneration`, and every submit revalidates both (`homer_service_dpu_dma.c:1771`, `:2031`). A cached ref
+that outlives its import fails loudly instead of addressing the wrong host memory.
+
+**Layering.** `HomerDpuDmaSubmitBackendCompletionPulls` lives in the DMA **engine**, which knows nothing
+about sessions — so from where it sits, scanning by role is the only thing it *can* do. The fix moves the
+choice up a layer: the engine offers `HomerDpuDmaSubmitBackendCompletionPullForRef(engine, ref)`, and the
+service decides which refs. The TCP transport smoke already builds refs via `FindDescriptorRef` at five
+sites (`homer_dpu_tcp_transport_smoke.c:1431`, `:1527`, `:1657`, `:1847`, `:1983`), so it converts for free.
+
+*Rejected: a ring-level ready queue.* `HOMER_DPU_DMA_READY_QUEUE_HOST_TO_DPU_BACKEND_COMPLETION` is
+**already declared** (`homer_service_dpu_dma.c:113`) and mapped by role (`:5857`), and is **never pushed
+and never popped** — dead scaffolding, a fourth instance of "the design was anticipated, the implementation
+took a shortcut." The shape does not transfer: for command pull (`:1195`) and payload pull (`:3734`) the
+*host* announces readiness by advancing a publish line, and grouped-control discovery pushes the ref. For
+backend completion the host announces nothing the DPU can see without a DMA read — **the poll IS the
+discovery** — so the queue would have to be refilled every pass with exactly {rings whose session awaits a
+completion}. That is a materialization of the session set, plus a queue. Session iteration is that set,
+without the queue.
+
+*Rejected: arm per ring instead of per session.* The arming is already correct. A session awaits at most
+one completion at a time, so the per-session armed set and the per-ring armed set are the same set. The
+arming was never the problem; the execution ignores it.
+
+**Sequencing.** S3 builds the map (bind lives there). **S4.1** switches the consumers, deletes the scan, and
+demotes the skip. Do not switch consumers in S3: role-3 iteration by session is only testable once a
+session exists.
+
+**Also retracted here:** an earlier note said "S4 will need a `boundServiceSinkId` twin" for the arena's
+role-5 ring. That was an assumption. With the ref cached at bind, no `(session, sink)` lookup is needed for
+the arena ring at all. What must still be checked in S4 is the **teardown** scans —
+`HomerDpuDmaByteRingFrontierForServiceSink` and `HomerDpuDmaMarkImportSenderCloseReleased` search by
+`(serviceSessionId, serviceSinkId)` and an arena role-5 descriptor carries `serviceSinkId = 0`. Either they
+take the cached ref, or a sink binding is stamped. Decide it there, with the code in view.
+
+---
+
+## D7 — spawn-slot ownership is PARTITIONED BY PRODUCER (contract, decided July 9, 2026)
+
+> ### ⚠ CONTRACT — `slots[0..15]` are the HOST's. `slots[16..31]` are the DPU's.
+>
+> `CITUS_REMOTE_EXEC_BACKEND_SPAWN_SLOT_COUNT` is 32 (`remote_execution_backend_protocol.h:30`). The range
+> is split by **producer**:
+>
+> - **`slots[0 .. 15]` — host-resident producers.** They contend (the host `citus_tuple_sink_service`
+>   submitter, and `HomerFrontendDmaLifecycleSubmitBackendSpawnRequest`,
+>   `homer_frontend_dma_lifecycle.c:188`), so they **must claim by CAS**.
+> - **`slots[16 .. 31]` — the DPU service.** It is a single-threaded remote producer that reaches this
+>   region **only by DOCA DMA**, which gives `memcpy` semantics across PCIe and **no compare-and-swap on
+>   host memory**. It therefore *cannot* perform an atomic claim, and it does not need to: its range is its
+>   own, and its free list is DPU-local.
+>
+> The postmaster consumer (`CitusRemoteExecPostmasterSigusr1Hook` → `ProcessSpawnRequestSlot`) is
+> **range-agnostic**: it scans all 32 and dispatches on `state`. No ABI change.
+>
+> **Violating this split reintroduces a race that no code on the DPU side is able to detect.** Each
+> producer asserts that the slot it reserved lies in its own range.
+
+**Two pre-existing bugs, fixed in S3 while this contract lands:**
+
+1. **Reservation is load-then-store, not CAS** (`tuple_sink_service_process.c:18909`-`:18921`). Two
+   producers can both read `FREE` and both store `CLIENT_OWNED`. Fix: CAS `FREE → CLIENT_OWNED`, and on a
+   lost CAS continue to the next slot rather than `break`. **Applies to the host range only** — the DPU
+   cannot CAS, which is the whole reason for D7.
+
+2. **The success path publishes `FREE` before it reads the response** (`:19004` stores `FREE`; `:19012` and
+   `:19018` then read `reservedSlot->response.launchedPid`). This is **not a writer race — it is a
+   use-after-release.** The release store *is* the act of handing the slot away; the postmaster `memset`s
+   `slot->response` at the top of `ProcessSpawnRequestSlot` (`remote_execution_backend_bridge.c:2980`) once
+   a new owner publishes `REQUEST_READY`. The symptom is an impossible `launchedBackendPid`.
+
+   **The fix is NOT a copy.** Hoist one `int32` read above one store:
+   ```c
+   int32 launchedPid = reservedSlot->response.launchedPid;   /* take it while we still own the slot */
+   TupleSinkServiceAtomicStoreU32(&reservedSlot->state, ..._SLOT_FREE);
+   sessionState->launchedBackendPid = launchedPid;
+   ```
+   The value was already being loaded — just too late. The **error path directly above already does this
+   correctly**: it `snprintf`s `response.errorMessage` into the caller's buffer *before* releasing
+   (`:18991`-`:18997`). Only the success path is inverted.
+
+   **General rule, worth stating once:** a release-store publishes everything before it and *unpublishes*
+   everything after it. Once you store the word that says "this resource is available", every field of that
+   resource belongs to someone else. Extract before you publish. Ownership is a property of the protocol
+   word, not of the address.
+
+   **The rule gets stricter on the DPU side**, where the read and the release are two DMA tasks: the DPU
+   must DMA-read the response, **await it**, and only then DMA-write `FREE`. Same family as the
+   ⚠ DMA-BEFORE-DOORBELL invariant — nothing orders two DMA tasks for you unless you await them.
+
+3. (Lesser) The response wait loop (`:18976`) spins with no timeout and no postmaster-liveness check.
+
+---
+
 ### S3 — spawn trigger (D2′)
 - **S3.1** Doorbell protocol: add `DOORBELL_ATTACH` / `DOORBELL_ATTACH_ACK` / `SPAWN_DOORBELL` message
   kinds to `homer_dpu_comch_abi.h` (`:33`-`:36`) and bump `HOMER_DPU_COMCH_PROTOCOL_VERSION`. Default
@@ -1233,10 +1363,32 @@ the arena by roughly 8×. Do not do it here.
 - **S3.2** Agent: connect the doorbell lazily with bounded backoff (the local DPU service may not be up
   at `_PG_init`), `DOORBELL_ATTACH`, then block in `recv()`. On readable: drain to `EAGAIN` **without
   parsing**, then `kill(PostmasterPid, SIGUSR1)`. **No postgres core change.**
+- **S3.2b** Agent idle loop: an **`ownerPid` reaper**. Walk the arena's `BOUND` slots and release any whose
+  `ownerPid` is gone (`kill(pid, 0)` → `ESRCH`). Covers a hard-crashed backend and the crash-restart leak
+  (`_PG_init` does not re-run, so `CreateArena`'s whole-arena `memset` does not either). A recycled pid can
+  give a false positive; acceptable for a prototype, and the checked claim still catches disagreement.
+- **S3.2c** Backend: call `HomerFrontendAgentBindArenaSlot(arena, request.arenaSlotIndex, sessionId, ...)`
+  in the `SELECTED_DPU_DMA` branch of the socketless backend bootstrap, and register
+  `HomerFrontendAgentReleaseArenaSlot` with `on_proc_exit`. Fatal on a failed claim — a collision means the
+  DPU and the host disagree about allocation.
 - **S3.3** DPU service: replace `TupleSinkServiceSubmitBackendSpawnRequest`'s `shm_open`
   (`tuple_sink_service_process.c:18833`+) with a DMA write into the imported spawn region — **fields
   first, then `REQUEST_READY` with a release barrier, each awaited** — then one `SPAWN_DOORBELL` frame.
   Body in `homer_service_dpu_doorbell.c`; the 43k-line hub keeps only the call.
+  Per **D7** the DPU reserves from its own range `slots[16..31]` using a DPU-local free list; it never CASes
+  host memory (it cannot). Per **D7 bug 2**, it DMA-reads the response and **awaits it** before DMA-writing
+  `FREE`.
+- **S3.3b** DPU service: **allocate an arena slot and bind it** (this is where **D6**'s forward index is
+  built). Before submitting the spawn request, pick a free arena slot `k` from a DPU-local table, stamp
+  `arenaSlotIndex = k` into `CitusRemoteExecBackendSpawnRequest`, stamp
+  `ringRuntime[3k+{0,1,2}].boundServiceSessionId = serviceSessionId` on the arena import, and cache the
+  three resolved `HomerDpuDmaDescriptorRef`s on the selected session. Release both at session close.
+  New engine API: `HomerDpuDmaBindRingSession()` / `...UnbindRingSession()`.
+  **Consumers keep using the scans in S3** — the switch is S4.1, where a session exists to test it.
+- **S3.3c** ABI: bump `CITUS_REMOTE_EXEC_BACKEND_PROTOCOL_VERSION` 14 → 15 (shm name `_v15`), add
+  `uint32_t arenaSlotIndex` to `CitusRemoteExecBackendSpawnRequest` **and**
+  `CitusRemoteExecBackendStartupData`, and copy it in `ProcessSpawnRequestSlot`. Host-service producers set
+  it to `UINT32_MAX` (unused). Update `AGENTS.md`'s `/dev/shm` list for the `_v15` name.
 - **S3.4** DPU service: on doorbell **EOF**, log loudly that the frontend agent for that
   `bridgeGeneration` is gone, and begin the existing import teardown
   (`HomerDpuDmaBeginHostMmapImportTeardown`, `homer_service_dpu_dma.c:6964` — the same path a graceful
@@ -1274,6 +1426,16 @@ exercises both directions (`--expect-backend-command-publish`, `--expect-backend
 now including into a tmpfs mapping (S0).
 
 So S4's own work is:
+- **S4.0 — cash in D6.** Switch the consumers to the forward index S3.3b built, and delete the scans:
+  role-2 publish reads `session->backendCommandMailboxRef` instead of calling `FindDescriptorRef` per
+  `START_COMMAND`; role-3 pull iterates selected sessions awaiting a completion, via a new engine entry
+  point `HomerDpuDmaSubmitBackendCompletionPullForRef(engine, ref)`, instead of scanning every ring of
+  every import. `HomerDpuDmaSubmitBackendCompletionPulls` (the scan) is then deleted or reduced to the
+  smoke's use. **Demote D5's `continue` to a one-shot loud diagnostic** — it is now unreachable, and if it
+  ever fires, the grant and the iteration bookkeeping disagree.
+  Also decide the role-5 teardown question D6 leaves open (`ByteRingFrontierForServiceSink` /
+  `MarkImportSenderCloseReleased` search by `(serviceSessionId, serviceSinkId)`; the arena ring has
+  `serviceSinkId = 0`).
 - **S4.1** Export **role 6** from `HomerClientOpenSqlSessionSelectedDpu` (today the only role-6 exporter
   is the deprecated `homer_frontend_dma.c:1617`), alongside role 1.
 - **S4.2** Drive `START_COMMAND` down the control slot from the client, and consume role-6 completion
