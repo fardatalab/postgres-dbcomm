@@ -912,6 +912,136 @@ this point). Build all targets, including the smokes.
 **Gate:** the DPU service's engine shows host mmap imports for the arena and the spawn region
 (`HomerDpuDmaImportHostMmapDescriptorForSetup`) — the exact thing whose absence caused the three-run hang.
 
+---
+
+#### S2 — implementation design, settled by reading the code (July 9, 2026)
+
+Six facts, each verified in source, that together make S2 much **smaller** than the sketch above.
+Read these before touching anything; several contradict what a reasonable person would assume.
+
+**F1. `mmapExportCount > 1` is genuinely implemented, not merely declared.**
+`homer_service_dpu_setup_tcp.c:749`-`:781` loops `for (exportIndex < parts.mmapExportCount)` and calls
+`HomerDpuDmaImportHostMmapDescriptorForSetup` per export, **with rollback** on partial failure. Each
+export becomes its **own** `hostMmapImports[]` slot with its own descriptor slice and `ringRuntime[]`
+(`homer_service_dpu_dma.c:5593`-`:5653`). *Caveat:* `HomerDpuComchSetupParts.mmapExport` /
+`.mmapExportBytes` (`homer_dpu_comch_abi.h:571`-`:572`) surface **only export [0]** — a convenience
+shortcut, not the import path. Do not mistake it for a one-export limit.
+
+**F2. The bridge control block's `hostPublishOffset`/`dpuCreditOffset` are host-side bookkeeping.**
+The DPU **never reads them.** All DPU addressing is per-descriptor:
+`hostRingAddress + hostControlOffset` for the control line (`homer_service_dpu_dma.c:8472`, `:9047`,
+`:9189`) and `+ hostRingOffset` for the data. So two exports with completely different internal layouts
+coexist under one bridge header. This is what makes the arena and the spawn region exportable together.
+
+**F3. Roles 2/3/5 do NOT need bridge publish/credit lines.** The Tier-2 prior art proves it:
+`homer_frontend_dma.c:1640`/`:1661`/`:1682` all set `hostControlOffset = 0` and
+`controlBytes = offsetof(mailbox, slots)`. **The mailbox's own epoch header IS its control block.**
+So the arena needs no `HostPublishLine[]`/`DpuCreditLine[]` arrays at all.
+
+**F4. Grouped-control discovery is enrolled BY ROLE, and only for roles 1, 4, 7.**
+`HomerDpuDmaDescriptorUsesHostPublishLine` (`homer_service_dpu_dma.c:639`, body ~`:2270`) returns true
+only for `FRONTEND_CONTROL_SLOT`, `PAYLOAD_BYTE_RING`, `PAYLOAD_BYTE_RING_DPU_TO_HOST`. Everything else
+is skipped at `:1055`. **The arena's 48 rings therefore cost ZERO discovery DMAs**, and a new
+spawn-region role is inert until the DPU explicitly writes to it. (Also worth knowing: "grouped" control
+reads are currently `controlCount = 1` — one 64-byte DMA per ring, `:8467`. The name is aspirational.)
+
+**F5. There is NO descriptor role that fits the spawn region, and one is required.**
+Every mmap export must cover ≥ 1 descriptor (`homer_dpu_comch_abi.h:508`, `:554`), every descriptor must
+pass `HomerDpuBridgeDescriptorRoleMatchesShape` (roles 1-7 only, `homer_dpu_bridge_abi.h:283`-`:325`) and
+`HomerDpuDmaValidateDescriptorForImport`'s per-role `minControlBytes`/`minSlotBytes` switch, whose
+`default:` arm errors with *"host mmap descriptor role is unknown"* (`homer_service_dpu_dma.c:5410`).
+Reusing role 2 would make the DPU treat the spawn region as a backend command mailbox. **Role 8 it is.**
+
+**F6. ⚠ LANDMINE — `EnsureSpawnRegionMapped()` unconditionally `memset`s the whole region.**
+`remote_execution_backend_bridge.c:1709` opens `O_CREAT|O_RDWR` **without `O_EXCL`**, `ftruncate`s to
+`sizeof(CitusRemoteExecBackendSpawnRegion)` if the size differs, and `memset`s at `:1756`. It is
+idempotent *within* a process (`if (SpawnRegion != NULL) return`), which is why the postmaster's second
+call from the SIGUSR1 hook (`:3083`) is harmless. **The agent must never call it** — it would wipe the
+postmaster's `postmasterPid`/`slotCount` and any in-flight request. The agent needs an attach-only
+helper. The same `ftruncate` is why the arena must be a **separate object**: a single fused object would
+be truncated back down by whichever process called `EnsureSpawnRegionMapped` first.
+
+##### Measured sizes (July 9, 2026, `sizeof` on this tree)
+
+| Component | bytes | `controlBytes` | `slotBytes` |
+|---|---|---|---|
+| `CitusRemoteExecLocalCommandMailbox` (role 2) | 3,202,584 | 24 | 50,040 |
+| `CitusRemoteExecLocalCompletionMailbox` (role 3) | 270,552 | 24 | 33,816 |
+| SQL result byte ring (role 5) = 64 + 256×1024 | 262,208 | 64 | 1 |
+| **per arena slot** (each component 64B-aligned) | **3,735,424** (3.562 MiB) | | |
+| **arena, N = 16** | **≈ 57.0 MiB** | | ~43 MB headroom under the ceiling |
+| `CitusRemoteExecBackendSpawnRegion` (role 8) | 17,424 | 16 | 544 |
+
+##### Decisions made within the plan's direction (per the "record your reasoning" rule)
+
+1. **New bridge role 8 `BACKEND_SPAWN_REGION`** — shape identical to role 2
+   (`{COMMAND, DPU_TO_HOST, FIXED_SLOT, COMMAND_SLOT|FIXED_SLOT_RING}`), distinguished only by
+   `descriptorRole`, and deliberately **not** grouped-control enrolled (F4). Its `minControlBytes =
+   offsetof(SpawnRegion, slots)` (16), `minSlotBytes = sizeof(SpawnRegionSlot)` (544). Bumps
+   `HOMER_DPU_BRIDGE_PROTOCOL_VERSION` 2→3 and `HOMER_DPU_COMCH_PROTOCOL_VERSION` 2→3. An old DPU
+   receiving role 8 answers `BAD_DESCRIPTOR` — a clean rejection, not silent corruption.
+   *Rejected:* smuggling the spawn-region offset through a `reserved` field of the setup header, to avoid
+   the bump. Every other addressable thing in this ABI is self-describing via a descriptor; this would be
+   the one exception, and the ABI's own bounds checks would not cover it.
+2. **The spawn region's ABI is UNCHANGED in S2.** It is only *exported*, not restructured — no bridge
+   prefix/suffix, no version bump, no `_v15` rename. This falls out of F3: its own 16-byte header is a
+   legal `controlBytes`. The `arenaSlotIndex` field that `CitusRemoteExecBackendSpawnRequest` will need
+   (see below) lands in **S3**, where it has a consumer, together with the `v14 → v15` name bump.
+3. **The agent is GUC-gated, default OFF:** `citus.enable_homer_dpu_frontend_agent` (`PGC_POSTMASTER`).
+   Without this, every existing `--homer` and basebackup postmaster would start an agent that DOCA-exports
+   57 MiB and then fails to reach a DPU setup listener, restarting every 5 s. The arena is created only
+   when the GUC is on. Setup host/port/device keep reusing the existing `HOMER_FRONTEND_*` env vars.
+4. **Build the `BackgroundWorker` struct directly; do not use `InitializeCitusBackgroundWorker`.**
+   That helper hardcodes `bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION`
+   (`background_worker_utils.c:47`) and defaults `bgw_start_time = BgWorkerStart_ConsistentState`
+   (`background_worker_utils.h:48`). The agent wants **neither**: no database connection, and
+   `BgWorkerStart_PostmasterStart` so it is attached before any client opens a session. Ten lines of
+   struct fill beats adding a flags field to a shared Citus helper for one Homer-specific caller.
+5. **S2.4's backend-side bind: helper in S2, CALL SITE in S3.** Nothing spawns a `SELECTED_DPU_DMA`
+   backend until S3 exists, so the call site cannot be exercised in S2 and would be dead-on-arrival code
+   validated by nothing. `HomerFrontendAgentBindArenaSlot()` ships in S2 with the arena ABI; S3 calls it.
+   Corollary: **the DPU allocates the slot index and stamps it into the spawn request** — it must, since
+   it is the party that DMAs into that slot's mailboxes. The backend then does a *checked* claim
+   (`FREE → CAS to mine`, fatal otherwise), which also catches a DPU/host allocator disagreement after a
+   DPU restart. Slot release is `on_proc_exit` (covers `ereport(FATAL)`); a hard backend crash leaks a
+   slot, but that already triggers a postmaster crash-restart cycle which recreates the arena.
+6. **S2.5 moves to S7.3.** Retiring the Tier-2 `SELECTED_DPU_DMA` mailbox-open path now would delete the
+   only worked example of exporter ≠ reader while S3/S4 are still unwritten — and it is dead code that
+   costs nothing to keep. It retires alongside the rest of `homer_frontend_dma*`, which is where it
+   belongs. **The plan's instruction to read it first was worth following:** F3 (mailbox-header-as-control-
+   block) and F1's multi-export composition both came straight out of it
+   (`homer_frontend_dma.c:1261`-`:1304`, `:1590`-`:1697`, `:1704`-`:1735`).
+
+##### Arena region layout (`/citus_homer_frontend_arena_v1`)
+
+```
++0      HomerDpuBridgeControlBlockHeader   64 B   -- advisory: the DPU takes its copy from the
+                                                     setup message (homer_service_dpu_dma.c:5643).
+                                                     Kept in-region for gdb/`hexdump` attribution.
++64     HomerFrontendArenaSlot slots[16]          -- each: { commandMailbox | completionMailbox |
+                                                     byteRingControl + byteRing }, components 64B-aligned
+```
+Descriptors 0..47 = arena (`mmapExportId = 1`), ring index `3*i + {0,1,2}` for slot `i`;
+descriptor 48 = spawn region (`mmapExportId = 2`). `ringIndex` must equal the descriptor's position
+**globally across the message** (`homer_dpu_comch_abi.h:487`), and each export covers a **contiguous**
+descriptor slice (`:505`-`:529`).
+
+##### S2 file-by-file
+
+| File | Change |
+|---|---|
+| `homer_dpu_bridge_abi.h` | role 8 + shape arm; `PROTOCOL_VERSION` 2→3 |
+| `homer_dpu_comch_abi.h` | `PROTOCOL_VERSION` 2→3 |
+| `homer_service_dpu_dma.c` | **one** `case` arm in the `minControlBytes` switch (`~:5380`). The only DPU-side change in S2. |
+| `homer_frontend_agent.{c,h}` | **new.** Arena ABI + create/attach/bind/release; the bgworker (register, export both regions, compose the 2-export setup message, send, log). |
+| `remote_execution_backend_bridge.c` | attach-only spawn-region helper (F6); call arena-create + bgworker-register from the `!IsUnderPostmaster` branch (`:3119`) |
+| `shared_library_init.c` | define the GUC |
+| `src/backend/distributed/Makefile` | `utils/homer/homer_frontend_agent.o` into the `citus.so` list (`:50`-`:58`) |
+
+**Deferred out of S2, tracked:** the 3.05 MiB role-2 mailbox is 64 slots × a 50,040-byte record — the same
+fixed-size-union bloat as the 66 KiB control slot. Shrinking the ABI unions (S4 perf item, fix 3) shrinks
+the arena by roughly 8×. Do not do it here.
+
 ### S3 — spawn trigger (D2′)
 - **S3.1** Doorbell protocol: add `DOORBELL_ATTACH` / `DOORBELL_ATTACH_ACK` / `SPAWN_DOORBELL` message
   kinds to `homer_dpu_comch_abi.h` (`:33`-`:36`) and bump `HOMER_DPU_COMCH_PROTOCOL_VERSION`. Default
