@@ -122,6 +122,31 @@ one RDMA WR per record — and needs **none** of the byte-stream layer. Concrete
 That is the "should be simpler than that" the discussion flagged: we skip the entire payload-stream machine
 and land on the same two-line arm / bounded-drain action that PUBLISH already is.
 
+**Settled (July 10, 2026, user-confirmed): build the fixed-size RDMA half; do NOT lift the variable-size
+payload-stream half for fixed records.** Two reasons, so nobody re-litigates this:
+1. *"Fixed can ride variable" is true at the substrate level and false at the scheduler-source level.* The
+   payload-stream source is coupled to being a byte stream in three places that cannot be cheaply
+   decoupled: its ingress is the tuple-deform relay (`:32475` — there is no generic byte receiver to
+   reuse, so a command receiver would be new code anyway); its egress starts from a *mirrored byte range*
+   produced by role-5 DMA (commands live as staged fixed records, so they would first need a synthetic
+   byte-ring encoding); and its credit is byte-granular where a fixed ring wants per-slot credit. Reusing
+   it is MORE code than the fixed half, and it puts latency-critical control records behind the
+   bulk-payload scheduler.
+2. *The fixed-size half is ~90% retarget, not new transport.* Both directions already have working
+   fixed-record RDMA sends in-tree on the shared substrate: the peer completion publish
+   (`TupleSinkServicePublishPeerClientCommandCompletion` `:18181` — fixed-slot ring
+   `completionSlots[slotIndex]` masked at `:18273`, WIMM doorbell `:18277`, reverse slot credit `:18288`
+   returning BLOCKED_SOURCE_CREDIT, EOS guard `:18252`) and the peer command post
+   (`TupleSinkServicePumpRemoteClientSqlCommands`'s body-then-readySeq publication `:20719`/`:20737` into
+   `clientSqlPeerCommandMailboxDescriptor`). "Build the fixed half" concretely means retargeting those two
+   sends from a host mailbox to a DPU landing ring.
+
+What stays uniform across command/completion/result is the **substrate** (QP, MR exchange, WIMM
+publication, reverse credit, `sessionUID` routing) and the **orchestration shape** (pull → egress → land →
+publish). What differs is only the record **framing** — fixed slot ring vs. byte ring — and that split is
+inherent to the objects (results are variable-length; commands/completions are fixed). Two framings over
+one substrate is the minimal design, not a compromise.
+
 ### 3.1 The two new egress collectors — no new queues, just new consumers
 
 The decisive simplification: **the egress collectors reuse the queues the existing pull collectors already
