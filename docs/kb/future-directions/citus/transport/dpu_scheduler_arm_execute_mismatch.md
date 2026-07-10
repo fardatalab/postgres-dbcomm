@@ -92,26 +92,178 @@ after fix    imported=0 rings=0    pass=500001   pedrain_grants=500000
 
 | | Fix | Where |
 |---|---|---|
-| A | Count **enrolled** rings, once, at import: `HomerDpuDmaHostMmapImport.groupedControlRingCount`, summed into `HomerDpuDmaSchedulerFacts.groupedControlRingCount`. Arm discovery from **that**, never from `importedRingCount`. Precomputed at import because `GetSchedulerFacts` runs on the busy-poll loop. | `homer_service_dpu_dma.{c,h}`, `tuple_sink_service_process.c` |
-| C | `setupTcpKnownWork = setupTcpFacts.started` (was `.activeConnection`). A **started listener is known work**, which takes it out of the blind class and therefore out of backoff. Costs one `accept4()` `EAGAIN` per grant on a cold control path — exactly what `PEER_CM_SETUP` already does. | `tuple_sink_service_process.c` |
-| B | **NOT FIXED.** The starvation clock is still per-source. Any future blind DPU collector can be suppressed indefinitely by a busy sibling. Fixing it means giving `HomerProgressCollectorFacts` its own `lastGrantedTick`, updated when *that collector* is granted. | — |
-| C (proper) | **NOT DONE.** The accept loop should be its own collector/action/source, not fused into a DOCA PE drain. | — |
+| A | Count **enrolled** rings, once, at import: `HomerDpuDmaHostMmapImport.groupedControlRingCount` (`homer_service_dpu_dma.c:5904`), summed into `HomerDpuDmaSchedulerFacts.groupedControlRingCount`. Arm discovery from **that**, never from `importedRingCount`. Precomputed at import because `GetSchedulerFacts` runs on the busy-poll loop. | `homer_service_dpu_dma.{c,h}`, `tuple_sink_service_process.c` |
+| C′ | `setupTcpKnownWork = setupTcpFacts.started` (was `.activeConnection`). Takes `DPU_PE_DRAIN` out of the blind class and therefore out of backoff. **A tactical hotfix, not the resting state** — see the corrections below. | `tuple_sink_service_process.c:39897`+ |
+| B | **NOT FIXED.** | — |
+| C (proper) | **NOT DONE.** | — |
+| D | **NOT FIXED** (found after the above shipped). | — |
 
-### Two rules this buys
+---
 
-1. **Never arm a collector from a count its executor will filter.** If the executor has a predicate, the
-   facts must apply the same predicate. Defect A is exactly finding 1–10's disease with the arrow
-   reversed, and it was the dangerous direction: an over-armed collector doesn't just waste passes, it
-   **steals fairness credit from its siblings**.
-2. **A listener is never blind maintenance.** ⚠ **S3.2's doorbell listener MUST get its own collector
-   with `knownExpectedWork = started`, and MUST NOT be fused into another action.** It would otherwise
-   inherit all three defects verbatim, and the failure is silent.
+## §0b — CORRECTIONS to §0, and a fourth defect (July 10, 2026, later the same day)
+
+Written after (i) an experiment that reverted C′ on the DPU tree only, and (ii) an independent Codex
+review. Every claim below was measured or verified against source; the ones that contradict §0 above are
+marked. **§0's narrative stands; three of its supporting claims do not.**
+
+### ❌ CORRECTION 1 — fix A **alone** unwedges the listener. C′ is not load-bearing.
+
+Measured on the DPU with C′ reverted and A kept, arena imported, zero sessions:
+
+```
+pass=2500001  pedrain_grants=1250010          <- ~50% of passes (was FROZEN)
+[starve-diag] PE_DRAIN dropped: feedback-backoff   <- backoff still fires
+ss -ltn: LISTEN Recv-Q=0                       <- listener healthy
+```
+
+With grouped-control no longer granted, nothing else advances the shared `lastTouchedTick`, so
+`grantsSinceLastCollectorTouch` grows and the 4-skip escape hatch opens as designed.
+
+So the wedge required **A (the trigger) AND B (the amplifier)**. Removing either breaks it. C′ merely
+raises the grant rate from ~50% to 100% of passes. §0's *"Fixed by (A) and (C)"* overstates C′.
+
+### ❌ CORRECTION 2 — C′'s cost is not "one `accept4()` per pass".
+
+Three things, verified:
+- The listener calls **`accept()`**, not `accept4()` (`homer_service_dpu_setup_tcp.c:369`).
+- The same action then calls `HomerDpuDmaDrainPe` → `doca_pe_progress()` on an empty PE.
+- The same action then calls `HomerDpuDmaReclaimDetachedImports` **and** `HomerDpuDmaHasDetachedImports`
+  (`tuple_sink_service_process.c:41625`, `:41634`), each an **O(1024) import-table scan**.
+
+So C′ buys, per pass while idle: one syscall + one empty PE progress + up to two 1024-slot scans. Not
+visible in the 23 GB basebackup band (see the cost note below), because during real work `inflight > 0`
+already made `PE_DRAIN` non-blind. The cost is paid **only when idle** — which is also when it is useless.
+
+### ❌ CORRECTION 3 — `knownExpectedWork = true` does **not** guarantee the collector executes.
+
+`HomerServiceMachineBaselineAppendCollectorAction` (`:9850`) reserves budget *after* the backoff gate.
+A non-blind collector still competes for the **total collector quota** and loses to **fixed collector
+ordering** (command send CQ and grouped control are appended before PE drain). So C′ made the wedge
+unlikely, not impossible. **By the same argument, fixing B does not guarantee it either.** The only
+construct that guarantees a listener poll is a **reserved admission** that generic collectors cannot
+consume. *(Credit: Codex review. Neither the original diagnosis nor the first proposed fix caught this.)*
+
+### 🆕 DEFECT D — `runnableMachineWork` is *always* true, so backoff's idle-service guard is dead
+
+`HomerMachineBaselineCollectorFeedbackBackoffActive` short-circuits to `false` unless `runnableMachineWork`
+(`:9612`), and its comment promises *"keeps an otherwise idle service from suppressing unknown-arrival
+collectors indefinitely."*
+
+That promise is void. `HomerServiceBuildPeerAndMaintenanceMachineCandidates` (`:40803`) unconditionally
+appends a heartbeat machine with `readyActionMask = RUN_MAINTENANCE` (`:40827`) whenever the
+`HEARTBEAT_MAINTENANCE` collector is a candidate — which is always. Measured, per plan phase, on a service
+with **zero sessions, zero streams, zero in-flight DMA**:
+
+```
+plan phase=0 runnable=0 machines=0     (RESET)
+plan phase=1 runnable=0 machines=0     (LOCAL_IPC)
+plan phase=2 runnable=1 machines=1     (COLLECTOR)   <- the phase that plans DPU collectors
+plan phase=3 runnable=0 machines=0     (SEMANTIC)
+```
+
+**Blind-poll backoff is permanently armed in the collector phase, on every DPU service.**
+
+D is also, right now, *load-bearing in the other direction*: the escape hatch is denominated in **grants**
+(`HomerProgressFeedbackTick` advances only when some grant executes), so if a skipped collector were the
+only thing with work, the tick would never move and the skip would be permanent. That cannot happen today
+**only because** the always-runnable heartbeat machine yields a grant every pass. Two mechanisms, either
+sufficient, neither documented. Any fix to D must pick one on purpose.
+
+### 🔎 THE REAL SHAPE OF B — the DPU family is the only one that is not 1:1 collector→source
+
+Both directions of the feedback mapping collapse for the DPU family, and only for it:
+
+| | mapper | DPU family |
+|---|---|---|
+| write | `HomerServiceUpdateProgressFeedbackAtTick` (`:13231`) resolves feedback from `sourceRef` | 11 collectors → `dpuDmaSource` (`:9758`) → `dpuDmaFeedback` (`:13219`) |
+| read | `HomerServiceProgressCollectorFeedbackForKind` (`:38182`) | 11 collectors → `dpuDmaFeedback` (`:38218`) |
+
+Every other collector is 1:1 with its own source and its own feedback struct (`localControlSource`,
+`cqDrainSource`, `peerCmSetupSource`, `peerRecvCqSource`, `peerSendCqSource`, `peerCloseLifetimeSource`).
+**The per-source feedback machinery is correct under a 1:1 invariant. The DPU family broke the invariant.**
+
+And it is not only the tick. `HomerServicePopulateCollectorFeedbackFacts` (`:40159`) copies **all three**
+backoff inputs from the shared struct:
+
+```c
+collectorFacts->recentEmptyPolls      = sourceFeedback->consecutiveEmptyGrants;      /* :40174 */
+collectorFacts->recentProductivePolls = sourceFeedback->consecutiveProductiveGrants; /* :40175 */
+collectorFacts->lastCollectedTick     = sourceFeedback->lastTouchedTick;             /* :40176 */
+```
+
+So a productive grouped-control read can clear `DPU_PE_DRAIN`'s empty streak, and an empty PE drain can
+increment grouped control's. **A per-collector `lastGrantedTick` alone does not fix B.**
+
+> *Retracted:* an earlier note claimed `HomerProgressMachineCandidateSetAppendCollector` (`:8697`) sums
+> these counters *across* collectors. It does not — the merge is guarded on
+> `candidate->kind == collectorFacts->kind && candidate->index == collectorFacts->index`, so it merges
+> duplicate records of the **same** collector. Summing a monotone *streak* across duplicate records is
+> still wrong, but it is not the aliasing channel.
+
+### ✅ THE HONEST ARMING FOR A LISTENER — and it already exists in this repo
+
+The service cannot learn that the kernel's listen backlog became non-empty without a syscall. There is no
+maintained user-space "pending connection" bit. So `knownExpectedWork` for a listener must not assert
+*"an item is ready"* — it can't know that. It should assert **"a poll is due."**
+
+That is a maintained, honest, cadence-controlled fact, and the RDMA peer listener already implements it:
+
+| step | code |
+|---|---|
+| choose the interval | `TupleSinkServiceListenerLivenessInterval` (`remote_execution_peer_transport_rdma.c:1939`) |
+| arm the next due pass | `TupleSinkServiceArmListenerLiveness` (`:1954`) |
+| raise the durable due bit at pass start | `listenerLivenessDue = true` (`:1987`) |
+| scheduler consumes it | `peerSchedulerFacts.listenerPollDue` (`tuple_sink_service_process.c:41081`) |
+| clear **and rearm only at actual execution** | `:10803` |
+
+Seen this way, **C′ is the degenerate case of this pattern with `interval = 0`** — "a poll is due, always."
+The right version says "a poll is due every N passes": honest, bounded-latency, and it deletes the idle
+per-pass syscall and the two 1024-slot scans.
+
+It also explains the two-name exemption list. `PEER_CM_SETUP` has its own source, so its 4-grant bound
+*already worked* — yet it was exempted anyway. Because once you have a **due** obligation, "due" must mean
+"will run", and backoff could delay a due poll. The exemption is not belt-and-braces; **it is the missing
+half of the poll-due contract**, added by hand, for one collector.
+
+### Three latches, all found open
+
+| latch | intent | why it was inert |
+|---|---|---|
+| "only back off while busy" | idle service polls everything | **D** — the heartbeat machine makes the service permanently "busy" |
+| "skip at most 4 grants" | bounded starvation | **B** — the starvation clock is shared by 11 collectors |
+| "never back off a listener" | correctness-visible lifecycle work | **C** — the listener is not a collector; it is fused inside one |
+
+Defect **A** merely pushed on a door that three separate latches had quietly stopped holding.
+
+### Revised rules
+
+1. **Never arm a collector from a count its executor will filter.** (Unchanged; this is defect A, and it
+   is findings 1–10's disease with the arrow reversed. An over-armed collector does not merely waste
+   passes — it **steals fairness credit from its siblings** through the shared feedback struct.)
+   *Refinement (Codex, adopted):* store the enrolled ring **index vector / bitset**, not just a count, so
+   enrolled membership — rather than a predicate re-evaluated in two places — is the single source of
+   truth. And name the fact honestly: it is an **enrolment** count, not an *immediately submittable* count
+   (rings with `controlReadInFlight` set are skipped by the executor anyway,
+   `homer_service_dpu_dma.c:1202`).
+2. ~~*A listener is never blind maintenance; give it its own collector with `knownExpectedWork = started`.*~~
+   **SUPERSEDED.** `knownExpectedWork = started` is a tactical hotfix and does not guarantee execution
+   (correction 3). The rule is:
+   > **A listener gets its own collector, its own action, and its own progress source; it advertises a
+   > durable `pollDue` obligation on an interval, cleared and rearmed only when the poll actually runs;
+   > and a due listener poll gets RESERVED admission that generic collector budgets cannot consume.**
+   ⚠ **S3.2's doorbell listener must be built this way from the start.** Do not fuse it into another
+   action, and do not copy C′.
+3. **Do not measure performance on aliased scheduler feedback.** B corrupts the empty/productive streaks
+   of all eleven DPU collectors, including the data-path ones (grouped control, command pull, payload
+   pull, completion push). Fix B before any S6 number is recorded, or the number cannot be explained.
 
 ### Cost note
 
-The fix makes `DPU_PE_DRAIN` run on ~100% of passes rather than ~50%. Measured effect on the 23 GB 4-role
-DPU-relay basebackup: none detectable. Warm repeats, agent OFF `19.50 / 18.92 / 22.80 s`; agent ON
-`20.34 / 22.09 / 19.89 s`. Bands overlap. (Both arms discard the first run after a service restart.)
+C′ makes `DPU_PE_DRAIN` run on ~100% of passes rather than ~50% **while idle** (during real work
+`inflight > 0` already made it non-blind). Measured effect on the 23 GB 4-role DPU-relay basebackup: none
+detectable. Warm repeats, agent OFF `19.50 / 18.92 / 22.80 s`; agent ON `20.34 / 22.09 / 19.89 s`. Bands
+overlap. (Both arms discard the first run after a service restart.) This is a *no-regression* result on a
+streaming workload, **not** evidence that the idle cost is free — see correction 2.
 
 ---
 
