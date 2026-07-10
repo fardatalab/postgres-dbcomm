@@ -165,7 +165,8 @@ the backend must `shm_open` by name on its own host.
 ### D2 — spawn trigger: postmaster exports the region; DPU DMA-writes the slot; doorbell over the existing setup socket
 **The postmaster OWNS the spawn region.** It creates it: `shm_open(O_CREAT|O_RDWR)`
 (`remote_execution_backend_bridge.c:1709`), `ftruncate` (`:1730`), `mmap` (`:1740`), initialises
-`slotCount`/`postmasterPid` (`:1758`). Region name `/citus_remote_exec_backend_spawn_v14`
+`slotCount`/`postmasterPid` (`:1758`). Region name `/citus_remote_exec_backend_spawn_v15` (bumped from
+`_v14` in S3.1, when the request grew `arenaSlotIndex`; the log quotes further down predate the bump)
 (`remote_execution_backend_protocol.h:28`), fixed slot count (`:30`), slot states (`:47`).
 **So there is no "DOCA-export a region you do not own" problem** — an earlier note claimed there was;
 corrected. The postmaster calls a Homer frontend API and exports its own region.
