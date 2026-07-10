@@ -2759,8 +2759,20 @@ So S4's own work is:
   first consumed-head publish for an arena result ring with
   `"byte-ring credit descriptor is not a payload byte ring"` (`:3064`), which fails the whole sweep.
   Space is already reserved; nothing here needs an ABI bump.
+
+  > **✅ DONE + VALIDATED — citus `ab850f892`, July 10, 2026.** Landed EXPANDED (5 parts, bridge v3→4 —
+  > the "no ABI bump" line above predates the role-5 discovery correction): rebase+credit, flag-gated
+  > role-5 grouped-control enrolment (PUBLISH_LINE), engine `boundServiceSinkId` (5 sites + sink gate +
+  > deferred enqueue via `HomerDpuDmaBindArenaResultSink`), arena backend result wiring, producer
+  > publish-line mirror. Validated on the full four-role deployment incl. the corrected DPU→DPU spawn
+  > topology (arena backend `launched_pid=884091` survived with the new wiring; sink gate silent; 4-role
+  > basebackup green). Full record: bridges design doc §4 P0.
 - **S4.1** Export **role 6** from `HomerClientOpenSqlSessionSelectedDpu` (today the only role-6 exporter
   is the deprecated `homer_frontend_dma.c:1617`), alongside role 1.
+
+  > **✅ DONE + VALIDATED — citus `68051ef88`, July 10, 2026.** 1→2 rings; role-6 line resolvable at
+  > import (declared session id auto-binds); farnet0 DPU accepted the 2-ring import
+  > (`descriptor_count=2`) in P0 validation.
 - **S4.2** Drive `START_COMMAND` down the control slot from the client, and consume role-6 completion
   events instead of `HomerClientWaitCommandCompletion`'s shm mailbox.
 - **S4.3** Depends on S2+S3 for the backend to exist at all.

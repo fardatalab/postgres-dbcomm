@@ -286,8 +286,19 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
 > (2) the **publish mirror** is generic tuple-sink infrastructure (`CitusTupleSinkAttachDpuPublishMirror`
 > + a two-store stamp at the three commit sites: batch submit, error record, empty EOS) with its arena
 > caller deferred to P3.1 (the sink handle doesn't exist until the first row-producing command).
-> Validation: TCP smoke + v4 arena import + selected-DPU spawn + 4-role basebackup listener check — see
-> the plan's P0 validation record.
+>
+> **✅ P0 VALIDATED (July 10, 2026, three runs, full four-role deployment, v4 on both DPUs).**
+> Run 1: TCP transport smoke ok both ends; v4 arena import accepted (48+1 rebased descriptors); S4.1
+> client 2-ring import accepted (`descriptor_count=2`, farnet0 DPU); 4-role basebackup (23.2 GB) proved
+> the setup listener survives the new 16-enrolled-rings state. Run 2: proved there is NO silent
+> host-service fallback, and found S4.2's second client dependency (thread-level local control open).
+> Run 3 (corrected topology: peer=farnet1 DPU 10.10.1.201, farnet0 host service up for control hosting
+> only, farnet1 host service DOWN): farnet0-DPU→farnet1-DPU peer transport confirmed
+> (`established persistent outgoing RDMA peer transport host=10.10.1.201`), `DPU backend spawn begin` →
+> `spawn COMPLETED … launched_pid=884091`, live arena backend pid-cross-checked with zero FATALs — the
+> S4.0b arena result-ring wiring arm survives real startup — and the sink-gate diagnostic never fired.
+> The client died exactly at the predicted S4.2 boundary (`client_sql_session_warmup_begin: invalid
+> arguments`, the selected-DPU `control==NULL` gap), AFTER opening the session.
 - **S4.1** Add role 6 to `HomerClientOpenSqlSessionSelectedDpu` (`homer_client.c:3062`): bump
   `HOMER_CLIENT_DPU_COMMAND_SETUP_RING_COUNT` 1→2, add a role-6 descriptor as a client-completion structure
   the node-A DPU DMAs into (carry `serviceSessionId` + `sessionUID` like role 1). Checkpoint: the DPU setup
