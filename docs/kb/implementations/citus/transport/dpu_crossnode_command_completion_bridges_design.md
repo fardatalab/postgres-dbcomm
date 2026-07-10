@@ -58,6 +58,28 @@ scalars). So control-plane records need nothing new on the wire.
 pull `DPU_PAYLOAD_PULL`; role-7 the tuple deform relay (`:32475`). **Consumers A/B only ever produce/consume
 their LOCAL role** — that is their whole job and it does not change.
 
+> **⚠ CORRECTION (July 10, 2026, codex trace + hand-verified): role-5 DPU discovery has NEVER existed —
+> for ANY path.** The "results are the built template" claim above is true only for the *transport* layers:
+> the mirror pull, mirrored-range egress pump, RDMA byte-stream, deform relay, and credit machinery are
+> real and proven — **for role 4/role 7 (basebackup + DPU→host relay)**. Role 5 (SQL result ring) was
+> never wired into discovery:
+> - Grouped-control enrolment is a role WHITELIST — exactly {1, 4, 7} (`HomerDpuDmaDescriptorUsesHostPublishLine`,
+>   `homer_service_dpu_dma.c:6632`–`:6661`; its comment explicitly names 2/3/5/8 as "UNREGISTERED").
+>   Nothing else ever advances a role-5 ring's `acceptedPublishedTail` (`:11359` is the only writer, fed
+>   solely by grouped-control snapshot acceptance).
+> - The "working" SQL-UDF Tier-2 path never needed it: its result ring is consumed HOST-side (the frontend
+>   maps the shm object by name from the completion's `resultQueueDescriptor`) — the DPU never mirror-pulls
+>   role 5 there.
+> - Consequently the mirror-pool join is also missing for arena rings: `HomerDpuDmaResolveMirrorSlot`
+>   looks the pool up **by descriptor `serviceSinkId`** (`:4355`–`:4371`) and rejects sink 0 (`:4333`);
+>   the pool slot is bound by `(parentServiceSessionId, serviceStreamId)` (`tuple_sink_service_process.c:17241`);
+>   the pool rejects stream 0 (`homer_dpu_byte_ring_pool.c:145`). So `descriptor sink id == service stream id`
+>   is the JOIN KEY — which kills the "sink-0 wildcard match" fix idea (recorded below as rejected).
+>
+> What this changes: S4.0b (P0) grows the *discovery enablement* and the engine's *bound-sink* concept;
+> P3.1 stops being "little/no new code" and becomes the real work item that creates the service-side
+> stream entry + mirror-pool slot + sink binding. The full expanded specs are in §4 P0/P3 below.
+
 **What we build is only the RDMA relay halves for command and completion**, mirroring how the payload-stream
 pump relays results (`HomerServicePumpOutgoingDpuMirrorByteRingPayload` `:29845`,
 `HomerServicePumpIncomingTupleViewDpuTwoRingRelay` `:32475`):
@@ -256,11 +278,97 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   `HOMER_CLIENT_DPU_COMMAND_SETUP_RING_COUNT` 1→2, add a role-6 descriptor as a client-completion structure
   the node-A DPU DMAs into (carry `serviceSessionId` + `sessionUID` like role 1). Checkpoint: the DPU setup
   log shows a 2-ring import for the session.
+
+  *Grounded (July 10, 2026):*
+  - The DPU-side publisher is already built and resolves the target by
+    `FindDescriptorRef(bridgeGeneration, serviceSessionId, ROLE_FRONTEND_COMPLETION_EVENT)`
+    (`tuple_sink_service_process.c:40412`) and DMAs one `HomerDpuBridgeFrontendCompletionEvent`
+    (`homer_dpu_bridge_abi.h:252`) via `HomerDpuDmaSubmitFrontendCompletionEventPublication` (`:40428`).
+  - The layout template is the deprecated Tier-2 exporter's role-6 descriptor
+    (`homer_frontend_dma.c:1608-1627`): DPU_TO_HOST, `COMPLETION_SLOT|FIXED_SLOT_RING`, FIXED_SLOT geometry,
+    `slotCount=1`, `slotBytes=controlBytes=ringBytes=sizeof(event)`, `hostRingOffset=hostControlOffset=0`.
+  - **No extra bind step is needed**: the client PRE-ASSIGNS its session id
+    (`stream->serviceSessionId = stream->dpuBridgeGeneration`, `homer_client.c:3001`) and declares it in the
+    descriptor; import auto-binds declared ids (`boundServiceSessionId = descriptor.serviceSessionId`,
+    `homer_service_dpu_dma.c:6809`). Role 6 declares the same id → resolvable immediately.
+  - Client export layout is `[bridge header][hostPublishLines×N][dpuCreditLines×N][control slot]` with all
+    offsets derived from the ring-count macro (`homer_client.c:2916-2920`, `:3003`); append the
+    cache-line-aligned event line after the control slot and grow `mappingBytes`. Two-ring client exports
+    are precedented (basebackup builds `descriptor[1]`, `:3428/:3453`), so setup-side handling is generic.
 - **S4.0b** Turn on the arena role-5 credit lines (rebase role-5 arena descriptors onto the arena base; set
   `bridgeHeader.dpuCreditOffset = offsetof(HomerFrontendArena, dpuCreditLines)` — see plan §S4.0b/D8b), and
-  flip the backend's `resultQueueReady` (`remote_execution_backend_bridge.c:2782`). Fix the role-5 teardown
-  sink-0 miss (plan §S4.0 role-5 decision). Checkpoint: backend produces role-5 bytes; the mirror
-  machinery accepts them (`HomerDpuDmaMirroredByteRangeReadyForServiceSink` no longer rejects).
+  wire the arena backend's result queue (see below). Fix the role-5 **sink-0 miss** (below). Checkpoint:
+  backend produces role-5 bytes; the mirror machinery accepts them
+  (`HomerDpuDmaMirroredByteRangeReadyForServiceSink` no longer rejects).
+
+  *Grounded (July 10, 2026), EXPANDED after the role-5 discovery correction (§2 banner) — S4.0b is now
+  five sub-parts, not two field edits:*
+
+  - **(a) Descriptor rebase + credit lines, with ONE D8b value corrected.** Rebase the role-5 arena
+    descriptors (`homer_frontend_agent.c:750-763`, component-addressed today) onto the arena base and set
+    `bridgeHeader.dpuCreditOffset = offsetof(HomerFrontendArena, dpuCreditLines)` (`:210` holds it at 0).
+    D8b's recorded `hostControlOffset = offsetof(arena, slots[k].resultRingControl)` is **superseded**: for
+    an enrolled ring, `hostControlOffset` is the PUBLISH-LINE pointer (that is the roles-1/4/7 convention —
+    e.g. the client's role-1 sets `hostControlOffset = hostPublishOffset`, `homer_client.c:3073`), so set
+    `hostControlOffset = offsetof(arena, hostPublishLines[k*3+2])`, `controlBytes =
+    sizeof(HomerDpuBridgeHostPublishLine)`. Nothing DPU-side ever reads the role-5 byte-ring control (pull
+    math uses `hostRingOffset`, `homer_service_dpu_dma.c:11046`; storage = `ringBytes - hostRingOffset`
+    `:2955`/`:4492`; credit dst = `hostRingAddress + dpuCreditOffset + ringIndex*64` `:11113`), so no
+    address is lost. The rebased form passes every existing byte-ring check — verified: import validation
+    imposes only in-range checks, no adjacency/zero-offset assumptions (`:6598`, `:6604`; the only
+    adjacency check is spawn-region-specific, `:9828`) — EXCEPT the role-5 `controlBytes >=
+    sizeof(CitusHomerPayloadByteRingControl)` branch (`:6578`), which must learn the publish-line shape
+    (part c).
+  - **(b) Discovery enablement — cash in D8 exactly as the whitelist comment prescribes.**
+    `HomerDpuDmaDescriptorUsesHostPublishLine` (`:6632`) documents the promotion recipe itself: "(a) lay
+    out a HostPublishLine array in the exporting region (already reserved: HomerFrontendArena.hostPublishLines,
+    D8), (b) point their hostControlOffset at it, (c) add their roles here — IN THAT ORDER". Add role 5 to
+    the whitelist, **gated by a new descriptor flag** (e.g. `HOMER_DPU_BRIDGE_RING_FLAG_PUBLISH_LINE`) set
+    only by the arena builder — this keeps the dying Tier-2 per-session role-5 exporters (whose
+    `hostControlOffset` semantics differ) inert without touching them. Bump
+    `HOMER_DPU_BRIDGE_PROTOCOL_VERSION` 3→4 so an undeployed DPU fails LOUD (`BAD_PROTOCOL`) instead of
+    silently not discovering (both DPUs must be resynced+rebuilt — standing AGENTS.md rule).
+    *Noted deviation:* the comment's "only after grouped-control actually groups" gate (a batching
+    optimization that doesn't exist) is deliberately NOT honored — correctness bring-up accepts 16 single
+    64-B reads per sweep; the batching optimization queues behind the cross-node gate. Watch the
+    starve-diag listener cadence at P0 validation to confirm the extra enrolment doesn't shift scheduling.
+  - **(c) Engine: `boundServiceSinkId`, replacing the REJECTED sink-0 wildcard.** The sink id is a JOIN
+    KEY, not just a match predicate — `HomerDpuDmaResolveMirrorSlot` looks the mirror pool up BY descriptor
+    sink (`:4355-:4371`, rejects 0 at `:4333`), and the pool slot is bound by `(session, streamId)`
+    (`tuple_sink_service_process.c:17241`), so a wildcard cannot join; the arena ring must carry the REAL
+    stream id. Extend D5's rule ("ring→session is always the DPU's binding") to the sink: add
+    `boundServiceSinkId` to `HomerDpuDmaRingRuntime` + a `HomerDpuDmaRingBoundSinkId()` accessor
+    (bound-if-nonzero, else descriptor-declared), a bind API to stamp it (called in P3 when the service
+    creates the result stream), and use it at ALL FIVE sink-consuming sites:
+    `HomerDpuDmaMirroredRangeMatchesServiceSink` (`:4446` — the egress data path),
+    `ByteRingFrontierForServiceSink` (`:4693-4695`), `MarkImportSenderCloseReleased` (`:8579-8581`),
+    `HoldImportForSenderClose` (`:8639`), and `ResolveMirrorSlot` (`:4355`). Role-5 validation branch
+    (`:6578`) learns the flag-gated publish-line shape here too.
+    **Phase gating:** grouped-control snapshot acceptance advances tails unconditionally, but only
+    enqueues a ready reference when `RingBoundSinkId != 0` (one-shot diagnostic line otherwise) — so P0's
+    discovery cannot spam mirror-resolve failures before P3 stamps the sink.
+  - **(d) Backend result-queue wiring is a re-point, not a flip.** The legacy Tier-2 arm `shm_open`s a
+    separate result object (`remote_execution_backend_bridge.c:2789-2843`, skipped for `arenaBackend`); the
+    arena backend's ring lives INSIDE the already-mapped arena slot, and the backend consumes via
+    `resultQueueControlMappingAddress` = control + contiguous storage — exactly the arena slot's
+    `resultRingControl`/`resultRingStorage` layout (`_Static_assert`, `homer_frontend_agent.c:135`). Wire
+    it in the arena bind block (`:2670-2723`, `arenaSlot` at `:2712`): point the mapping fields at
+    `&arenaSlot->resultRingControl`, run `RemoteExecResetResultQueueControl` (`:630`) to establish full
+    producer control state (arena bind at `homer_frontend_agent.c:432` skips the producer-owned flag),
+    synthesize send/receive descriptors locally, `resultQueueReady = true`. No shm_open; no munmap of the
+    arena mapping at teardown.
+  - **(e) Producer publish-line hook.** The backend's result commit path must additionally update
+    `arena->hostPublishLines[slot*3+2]` (tail/epoch/entryState) after committing to the ring control —
+    that line is what grouped-control discovery reads. REUSE the canonical publish-line store helper the
+    role-4 producer uses (locate it; do NOT hand-roll the store ordering). Gated on `arenaBackend`.
+
+  **P0 checkpoint (adjusted — no result bytes can flow in P0):** commands don't execute until P3, so the
+  S4.0b checkpoint is: v4 arena import accepted on the DPU (49 rings, role-5 descriptors carrying the
+  publish-line flag), client 2-ring import accepted (S4.1), DPU-spawned backend binds the slot + wires the
+  arena result ring + survives (FATAL-absence rule per AGENTS.md), TCP transport smoke green (mandatory for
+  the ABI bump), starve-diag listener cadence unchanged with 16 newly-enrolled rings. An optional
+  compile-gated backend probe (write one record via the normal commit path at bind, à la the S3.2
+  TEST_FIRE precedent) can light discovery up early — deferred unless P3 debugging needs it.
 
 **Phase P1 — command bridge (node-A role-1 → node-B role-2).**
 - P1.1 Add the **command landing ring** on node B (fixed-record, WIMM, reverse credit), registered as an
@@ -292,9 +400,21 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
 - **Checkpoint P2:** the client observes a role-6 completion for its command.
 
 **Phase P3 — results + client + gate.**
-- P3.1 Results: with role 5 live (P0) and the tuple deform relay already built, node-B role-5 egress →
-  node-A role-7 should flow with little/no new code. Verify the arena role-5 source drives the existing
-  `HomerServicePumpOutgoingDpuMirrorByteRingPayload`/`...TupleViewDpuTwoRingRelay`.
+- P3.1 Results — **REAL WORK ITEM** (corrected July 10, 2026; was "little/no new code" until the §2
+  discovery correction). P0 leaves discovery armed but sink-less; P3.1 supplies the join:
+  - Create the node-B service-side result **stream entry** for a spawned arena backend
+    (`HomerServiceCreatePayloadStreamEntry`, `tuple_sink_service_process.c:24305` — allocates
+    `serviceStreamId`); decide the creation point (peer OPEN handling vs. first START_COMMAND — the
+    peer-open path already reaches it at `:26540/:26570` for the receiver side; trace which side needs
+    what before coding).
+  - Bind the **mirror-pool slot** with `(serviceSessionId, serviceStreamId)` (`:17241`).
+  - **Stamp the ring's `boundServiceSinkId`** (P0's engine API) with that stream id — this is what turns
+    grouped-control discovery into enqueued ready references (P0's gate) and lets `ResolveMirrorSlot` join.
+  - Pass the sink/stream id to the backend (spawn builder sets session identity but not
+    `resultServiceSinkId` today, `:19322`) so `RemoteExecPrepareResultQueueGeneration` and the completion's
+    `resultQueueDescriptor` carry real ids.
+  - Then verify node-B role-5 egress → node-A role-7 rides the existing (role-4-proven) pump + deform
+    relay (`HomerServicePumpOutgoingDpuMirrorByteRingPayload` / `...TupleViewDpuTwoRingRelay`).
 - P3.2 **S4.2 client side**: remove the `session->control == NULL` START rejection
   (`homer_client.c:5944`); drive START into role 1; consume role-6 completions (replace
   `HomerClientWaitCommandCompletion`'s shm mailbox) and role-7 result tuples.

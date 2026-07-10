@@ -13,9 +13,12 @@ S3.2 ✅ (citus `52fd1ab3d`), S3.3 ✅ (citus `455c7a556`), **S3.3b + S3.2c ✅ 
 July 10, 2026)** — the DPU allocates a frontend-arena slot, the spawned backend binds it and SURVIVES
 (the S3.3 gate ERROR is retired). **S3.2b ✅ (citus `f04f87715`)** — arena-slot reaper. **S3.4 ✅ (citus
 `81cb0ec45`)** — doorbell-EOF import teardown. **S3.5 ✅ (citus `89820eb36`)** — host-arm deprecation LOG.
-**The S3 spawn-trigger stage is COMPLETE.** Remaining: **S4** (single-node end-to-end: commands +
-completions + tuple results) — recommended NEXT — then **fix B** / **refine A** (D10) before **S6**. See the
-"S4 vs fix B ordering" note under D10. This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
+**The S3 spawn-trigger stage is COMPLETE.** Remaining: **S4+S5 MERGED → CROSS-NODE end-to-end**
+(user-confirmed July 10, 2026: Homer is RDMA-only, no single-node gate). The gate is a cross-node
+real-pgbench SELECT (client node A → backend node B, both through their DPUs). Detailed blueprint:
+[dpu_crossnode_command_completion_bridges_design.md](./dpu_crossnode_command_completion_bridges_design.md).
+Net-new work = two RDMA relay halves (command + completion) on the already-built substrate; results
+(role-5→role-7) and peer OPEN/spawn already built. Then **fix B** / **refine A** (D10) before **S6**.
 
 > **Decisions layered on top of the original plan. Read these before implementing anything.**
 > - **D5** — `HomerDpuDmaRingRuntime.boundServiceSessionId`. The descriptor says what the host *declared*;
@@ -1583,10 +1586,20 @@ with the descriptor rebase, as one edit — **S4.0b**:
 ```
 hostRingAddress   = arenaBase
 hostRingOffset    = offsetof(arena, slots[k].resultRingStorage)
-hostControlOffset = offsetof(arena, slots[k].resultRingControl)
+hostControlOffset = offsetof(arena, slots[k].resultRingControl)   /* SUPERSEDED -- see below */
 ringBytes         = hostRingOffset + RESULT_RING_STORAGE_BYTES     /* ringStorageBytes = ringBytes - hostRingOffset (:9651) */
 bridgeHeader.dpuCreditOffset = offsetof(arena, dpuCreditLines)
 ```
+
+> **⚠ hostControlOffset value SUPERSEDED (July 10, 2026).** For an enrolled ring, `hostControlOffset` is
+> the PUBLISH-LINE pointer (the roles-1/4/7 convention), not the byte-ring control address — and S4.0b
+> now also enrolls the arena role-5 rings in grouped-control discovery, because a codex-verified trace
+> showed **role-5 discovery never existed for any path** (whitelist = {1,4,7} only,
+> `HomerDpuDmaDescriptorUsesHostPublishLine` `homer_service_dpu_dma.c:6632`). Set
+> `hostControlOffset = offsetof(arena, hostPublishLines[k*3+2])`, `controlBytes = sizeof(HomerDpuBridgeHostPublishLine)`.
+> Nothing DPU-side reads the role-5 byte-ring control, so no address is lost. Full expanded S4.0b spec
+> (five sub-parts a-e, incl. `boundServiceSinkId` and the protocol v4 bump) lives in
+> [dpu_crossnode_command_completion_bridges_design.md](../../implementations/citus/transport/dpu_crossnode_command_completion_bridges_design.md) §4 P0.
 
 Both descriptor forms are legal — the DPU only ever computes `hostRingAddress + <offset>` (`:8684`) — and
 the rebase **cannot** accidentally enrol roles 2/3/5 in grouped-control discovery, because enrolment is a
@@ -2641,6 +2654,18 @@ store. **Where the body is immutable, do not rely on any of it — do the two-ph
 | R7 | **trust boundary**: after S3 the DPU DMA-writes `dbOid`/`userOid` into a spawn slot | acceptable for a prototype; named, not discovered |
 
 ### S4 — SINGLE-NODE end-to-end (the de-risking gate)
+
+> **⏺ RESTRUCTURED to CROSS-NODE-ONLY (user-confirmed, July 10, 2026).** Homer is going RDMA-only; the
+> single-node "local fast path" is being deleted, so we do NOT build a single-node gate. S4 MERGES with the
+> cross-node work: the gate becomes a cross-node real-pgbench SELECT (client node A, backend node B, both
+> through their DPUs, RDMA between the DPUs). The single-node text below is kept for historical context on
+> the shared mechanics, but the actual bring-up follows the **two-bridge design**:
+> [dpu_crossnode_command_completion_bridges_design.md](./dpu_crossnode_command_completion_bridges_design.md).
+> The net-new work is exactly two RDMA bridges — command ingress (node-A role-1 → node-B consumer A) and
+> completion egress (node-B consumer B → node-A role-6); the result plane (role-5→role-7) is already built
+> minus S4.0b, and the peer OPEN/spawn is already built. Order: S4.1+S4.0b → command bridge → completion
+> bridge → results → cross-node SELECT gate → S4.0 (D6) last.
+
 Client, PostgreSQL, and ONE DPU on the same host. **No peer leg, no RDMA, no second DPU.** The client
 opens its session on the local DPU; the DPU triggers the spawn; the backend exports its mailboxes to the
 same DPU; commands, completions and tuple results all flow host<->DPU by DMA.
@@ -2653,6 +2678,26 @@ DMA-pulled and republished into the client's role-6 line by `...AcceptOneBackend
 exercises both directions (`--expect-backend-command-publish`, `--expect-backend-completion-pull`),
 now including into a tmpfs mapping (S0).
 
+> **⚠ VALIDATION NET — the smoke does NOT cover the S4.0 hub refactor (traced July 10, 2026, codex).**
+> The sentence above is true only of the ENGINE primitives. The `dpu-tcp-transport-smoke-bin` target
+> links `homer_service_dpu_dma.c` but **not** `tuple_sink_service_process.c`; its
+> `--expect-backend-command-publish` / `--expect-backend-completion-pull` legs call
+> `HomerDpuDmaSubmitBackendCommandPublication` (`homer_dpu_tcp_transport_smoke.c:1456`) and
+> `HomerDpuDmaSubmitBackendCompletionPulls` (`:1538/:1568`) **directly**, and never enter the two hub
+> consumers S4.0 rewrites — `HomerServiceDpuStageOneBackendCommandForPublish`
+> (`tuple_sink_service_process.c:40050`, the role-2 *stage*; DMA submit is the separate
+> `DPU_BACKEND_COMMAND_STAGE`/publish action at `:43407`) or the
+> `HOMER_PROGRESS_ACTION_DPU_BACKEND_COMPLETION_PULL` case (`:43295`). So the smoke is a good engine
+> regression net but proves **nothing** about S4.0's consumer changes.
+> **The ONLY live workload that drives consumers A/B is the DOCA SQL-UDF path**
+> `citus_remote_exec_pgbench_transaction` + `citus.enable_experimental_homer_dpu_frontend=on` (recipe in
+> `dpu_dma_backend_homer_service_current_scheduler_design.md:2487`). `pgbench --homer-dpu-command` does
+> NOT reach them — `HomerClientOpenSqlSessionSelectedDpu` sets `session->control = NULL`
+> (`homer_client.c:2977`), so its first `BEGIN` is rejected at `homer_client.c:5944` before any
+> START_COMMAND is published. **Therefore every S4.0 sub-step must be validated by a real DPU DOCA run of
+> the SQL-UDF path; there is no host-only shortcut. Establish that path is GREEN at HEAD before
+> refactoring, or a regression cannot be attributed.**
+
 So S4's own work is:
 - **S4.0 — cash in D6.** Switch the consumers to the forward index S3.3b built, and delete the scans:
   role-2 publish reads `session->backendCommandMailboxRef` instead of calling `FindDescriptorRef` per
@@ -2664,6 +2709,48 @@ So S4's own work is:
   Also decide the role-5 teardown question D6 leaves open (`ByteRingFrontierForServiceSink` /
   `MarkImportSenderCloseReleased` search by `(serviceSessionId, serviceSinkId)`; the arena ring has
   `serviceSinkId = 0`).
+
+  > **⏺ SETTLED S4.0 design (decided July 10, 2026, within-direction, per "note your reasoning").**
+  > The plan's phrasing "role-2 publish reads `session->backendCommandMailboxRef`" hides a real
+  > two-struct gap: S3.3b cached the D6 refs (`dpuArenaRingRefs[3]`, roles {2,3,5}) on the **frontend**
+  > session `TupleSinkServiceSessionState` at bind time — but consumers A/B use a **different** struct,
+  > the DPU-DMA scheduler's `HomerServiceDpuSelectedSessionState` (`:597`), created LAZILY at the first
+  > START_COMMAND (`FindOrCreateSelectedSession`, `:39665`), and `dpuDmaState` holds **no** back-pointer
+  > to the frontend session table (checked its struct body, `:650`–`:713`). Three ways to bridge that gap:
+  > - **(A) copy `dpuArenaRingRefs` from the frontend session** at selected-session creation — needs a
+  >   `serviceSessionId → TupleSinkServiceSessionState` lookup (`TupleSinkServiceFindSessionById`, `:22648`)
+  >   plumbed into the scheduler, coupling the DPU-DMA scheduler to the frontend session table.
+  > - **(B) prime the selected session at spawn time** from `dpuArenaRingRefs` — needs eager
+  >   selected-session creation in `BeginDpuBackendSpawn` and couples spawn ↔ scheduler; changes
+  >   `selectedSessionCount`/completion-wait arming semantics.
+  > - **(C, CHOSEN) resolve role-2 and role-3 ONCE at selected-session creation via `FindDescriptorRef`,
+  >   cache both on `HomerServiceDpuSelectedSessionState`, reuse per transaction.** This still "cashes in
+  >   S3.3b": `FindDescriptorRef` resolves via the ring's `boundServiceSessionId` — the exact key S3.3b
+  >   stamps — so it CANNOT diverge from `dpuArenaRingRefs`, and it also works unchanged for the OLD
+  >   per-session export path (where the descriptor DECLARES a nonzero `serviceSessionId`). It keeps the
+  >   scheduler self-contained (no frontend-table coupling), and it moves the scan off the per-transaction
+  >   path (D6's actual goal: resolve once per session, O(1) per START_COMMAND). Cost: one `FindDescriptorRef`
+  >   per session (at creation), vs. per transaction today. `dpuArenaRingRefs` on the frontend session stays
+  >   live — it is still the home for role-5 (S4.0b) and teardown.
+  >
+  > **Role-5 teardown decision — DEFER the fix to S4.0b, do NOT touch it in S4.0.** Confirmed both helpers
+  > REJECT `serviceSinkId == 0` up front (`ByteRingFrontierForServiceSink` `homer_service_dpu_dma.c:4668`;
+  > `MarkImportSenderCloseReleased` `:8558`) and then require exact sink equality (`:4693`, `:8579`), while
+  > the arena role-5 descriptor is built with `serviceSinkId = 0` (`homer_frontend_agent.c:750`) and binding
+  > stamps only the session id (`:5654`), leaving the ref's sink at 0 (`:5663`). So both helpers MISS the
+  > arena result ring. But **role 5 is not live until S4.0b** — no arena result ring exists to tear down in
+  > S4.0 — so the fix belongs in S4.0b, alongside turning the ring on. The fix options (record in S4.0b):
+  > give the arena result ring a nonzero synthetic `serviceSinkId`, OR add explicit "arena ring (sink 0)"
+  > handling to both helpers keyed on `boundServiceSessionId` alone. S4.0 only records the decision.
+  >
+  > **⏺ RESOLVED (July 10, 2026): neither option — `boundServiceSinkId`, stamped at stream creation.**
+  > Both recorded options are dead: the sink id is a JOIN KEY into the mirror pool
+  > (`HomerDpuDmaResolveMirrorSlot` looks the pool up BY descriptor sink, `:4355`, rejects 0 at `:4333`;
+  > pool slot bound by `(session, streamId)` at `tuple_sink_service_process.c:17241`), so a synthetic
+  > constant can't match the dynamically allocated stream id and a session-only wildcard can't join at
+  > all. The fix extends D5's rule to the sink: `boundServiceSinkId` on the ring runtime, stamped when
+  > the service creates the backend's result stream (P3.1), honored at all FIVE sink-consuming sites
+  > (the four match helpers + `ResolveMirrorSlot`). Spec in the bridges design doc §4 P0 part (c).
 - **S4.0b — turn on the arena's credit lines (D8b).** *Required before a backend can produce a single
   result byte through the arena.* Rebase the **role-5** arena descriptors onto the arena base and set
   `bridgeHeader.dpuCreditOffset = offsetof(HomerFrontendArena, dpuCreditLines)`, as ONE edit — see D8b for
@@ -2684,7 +2771,13 @@ possible blast radius, and is the first proof the architecture works at all.
 > The command/completion machinery it leans on is **TIER 2 → 1.5**: it exists, the smoke drives it, no
 > production client does. Expect bugs on first real contact — that is what this gate is for.
 
-### S5 — DPU<->DPU command peer-open — **RE-SCOPED: mostly already done**
+### S5 — DPU<->DPU command peer-open — **RE-SCOPED: mostly already done; MERGED INTO S4**
+
+> **⏺ MERGED with S4 (July 10, 2026).** With the single-node gate dropped, the cross-node command/completion
+> relay IS the S4 bring-up. Peer OPEN/spawn (below) is done; the remaining net-new work — the command and
+> completion RDMA relay halves — is specified in
+> [dpu_crossnode_command_completion_bridges_design.md](./dpu_crossnode_command_completion_bridges_design.md).
+> The S5.x items below stay as the peer-open record; the relay steps live in the design doc's §4.
 
 > **Observed working during the S1a gate run**, before any S5 work was attempted. The farnet0 DPU
 > established a `CRITICAL_CONTROL` RDMA connection to the farnet1 DPU and shipped an
