@@ -468,3 +468,14 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
 Cross-node DOCA pgbench selected-DPU SELECT (farnet0 client → farnet1 backend, both DPUs). The single-node
 SQL-UDF baseline (green at HEAD, citus `89820eb36`) remains a cheap engine-level smoke but is NOT the gate.
 Per phase, the checkpoints above are the intermediate signals; the final gate is a decoded SELECT value.
+
+**⚠ `--homer-peer-host` SELECTS THE RELAY TOPOLOGY, and the wrong value silently validates the wrong
+path (cost one P0 validation cycle, July 10, 2026).** With `10.10.1.101` (farnet1 HOST service — the
+value in the standing AGENTS.md pgbench recipe), the farnet0 DPU relays the OPEN to the farnet1 HOST
+service, which spawns a backend via the deprecated host-service arm — everything "passes" while the
+farnet1 DPU, the arena spawn, and the arena backend arm are never touched, and the only tell is the
+ABSENCE of `DPU backend spawn begin/COMPLETED` on the farnet1 DPU. The DPU-relay command chain needs
+`--homer-peer-host 10.10.1.201` (the farnet1 **DPU**) and the DPU services started WITH peer-bind env
+(`HOMER_SERVICE_PEER_BIND_HOST=10.10.1.201/10.10.1.200`, `HOMER_SERVICE_PEER_PORT=9717`) on top of the
+DMA env. For cross-node validations of THIS design, also leave the two HOST services DOWN so a silent
+host-relay fallback fails loudly instead of masquerading as a pass.
