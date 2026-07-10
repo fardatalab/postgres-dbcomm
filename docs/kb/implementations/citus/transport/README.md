@@ -31,6 +31,12 @@ remote execution session semantics.
 
 - `../../../future-directions/citus/transport/`: Transport scheduler, payload
   stream, and RDMA publication design notes.
+- `../../../future-directions/citus/transport/dpu_readiness_collectors_and_continuation_edges.md`:
+  Root cause behind several decisions in `dpu_command_plane_migration_plan.md` (D5 reverse cookie,
+  D6 forward index, D8 arena publish-line reservation). Read before changing them.
+- `../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md`: Ranked map of the
+  ten sites where the DPU scheduler arms from exact demand and executes by linear scan. Finding 1 is on
+  the basebackup egress path and is unscheduled.
 - `../../../implementations/postgres/replication/`: PostgreSQL basebackup target
   integration notes that feed this transport path.
 - `homer_current_implementation_checkpoint.md`: Current top-level implementation

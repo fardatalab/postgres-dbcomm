@@ -3,11 +3,29 @@
 > **Status: FUTURE DIRECTION.** Nothing here is implemented. One instance (finding 2 + 6 + 7) is
 > already scheduled as **D6** in
 > [`dpu_command_plane_migration_plan.md`](../../../implementations/citus/transport/dpu_command_plane_migration_plan.md),
-> to be built at S3.3b and cashed in at S4.0. The rest is a map, deliberately made *before* we trip over
-> the instances one at a time.
+> to be built at S3.0/S3.3b and cashed in at S4.0. The rest is a map, deliberately made *before* we trip
+> over the instances one at a time.
 >
 > **Cost models below are ANALYTIC, not measured.** They are loop bounds read out of the source. None of
 > this has been profiled. Do not cite a factor from this doc as a benchmark result.
+
+> ## 👉 This doc is the SYMPTOM MAP. The root cause is one missing field.
+>
+> Read [`dpu_readiness_collectors_and_continuation_edges.md`](dpu_readiness_collectors_and_continuation_edges.md)
+> **first**, or at least alongside. Every finding below is a consequence of a single fact:
+>
+> **The ready queue is a hand-rolled completion queue with no cookie slot.** Its entries name the *source*
+> (`importIndex`, `ringIndex`) and carry an `acceptedPublishedEpoch` that is literally immediate data — but
+> no `wr_id`. So each consumer must re-derive *who was waiting*, by scanning. A recv-CQ hands back a
+> `wr_id`; a `doca_pe` task hands back `doca_data`; a host CPU store into DOCA-exported memory hands back
+> nothing, because there is no `WRITE_WITH_IMM` across PCIe.
+>
+> Ten findings, one missing edge, in two directions:
+> **forward index** (waiter → resource, for pushers — this is D6) and
+> **reverse cookie** (resource → waiter, for collectors — this is where the continuation runtime's
+> `HomerDependencyResolve()` will land).
+>
+> If you fix these one at a time from the table below, you will write the same edge ten times.
 
 ## The pattern
 
@@ -133,7 +151,14 @@ available locally and the identity is not.** The identity is one layer up. The f
 handle down, never to teach the lower layer to guess.
 
 ## Related
+- [`dpu_readiness_collectors_and_continuation_edges.md`](dpu_readiness_collectors_and_continuation_edges.md)
+  — **the root cause of every finding here.** Why everything is polled, what a completion queue actually
+  buys (aggregation + a cookie slot), the ready queue as a cookie-less CQ, and the two missing edges.
+- [`homer_continuation_graph_scheduler_plan.md`](homer_continuation_graph_scheduler_plan.md) — the runtime
+  these edges are for. Its `HomerReadyCatalog` is this engine's ready queue, keyed on a continuation instead
+  of a ring.
 - [`dpu_command_plane_migration_plan.md`](../../../implementations/citus/transport/dpu_command_plane_migration_plan.md)
-  — D6 (the forward index; findings 2/6/7), D7 (spawn-slot partition), D5 (`boundServiceSessionId`).
+  — D5 (`boundServiceSessionId`, the reverse cookie in its weakest form), D6 (the forward index; findings
+  2/6/7), D7 (spawn-slot partition), D8 (arena publish-line reservation, S3.0).
 - [`dpu_dma_backend_homer_service_current_scheduler_design.md`](dpu_dma_backend_homer_service_current_scheduler_design.md)
-  — how the progress collectors/actions/grants fit together.
+  — how the progress collectors/actions/grants fit together. Read it to see that the *arming* half is sound.

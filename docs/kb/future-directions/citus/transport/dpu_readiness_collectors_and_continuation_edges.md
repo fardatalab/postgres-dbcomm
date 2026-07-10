@@ -405,9 +405,24 @@ Ordered by (door opened) ÷ (cost). The first has a **closing window**.
 
 ## Related
 
-- [`homer_continuation_graph_scheduler_plan.md`](homer_continuation_graph_scheduler_plan.md) — the design
-  this grounds: `HomerDependencyKind`, `HomerWaitRegistration`, `HomerReadyCatalog`, collectors, gates.
-- [`dpu_scheduler_arm_execute_mismatch.md`](dpu_scheduler_arm_execute_mismatch.md) — the ten sites where the
-  missing edges show up as linear scans.
+Reading order, when resuming the async-continuation work:
+
+1. **this doc** — the *why*: what a collector is, what a cookie is, and which of the two edges is missing
+   where.
+2. [`dpu_scheduler_arm_execute_mismatch.md`](dpu_scheduler_arm_execute_mismatch.md) — the *where*: ten sites
+   in the live engine where the missing edges surface as linear scans, ranked, with false positives named.
+3. [`homer_continuation_graph_scheduler_plan.md`](homer_continuation_graph_scheduler_plan.md) — the *what*:
+   `HomerDependencyKind`, `HomerWaitRegistration`, `HomerReadyCatalog`, collectors, gates, the migration
+   sequence. Its §"DPU-offloaded grounding" now carries a summary of this doc; §"Dependency resolution
+   model" is where `HomerDependencyResolve()` is specified.
+4. [`dpu_dma_backend_homer_service_current_scheduler_design.md`](dpu_dma_backend_homer_service_current_scheduler_design.md)
+   — the *today*: how progress collectors / actions / grants actually fit together. Read it to see that the
+   **arming** half is already demand-driven and sound; only the execution half scans.
+
+Landed work that this analysis came out of, and that must stay consistent with it:
+
 - [`dpu_command_plane_migration_plan.md`](../../../implementations/citus/transport/dpu_command_plane_migration_plan.md)
-  — D5 (`boundServiceSessionId`), D6 (forward index), D8 (arena publish-line reservation).
+  — **D5** (`boundServiceSessionId` — the reverse cookie, by value; §7), **D6** (the forward index, i.e.
+  continuation-graph edge #1; §7), **D7** (spawn-slot producer partition — unrelated, but the same file),
+  **D8 / S3.0** (reserve the arena's `hostPublishLines[]` while the ABI is still `v1`; §6, §11). Its fact
+  **F2** was corrected by §6 of this doc.

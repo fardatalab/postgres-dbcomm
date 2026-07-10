@@ -4,25 +4,45 @@
 > data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
 > independently — cite them as "command-plane S1a", etc.
 
-**Status (July 9, 2026): IN PROGRESS. S0 ✅, S0b ✅, S1a ✅, S1b ✅, S2 ✅ (citus `008f4f20b`),
+**Status (July 10, 2026): IN PROGRESS. S0 ✅, S0b ✅, S1a ✅, S1b ✅, S2 ✅ (citus `008f4f20b`),
 S3.1 ✅ (citus `c2ec17852`). S5 turned out to be already working — see "S5 IS ALREADY WORKING" below.
-The remaining critical path is S3.2 → S3.3 (doorbell; spawn DMA). This is a PREREQUISITE for
-`pgbench --homer-dpu`, not a follow-on.**
+The remaining critical path is S3.0 → S3.2 → S3.3 (arena publish-line reservation; doorbell; spawn DMA).
+This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
 
 > **Decisions layered on top of the original plan. Read these before implementing anything.**
 > - **D5** — `HomerDpuDmaRingRuntime.boundServiceSessionId`. The descriptor says what the host *declared*;
->   the DPU records what it *bound*. Arena rings are declared before any session exists.
-> - **D6** — the forward index. A session caches refs to its own rings, built at bind. Supersedes D5's
->   `continue`; kills survey findings 2, 6 and 7. Built in S3.3b, cashed in at S4.0.
+>   the DPU records what it *bound*. Arena rings are declared before any session exists. **It is also the
+>   reverse cookie** (`resource → waiter`) — see the scheduler thread below.
+> - **D6** — the forward index (`waiter → resource`). A session caches refs to its own rings, built at bind.
+>   Supersedes D5's `continue`; kills survey findings 2, 6 and 7. Built in S3.3b, cashed in at S4.0.
+>   **It is continuation-graph edge #1.**
 > - **D7** — spawn-slot producer partition. **TRANSITIONAL**; expires at S7.1 into **D7′** (exactly one
 >   claimant).
+> - **D8 / S3.0** — reserve `hostPublishLines[48]` in the arena **now**, while the arena ABI is still `v1`
+>   and only S2 has shipped against it. 3 KiB on a 57 MiB region; no writers, no readers. **⏳ Closing
+>   window:** later it costs an ABI bump and a synchronised two-DPU redeploy.
 > - **S3.5's discovery** — basebackup never spawns a socketless backend, so `pgbench --homer` is the *only*
 >   working regression net for the spawn path. Do not retire it before its replacement's gate passes.
 > - **The spawn wait** — bounded timed spin now; async responder at **S3.7**, a hard prerequisite before any
 >   concurrent-workload measurement.
-> - See also: [`dpu_scheduler_arm_execute_mismatch.md`](../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md)
->   — the survey of *arm from exact demand, execute by linear scan*. Finding 1 sits on the basebackup egress
->   path and is **unscheduled**.
+
+> ## 🧭 This plan feeds a much larger scheduler overhaul. Know that before you touch D5, D6, D8 or S4.0.
+>
+> Three decisions here turned out to be the first hand-built pieces of the async-continuation runtime. The
+> *decisions* live in this doc; the *constraints* live in these:
+>
+> - [`dpu_readiness_collectors_and_continuation_edges.md`](../../../future-directions/citus/transport/dpu_readiness_collectors_and_continuation_edges.md)
+>   — **the root cause.** Everything is polled; a completion queue buys only *aggregation* + *a cookie slot*;
+>   the DPU's ready queue is a hand-rolled CQ **missing the cookie**. Defines the forward index (= D6) and the
+>   reverse cookie (= D5's field), shows where `HomerDependencyResolve()` lands, and is the source of D8.
+>   It also **corrects fact F2 below** (`dpuCreditOffset` *is* read).
+> - [`dpu_scheduler_arm_execute_mismatch.md`](../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md)
+>   — the survey of *arm from exact demand, execute by linear scan*. Findings 2/6/7 **are** D6. Finding 1
+>   sits on the basebackup egress path and is **unscheduled**.
+> - [`homer_continuation_graph_scheduler_plan.md`](../../../future-directions/citus/transport/homer_continuation_graph_scheduler_plan.md)
+>   — the destination.
+>
+> **Do not "fix" the ten scan sites one at a time.** They are one missing edge, ten times.
 
 > **Two decisions supersede the original plan. Read both before implementing S2/S3.**
 > - **D2′ — the doorbell agent bgworker.** The doorbell socket *and* the DOCA export live in a
@@ -1163,6 +1183,17 @@ be truncated back down by whichever process called `EnsureSpawnRegionMapped` fir
    *Rejected: per-session export by the backend.* That is the D4 alternative; it reintroduces DOCA init on
    the session-open path, which is the entire thing D4 exists to avoid.
 
+   > **D5 turned out to be more than a lookup fix, and the field is now load-bearing for later work.**
+   > `boundServiceSessionId` is the **reverse cookie**: the `resource → waiter` edge. A recv-CQ hands back a
+   > `wr_id`; a `doca_pe` task hands back `doca_data` (we use it: `taskUserData.ptr = slot`); a host CPU
+   > store into DOCA-exported memory hands back **nothing**, because there is no `WRITE_WITH_IMM` across
+   > PCIe. So when a collector learns "ring 37 advanced," the map back to the waiter has to be one we keep.
+   > D5 put it, by accident, in exactly the right struct: `HomerDpuDmaRingRuntime` is the *frontier owner*
+   > the continuation-graph plan prescribes, and it already carries every frontier field and no waiter.
+   > **Keep the field there.** It widens to a `HomerWaitRegistration` later — a type change, not a redesign.
+   > See [`dpu_readiness_collectors_and_continuation_edges.md`](../../../future-directions/citus/transport/dpu_readiness_collectors_and_continuation_edges.md)
+   > §7–§8, and the long note at the field itself (`homer_service_dpu_dma.c`).
+
 ##### Two pre-existing bugs in `TupleSinkServiceSubmitBackendSpawnRequest`, found while tracing (fix in S3)
 
 Not on S2's path; do not fix them here. But S3 rewrites this submitter's DPU twin and keeps the host one
@@ -1260,6 +1291,21 @@ the arena by roughly 8×. Do not do it here.
 ## D6 — the forward index: a session holds handles to its rings (decided July 9, 2026)
 
 **Supersedes D5's `continue`. Keeps D5's field.**
+
+> **D6 is continuation-graph edge #1.** It is not a local optimisation. The async-continuation runtime needs
+> two edges, in opposite directions, and **neither exists in the engine today**:
+>
+> | Edge | Direction | Needed by | Today | Status |
+> |---|---|---|---|---|
+> | **forward index** | waiter → resource | *pushers*: "I have a session; which ring do I DMA into?" | `FindDescriptorRef` scans imports × rings, **per transaction** | **this is D6** |
+> | **reverse cookie** | resource → waiter | *collectors*: "ring 37 advanced; who was waiting?" | `FindSelectedSession` scans 64 sessions | D5's field, in weak form; unscheduled |
+>
+> The reverse cookie is where `HomerDependencyResolve()` lands. Full reasoning — why everything is polled,
+> why a completion queue is only *aggregation + a cookie slot*, and why the ready queue is a hand-rolled CQ
+> missing the cookie:
+> [`dpu_readiness_collectors_and_continuation_edges.md`](../../../future-directions/citus/transport/dpu_readiness_collectors_and_continuation_edges.md).
+> The ten places the missing edges surface as linear scans:
+> [`dpu_scheduler_arm_execute_mismatch.md`](../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md).
 
 Both consumers of a session's rings perform a **reverse lookup by linear search**, because the forward map
 was never built:
@@ -1946,6 +1992,28 @@ POST-FIX  POLL-PROBE: ... poll completion referenced an unknown compatibility se
    error; it has now cost three separate investigations. Fix before the next hard bug.
 
 ## Related
+
+### The scheduler / async-continuation thread (read these before touching D5, D6, or S4.0)
+
+Several decisions in this plan turned out to be the first hand-built pieces of a much larger scheduler
+overhaul. They are recorded here as decisions, and *reasoned* there. If you change D5, D6, D8 or S4.0, read
+these first — the constraints live in them.
+
+- [`dpu_readiness_collectors_and_continuation_edges.md`](../../../future-directions/citus/transport/dpu_readiness_collectors_and_continuation_edges.md)
+  — **the root cause.** Everything is polled; a completion queue buys only *aggregation* and *a cookie slot*;
+  the ready queue is a hand-rolled CQ missing the cookie. Defines the **forward index** (= D6) and the
+  **reverse cookie** (= D5's `boundServiceSessionId`), and where `HomerDependencyResolve()` lands. Also
+  corrects this plan's fact **F2**, and is the source of **D8 / S3.0**.
+- [`dpu_scheduler_arm_execute_mismatch.md`](../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md)
+  — **the symptom map.** Ten sites where the engine arms work from exact per-entity demand and then executes
+  it with a linear scan on a type tag, ranked, with false positives named. Findings 2/6/7 *are* D6. Finding 1
+  is on the basebackup egress path and is **unscheduled**.
+- [`homer_continuation_graph_scheduler_plan.md`](../../../future-directions/citus/transport/homer_continuation_graph_scheduler_plan.md)
+  — **the destination.** Its `HomerReadyCatalog` is this engine's ready queue keyed on a continuation rather
+  than a ring; its `HomerWaitRegistration` is the field `HomerDpuDmaRingRuntime` does not yet have.
+
+### The data-plane thread
+
 - [byte_ring_slot_capacity_regression.md](byte_ring_slot_capacity_regression.md) — the descriptor split,
   and the three `--homer-dpu` bring-up runs that exposed the wall.
 - [dpu_byte_ring_pool_per_session_plan.md](dpu_byte_ring_pool_per_session_plan.md) — pool Stage 2 is

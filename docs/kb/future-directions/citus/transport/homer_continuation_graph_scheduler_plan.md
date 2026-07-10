@@ -1207,6 +1207,21 @@ one strand dormant.
 
 ## Current-code migration mapping
 
+> **Some of this runtime has already been hand-built, one edge at a time, by the DPU command-plane
+> migration.** Before designing against the table below, check what landed:
+> [`dpu_command_plane_migration_plan.md`](../../../implementations/citus/transport/dpu_command_plane_migration_plan.md).
+>
+> | Landed decision | What it really is, in this plan's vocabulary | Where |
+> |---|---|---|
+> | **D5** — `HomerDpuDmaRingRuntime.boundServiceSessionId` | the **reverse cookie** (`resource → waiter`), by *value* rather than index+generation. The field sits, by accident, on the exact struct this plan calls the *frontier owner*. Widen it to a `HomerWaitRegistration` and the grouped-control acceptance handler becomes `HomerDependencyResolve()`. | `homer_service_dpu_dma.c`, ~`:9895` |
+> | **D6** — a session caches descriptor refs to its own rings, resolved at bind | the **forward index** (`waiter → resource`). Continuation-graph edge #1. | command-plane S3.3b / S4.0 |
+> | **D8 / S3.0** — reserve `hostPublishLines[]` in the frontend arena | address space for the **shared bitmap collector**, bought while the ABI is cheap. Nothing writes or reads it yet. | command-plane S3.0 |
+> | the ready queue (`readyQueues[7]`, 5 kinds dead) | this plan's `HomerReadyCatalog`, keyed on a **ring** instead of a **continuation**, and missing `registrationGeneration`'s sibling: a cookie. | `homer_service_dpu_dma.c:238`, `:612` |
+> | `HomerDpuDmaGroupedControlOwner.{controlFirstIndex, controlCount}` | the **shared bitmap collector**, written by two contradicting writers and read by nobody. `controlCount` is always 1; an init-time guard now rejects any attempt to half-implement it. | `homer_service_dpu_dma.c:8613`, `:10520` |
+>
+> Full reasoning:
+> [`dpu_readiness_collectors_and_continuation_edges.md`](dpu_readiness_collectors_and_continuation_edges.md).
+
 | Current object | New role |
 |---|---|
 | `HomerProgressActionKind` | Initial `HomerActionKind` executor implementation enum. |
