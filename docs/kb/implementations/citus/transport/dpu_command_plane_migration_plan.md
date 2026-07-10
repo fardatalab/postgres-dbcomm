@@ -4,9 +4,9 @@
 > data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
 > independently — cite them as "command-plane S1a", etc.
 
-**Status (July 9, 2026): IN PROGRESS. S0 ✅, S1a ✅, S1b ✅. S5 turned out to be already working — see
-"S5 IS ALREADY WORKING" below. The remaining critical path is S0b → S2 → S3 (spike; arena + frontend
-agent; spawn trigger). This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
+**Status (July 9, 2026): IN PROGRESS. S0 ✅, S0b ✅, S1a ✅, S1b ✅. S5 turned out to be already working —
+see "S5 IS ALREADY WORKING" below. The remaining critical path is S2 → S3 (arena + frontend agent;
+spawn trigger). This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
 
 > **Two decisions supersede the original plan. Read both before implementing S2/S3.**
 > - **D2′ — the doorbell agent bgworker.** The doorbell socket *and* the DOCA export live in a
@@ -357,23 +357,44 @@ as two mmaps in one setup message.**
 
 ---
 
-## S0b — spike: exporter ≠ reader (DO THIS BEFORE S2)
+## S0b — spike: exporter ≠ reader ✅ **PASSED (July 9, 2026, citus `37cc74b06`)**
 
-**S0 proved DOCA can export a tmpfs `MAP_SHARED` mapping — but its exporter and its reader were the same
-process.** D2′/D4′ need something S0 did not test: process **A** DOCA-exports its mapping of a POSIX shm
-object, the DPU DMA-writes into it, and process **B** — which mapped the same object by name at a
-different VA and never touched DOCA — observes the write.
+**The question.** S0 proved DOCA can export a tmpfs `MAP_SHARED` mapping and DMA into it — but its
+exporter and its reader were the **same process**. D2′/D4′ need them to differ: process **A**
+DOCA-exports its mapping of a POSIX shm object, the DPU DMA-writes into it, and process **B** — which
+mapped the same object by name at a different VA and never touched DOCA — observes the write.
 
 Standard `MAP_SHARED` aliasing says this works. **This project's discipline is not to trust "says."**
-It is the single load-bearing assumption of D2′/D4′, and if it fails the whole doorbell-agent design
+It was the single load-bearing assumption of D2′/D4′: had it failed, the whole doorbell-agent design
 collapses back to a postmaster-owned export plus the four-point core patch.
 
-**Method (~30 min):** the TCP transport smoke already exports POSIX shm (`--export-posix-shm`). Add
-`--fork-reader`: do not `shm_unlink` immediately; `fork()` a child that `shm_open`s the same name and
-`mmap`s it; after the DPU's response publication lands, the **child** validates the DMA'd bytes and
-reports. Parent never reads them.
+**Result.**
+```
+FORK-READER: exporter_va=0x7f3794bc6000 reader_va=0x7f3794865000 distinct_va=YES
+FORK-READER: observed the DPU's DMA write through its OWN mapping state=4 command_seq=7001
+             -- exporter != reader CONFIRMED
+homer_dpu_tcp_transport_smoke: ok    (rc=0, all six legs, no /dev/shm leak)
+```
+A process holding **no DOCA handle**, mapping the object at a **different virtual address**, observed
+the DPU's PCIe DMA write. The DMA lands in the **page-cache pages of the shm object**; the exporter's
+host VA is only an offset key. **D2′/D4′ stand.**
 
-**Gate:** the child observes the DPU's DMA write. Then, and only then, start S2.
+**How to run it:** `--export-posix-shm --fork-reader` on the TCP transport smoke. The child `munmap`s
+the mapping it inherited, reserves the vacated range with `MAP_FIXED|PROT_NONE` so the next `mmap`
+cannot reuse the exporter's address, `shm_open`s the object by name, maps it at its own VA, and
+verifies the DPU's response publication. **The child's exit status gates the smoke's exit code.**
+
+**Two bugs in the first cut of this spike, both instructive:**
+- The child got the **same** virtual address — the kernel handed back the hole the `munmap` had just
+  left. It "passed" while proving nothing about VA independence. Hence the `MAP_FIXED` placeholder, and
+  landing on the exporter's VA is now **INCONCLUSIVE, not a pass**.
+- The child's verdict line **never printed**: `_exit()` does not flush stdio. *A spike whose evidence
+  can silently vanish is exactly the failure mode this smoke already had once.* The child now flushes
+  explicitly; the parent `fflush(NULL)`s before forking so the child cannot duplicate its buffer.
+
+**Caveat.** The spike's reader is a *descendant* of the exporter; in D2′ the reader (postmaster) is the
+*parent* of the exporter (agent). Aliasing is symmetric, and the child re-opens the object **by name**
+rather than relying on inheritance, so provenance is clean either way.
 
 ---
 
@@ -793,12 +814,12 @@ this point). Build all targets, including the smokes.
 > **New source files, not more of `tuple_sink_service_process.c` (43,090 lines).** Everything below
 > lands in dedicated translation units. The existing 43k-line hub gets *call sites only*.
 
+**Two new TUs, one per side** (decided with the user — four was over-split):
+
 | New file (citus `src/backend/distributed/utils/homer/`) | Owns |
 |---|---|
-| `homer_backend_arena.{c,h}` | arena ABI + layout, create (postmaster), map (agent/backend), slot bind/unbind |
-| `homer_frontend_agent.{c,h}` | the bgworker: registration, DOCA export via S1b, setup send, doorbell connect/backoff/recv, `kill(PostmasterPid, SIGUSR1)` |
-| `homer_service_dpu_doorbell_tcp.{c,h}` | DPU side: the doorbell listener (its own port, **separate** from the serial setup listener), one persistent connection per attached host, **EOF ⇒ invalidate that import** |
-| `homer_service_dpu_spawn.{c,h}` | DPU side: DMA the spawn slot + ring the doorbell (S3) |
+| `homer_frontend_agent.{c,h}` | **host side.** Arena ABI + layout; create (postmaster), map (agent/backend), slot bind/unbind. The bgworker itself: registration, DOCA export via the S1b API, setup send, doorbell connect/backoff/recv, `kill(PostmasterPid, SIGUSR1)`. |
+| `homer_service_dpu_doorbell.{c,h}` | **DPU side.** The doorbell listener (its own port, **separate** from the serial setup listener), one persistent connection per attached host, **EOF ⇒ invalidate that import**; and the DMA-the-spawn-slot + ring-the-doorbell path (S3). |
 
 - **S2.1** Postmaster creates the arena at `_PG_init` (`!IsUnderPostmaster`, beside
   `EnsureSpawnRegionMapped`): a named POSIX shm object holding `N = 16` slots of
@@ -830,7 +851,7 @@ this point). Build all targets, including the smokes.
 - **S3.3** DPU service: replace `TupleSinkServiceSubmitBackendSpawnRequest`'s `shm_open`
   (`tuple_sink_service_process.c:18833`+) with a DMA write into the imported spawn region — **fields
   first, then `REQUEST_READY` with a release barrier, each awaited** — then one `SPAWN_DOORBELL` frame.
-  Body in `homer_service_dpu_spawn.c`; the hub keeps only the call.
+  Body in `homer_service_dpu_doorbell.c`; the 43k-line hub keeps only the call.
 - **S3.4** DPU service: on doorbell **EOF**, invalidate that bridge generation's import. The exporter is
   gone; its pages are unpinned; DMA into them is a memory-corruption bug. **Hard requirement, not an
   optimisation** (see D2′).
@@ -843,7 +864,7 @@ this point). Build all targets, including the smokes.
 
 | | Risk | Mitigation |
 |---|---|---|
-| R1 | **exporter ≠ reader** aliasing (load-bearing) | **S0b spike, before S2** |
+| R1 | ~~**exporter ≠ reader** aliasing (load-bearing)~~ | **CLEARED — S0b passed** (citus `37cc74b06`) |
 | R2 | DOCA ~100 MB single-region ceiling | N = 16 ⇒ ≈ 57 MiB; growth path is `mmapExportCount > 1`, already in the ABI |
 | R3 | agent death unpins exported pages mid-DMA | doorbell EOF ⇒ invalidate import (S3.4) |
 | R4 | DOCA state across `fork()` | agent is a leaf process; postmaster never touches DOCA |

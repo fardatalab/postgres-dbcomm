@@ -116,14 +116,20 @@ Three things about this smoke that each cost a cycle (validated July 9, 2026, ci
   --timeout-ms 45000 \
   --expect-loop2-backpressure
 
-# On farnet1 host: all six legs. --export-posix-shm additionally exports a tmpfs
-# MAP_SHARED region instead of anonymous heap (the shape the postmaster's spawn
-# region has); it is the S0 command-plane-migration proof and should stay green.
+# On farnet1 host: all six legs. Two command-plane-migration proofs ride along and
+# should stay green:
+#   --export-posix-shm  exports a tmpfs MAP_SHARED region instead of anonymous heap
+#                       (the shape the postmaster's spawn region has)   -- spike S0
+#   --fork-reader       forks a child that re-maps that object BY NAME at its own VA,
+#                       touches no DOCA, and must observe the DPU's DMA write; its
+#                       exit status gates the smoke's exit code          -- spike S0b
 ./build/homer/homer_dpu_tcp_transport_smoke --client \
   --host 10.10.1.201 \
   --dev-pci 0000:21:00.0 \
   --port 9727 \
   --timeout-ms 40000 \
+  --export-posix-shm \
+  --fork-reader \
   --expect-backend-command-publish \
   --expect-response-publish \
   --expect-backend-completion-pull \
