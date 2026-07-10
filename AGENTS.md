@@ -120,8 +120,16 @@ Three things about this smoke that each cost a cycle (validated July 9, 2026, ci
 # GENERAL RULE for every process in this project: `pkill -f <substring>` from an ssh one-liner or a
 # `bash -c` wrapper matches its OWN command line. This has silently killed the ssh session, and it has
 # silently NOT killed the target (leaving a stale service that then fails "Address already in use").
-# Prefer `pkill -x <exact-comm>` (matches the process name, never the wrapper's argv), or resolve the
-# pid with `pgrep` and `kill` it, or put the pattern inside a script file so the caller's argv differs.
+#
+# `pkill -x <name>` does NOT rescue you either: it matches /proc/<pid>/comm, which the kernel truncates
+# to 15 characters. `citus_tuple_sink_service` is `citus_tuple_sin` there, so `pkill -x
+# citus_tuple_sink_service` matches nothing and silently succeeds. Verify with `cat /proc/<pid>/comm`.
+#
+# What actually works: resolve the pid first and kill it --
+#   for p in $(pgrep -f 'homer/citus_tuple_sink_service'); do sudo -n kill -9 "$p"; done
+# -- run from a script file (so the caller's own argv does not contain the pattern), or filter the
+# caller out by pid. Note `sudo -n pkill` is also needed when the target runs as `dbcomm`; a plain
+# `pkill` reports "Operation not permitted" and leaves the process alive.
 ./homer_dpu_tcp_transport_smoke --server \
   --dev-pci 0000:03:00.0 \
   --port 9727 \
