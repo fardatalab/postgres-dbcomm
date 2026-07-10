@@ -283,11 +283,27 @@ connection**, `bgw_start_time = BgWorkerStart_PostmasterStart`, `bgw_restart_tim
    hazard we tolerate.*
 2. **Open question 6 dissolves.** "The postmaster's doorbell fd must be closed in every forked child" —
    there is no postmaster fd. Backends are siblings of the agent and inherit nothing from it.
-3. **The doorbell connection becomes the exporter's LIVENESS BEACON.** If the exporter dies, its pages
-   unpin while the DPU may still be DMA-ing into them — a memory-corruption class bug. Because the agent
-   holds *both* the export and the persistent doorbell socket, **doorbell EOF ⇒ that exporter is gone ⇒
-   the DPU must invalidate the import.** A postmaster-owned export has no such signal. **This is now a
-   hard requirement on the DPU doorbell listener**, not an optimisation.
+3. **The doorbell connection is a DIAGNOSTIC liveness beacon** (downgraded — see below). Because the
+   agent holds *both* the export and the persistent doorbell socket, **doorbell EOF ⇒ that exporter is
+   gone.** Useful for attributing the failure; **not** a safety mechanism.
+
+> **⚠ CORRECTED (July 9, 2026).** An earlier revision called this a *hard requirement*, on the grounds
+> that an agent crash "unpins its pages while the DPU may still be DMA-ing into them — a
+> memory-corruption class bug." **That was overstated, twice:**
+> - **The postmaster keeps the arena mapped**, so its pages cannot be freed and reused. A stale DMA
+>   would land in the arena's *own* pages, not in unrelated memory.
+> - With the IOMMU on, a torn-down registration makes the DPU's write **fault**, not land silently.
+>
+> The real consequence of an agent crash is a **fatal engine error on the DPU service** — and that is
+> the behaviour we want. **Decided with the user: the agent must not crash; if it does, that is a bug,
+> and failing loudly and fatally is correct.** No graceful re-export, no recovery path.
+>
+> **Consequently RETRACTED:** an earlier draft proposed reclassifying `DOCA_ERROR_IO_FAILED` on
+> command/response/completion tasks from fatal to "export lost, recover". That would weaken a
+> *deliberate* guard. `HomerDpuDmaRetireStaleGroupedControlImport`
+> (`homer_service_dpu_dma.c:8342`) says so explicitly: *"Treat only that discovery-read failure as
+> stale import removal; command, response, and backend-completion task failures remain fatal
+> correctness bugs."* Leave it fatal.
 
 ### The sequence
 
@@ -394,7 +410,61 @@ verifies the DPU's response publication. **The child's exit status gates the smo
 
 **Caveat.** The spike's reader is a *descendant* of the exporter; in D2′ the reader (postmaster) is the
 *parent* of the exporter (agent). Aliasing is symmetric, and the child re-opens the object **by name**
-rather than relying on inheritance, so provenance is clean either way.
+rather than relying on inheritance, so provenance is clean either way. The child also `closefrom(3)`s
+before mapping, so it holds **no inherited DOCA descriptor** — matching the postmaster, which never has
+one. (`fork()` copies the descriptor *table*; the parent's registration is untouched.)
+
+### The mechanism, from the DOCA 3.2.0118 headers
+
+Read alongside the empirical result. **Documentation alone would NOT have sufficed** — it explains *why*
+it works but never promises it.
+
+- `doca_mmap_set_memrange` takes "the start address of the memory range." Its documented restrictions
+  concern object state, one-time configuration, and `addr + len` overflow — **nothing about anonymous vs
+  file-backed vs tmpfs vs hugepages** (`doca_mmap.h:404-427`).
+- `doca_mmap_start()` can fail because "the kernel failed to pin the requested amount of memory"
+  (`:124-152`) — so registration **pins pages**.
+- The export blob is **opaque**: DOCA calls it a serialized mmap representation and never says whether it
+  carries virtual, physical, or IOVA addresses (`:252-261`).
+- The DPU-side import is "not backed by local memory" (`:354-398`), and
+  `doca_buf_inventory_buf_get_by_addr()` forwards `(addr, len)` into a lookup against the imported range,
+  rejecting an address with "no suitable memory range" (`doca_buf_inventory.h:138-204`).
+- **No PASID / ATS / SVA / per-process IOMMU domain / bounce buffer** appears anywhere in this path. The
+  exposed model is a device *protection domain* (`doca_dev.h:160-181`) plus a device-associated mmap
+  memory key (`doca_mmap.h:567-584`) — conventional pinned registered memory.
+- NVIDIA's own `dma_copy` sample transports `host_addr` **separately** from the export blob and hands it
+  to `buf_get_by_addr` on the DPU (`applications/dma_copy/dma_copy_core.c:709-729`, `:1194-1215`); and
+  `file_compression` registers a `MAP_SHARED` **file** mapping (`file_compression_core.c:536-560`).
+
+**Our own ABI already said this**: `hostRingAddress` is *"only an address token for DOCA buffer
+construction against the imported mmap"* (`homer_dpu_bridge_abi.h:190-194`).
+
+**Graceful teardown is documented**: `doca_mmap_stop()` invalidates every mmap created from its export
+(`doca_mmap.h:154-160`) and `doca_mmap_destroy()` implicitly stops (`:104-122`). **Ungraceful exporter
+death is not documented at all** — see the R3 decision in D2′: the agent must not crash, and a fatal DPU
+engine error is the correct outcome if it does.
+
+**What DOCA still does not promise:** that `doca_mmap_start()` pins the *tmpfs page-cache* pages rather
+than some process-affine representation, nor anything about cross-process cache visibility. That is
+precisely the gap S0b closed.
+
+### Prior art: the Tier-2 path already implements exporter ≠ reader
+
+Found while investigating. The GUC-gated, unexercised `SELECTED_DPU_DMA` path is **already exactly this
+shape**:
+- process A creates named shm objects and maps them `MAP_SHARED`
+  (`homer_frontend_dma_lifecycle.c:475-501`) and DOCA-exports those mailbox mappings
+  (`homer_frontend_dma.c:1267-1279`);
+- process B independently `shm_open`s the same names and maps them `MAP_SHARED`
+  (`remote_execution_backend_bridge.c:2610-2674`);
+- B polls the **DPU-written publication epoch** through its own mapping (`:423-476`).
+
+So a third piece of the architecture — after the descriptor roles and the transport-agnostic control
+dispatcher — turns out to have been anticipated. But it is **Tier 2**: source expressing an assumption is
+not evidence the hardware honours it, which is exactly why S0b was worth thirty minutes.
+
+> **Read it before deleting it.** S2.5 retires that path. It is currently the *only* implementation of
+> the exporter ≠ reader shape we are about to build — mine it for patterns first.
 
 ---
 
@@ -836,6 +906,8 @@ this point). Build all targets, including the smokes.
   inheritance required.**
 - **S2.5** Retire the Tier-2 `SELECTED_DPU_DMA` mailbox-open path in
   `remote_execution_backend_bridge.c` (`:2572`-`:2669`) — superseded, and never exercised.
+  **But read it first:** it is currently the only implementation of the exporter ≠ reader shape (see
+  "Prior art" under S0b). Mine it for patterns before deleting it.
 
 **Gate:** the DPU service's engine shows host mmap imports for the arena and the spawn region
 (`HomerDpuDmaImportHostMmapDescriptorForSetup`) — the exact thing whose absence caused the three-run hang.
@@ -852,9 +924,12 @@ this point). Build all targets, including the smokes.
   (`tuple_sink_service_process.c:18833`+) with a DMA write into the imported spawn region — **fields
   first, then `REQUEST_READY` with a release barrier, each awaited** — then one `SPAWN_DOORBELL` frame.
   Body in `homer_service_dpu_doorbell.c`; the 43k-line hub keeps only the call.
-- **S3.4** DPU service: on doorbell **EOF**, invalidate that bridge generation's import. The exporter is
-  gone; its pages are unpinned; DMA into them is a memory-corruption bug. **Hard requirement, not an
-  optimisation** (see D2′).
+- **S3.4** DPU service: on doorbell **EOF**, log loudly that the frontend agent for that
+  `bridgeGeneration` is gone, and begin the existing import teardown
+  (`HomerDpuDmaBeginHostMmapImportTeardown`, `homer_service_dpu_dma.c:6964` — the same path a graceful
+  setup `CLOSE` drives). **Diagnostics and clean shutdown, not a recovery path**: a subsequent DMA
+  against a dead export is *supposed* to be fatal (see D2′ correction). Do **not** reclassify
+  `DOCA_ERROR_IO_FAILED` as recoverable.
 - **S3.5** Keep the host-service `shm_open` submitter intact for the non-DPU `--homer` path.
 
 **Gate:** a DPU service causes a socketless backend to be forked on its own host. Assert the ordering
@@ -866,7 +941,7 @@ this point). Build all targets, including the smokes.
 |---|---|---|
 | R1 | ~~**exporter ≠ reader** aliasing (load-bearing)~~ | **CLEARED — S0b passed** (citus `37cc74b06`) |
 | R2 | DOCA ~100 MB single-region ceiling | N = 16 ⇒ ≈ 57 MiB; growth path is `mmapExportCount > 1`, already in the ABI |
-| R3 | agent death unpins exported pages mid-DMA | doorbell EOF ⇒ invalidate import (S3.4) |
+| R3 | agent death mid-DMA | **DOWNGRADED.** The agent must not crash; if it does that is a bug and a fatal DPU engine error is the correct outcome. Postmaster keeps the arena mapped, so pages cannot be recycled. Doorbell EOF is logged for attribution (S3.4), not for recovery. |
 | R4 | DOCA state across `fork()` | agent is a leaf process; postmaster never touches DOCA |
 | R5 | agent `shm_open` races postmaster creation | postmaster creates in `_PG_init`, before the agent starts; agent retries with backoff regardless |
 | R6 | bridge-generation churn on agent restart | R3 closes the old import; new export mints a new generation |
