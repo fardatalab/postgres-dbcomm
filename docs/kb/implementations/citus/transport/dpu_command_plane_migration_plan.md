@@ -4,9 +4,19 @@
 > data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
 > independently — cite them as "command-plane S1a", etc.
 
-**Status (July 9, 2026): IN PROGRESS. S0 ✅, S1a ✅. S5 turned out to be already working — see
-"S5 IS ALREADY WORKING" below. The whole remaining critical path is S2 + S3 (postmaster arena +
-spawn trigger). This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
+**Status (July 9, 2026): IN PROGRESS. S0 ✅, S1a ✅, S1b ✅. S5 turned out to be already working — see
+"S5 IS ALREADY WORKING" below. The remaining critical path is S0b → S2 → S3 (spike; arena + frontend
+agent; spawn trigger). This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
+
+> **Two decisions supersede the original plan. Read both before implementing S2/S3.**
+> - **D2′ — the doorbell agent bgworker.** The doorbell socket *and* the DOCA export live in a
+>   `shared_preload_libraries` background worker, **not** the postmaster. **Zero PostgreSQL core
+>   changes**, because `postmaster_sigusr1_hook` already exists in our fork and is Tier 1. The original
+>   D2 (postmaster owns the fd; new hook into `pm_wait_set`) is **retracted**.
+> - **D4′ — the arena is named POSIX shm, addressed by offset.** Backends `shm_open` it; they need not
+>   inherit it by `fork()`. Exporter (agent) and readers (postmaster, backends) are different processes
+>   at different VAs aliasing the same physical pages. **That aliasing is the single load-bearing
+>   assumption of the design — prove it in S0b before writing a line of S2.**
 
 **Runbook for the S1a gate** (all four roles, farnet0 as the client node):
 ```sh
@@ -184,6 +194,12 @@ raw byte onto it:
    doorbell could arrive while the host is blocked waiting for a `CLOSE_ACK`, and the host reader would
    have to demultiplex an interleaved request/response + notification stream.
 
+> ## ⚠ SUPERSEDED — see "D2′ — the doorbell agent bgworker" below
+>
+> Everything in this D2 section about the **postmaster** owning the doorbell socket and about adding a
+> hook to `pm_wait_set` is **retracted**. The framing and the protocol survive; the process that holds
+> the socket does not. Read D2′ before implementing.
+
 **Chosen: a DEDICATED doorbell connection on its OWN LISTENER (Option B).**
 
 > **CORRECTED on review.** An earlier draft said "a second connection to the same setup listener".
@@ -214,21 +230,152 @@ postmaster, and — decisively — a persistent connection starves the serial se
 *Rejected (Option C): a bgworker or agent that owns the socket and raises SIGUSR1.* An extra process
 and a poll loop to solve what an already-watched fd solves.
 
-#### The sequence
+---
 
-1. Postmaster: at startup, DOCA-mmap its own spawn region, export it over the setup TCP, and open the
-   dedicated doorbell connection.
-2. Postmaster: add the doorbell fd to its main-loop wait set.
-3. DPU: DMA the slot (fields, then `REQUEST_READY`, each awaited), then send one `SPAWN_DOORBELL`.
-4. Postmaster: wakes on the fd, drains it, runs the **existing** slot scan + `ProcessSpawnRequestSlot`.
+## D2′ — the doorbell agent bgworker (SUPERSEDES D2's process placement)
 
-*No polling, no sleep, no background worker; the SIGUSR1 hop is replaced rather than emulated.*
+**Decided July 9, 2026, after scoping the postmaster seam. Zero PostgreSQL core changes.**
 
-**Postmaster hygiene (decided, not open).** Upstream PostgreSQL keeps the postmaster minimal out of
-extreme engineering caution; we do not have to follow that strictly. **The bar is: the normal path must
-never fatally break the postmaster** — and if it does, that is our bug, not a reason to redesign. A
-failed `recv()` degrades to close / rescan / reconnect. Keep the receiver parse-free so there is no
-input a malformed stream can exploit.
+### Why D2 was wrong
+
+D2 put the doorbell socket in the postmaster and had it wake on the fd. That needs **four** touch points
+in `postmaster.c`, all new core surface:
+1. `ConfigurePostmasterWaitSet` (`:1605`) sizes the set exactly:
+   `CreateWaitEventSet(NULL, accept_connections ? (1 + NumListenSockets) : 1)`.
+2. …so a hook is needed there to add extra events.
+3. `WaitEvent events[MAXLISTEN]` (`:1632`) must grow.
+4. `ServerLoop` handles only `WL_LATCH_SET` and `WL_SOCKET_ACCEPT` (`:1673`) — a new dispatch arm is
+   needed for a readable, non-accept fd.
+
+**But `postmaster_sigusr1_hook` ALREADY EXISTS in our fork** (`src/include/postmaster/postmaster.h:18`,
+`src/backend/postmaster/postmaster.c:180`), invoked at the end of `process_pm_pmsignal()` (`:3977`),
+which `ServerLoop` runs when the signal handler sets `pending_pm_pmsignal`. **It is TIER 1** — every
+`--homer` run spawns socketless backends through it, driven by an *arbitrary non-child process* doing
+`kill(postmasterPid, SIGUSR1)` (`tuple_sink_service_process.c:18927`).
+
+So a process that owns the doorbell socket and raises `SIGUSR1` needs **no core change at all**.
+
+*The original rejection of this ("Option C: an extra process and a poll loop") was wrong twice:* it is a
+**blocking `recv()`**, not a poll loop; and the "already-watched fd" alternative costs a core patch that
+upstream would never take and we would carry forever.
+
+### The design
+
+A `shared_preload_libraries` **background worker** — the **Homer frontend agent** — owns *both* the DOCA
+export and the doorbell socket. The postmaster does **no DOCA and holds no socket**.
+
+| Process | Does | Does NOT |
+|---|---|---|
+| **postmaster** | creates + `mmap`s the arena and spawn region (POSIX shm, as `EnsureSpawnRegionMapped` already does); runs its existing SIGUSR1 hook → existing slot scan | touch DOCA; hold any socket; gain any new core hook |
+| **frontend agent** (bgworker) | `shm_open`s both regions, DOCA-exports them via the **S1b** API, sends the setup message, holds the doorbell connection, `recv()`s, `kill(PostmasterPid, SIGUSR1)` | fork backends; parse doorbell frames |
+| **socketless backend** | `shm_open`s the arena, binds a mailbox slot | touch DOCA; open a setup connection |
+
+Registration mirrors the existing citus daemon: `InitializeCitusBackgroundWorker` +
+`RegisterBackgroundWorker` from `_PG_init` (`shared_library_init.c:512`, right beside
+`CitusInstallRemoteExecutionBackendHooks()` at `:525`). Flags `BGWORKER_SHMEM_ACCESS`, **no database
+connection**, `bgw_start_time = BgWorkerStart_PostmasterStart`, `bgw_restart_time = 5s`.
+
+### Three properties this buys, beyond "no core patch"
+
+1. **DOCA never runs in the postmaster.** The postmaster forks every backend; inheriting a DOCA device's
+   fds and internal state (possibly threads) across `fork()` is exactly the kind of thing that fails
+   rarely and mysteriously. The agent is a leaf process. *This is now a positive design property, not a
+   hazard we tolerate.*
+2. **Open question 6 dissolves.** "The postmaster's doorbell fd must be closed in every forked child" —
+   there is no postmaster fd. Backends are siblings of the agent and inherit nothing from it.
+3. **The doorbell connection becomes the exporter's LIVENESS BEACON.** If the exporter dies, its pages
+   unpin while the DPU may still be DMA-ing into them — a memory-corruption class bug. Because the agent
+   holds *both* the export and the persistent doorbell socket, **doorbell EOF ⇒ that exporter is gone ⇒
+   the DPU must invalidate the import.** A postmaster-owned export has no such signal. **This is now a
+   hard requirement on the DPU doorbell listener**, not an optimisation.
+
+### The sequence
+
+1. **Postmaster** (`_PG_init`, `!IsUnderPostmaster`): create + `mmap` the spawn region (unchanged) and
+   the new arena. Register the agent bgworker.
+2. **Agent**: `shm_open` + `mmap` both regions; `HomerDpuFrontendExportRegion` each (S1b); build one setup
+   message carrying **two** mmap exports; `HomerDpuFrontendSendSetup`; then connect the doorbell listener
+   and send `DOORBELL_ATTACH`.
+3. **DPU**: DMA the spawn slot (fields → await; then `state = REQUEST_READY` release → await), **then**
+   send one `SPAWN_DOORBELL`. *(The ⚠ DMA-BEFORE-DOORBELL invariant at the top is unchanged and still
+   the easiest thing here to get wrong.)*
+4. **Agent**: `recv()` returns; drain to `EAGAIN` **without parsing**; `kill(PostmasterPid, SIGUSR1)`.
+5. **Postmaster**: existing hook, existing slot scan, existing `ProcessSpawnRequestSlot`. Rescan is
+   idempotent, so coalescing N doorbells into one wake is correct by construction.
+6. **Agent dies** → socket closes → DPU sees EOF → invalidates the import. Postmaster restarts the agent
+   → fresh export, fresh `bridgeGeneration`.
+
+**Cost:** one signal hop (µs) on a path whose next step is a `fork()` (hundreds of µs). Irrelevant.
+
+**Hygiene.** The agent is an ordinary backend-like process; a failed `recv()` degrades to close / rescan
+/ reconnect with bounded backoff. Keep the receiver **parse-free**: it cannot mis-drive the postmaster
+with input it never parses.
+
+---
+
+## D4′ — the arena is POSIX shm, addressed by offset (REFINES D4)
+
+D4 said backends inherit the arena "by `fork()` after the postmaster `mmap`s it". **Not required, and it
+was the wrong reason.** The arena is a **named POSIX shm object**, exactly like the spawn region, so any
+process maps it by name — postmaster, agent, and backends alike. What D4 actually buys survives intact:
+**one DOCA context per node, one export, and backends that do no DOCA.**
+
+The load-bearing consequence is that **the exporter and the readers are different processes at different
+virtual addresses.** Bridge descriptors already address as `hostRingAddress` (the exporter's base VA) +
+`hostRingOffset`, so the DPU writes at the *agent's* VA and the postmaster/backends observe it through
+their own mappings of the same physical pages. **That aliasing is the single load-bearing assumption of
+this whole design — see S0b.**
+
+### Sizing (measured July 9, 2026)
+
+| Component | bytes |
+|---|---|
+| `CitusRemoteExecBackendSpawnRegion` (32 slots) | 17,424 |
+| `CitusRemoteExecLocalCommandMailbox` (role 2) | **3,202,584** (3.05 MiB) |
+| `CitusRemoteExecLocalCompletionMailbox` (role 3) | 270,552 (264 KiB) |
+| SQL result byte ring (role 5, 256 × 1024) | 262,144 (256 KiB) |
+| **per backend slot** | **≈ 3.56 MiB** |
+
+A **single DOCA-registered region has a ~100 MB ceiling** (recorded in
+`dpu_byte_ring_pool_per_session_plan.md:175` — raising the landing region to 100 MB crashed DOCA). So:
+
+| N backend slots | arena size | verdict |
+|---|---|---|
+| 8 | ≈ 28.5 MiB | fine |
+| **16** | **≈ 57 MiB** | **chosen** — ample headroom, ≫ pgbench `-c 4` |
+| 32 | ≈ 114 MiB | **over the ceiling** — would need splitting |
+
+**Decision: N = 16.** If it must grow, split the arena across several DOCA mmaps — **the setup ABI already
+supports this**: `HomerDpuComchSetupHeader.mmapExportCount` (`homer_dpu_comch_abi.h:75`),
+`HomerDpuComchSetupMessageBytesForExports(ringCount, mmapExportCount, ...)` (`:177`), and each descriptor
+names its mapping through `mmapExportId` (`:99`). `HomerDpuComchSetupMessageBytes` is just the
+`count == 1` convenience wrapper. **This is also why the agent can export the spawn region and the arena
+as two mmaps in one setup message.**
+
+> Note the 3.05 MiB command mailbox is the same bloat as the 66 KiB control slot: 64 slots of a
+> fixed-size record. Shrinking the ABI unions (S4 perf item, fix 3) shrinks the arena too.
+
+---
+
+## S0b — spike: exporter ≠ reader (DO THIS BEFORE S2)
+
+**S0 proved DOCA can export a tmpfs `MAP_SHARED` mapping — but its exporter and its reader were the same
+process.** D2′/D4′ need something S0 did not test: process **A** DOCA-exports its mapping of a POSIX shm
+object, the DPU DMA-writes into it, and process **B** — which mapped the same object by name at a
+different VA and never touched DOCA — observes the write.
+
+Standard `MAP_SHARED` aliasing says this works. **This project's discipline is not to trust "says."**
+It is the single load-bearing assumption of D2′/D4′, and if it fails the whole doorbell-agent design
+collapses back to a postmaster-owned export plus the four-point core patch.
+
+**Method (~30 min):** the TCP transport smoke already exports POSIX shm (`--export-posix-shm`). Add
+`--fork-reader`: do not `shm_unlink` immediately; `fork()` a child that `shm_open`s the same name and
+`mmap`s it; after the DPU's response publication lands, the **child** validates the DMA'd bytes and
+reports. Parent never reads them.
+
+**Gate:** the child observes the DPU's DMA write. Then, and only then, start S2.
+
+---
 
 ### D4 — the postmaster exports a per-node ARENA; backends inherit it by `fork()`
 
@@ -465,6 +612,57 @@ simply becomes DPU-local memory nobody else maps. **It likely survives the move 
 > `IBV_SEND_INLINE` (`:19883`-`:19894`), where the HCA copies the payload into the WQE and the MR is
 > nearly vestigial — but a pgbench `UPDATE`/`SELECT` record exceeds 124 bytes, so the normal path is the
 > registered one.
+
+### 📌 S4-stage perf item: the command pull moves 67,912 bytes to carry a few hundred
+
+**Measured, July 9, 2026.** `sizeof(CitusRemoteExecControlSlot) == 67912`. `HomerDpuDmaSubmitOneCommandPull`
+DMAs the **entire slot** every time — `doca_buf_set_data(srcBuf, srcAddress, sizeof(CitusRemoteExecControlSlot))`
+— regardless of the request in it:
+
+| | bytes |
+|---|---|
+| `CitusRemoteExecControlSlot` (what we DMA) | **67,912** |
+| ├─ request union | 33,784 (all of it is `OpenSessionRequest`) |
+| └─ response union | 34,112 (`CommandCompletion` is 33,816 of it) |
+| `PollCommandCompletionRequest` (actual payload) | 40 |
+| a pgbench `START_COMMAND` | a few hundred meaningful bytes |
+
+Harmless today — control slots carry only `OPEN`/`CLOSE`. **From S4 on, `START_COMMAND` is per
+transaction**, so this becomes a ~66 KiB PCIe read on the measured path. Same family as
+"direct PCI-source RDMA" above: *don't move bytes you don't need.*
+
+**Do not pre-optimize. Measure at S4/S6.** If it bites, the fix ladder, cheapest first:
+1. **Two-phase pull.** DMA a small fixed prefix (slot header + request header, ~512 B). The request
+   header carries `payloadBytes`; issue a second pull only if the request exceeds the prefix. For
+   pgbench that is one ~512-byte DMA instead of 67,912. **No ABI change.**
+2. **Advertise the length up front.** The grouped-control read of the host publish line *already*
+   precedes every pull, so the client could stamp the request byte length there and the DPU could pull
+   exactly that much — **no extra round trip.** Costs a field in `HomerDpuBridgeHostPublishLine`.
+3. **Shrink the unions.** 33.8 KiB per side is fixed-size arrays (`CommandCompletion` alone is 33,816).
+   An ABI change, but it shrinks the control slot, the client's export buffer, *and* the mailboxes.
+
+#### Why the per-ring scratch buffer is part of THIS item, not a separate one
+
+The obvious-looking cleanup — give each ring its own pull buffer and delete
+`commandPullBufferInUse[]` + `HomerDpuDmaFindFreeCommandPullBuffer` — is **not a perf win and is
+currently a memory regression**:
+
+- The free-list scan is 64 `bool`s = **one cache line**, a few ns, against a **67,912-byte** PCIe DMA on
+  the same request. Three orders of magnitude apart. Optimising the scan is optimising the wrong thing.
+- Per-ring ownership costs `67,912 × rings`. At `hostMmapImportCapacity = 1024` that is **66 MiB** of DPU
+  memory versus **4.1 MiB** for the 64-slot pool. Lazy allocation fixes the memory but puts an allocation
+  on the control path.
+- It touches **three** pools (`commandPullBufferInUse`, `commandResponseBufferInUse`, `controlCellInUse`,
+  all sized by `commandPullBufferCount`) plus the `localBufferIndex` validation in
+  `HomerDpuDmaAcceptCommandPullSlot`.
+
+**Strong suspicion: the global pool exists BECAUSE the slot is 66 KiB.** Per-ring is the natural design —
+`ringRuntime->lastCommandBufferIndex` is already per-ring — and whoever wrote it hit the memory wall and
+pooled instead. **Shrink the slot (fix 3) and per-ring ownership becomes nearly free**, deleting a shared
+mutable pool, an exhaustion mode, and an artificial 64-concurrent-session cap that is inconsistent with
+`hostMmapImportCapacity = 1024`.
+
+**So: if the 66 KiB DMA turns out to matter, solve both together.** Do not do the per-ring change alone.
 >
 > **Rename** `clientSqlCommandScratchRegionHandle` → `clientSqlCommandMailboxRegionHandle` as part of
 > the pending scoped rename (see `byte_ring_slot_capacity_regression.md`). A name that describes a
@@ -590,52 +788,68 @@ drag DOCA into every translation unit that includes it.
 **Gate:** the selected-DPU basebackup regression still passes (the module's only validated consumer at
 this point). Build all targets, including the smokes.
 
-### S2 — the node's Homer frontend is the postmaster; backends bind arena slots (D1 + D4)
-- **S2.1** Postmaster creates the arena at startup: spawn region + `N` x {role-2 command mailbox,
-  role-3 completion mailbox, role-5 result byte-ring}. `mmap` it BEFORE any fork.
-- **S2.2** Postmaster DOCA-exports the whole arena once via the S1b module, declaring every descriptor.
-- **S2.3** The spawned backend binds a slot index (prefer-own / adopt-free / fatal-on-exhaustion,
-  mirroring `HomerDpuByteRingBind`). It performs **no DOCA and no setup connection**; it inherited the
-  mapping through `fork()`.
-- **S2.4** Retire the Tier-2 `SELECTED_DPU_DMA` mailbox-open path in
+### S2 — the arena + the frontend agent (D1 + D4′)
+
+> **New source files, not more of `tuple_sink_service_process.c` (43,090 lines).** Everything below
+> lands in dedicated translation units. The existing 43k-line hub gets *call sites only*.
+
+| New file (citus `src/backend/distributed/utils/homer/`) | Owns |
+|---|---|
+| `homer_backend_arena.{c,h}` | arena ABI + layout, create (postmaster), map (agent/backend), slot bind/unbind |
+| `homer_frontend_agent.{c,h}` | the bgworker: registration, DOCA export via S1b, setup send, doorbell connect/backoff/recv, `kill(PostmasterPid, SIGUSR1)` |
+| `homer_service_dpu_doorbell_tcp.{c,h}` | DPU side: the doorbell listener (its own port, **separate** from the serial setup listener), one persistent connection per attached host, **EOF ⇒ invalidate that import** |
+| `homer_service_dpu_spawn.{c,h}` | DPU side: DMA the spawn slot + ring the doorbell (S3) |
+
+- **S2.1** Postmaster creates the arena at `_PG_init` (`!IsUnderPostmaster`, beside
+  `EnsureSpawnRegionMapped`): a named POSIX shm object holding `N = 16` slots of
+  {role-2 command mailbox, role-3 completion mailbox, role-5 result byte-ring} — **≈ 57 MiB**, under the
+  ~100 MB DOCA single-region ceiling. The spawn region stays its **own** object, unchanged, because the
+  non-DPU `--homer` host service still `shm_open`s it by name.
+- **S2.2** Postmaster registers the frontend-agent bgworker (`InitializeCitusBackgroundWorker` +
+  `RegisterBackgroundWorker`, mirroring `maintenanced.c:205`-`:207`).
+- **S2.3** Agent maps both regions, DOCA-exports each with `HomerDpuFrontendExportRegion` (S1b), and sends
+  **one setup message carrying two mmap exports** (`mmapExportCount = 2`; descriptors keyed by
+  `mmapExportId`). *S1b's carrier-free API is precisely what makes this possible — it was worth doing.*
+- **S2.4** The spawned backend `shm_open`s the arena and binds a slot index (prefer-own / adopt-free /
+  fatal-on-exhaustion, mirroring `HomerDpuByteRingBind`). **No DOCA, no setup connection, no fork
+  inheritance required.**
+- **S2.5** Retire the Tier-2 `SELECTED_DPU_DMA` mailbox-open path in
   `remote_execution_backend_bridge.c` (`:2572`-`:2669`) — superseded, and never exercised.
 
-**Gate:** the DPU service's engine shows a host mmap import for the backend's result ring
-(`HomerDpuDmaImportHostMmapDescriptorForSetup`) — the exact thing whose absence caused the three-run
-hang.
+**Gate:** the DPU service's engine shows host mmap imports for the arena and the spawn region
+(`HomerDpuDmaImportHostMmapDescriptorForSetup`) — the exact thing whose absence caused the three-run hang.
 
-#### S2/S3 hook points — located (July 9, 2026)
-
-- **The postmaster already creates AND maps the spawn region before any fork.**
-  `CitusInstallRemoteExecutionBackendHooks` (`remote_execution_backend_bridge.c:3108`) runs from citus
-  `_PG_init` under `shared_preload_libraries`, and its `if (!IsUnderPostmaster)` branch (`:3120`) calls
-  `EnsureSpawnRegionMapped()` (`:1699`). Region `/citus_remote_exec_backend_spawn_v14`, 32 slots
-  (`remote_execution_backend_protocol.h:28`, `:30`).
-  → **S2.1/S2.2 and S3.1 attach here.** Extend that `!IsUnderPostmaster` branch to allocate the arena
-  alongside the spawn region, DOCA-export it with the S1b API, and send the setup message. Children
-  inherit the mapping through `fork()` for free, which is D4's entire point.
-- **The wait-set registration cannot happen there.** `_PG_init` runs *before* `ServerLoop`, and
-  `pm_wait_set` is built inside it (`ConfigurePostmasterWaitSet(true)`, `postmaster.c:1635`). So the
-  postgres fork needs a small **hook that lets an extension contribute fds to `pm_wait_set`**, called
-  from `ConfigurePostmasterWaitSet`. This is the one genuinely new postgres-side seam.
-- **Connect direction / timing.** Under D2 the postmaster is the TCP *client* of the DPU's doorbell
-  listener. At `_PG_init` the local DPU service may not be running yet, so the connect must be lazy and
-  retried with bounded backoff from the main loop rather than attempted once at preload. A failed or
-  absent doorbell must degrade to "no DPU-triggered spawn", never to a postmaster failure — the normal
-  path must not break when the DPU is down.
-
-### S3 — spawn trigger (D2)
-- **S3.1** Postmaster: at startup, DOCA-mmap its own spawn region and export it over the setup TCP;
-  keep the socket.
-- **S3.2** Postmaster: add the setup socket fd to its main-loop wait set; on readable, run the existing
-  slot scan.
+### S3 — spawn trigger (D2′)
+- **S3.1** Doorbell protocol: add `DOORBELL_ATTACH` / `DOORBELL_ATTACH_ACK` / `SPAWN_DOORBELL` message
+  kinds to `homer_dpu_comch_abi.h` (`:33`-`:36`) and bump `HOMER_DPU_COMCH_PROTOCOL_VERSION`. Default
+  doorbell port **9728**, its own listener — *never* the setup listener, whose single `clientFd` serial
+  accept loop a persistent connection would starve (`homer_service_dpu_setup_tcp.c:48`, `:223`).
+- **S3.2** Agent: connect the doorbell lazily with bounded backoff (the local DPU service may not be up
+  at `_PG_init`), `DOORBELL_ATTACH`, then block in `recv()`. On readable: drain to `EAGAIN` **without
+  parsing**, then `kill(PostmasterPid, SIGUSR1)`. **No postgres core change.**
 - **S3.3** DPU service: replace `TupleSinkServiceSubmitBackendSpawnRequest`'s `shm_open`
   (`tuple_sink_service_process.c:18833`+) with a DMA write into the imported spawn region — **fields
-  first, then `REQUEST_READY` with a release barrier** — then one doorbell byte on the setup socket.
-- **S3.4** Keep the host-service `shm_open` submitter intact for the non-DPU `--homer` path.
+  first, then `REQUEST_READY` with a release barrier, each awaited** — then one `SPAWN_DOORBELL` frame.
+  Body in `homer_service_dpu_spawn.c`; the hub keeps only the call.
+- **S3.4** DPU service: on doorbell **EOF**, invalidate that bridge generation's import. The exporter is
+  gone; its pages are unpinned; DMA into them is a memory-corruption bug. **Hard requirement, not an
+  optimisation** (see D2′).
+- **S3.5** Keep the host-service `shm_open` submitter intact for the non-DPU `--homer` path.
 
 **Gate:** a DPU service causes a socketless backend to be forked on its own host. Assert the ordering
 (fields before state word) with a debug check.
+
+#### Risks, named
+
+| | Risk | Mitigation |
+|---|---|---|
+| R1 | **exporter ≠ reader** aliasing (load-bearing) | **S0b spike, before S2** |
+| R2 | DOCA ~100 MB single-region ceiling | N = 16 ⇒ ≈ 57 MiB; growth path is `mmapExportCount > 1`, already in the ABI |
+| R3 | agent death unpins exported pages mid-DMA | doorbell EOF ⇒ invalidate import (S3.4) |
+| R4 | DOCA state across `fork()` | agent is a leaf process; postmaster never touches DOCA |
+| R5 | agent `shm_open` races postmaster creation | postmaster creates in `_PG_init`, before the agent starts; agent retries with backoff regardless |
+| R6 | bridge-generation churn on agent restart | R3 closes the old import; new export mints a new generation |
+| R7 | **trust boundary**: after S3 the DPU DMA-writes `dbOid`/`userOid` into a spawn slot | acceptable for a prototype; named, not discovered |
 
 ### S4 — SINGLE-NODE end-to-end (the de-risking gate)
 Client, PostgreSQL, and ONE DPU on the same host. **No peer leg, no RDMA, no second DPU.** The client
@@ -899,20 +1113,17 @@ POST-FIX  POLL-PROBE: ... poll completion referenced an unknown compatibility se
    so the *import* count is a non-issue at our concurrency — two exports per pgbench client is nothing.
    What still needs sizing is `ringCount` per export and the arena's per-session descriptor sets.
 5. ~~**Postmaster wait-set surgery** (S3.2): confirm where `ServerLoop` builds its fd set.~~
-   **ANSWERED.** `ServerLoop` (`src/backend/postmaster/postmaster.c:1628`) blocks in
-   `WaitEventSetWait(pm_wait_set, DetermineSleepTime(), events, lengthof(events), 0)` at `:1642`;
-   `pm_wait_set` is built by `ConfigurePostmasterWaitSet(bool accept_connections)` at `:1605` (called
-   at `:1635` and, on shutdown, `:3287`).
-   - Register the doorbell fd with **`WL_SOCKET_READABLE`**, not `WL_SOCKET_ACCEPT`. The loop's accept
-     branch (`:1673`) keys off `WL_SOCKET_ACCEPT`, so a readable-only fd cannot be mistaken for an
-     inbound client connection. No surgery on the accept path.
-   - **Grow `WaitEvent events[MAXLISTEN]` (`:1632`) by at least one.** It is sized for the listen
-     sockets alone; `WaitEventSetWait` returns at most `lengthof(events)` events, so an undersized
-     array does not overflow but can starve the doorbell behind a full complement of listen sockets.
-   - The bar is "never fatally break the postmaster on the normal path"; upstream's stricter
-     minimalism is not a constraint we adopt.
-6. **fd hygiene.** The postmaster's doorbell fd must be closed in every forked child, or a backend
-   outliving the postmaster keeps the DPU's doorbell connection alive.
+   **CLOSED by D2′ — we do not touch the wait set at all.** For the record, the seam was located and
+   sized: `ServerLoop` (`postmaster.c:1628`) waits on `pm_wait_set`, built by
+   `ConfigurePostmasterWaitSet` (`:1605`) with an exactly-sized `CreateWaitEventSet(NULL,
+   1 + NumListenSockets)`; `ServerLoop` handles only `WL_LATCH_SET` and `WL_SOCKET_ACCEPT` (`:1673`)
+   into a `WaitEvent events[MAXLISTEN]` (`:1632`). Adding a doorbell fd would have meant **four** new
+   core touch points. The agent bgworker needs **none**.
+
+6. ~~**fd hygiene.** The postmaster's doorbell fd must be closed in every forked child.~~
+   **DISSOLVED by D2′** — the postmaster holds no doorbell fd. The agent is a sibling of the backends;
+   they inherit nothing from it.
+
 7. **Trust boundary.** After S3 the DPU DMA-writes `dbOid`/`userOid` into a spawn slot, so the DPU is
    now inside the trust boundary for backend spawn (previously a local host process was). Acceptable
    for a prototype; name it rather than discover it.
