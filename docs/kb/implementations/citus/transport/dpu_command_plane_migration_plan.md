@@ -11,8 +11,10 @@ cadence rule.
 S5 turned out to be already working — see "S5 IS ALREADY WORKING" below.
 S3.2 ✅ (citus `52fd1ab3d`), S3.3 ✅ (citus `455c7a556`), **S3.3b + S3.2c ✅ VALIDATED (citus `30dfc9e9a`,
 July 10, 2026)** — the DPU allocates a frontend-arena slot, the spawned backend binds it and SURVIVES
-(the S3.3 gate ERROR is retired). Remaining: **S3.2b** (ownerPid reaper) → **S3.4** (doorbell-EOF teardown),
-then **fix B** and **refine A** per D10, then S4.
+(the S3.3 gate ERROR is retired). **S3.2b ✅ (citus `f04f87715`)** — arena-slot reaper. **S3.4 ✅ (citus
+`81cb0ec45`)** — doorbell-EOF import teardown. **The S3 spawn-trigger stage is functionally COMPLETE**
+(only **S3.5**, the one-shot host-arm deprecation LOG, remains within S3). Remaining beyond S3: **fix B**
+and **refine A** per D10, then **S4** (single-node end-to-end: commands + completions + tuple results).
 This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
 
 > **Decisions layered on top of the original plan. Read these before implementing anything.**
@@ -2545,6 +2547,25 @@ store. **Where the body is immutable, do not rely on any of it — do the two-ph
   setup `CLOSE` drives). **Diagnostics and clean shutdown, not a recovery path**: a subsequent DMA
   against a dead export is *supposed* to be fatal (see D2′ correction). Do **not** reclassify
   `DOCA_ERROR_IO_FAILED` as recoverable.
+
+  > ### ✅ S3.4 DONE + VALIDATED — citus `81cb0ec45` (July 10, 2026)
+  > Implemented in `HomerServiceExecuteDpuDoorbellAction`: `HomerServiceDpuDoorbellServerProgress` already
+  > runs EOF detection (which closes an attached connection nonfatally); after refreshing the doorbell
+  > facts, the action detects the attached→detached transition and calls
+  > `HomerServiceDpuDoorbellTeardownGoneImport` → `HomerDpuDmaBeginHostMmapImportTeardown`. The attached
+  > `(bridgeGeneration, clientInstanceId)` is tracked on `HomerServiceDpuDmaSchedulerState` because both are
+  > zeroed on detach; the new-generation-attached-in-place case is also handled (the ~5 s bgworker restart
+  > gap normally makes us see a plain detach first). Teardown is idempotent; the R3 fatal-on-DMA-fault guard
+  > is untouched.
+  >
+  > **Validated** by the same crash-restart fault injection as S3.2b, now DPU-side: kill -9 a backend →
+  > postmaster crash-restart → agent dies → doorbell EOF. The farnet1 DPU logged
+  > `DPU spawn doorbell EOF -- frontend agent gone for bridge_generation=2959490104499559 …; tearing down
+  > its host mmap import`, then `setup import closing` for BOTH imports (arena `mmap_export_id=1` and
+  > spawn-region `=2`), the generation an exact match to the setup import, `inflight=0` on both (no fault
+  > path taken), **zero `FATAL`/`DOCA_ERROR`** anywhere. The service then accepted the restarted agent's
+  > new-generation import and kept running. At an idle gate there is no in-flight DMA to the dying import,
+  > so the teardown completes cleanly rather than tripping the R3 fatal — exactly as intended.
 - **S3.5** Keep the host-service `shm_open` arm intact and **functional** through S6. Add a one-shot
   `LOG` on first use — *"host-service backend spawn is deprecated; retires at S7.1"* — and nothing more.
   **Do not gut it early.** See the box below; this is not sentimentality about legacy code.
