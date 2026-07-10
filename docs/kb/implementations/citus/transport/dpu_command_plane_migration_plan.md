@@ -1466,7 +1466,11 @@ take the cached ref, or a sink binding is stamped. Decide it there, with the cod
 
 ## D8 — reserve the arena's host publish-line array NOW (decided July 10, 2026)
 
-> **⏳ This decision has a closing window.** The arena ABI is `v1` and only S2 has shipped against it.
+> ✅ **DONE — citus `36a61a5a1`.** Arena ABI bumped `v1 → v2`
+> (`/dev/shm/citus_homer_frontend_arena_v2`, **59,774,080 bytes**, `+6,144` = 2 × 48 × 64). That bump is
+> **host-only**: `HOMER_FRONTEND_ARENA_SHM_NAME` is referenced by exactly one TU and the header is
+> citus.so-only, so `HOMER_DPU_BRIDGE_PROTOCOL_VERSION` stays `3` and no DPU redeploy rides on it. That
+> asymmetry — host layout private, bridge layout shared — is what D8 was buying.
 
 **What.** Add to `HomerFrontendArena`, at the head, immediately after the advisory bridge header:
 
@@ -1504,13 +1508,57 @@ Full reasoning, code pointers, and the migration order:
 [`dpu_readiness_collectors_and_continuation_edges.md`](../../../future-directions/citus/transport/dpu_readiness_collectors_and_continuation_edges.md).
 
 **Also do, cheaply, alongside D8:**
-- **Make `controlCount` honest.** `HomerDpuDmaGroupedControlOwner.{controlFirstIndex, controlCount}` are
-  **written and never read**, by two writers that contradict each other: task-slot init computes
-  `controlCount = groupedControlBufferBytes / 64` and sets `ringIndex = INVALID` (the grouped design), and
-  submit overrides both with `controlCount = 1` and a scalar `ringIndex` (the shortcut). Assert and comment.
-  Five ready-queue kinds were born dead behind exactly this kind of silence.
-- **Name D5's `boundServiceSessionId` as the reverse cookie** (`resource → waiter`), so widening it to a
+- ✅ **Make `controlCount` honest** (citus `14e655e11`). `HomerDpuDmaGroupedControlOwner.{controlFirstIndex,
+  controlCount}` are **written and never read**, by two writers that contradict each other: task-slot init
+  computes `controlCount = groupedControlBufferBytes / 64` and sets `ringIndex = INVALID` (the grouped
+  design), and submit overrides both with `controlCount = 1` and a scalar `ringIndex` (the shortcut).
+  Asserted and commented. Five ready-queue kinds were born dead behind exactly this kind of silence.
+- ✅ **Name D5's `boundServiceSessionId` as the reverse cookie** (citus `722166988`), so widening it to a
   `HomerContinuationRef` is later a type change rather than a redesign.
+
+---
+
+## D8b — reserve the arena's DPU CREDIT-line array too, and leave it SWITCHED OFF (decided July 10, 2026)
+
+> ✅ **Reserved — citus `36a61a5a1`.** `HomerFrontendArena.dpuCreditLines[48]`, another 3 KiB.
+> `bridgeHeader.dpuCreditOffset` stays **0**, deliberately.
+
+**Why this is not "D8 for symmetry".** `hostPublishOffset` is written and **never read** by the DPU —
+every ring is addressed from its own descriptor. `dpuCreditOffset` is *read*, it *hard-gates* three submit
+paths, and it is the **destination of a DMA write**:
+
+```
+reject if  import->bridgeHeader.dpuCreditOffset == 0          (:3064, :3286, :3616)
+dst      =  descriptor->hostRingAddress + dpuCreditOffset + ringIndex * 64      (:9716)
+```
+
+And the arena's role-5 SQL result ring **is** a host→DPU byte ring —
+`HomerDpuDmaDescriptorIsHostToDpuByteRing` accepts role 5 (`:5680`) — so
+`HomerDpuDmaSubmitMirroredByteRingConsumedHeadPublications` (`:4007`) will try to publish the DPU's
+`consumedHead` back to it the moment a backend produces results and the DPU pulls them. **That is S4.**
+Today it cannot: the arena declares no credit array, so `dpuCreditOffset == 0` and the publish is rejected.
+
+So the credit array is not speculative like the publish lines. It is a **hard S4 prerequisite** that the
+arena was missing, discovered while reserving the publish lines. Same 3 KiB, same closing window.
+
+**Why the offset stays 0.** Every arena descriptor sets `hostRingAddress` to the *component* address
+(`&slot.resultRingControl`), not the arena base. A nonzero `dpuCreditOffset` would pass the
+`ringBytes`-relative bounds check and DMA a 64-byte credit line **into the middle of the result ring's own
+payload storage**. Silent corruption. Zero rejects loudly instead. So the offset is turned on together
+with the descriptor rebase, as one edit — **S4.0b**:
+
+```
+hostRingAddress   = arenaBase
+hostRingOffset    = offsetof(arena, slots[k].resultRingStorage)
+hostControlOffset = offsetof(arena, slots[k].resultRingControl)
+ringBytes         = hostRingOffset + RESULT_RING_STORAGE_BYTES     /* ringStorageBytes = ringBytes - hostRingOffset (:9651) */
+bridgeHeader.dpuCreditOffset = offsetof(arena, dpuCreditLines)
+```
+
+Both descriptor forms are legal — the DPU only ever computes `hostRingAddress + <offset>` (`:8684`) — and
+the rebase **cannot** accidentally enrol roles 2/3/5 in grouped-control discovery, because enrolment is a
+role whitelist (`:5645`), not a typing test. Layout order `[header][hostPublishLines][dpuCreditLines][rings]`
+matches what the host frontend already builds at `homer_frontend_dma.c:292-293`.
 
 > ### D6, restated: it is continuation-graph edge #1
 >
@@ -1529,16 +1577,56 @@ Full reasoning, code pointers, and the migration order:
 ---
 
 ### S3 — spawn trigger (D2′)
-- **S3.0** **D8**: reserve `hostPublishLines[48]` in the arena and point `bridgeHeader.hostPublishOffset` at
-  it; assert-and-comment `controlCount`; document `boundServiceSessionId` as the reverse cookie. No writers,
-  no readers, no behaviour change. Regression: arena import still accepted, basebackup + smoke green.
+- **S3.0** ✅ **DONE — citus `36a61a5a1`.** **D8** + **D8b**: reserved `hostPublishLines[48]` and
+  `dpuCreditLines[48]` in the arena, pointed `bridgeHeader.hostPublishOffset` at the former, left
+  `dpuCreditOffset = 0` deliberately (see D8b). Arena ABI `v1 → v2`, host-only. `controlCount` and
+  `boundServiceSessionId` were already landed.
+
+  > #### 🔥 S3.0 was supposed to be a no-op. It uncovered a permanent, silent DPU wedge.
+  >
+  > The gate ("arena import still accepted, basebackup + smoke green") **failed** — not because of the
+  > reservation, but because **basebackup had never once been run against a DPU holding a live arena
+  > import.** S2's gate proved the import was *accepted*; nothing proved the service still *worked*
+  > afterwards. Trust-tier discipline says exactly this: "a written artifact describing a path was trusted
+  > as evidence the path works."
+  >
+  > With the arena imported, the DPU stopped accepting **any** further host setup connection, forever.
+  > `pg_basebackup` failed with `DPU setup socket exchange failed`; the DPU logged nothing and spun at
+  > 100% CPU with a connection stuck in its listen backlog. Deterministic: agent off → 19.42 s / 23.2 GB /
+  > `CLOSE_ACK`; agent on → setup failure. Root cause, evidence, and the two defects still unfixed:
+  > [`dpu_scheduler_arm_execute_mismatch.md` §0](../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md).
+  >
+  > Short version: `DPU_GROUPED_CONTROL_READ` was armed from `importedRingCount`, but its executor skips
+  > every ring outside the role-{1,4,7} whitelist — and the arena's 49 rings contain **zero** enrolled.
+  > That permanently-armed, permanently-empty sibling kept resetting the *shared-per-source* starvation
+  > clock of the blind `DPU_PE_DRAIN` collector, which is the **only caller of the setup listener's
+  > `accept()`**. Fixed by (A) arming discovery from a new `groupedControlRingCount` fact computed at
+  > import, and (C) treating a **started** listener as known work rather than blind maintenance.
+  >
+  > Also uncovered: the **S3.1 comch bump `3 → 4` had never been deployed to either DPU.** Both DPU trees
+  > were still at v3, so no `--homer-dpu` path could have worked. Resynced and rebuilt both.
+
+  Regression on the final binaries: arena import accepted (48 + 1 descriptors); 4-role DPU-relay basebackup
+  **with the agent on** — 23.236 GB, `CLOSE_ACK`, rc=0, warm `19.55 / 23.00 s`; `pgbench --homer` 1000/1000,
+  0 failed, 2983 TPS; six-leg TCP transport smoke `ok` on both ends with `distinct_va=YES`.
 - **S3.1** Doorbell protocol: add `DOORBELL_ATTACH` / `DOORBELL_ATTACH_ACK` / `SPAWN_DOORBELL` message
   kinds to `homer_dpu_comch_abi.h` (`:33`-`:36`) and bump `HOMER_DPU_COMCH_PROTOCOL_VERSION`. Default
   doorbell port **9728**, its own listener — *never* the setup listener, whose single `clientFd` serial
   accept loop a persistent connection would starve (`homer_service_dpu_setup_tcp.c:48`, `:223`).
+  ✅ **DONE — citus `c2ec17852`** (ABI only). ⚠ The bump was **not deployed to the DPUs until S3.0**; a
+  comch bump means *both* DPU trees must be resynced and rebuilt or setup fails `BAD_PROTOCOL`.
 - **S3.2** Agent: connect the doorbell lazily with bounded backoff (the local DPU service may not be up
   at `_PG_init`), `DOORBELL_ATTACH`, then block in `recv()`. On readable: drain to `EAGAIN` **without
   parsing**, then `kill(PostmasterPid, SIGUSR1)`. **No postgres core change.**
+
+  > ### ⚠⚠ THE DOORBELL LISTENER MUST GET ITS OWN COLLECTOR. Do not fuse it into an existing action.
+  >
+  > It is a second listener with exactly the readiness profile that just wedged the first one. Give it:
+  > its own `HOMER_PROGRESS_COLLECTOR_*` kind, its own progress source (so its starvation clock is not
+  > shared — defect B is still unfixed), and `knownExpectedWork = started`. If you instead call its
+  > progress function from inside `DPU_PE_DRAIN` "because the setup listener does it there", you inherit
+  > all three defects and the failure is **silent**: the agent hangs in `connect()` and the DPU logs
+  > nothing. See `dpu_scheduler_arm_execute_mismatch.md` §0, rule 2.
 - **S3.2b** Agent idle loop: an **`ownerPid` reaper**. Walk the arena's `BOUND` slots and release any whose
   `ownerPid` is gone (`kill(pid, 0)` → `ESRCH`). Covers a hard-crashed backend and the crash-restart leak
   (`_PG_init` does not re-run, so `CreateArena`'s whole-arena `memset` does not either). A recycled pid can
@@ -1779,6 +1867,14 @@ So S4's own work is:
   Also decide the role-5 teardown question D6 leaves open (`ByteRingFrontierForServiceSink` /
   `MarkImportSenderCloseReleased` search by `(serviceSessionId, serviceSinkId)`; the arena ring has
   `serviceSinkId = 0`).
+- **S4.0b — turn on the arena's credit lines (D8b).** *Required before a backend can produce a single
+  result byte through the arena.* Rebase the **role-5** arena descriptors onto the arena base and set
+  `bridgeHeader.dpuCreditOffset = offsetof(HomerFrontendArena, dpuCreditLines)`, as ONE edit — see D8b for
+  the exact field values and for why a nonzero offset without the rebase is silent memory corruption.
+  Until this lands, `HomerDpuDmaSubmitMirroredByteRingConsumedHeadPublications` (`:4007`) will reject the
+  first consumed-head publish for an arena result ring with
+  `"byte-ring credit descriptor is not a payload byte ring"` (`:3064`), which fails the whole sweep.
+  Space is already reserved; nothing here needs an ABI bump.
 - **S4.1** Export **role 6** from `HomerClientOpenSqlSessionSelectedDpu` (today the only role-6 exporter
   is the deprecated `homer_frontend_dma.c:1617`), alongside role 1.
 - **S4.2** Drive `START_COMMAND` down the control slot from the client, and consume role-6 completion

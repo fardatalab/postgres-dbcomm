@@ -104,12 +104,24 @@ Three things about this smoke that each cost a cycle (validated July 9, 2026, ci
   `client TCP close exchange failed`. Always read the server log; the exit code is not the verdict.
   Both ends print `homer_dpu_tcp_transport_smoke: ok` on a real pass.
 - **Give the server a generous `--timeout-ms`.** It counts from process start, not from accept, so a
-  slow client launch eats the window and you get a bare `could not connect`.
+  slow client launch eats the window and you get a bare `could not connect`. **Launch the server and the
+  client from the SAME shell invocation**; if the client runs in a later tool call, minutes can elapse and
+  the server has already exited with `server failed setup_done=0` — which reads exactly like a bind
+  failure and is not one.
+- **`setsid` alone is not enough to survive `ssh` exit.** Use `nohup setsid … </dev/null &`, invoked from a
+  small script on the DPU. Without `nohup` the server dies as soon as the ssh channel closes, and the only
+  symptom you see is the client's `could not connect`.
 
 ```sh
-# On the DPU, after compiling/copying the smoke there. Run it under setsid + </dev/null
+# On the DPU, after compiling/copying the smoke there. Run it under nohup + setsid + </dev/null
 # or ssh will tear it down; and do NOT `pkill -f transport_smoke` from an ssh one-liner --
 # the pattern matches the ssh command line itself and kills the session.
+#
+# GENERAL RULE for every process in this project: `pkill -f <substring>` from an ssh one-liner or a
+# `bash -c` wrapper matches its OWN command line. This has silently killed the ssh session, and it has
+# silently NOT killed the target (leaving a stale service that then fails "Address already in use").
+# Prefer `pkill -x <exact-comm>` (matches the process name, never the wrapper's argv), or resolve the
+# pid with `pgrep` and `kill` it, or put the pattern inside a script file so the caller's argv differs.
 ./homer_dpu_tcp_transport_smoke --server \
   --dev-pci 0000:03:00.0 \
   --port 9727 \
@@ -337,6 +349,20 @@ For counter-based diagnosis, rebuild Citus/Homer with:
 CPPFLAGS='-D_GNU_SOURCE -DHOMER_SERVICE_PAYLOAD_STATS=1 -DHOMER_CLIENT_BASEBACKUP_STATS=1'
 ```
 
+When the DPU service "does nothing" — spins at 100% CPU, logs nothing, and stops accepting setup
+connections (`ss -ltn` on the DPU shows a nonzero `Recv-Q` on the `9727` LISTEN socket) — build the DPU
+service with the scheduler-starvation probe. It prints scheduler passes vs. actual `DPU_PE_DRAIN` grants,
+and names the exact gate that dropped the collector:
+
+```sh
+CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_SETUP_STARVE_DIAG=1'
+# [starve-diag] pass=2000001 pedrain_grants=812042 imported=1 rings=49 tcp{active=0 accepted=2 ...}
+# [starve-diag] PE_DRAIN dropped: feedback-backoff (count=2500001)
+```
+
+A frozen `pedrain_grants` while `pass` climbs means the setup listener is starved. See
+`docs/kb/future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md` §0.
+
 For scheduler/action-grant diagnostics, include the service progress and peer
 transport stats switches:
 
@@ -549,12 +575,14 @@ The shared-memory files have different owners in the runtime lifecycle:
   and completion rings.
 - `/dev/shm/citus_remote_exec_backend_spawn_v*` is created by the PostgreSQL
   backend bridge when PostgreSQL starts.
-- `/dev/shm/citus_homer_frontend_arena_v*` (**57 MiB**) is created by the
-  postmaster only when `citus.enable_homer_dpu_frontend_agent=on`. It is neither
-  `shm_unlink`ed at shutdown nor re-zeroed on a postmaster crash-restart, so a
-  stale one can leave arena slots marked BOUND. That fails loudly at the next
-  claim (`arena slot N is already bound`), never silently — but remove it as
-  part of a hard clean baseline.
+- `/dev/shm/citus_homer_frontend_arena_v2` (**59,774,080 B ≈ 57 MiB**; `_v1` was 59,767,936 B and is
+  orphaned — delete it) is created by the postmaster only when
+  `citus.enable_homer_dpu_frontend_agent=on`. It is neither `shm_unlink`ed at
+  shutdown nor re-zeroed on a postmaster crash-restart, so a stale one can leave
+  arena slots marked BOUND. That fails loudly at the next claim (`arena slot N is
+  already bound`), never silently — but remove it as part of a hard clean
+  baseline. The version is in the name, so an old object is simply not found;
+  the arena ABI bump is **host-only** and needs no DPU redeploy.
 - `/dev/shm/citus_res_*` files are payload/result queues created by active or
   recently active Homer sessions.
 
@@ -1256,6 +1284,14 @@ validation built ONE target and ran ONE workload. Cheap insurance:
 - **Run all three workloads:** basebackup (4-role DPU relay), `pgbench --homer`,
   and backend-to-backend COPY. Two of the three are currently broken — fix or
   re-check them before trusting a "no regression" claim.
+- **Run at least one workload with `citus.enable_homer_dpu_frontend_agent=on`.** Start PostgreSQL with
+  `pg_ctl -o "-c citus.enable_homer_dpu_frontend_agent=on"`. The agent puts a **permanent 49-ring mmap
+  import** into the local DPU service, which is a state no default-off run ever reaches. That state
+  permanently wedged the DPU's setup listener for four days without a single log line (July 10, 2026), and
+  the reason nobody saw it is that "the arena import was accepted" had been recorded as if it were "the
+  service still works afterwards." **An import being accepted proves nothing about the next connection.**
+  Cheapest check: with the agent on, run the 4-role basebackup — its sender opens a *second* DPU setup
+  connection, so it fails immediately if the listener is starved.
 - **Stamp every recorded baseline with a commit SHA, not just a date.** A dated
   baseline reads like a standing fact; it is a timestamped observation. The June-6
   COPY baseline above was cited as evidence against a correct diagnosis. With a SHA,

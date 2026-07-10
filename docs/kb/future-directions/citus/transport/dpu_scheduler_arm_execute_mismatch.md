@@ -1,13 +1,119 @@
 # The DPU scheduler's arm/execute mismatch — a survey
 
-> **Status: FUTURE DIRECTION.** Nothing here is implemented. One instance (finding 2 + 6 + 7) is
-> already scheduled as **D6** in
+> **Status: FUTURE DIRECTION, except for §0 which is FIXED AND VALIDATED.** One instance
+> (finding 2 + 6 + 7) is already scheduled as **D6** in
 > [`dpu_command_plane_migration_plan.md`](../../../implementations/citus/transport/dpu_command_plane_migration_plan.md),
 > to be built at S3.0/S3.3b and cashed in at S4.0. The rest is a map, deliberately made *before* we trip
 > over the instances one at a time.
 >
 > **Cost models below are ANALYTIC, not measured.** They are loop bounds read out of the source. None of
 > this has been profiled. Do not cite a factor from this doc as a benchmark result.
+
+---
+
+## §0 — ⚡ CONFIRMED, AND IT WAS NOT A COST PROBLEM. It was a permanent, silent wedge.
+
+**Found and fixed July 10, 2026 (citus `36a61a5a1`), while validating S3.0.** This is the only entry in
+this doc that has been observed on hardware rather than read out of the source. Read it first: it changes
+what you should expect the other findings to cost you.
+
+### Symptom
+
+With a live Homer frontend arena import, the DPU service **stops accepting new host setup connections,
+forever**. `pg_basebackup` fails with `DPU setup socket exchange failed`; the DPU logs *nothing*; the
+service spins at 100% CPU; `ss -ltn` on the DPU shows `LISTEN Recv-Q=1` — a completed connection sitting
+in the backlog that is never `accept()`ed. Minutes later it is still there.
+
+Reproduced deterministically: `pg_basebackup` through the 4-role DPU relay **passes** with
+`citus.enable_homer_dpu_frontend_agent=off` (19.42 s, 23.2 GB, `CLOSE_ACK`) and **fails at setup** with it
+`on`, same binaries, same everything else.
+
+### Mechanism — three independent defects, each of which hid the others
+
+**A. The arming counted rings the executor skips.**
+`HOMER_PROGRESS_COLLECTOR_DPU_GROUPED_CONTROL_READ` was armed with
+`knownExpectedWork = facts.hostMmapImported` and a ready hint of `facts.importedRingCount`
+(`tuple_sink_service_process.c`, `HomerServiceAppendDpuDmaCollectorCandidates`). But the executor,
+`HomerDpuDmaSubmitGroupedControlReads` (`homer_service_dpu_dma.c:1163`), skips every ring for which
+`HomerDpuDmaDescriptorUsesHostPublishLine` is false — a **role whitelist of {1, 4, 7}**
+(`homer_service_dpu_dma.c:5645`).
+
+The arena imports **49 rings — 48 of roles 2/3/5, plus one role-8 spawn region. Zero enrolled.**
+So the collector claimed 49 units of known expected work, every pass, forever, and submitted nothing.
+
+> This is the *inverse* of findings 1–10 below. Those execute more work than the arming implies. This one
+> **arms more work than the execution performs** — and because the scheduler's fairness accounting is
+> driven by the arming, the lie propagated.
+
+**B. The anti-starvation escape hatch is keyed on a SHARED clock.**
+`HomerMachineBaselineCollectorFeedbackBackoffActive` suppresses a *blind* collector once
+`recentEmptyPolls >= 8` with no productive poll, and only lets it out again when
+`grantsSinceLastCollectorTouch >= HOMER_SERVICE_MACHINE_BASELINE_BLIND_BACKOFF_MAX_SKIP_GRANTS` (= 4).
+That quantity is `HomerProgressFeedbackTick - collector->lastCollectedTick`, and
+
+```c
+collectorFacts->lastCollectedTick = sourceFeedback->lastTouchedTick;   /* :40133 */
+```
+
+is copied from the **source**, not the collector. **All five DPU collectors share
+`HOMER_PROGRESS_SOURCE_DPU_DMA`.** So a permanently-armed sibling (defect A) keeps resetting every other
+DPU collector's starvation clock, and the hatch never opens. The guard that exists precisely to prevent
+indefinite suppression could not fire.
+
+**C. Two jobs with different readiness live in one action.**
+`HomerServiceDpuSetupTcpServerProgress` — which owns the listener's `accept()` — is called from
+**exactly one place**: inside `HOMER_PROGRESS_ACTION_DPU_PE_DRAIN`
+(`tuple_sink_service_process.c:41449`). A backoff policy that is *correct* for "don't poll an empty DOCA
+progress engine" is *fatal* for "don't stop listening". An `accept()` returning `EAGAIN` is, of course,
+an empty poll — so "no arrivals so far" was being used to justify "stop looking", which for a listener is
+never valid: **a backlog is not observable without an accept attempt.**
+
+The code already knew this shape. The same predicate hand-exempts `PEER_CM_SETUP` and
+`PEER_CLOSE_LIFETIME` with the comment *"cold, but they are correctness-visible lifecycle work … do not
+suppress them with blind-poll backoff"*. The DPU setup listener is the same species and was not on the
+list — it couldn't be, because it isn't a collector.
+
+### Evidence
+
+A macro-guarded probe (`-DHOMER_DPU_SETUP_STARVE_DIAG=1`, kept in-tree) counts scheduler passes against
+actual `DPU_PE_DRAIN` grants:
+
+```
+before fix   imported=0 rings=0    pass=1500001  pedrain_grants=750005     <- climbing
+             imported=1 rings=49   pass=2000001  pedrain_grants=812042     <- frozen at the import
+             imported=1 rings=49   pass=3500001  pedrain_grants=812042     <- still frozen
+             [starve-diag] PE_DRAIN dropped: feedback-backoff (count=2500001)
+
+after fix    imported=0 rings=0    pass=500001   pedrain_grants=500000
+             imported=1 rings=49   pass=1500001  pedrain_grants=1500000    <- 1:1, no drops
+```
+
+### What was fixed, and what was not
+
+| | Fix | Where |
+|---|---|---|
+| A | Count **enrolled** rings, once, at import: `HomerDpuDmaHostMmapImport.groupedControlRingCount`, summed into `HomerDpuDmaSchedulerFacts.groupedControlRingCount`. Arm discovery from **that**, never from `importedRingCount`. Precomputed at import because `GetSchedulerFacts` runs on the busy-poll loop. | `homer_service_dpu_dma.{c,h}`, `tuple_sink_service_process.c` |
+| C | `setupTcpKnownWork = setupTcpFacts.started` (was `.activeConnection`). A **started listener is known work**, which takes it out of the blind class and therefore out of backoff. Costs one `accept4()` `EAGAIN` per grant on a cold control path — exactly what `PEER_CM_SETUP` already does. | `tuple_sink_service_process.c` |
+| B | **NOT FIXED.** The starvation clock is still per-source. Any future blind DPU collector can be suppressed indefinitely by a busy sibling. Fixing it means giving `HomerProgressCollectorFacts` its own `lastGrantedTick`, updated when *that collector* is granted. | — |
+| C (proper) | **NOT DONE.** The accept loop should be its own collector/action/source, not fused into a DOCA PE drain. | — |
+
+### Two rules this buys
+
+1. **Never arm a collector from a count its executor will filter.** If the executor has a predicate, the
+   facts must apply the same predicate. Defect A is exactly finding 1–10's disease with the arrow
+   reversed, and it was the dangerous direction: an over-armed collector doesn't just waste passes, it
+   **steals fairness credit from its siblings**.
+2. **A listener is never blind maintenance.** ⚠ **S3.2's doorbell listener MUST get its own collector
+   with `knownExpectedWork = started`, and MUST NOT be fused into another action.** It would otherwise
+   inherit all three defects verbatim, and the failure is silent.
+
+### Cost note
+
+The fix makes `DPU_PE_DRAIN` run on ~100% of passes rather than ~50%. Measured effect on the 23 GB 4-role
+DPU-relay basebackup: none detectable. Warm repeats, agent OFF `19.50 / 18.92 / 22.80 s`; agent ON
+`20.34 / 22.09 / 19.89 s`. Bands overlap. (Both arms discard the first run after a service restart.)
+
+---
 
 > ## 👉 This doc is the SYMPTOM MAP. The root cause is one missing field.
 >

@@ -129,11 +129,34 @@ consequence of that one sentence.
 
 ## 5. Enrolment in discovery is a *typing* accident, not a semantic property
 
-Which rings get discovered at all is decided by `HomerDpuDmaDescriptorUsesHostPublishLine()`
-(`homer_service_dpu_dma.c:639`), which returns true for roles **1, 4, 7** only. But the predicate is not
-about semantics. It is about a struct:
+> ### ⚠ CORRECTION (July 10, 2026) — the *mechanism* is a hard-coded role whitelist
+>
+> An earlier version of this section said "a ring is enrolled iff its `hostControlOffset` points at a
+> 64-byte `HomerDpuBridgeHostPublishLine`." That is the **rationale**, not the **code**. The code is:
+>
+> ```c
+> return descriptorRole == FRONTEND_CONTROL_SLOT ||
+>        descriptorRole == PAYLOAD_BYTE_RING ||
+>        descriptorRole == PAYLOAD_BYTE_RING_DPU_TO_HOST;   /* homer_service_dpu_dma.c:5645 */
+> ```
+>
+> Three consequences, all good:
+> - Laying out a publish-line array in a region and rebasing its descriptors **cannot accidentally enrol**
+>   roles 2/3/5. Enrolment is a deliberate, separate edit to that list. (D8 relies on this.)
+> - Promotion is therefore "allocate the lines, point `hostControlOffset` at them, add three enum values",
+>   not "fix the types" — a much smaller change than the typing story implies.
+> - Conversely, the whitelist is invisible to the scheduler, which armed discovery from
+>   `importedRingCount`. That mismatch was a real, permanent wedge; see §0 of
+>   [`dpu_scheduler_arm_execute_mismatch.md`](dpu_scheduler_arm_execute_mismatch.md).
+>
+> The table below remains correct as an explanation of *why* the whitelist has the members it has.
 
-> **A ring is enrolled iff its `hostControlOffset` points at a 64-byte `HomerDpuBridgeHostPublishLine`.**
+Which rings get discovered at all is decided by `HomerDpuDmaDescriptorUsesHostPublishLine()`
+(`homer_service_dpu_dma.c:5645`), which returns true for roles **1, 4, 7** only. The list has the members
+it has because of a struct:
+
+> **A ring is enrollable iff its `hostControlOffset` can point at a 64-byte
+> `HomerDpuBridgeHostPublishLine`.**
 
 Because `HomerDpuDmaSubmitOneGroupedControlRead` reads exactly `sizeof(HomerDpuBridgeHostPublishLine)` bytes
 from `hostRingAddress + hostControlOffset` and casts them to that type (`:8430` requires
