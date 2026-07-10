@@ -912,6 +912,46 @@ this point). Build all targets, including the smokes.
 **Gate:** the DPU service's engine shows host mmap imports for the arena and the spawn region
 (`HomerDpuDmaImportHostMmapDescriptorForSetup`) — the exact thing whose absence caused the three-run hang.
 
+### ✅ S2 DONE — GATE PASSED (July 9, 2026)
+
+**The gate was not observable when it was written.** `homer_service_dpu_setup_tcp.c`'s import loop logged
+only on *failure*, so "the engine shows host mmap imports" could only ever be inferred from the ack the
+host received — i.e. from the DPU's own word, read on the far side of the wire. Added a success line, one
+per exported mapping, on the cold path. Now the gate is a direct service-side observation:
+
+```
+tuple-sink service: DPU TCP setup mmap import accepted bridge_generation=321564234350815
+  client_instance_id=550566416136833 export_index=0 mmap_export_id=1 descriptor_first=0 descriptor_count=48
+tuple-sink service: DPU TCP setup mmap import accepted bridge_generation=321564234350815
+  client_instance_id=550566416136833 export_index=1 mmap_export_id=2 descriptor_first=48 descriptor_count=1
+
+homer frontend agent: exported arena (region=59767936 bytes, 48 rings, export_blob=283 bytes) and spawn
+  region (region=17424 bytes, 1 ring, export_blob=279 bytes) to DPU 10.10.1.201:9727,
+  accepted_rings=49 imported_blob_bytes=562
+```
+48 arena rings under `mmapExportId=1`, the role-8 spawn region under `mmapExportId=2`, zero DPU errors.
+`/dev/shm/citus_homer_frontend_arena_v1` = 59,767,936 bytes. The agent stays resident and idle.
+
+**Regressions, all green on the same binaries:**
+- 4-role DPU-relay basebackup: `delivered_bytes=23233747354`, `CLOSE_ACK`, sender rc=0, consumer rc=0,
+  19.42 s (prior band ~20.8 s).
+- TCP transport smoke, all six legs + `--export-posix-shm --fork-reader`: both ends `ok`, `distinct_va=YES`.
+- **GUC default-off verified**: with `citus.enable_homer_dpu_frontend_agent` unset, no agent process and no
+  `/dev/shm` arena. Every existing `--homer` / basebackup deployment is untouched.
+
+**What of D5 is actually validated, and what is not:**
+- `HomerDpuDmaFindDescriptorRef` matching on `boundServiceSessionId` — **exercised**. The transport smoke
+  calls it at five sites (`homer_dpu_tcp_transport_smoke.c:1431`, `:1527`, `:1657`, `:1847`, `:1983`) and
+  is green. Basebackup does not touch it.
+- The role-3 `boundServiceSessionId == 0` skip — **proven not to fire spuriously** (0 polls over 15 s with
+  16 unbound rings imported), and, per the correction above, **proven not to be load-bearing until S4**,
+  because the action is never granted without a session. It stays in: from S4 it saves 15 dead-ring polls
+  per granted pass, and it costs nothing.
+- Everything the arena's 48 rings will eventually do (bind, DMA, publish) is **still Tier 2**. S2 proves the
+  *import*, not the *use*.
+
+Commits: citus `008f4f20b`.
+
 ---
 
 #### S2 — implementation design, settled by reading the code (July 9, 2026)
@@ -968,13 +1008,39 @@ session id:
 But the agent declares all 48 arena descriptors **at startup, before any session exists**, so they carry
 `serviceSessionId = 0`. Consequences:
 1. Role 2 is unresolvable: `FindDescriptorRef(gen, S, ROLE_2)` never matches a slot declared with 0.
-2. **Role 3 breaks the S2 gate itself, not just S4.** From the instant the arena is imported, the DPU
-   would submit **16** completion-mailbox control-read DMAs per scheduler pass — one per unbound arena
-   slot — each landing in `FindSelectedSession(0)`. Importing the arena is enough to trigger it; no
-   session required.
+   **This is the real blocker, and it is fatal to S4.**
+2. Role 3 polls dead rings: the enumerator would issue a completion-mailbox control-read DMA for each of
+   the 16 arena slots, of which at most a few are ever bound.
 
 There is no late-binding key in the descriptor ABI (no `arenaSlotIndex`, no opaque tag), and `ringIndex`
 is pinned to the descriptor's table position (`:5365`), so it cannot carry one.
+
+> ### ⚠ CORRECTED BY EXPERIMENT (July 9, 2026) — item 2 as first written was WRONG
+>
+> The first revision of this section claimed: *"Role 3 breaks the S2 gate itself... From the instant the
+> arena is imported, the DPU would submit 16 completion-mailbox control-read DMAs per scheduler pass...
+> Importing the arena is enough to trigger it; no session required."*
+>
+> **Both halves are false, and a probe build proved it.** With the arena imported (48 rings, 16 of them
+> role-3, none bound) and the D5 skip **removed**, a temporary counter at the top of
+> `HomerDpuDmaSubmitBackendCompletionPulls` recorded **zero calls** across a 15-second window. The
+> scheduler never *grants* the `DPU_BACKEND_COMPLETION_PULL` action while no selected-DPU session exists,
+> so the enumerator body never runs. The S2 gate is not at risk.
+>
+> Also wrong: *"each landing in `FindSelectedSession(0)`."* An unbound slot's mailbox is all zeros, so
+> `publishedEpoch (0) != consumedEpoch + 1 (1)` and **nothing ever stages**. The semantic layer is never
+> reached; the "unknown selected-DPU session" error (`tuple_sink_service_process.c:39380`) cannot fire.
+>
+> **What is actually true.** From S4 on — as soon as ONE selected-DPU session exists and the action is
+> granted — the enumerator iterates **every ring of every import** filtering only on `descriptorRole`
+> (`:1250`, `:1257`), so it polls all 16 arena role-3 mailboxes and finds 15 of them dead. That is a
+> **silent, perpetual PCIe control-read tax proportional to arena size**, not a startup storm and not an
+> error. Silent is worse: it would have surfaced at S6 as an unexplained throughput gap, with nothing in
+> any log to point at it.
+>
+> **This is exactly the failure mode the plan's standing risk #1 warns about**, and I nearly wrote it into
+> the plan as a fact. The probe cost four minutes. *Reason from the code; then check the reasoning against
+> the machine.*
 
 **F6. ⚠ LANDMINE — `EnsureSpawnRegionMapped()` unconditionally `memset`s the whole region.**
 `remote_execution_backend_bridge.c:1709` opens `O_CREAT|O_RDWR` **without `O_EXCL`**, `ftruncate`s to
@@ -1109,6 +1175,55 @@ descriptor slice (`:505`-`:529`).
 **Deferred out of S2, tracked:** the 3.05 MiB role-2 mailbox is 64 slots × a 50,040-byte record — the same
 fixed-size-union bloat as the 66 KiB control slot. Shrinking the ABI unions (S4 perf item, fix 3) shrinks
 the arena by roughly 8×. Do not do it here.
+
+##### Found during implementation and review (July 9, 2026)
+
+- **⚠ INSTALL ORDER IS NOW LOAD-BEARING.** `citus.so` is built `-fvisibility=hidden` and has **four
+  undefined** `HomerDpuFrontend{OpenDevice,CloseDevice,ExportRegionOnDevice,DestroyRegionExport}` symbols;
+  they resolve at `dlopen` time from the **`postgres` executable**, which statically links
+  `libhomer_client.a` and is linked `--export-dynamic`. So:
+  **citus `make install` (installs the archive + citus.so) → postgres `ninja -C build` (RELINKS postgres
+  against the new archive) → `meson install` → only then start PostgreSQL.**
+  Starting PostgreSQL with a new `citus.so` against an old `postgres` fails every backend with
+  `undefined symbol: HomerDpuFrontendOpenDevice`. (`HomerFrontendAgentMain` survives `-fvisibility=hidden`
+  because `PGDLLEXPORT` marks it default-visible — verified with `nm -D`.)
+
+- **The S1b API needed a device-scoped variant.** `HomerDpuFrontendExportRegion` opens a `doca_dev` **per
+  call**; the agent exports two regions and they must share one device — opening the same PCI device twice
+  from one process is not something DOCA promises, and the Tier-2 path has always shared one device across
+  its four exports (`homer_frontend_dma.c:1267`-`:1279`). Added `HomerDpuFrontendOpenDevice` /
+  `...ExportRegionOnDevice` / `...DestroyRegionExport` / `...CloseDevice`; the original call is now a thin
+  open+export wrapper, so no existing caller changed.
+
+- **`RLIMIT_MEMLOCK` checked, not assumed.** `doca_mmap_start()` pins pages and can fail with "the kernel
+  failed to pin the requested amount of memory". `dbcomm` has `ulimit -l unlimited` on farnet1, so a 57 MiB
+  arena is fine. Re-check on any new host before blaming DOCA.
+
+- **⚠ A FREE arena slot must always already be zeroed.** The DPU chose `slotIndex` and stamped it into the
+  spawn request *before* the postmaster forked the backend, so it knows the index all along; once it binds
+  its ring it may DMA-read that slot's completion mailbox at any time. If the backend zeroed a dirty slot at
+  bind, the DPU could observe the previous tenant's `publishedEpoch` and then watch it go **backwards**.
+  Therefore `HomerFrontendAgentReleaseArenaSlot` zeroes the three components **before** publishing `FREE`,
+  and `...BindArenaSlot` zeroes again defensively. *The comment the first draft carried — "no consumer reads
+  this slot until the DPU is told its index strictly after this function returns" — was simply false.*
+
+- **Arena slot leak across a postmaster crash-restart (known, loud, deferred to S3).** `_PG_init` does not
+  re-run on crash-restart, so `HomerFrontendAgentCreateArena`'s whole-arena `memset` does not re-run either,
+  and slots left `BOUND` by SIGKILL'd backends stay `BOUND`. The DPU's allocator table *does* reset (new
+  import, new generation), so it will re-offer slot 0 and the backend's **checked claim fails loudly** with
+  `arena slot 0 is already bound` — attributable, not silent aliasing. That is the checked claim earning its
+  keep. **S3 adds an `ownerPid` reaper to the agent's idle loop** (`kill(pid, 0)`), which also covers a
+  hard-crashed backend.
+
+- **`ereport(ERROR)` in the agent IS the retry loop.** ERROR → bgworker `sigsetjmp` → `proc_exit(1)` →
+  postmaster restarts after `bgw_restart_time` (5 s) → a **new pid mints a new `bridgeGeneration`**, and
+  process exit already tore down every DOCA object. So a DPU service that starts *after* PostgreSQL is
+  handled with no extra code. The consequence — the graceful `shutdown:` path is skipped, no `CLOSE` is
+  sent, and the DPU keeps a stale import until its next DMA against it fails fatally — is the **decided R3
+  behaviour**, not an oversight.
+
+- **New `/dev/shm` object to clean:** `/dev/shm/citus_homer_frontend_arena_v1` (57 MiB). Neither it nor the
+  spawn region is `shm_unlink`ed at shutdown, matching existing practice. Added to `AGENTS.md`.
 
 ### S3 — spawn trigger (D2′)
 - **S3.1** Doorbell protocol: add `DOORBELL_ATTACH` / `DOORBELL_ATTACH_ACK` / `SPAWN_DOORBELL` message

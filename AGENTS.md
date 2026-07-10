@@ -409,6 +409,25 @@ names, verify the installed binaries agree before running pgbench. A stale
 `pgbench` or `libhomer_client.a` can silently map an old control shared-memory
 name while the service uses the new one.
 
+**⚠ Install order is load-bearing (since command-plane S2).** `citus.so` is built
+`-fvisibility=hidden` and leaves `HomerDpuFrontend*` **undefined**; those symbols
+resolve at `dlopen` time out of the **`postgres` executable**, which statically
+links `libhomer_client.a` and is linked `--export-dynamic`. So always:
+
+1. citus: `make ... && make install-headers install-service-bin install`
+   (installs the new `libhomer_client.a` **and** `citus.so`)
+2. postgres: `ninja -C build` — this **relinks** `postgres` against that archive
+3. postgres: `meson install`
+4. only now `pg_ctl start`
+
+Installing a new `citus.so` against an old `postgres` fails every backend with
+`undefined symbol: HomerDpuFrontendOpenDevice`. Check with
+`nm -D /data/dbcomm/pg-citus/bin/postgres | grep HomerDpuFrontend`.
+
+**A bridge/comch ABI bump means BOTH DPUs must be resynced and rebuilt**, or the
+setup handshake fails with `BAD_PROTOCOL`. `HOMER_DPU_BRIDGE_PROTOCOL_VERSION` is
+currently `3` (role 8, `BACKEND_SPAWN_REGION`).
+
 ### clangd / compile_commands.json
 
 C/C++ code intelligence (clangd, via the editor/agent `LSP` tools) needs a
@@ -530,6 +549,12 @@ The shared-memory files have different owners in the runtime lifecycle:
   and completion rings.
 - `/dev/shm/citus_remote_exec_backend_spawn_v*` is created by the PostgreSQL
   backend bridge when PostgreSQL starts.
+- `/dev/shm/citus_homer_frontend_arena_v*` (**57 MiB**) is created by the
+  postmaster only when `citus.enable_homer_dpu_frontend_agent=on`. It is neither
+  `shm_unlink`ed at shutdown nor re-zeroed on a postmaster crash-restart, so a
+  stale one can leave arena slots marked BOUND. That fails loudly at the next
+  claim (`arena slot N is already bound`), never silently — but remove it as
+  part of a hard clean baseline.
 - `/dev/shm/citus_res_*` files are payload/result queues created by active or
   recently active Homer sessions.
 
