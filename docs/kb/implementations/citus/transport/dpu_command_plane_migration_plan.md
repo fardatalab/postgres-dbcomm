@@ -5,8 +5,9 @@
 > independently — cite them as "command-plane S1a", etc.
 
 **Status (July 10, 2026): IN PROGRESS. S0 ✅, S0b ✅, S1a ✅, S1b ✅, S2 ✅ (citus `008f4f20b`),
-S3.1 ✅ (citus `c2ec17852`). S5 turned out to be already working — see "S5 IS ALREADY WORKING" below.
-The remaining critical path is S3.0 → S3.2 → S3.3 (arena publish-line reservation; doorbell; spawn DMA).
+S3.0 ✅ (citus `36a61a5a1`), S3.1 ✅ (citus `c2ec17852`), S3.1b ✅ (citus `84ac374ef` + `63b0df0a7`).
+S5 turned out to be already working — see "S5 IS ALREADY WORKING" below.
+The remaining critical path is S3.2 → S3.3 (doorbell; spawn DMA), then **fix B** and **refine A** per D10.
 This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
 
 > **Decisions layered on top of the original plan. Read these before implementing anything.**
@@ -30,8 +31,8 @@ This is a PREREQUISITE for `pgbench --homer-dpu`, not a follow-on.**
 >   collector, action and progress source; a durable `pollDue` bit cleared and rearmed only when the poll
 >   runs; **reserved admission** that generic collector budgets cannot consume. `knownExpectedWork` then
 >   means *"a poll is due"* — true and maintained — rather than *"an item is ready"*, which a listener
->   cannot know without a syscall. The RDMA peer listener already does this; copy it. Ordering: **S3.1b →
->   S3.2 → fix B → refine A.** ⚠ S3.2's doorbell must be built this way from the start.
+>   cannot know without a syscall. ✅ **VALIDATED in citus `84ac374ef`.** Ordering: **S3.2 → fix B →
+>   refine A.** ⚠ S3.2's doorbell must copy the now-working setup-listener implementation.
 > - **S3.5's discovery** — basebackup never spawns a socketless backend, so `pgbench --homer` is the *only*
 >   working regression net for the spawn path. Do not retire it before its replacement's gate passes.
 > - **D9 / the spawn wait — RETRACTED AND CORRECTED.** On the DPU the spin is **not a stall, it is a
@@ -1573,7 +1574,13 @@ matches what the host frontend already builds at `homer_frontend_dma.c:292-293`.
 
 ---
 
-## D10 — a listener is admitted by a POLL-DUE OBLIGATION, not by a readiness claim (decided July 10, 2026)
+## ✅ D10 — a listener is admitted by a POLL-DUE OBLIGATION, not by a readiness claim (validated July 10, 2026)
+
+> **IMPLEMENTED AND VALIDATED — citus `84ac374ef`.** The setup listener now owns a private
+> collector/action/source, a sticky poll-due obligation, and a reserved lifecycle grant. C′ is gone.
+> Defect B is **partially** fixed: this collector is now 1:1 with its feedback, while the other eleven
+> DPU collectors still alias `dpuDmaSource` / `dpuDmaFeedback`
+> (`tuple_sink_service_process.c:38425`-`:38443`).
 
 > **Ordering decided with the project owner after an independent Codex review.** The owner's initial
 > preference was "fix the shared feedback state (B) first, because we want a good fix, not a fast fix."
@@ -1609,21 +1616,48 @@ and the newly-found **D**) in
 > through a reserved budget line that generic collectors cannot consume.**
 
 `knownExpectedWork` then means *"a poll is due"*, which is true and maintained, rather than *"an item is
-ready"*, which a listener cannot know without a syscall. **This pattern already exists in-repo** for the
+ready"*, which a listener cannot know without a syscall. The implementation is
+`HomerServiceDpuSetupTcpListenerPollInterval` → `HomerServiceDpuSetupTcpArmPoll` →
+`HomerServiceDpuSetupTcpServerBeginSchedulerPass` (`homer_service_dpu_setup_tcp.c:240`, `:256`, `:282`),
+with the obligation retired only at the actual poll boundary (`:314`, `:401`). **The pattern already
+existed in-repo** for the
 RDMA peer listener — `TupleSinkServiceArmListenerLiveness` / `listenerLivenessDue` /
 `peerSchedulerFacts.listenerPollDue` (`remote_execution_peer_transport_rdma.c:1939`, `:1954`, `:1987`,
 `:10803`; consumed at `tuple_sink_service_process.c:41081`). S3.1b copies it; S3.2 reuses it.
 
 Seen this way, **C′ (`knownExpectedWork = started`) is the degenerate case with `interval = 0`.** It works,
 for a reason it does not state, at the cost of one `accept()` + one empty `doca_pe_progress()` + up to two
-O(1024) import-table scans on every idle pass.
+O(1024) import-table scans on every idle pass. **S3.1b reverted it.** The candidate path still performs
+four O(1024) `HomerDpuDmaGetSchedulerFacts` scans per pass — one per plan phase — so the landed saving is
+one idle `accept()`, one empty `doca_pe_progress()`, and two scans, not the elimination of all scans.
+
+### What validation taught us
+
+- **A due fact and reserved admission are separate obligations.** Backoff exemption is weaker: it stops
+  feedback suppression, but does not bypass the total/collector caps or fixed ordering. The two named sets
+  are deliberately different: `HomerServiceProgressCollectorBypassesBlindBackoff`
+  (`tuple_sink_service_process.c:9691`) contains three collectors, while
+  `HomerServiceProgressCollectorReservedLifecycleAdmission` (`:9709`) contains only the setup listener.
+- **A listener needs private feedback, but that is not the complete fix B.** The setup listener now maps
+  1:1 to `ProgressRegistry.dpuSetupListenerSource` / `.dpuSetupListenerFeedback`
+  (`tuple_sink_service_process.c:3464`-`:3473`, `:38425`-`:38443`); eleven DPU data-path collectors still
+  share `dpuDmaFeedback`.
+- **Proxy arming can hide real demand.** Reverting C′ exposed that `DPU_PE_DRAIN` had accidentally kept
+  detached-import reclaim alive merely because the socket listener was started. The safe revert required
+  the explicit `HomerDpuDmaSchedulerFacts.detachedImportCount` fact
+  (`homer_service_dpu_dma.h:147`-`:164`; populated by `HomerDpuDmaGetSchedulerFacts` at
+  `homer_service_dpu_dma.c:1024`-`:1089`).
+- **Enum exhaustiveness is manual here.** Nearly every source/collector/action switch has `default:`.
+  `HomerServiceDefaultCpuClassForProgressSource` is the only assignment to `sourceCore->cpuClass`; omitting
+  the new source there would silently leave it `HOMER_PROGRESS_CPU_CLASS_INVALID`
+  (`tuple_sink_service_process.c:15014`-`:15043`, `:15119`-`:15126`). `-Wswitch` did not protect the edit.
 
 ### The agreed order
 
 | # | Step | Why here |
 |---|---|---|
-| 1 | **S3.1b — listener lifecycle admission** on the *existing* setup listener | It is the only thing with a **live regression net** (agent-on basebackup opens a second setup connection and fails loudly). Fix what we can prove. |
-| 2 | **S3.2 — the doorbell** reuses that machinery | Safe by construction; inherits none of A/B/C/D. |
+| 1 | ✅ **S3.1b — listener lifecycle admission** on the *existing* setup listener | **Landed and validated in `84ac374ef`** against the live agent-on regression net. |
+| 2 | **S3.2 — the doorbell** reuses that machinery | Copy the validated two-predicate + poll-due + reserved-line implementation; inherits none of A/B/C/D. |
 | 3 | **B — per-collector feedback redesign**, and decide what `runnableMachineWork` should mean (D) | Not needed for listener liveness once (1) lands. **But it must land before any S6 number**: B aliases the empty/productive streaks of all eleven DPU collectors, including the data-path ones, so cadence measured on it cannot be explained. |
 | 4 | **A refinement** — an enrolled ring **index vector / bitset**, not a count | Makes enrolled membership the single source of truth instead of a predicate evaluated in two places. Also rename: it is an *enrolment* count, not an *immediately-submittable* one. |
 
@@ -1646,6 +1680,19 @@ A complete fix must:
 - handle peer **bundled** execution: `HomerServiceFinishPeerControlProgressGrant` (`:13564`) has
   phase-specific results, and updating every collector in the bundle from one aggregate result would
   recreate the aliasing in a new place.
+
+**Deferred with fix B — two pre-existing accounting defects, neither fixed by S3.1b:**
+
+1. `peDrainReadyCount` **double-counts**. A grouped-control-read submit increments both
+   `inflightTaskCount` and `controlReadInFlight` (`homer_service_dpu_dma.c:8803`-`:8804`), while backend
+   publish/completion-pull counters are subsets of `inflightTaskCount` too. The sum at
+   `tuple_sink_service_process.c:40293`-`:40307` therefore inflates only `maxPolls` /
+   `readyItemCountHint`; liveness is unaffected. Fold this into the fix-B collector-facts rework.
+2. Every `lastPlan*` field in `HomerMachineBaselinePolicyState` is really **last-PHASE**, not last-pass.
+   `HomerMachineBaselinePlanBudgetFinish` overwrites them after each of four phases, so readers normally
+   observe SEMANTIC; `lastPlanLifecycleGrantCount` consequently reads 0 outside COLLECTOR
+   (`tuple_sink_service_process.c:3144`-`:3158`, writes at `:9565`-`:9570`). Use the
+   `HOMER_DPU_SETUP_STARVE_DIAG` counters for cadence questions until the accounting is redesigned.
 
 Re-validate: alternating productive/empty siblings on one source; bounded escape under multiple grants per
 pass; peer bundled setup/send/close feedback; tight total and blind collector budgets; idle listener
@@ -1721,7 +1768,9 @@ constant and on the blind quota.
   > (`pedrain_grants = 1,250,010 / 2,500,001` passes with C′ reverted, backlog 0). **C′ is a tactical
   > hotfix, not the resting state**, and it does not even guarantee the listener runs. A **fourth** defect
   > (D) was also found: `runnableMachineWork` is always true, so backoff's idle-service guard is dead.
-  > See **D10** above and `dpu_scheduler_arm_execute_mismatch.md` §0b. C′ is removed by **S3.1b**.
+  > See **D10** above and `dpu_scheduler_arm_execute_mismatch.md` §0b. ✅ **SUPERSEDED by S3.1b:** C′ was
+  > removed in citus `84ac374ef`, and the listener no longer runs inside `DPU_PE_DRAIN`. This paragraph is
+  > retained as the history of the S3.0 diagnosis, not as current scheduler behaviour.
   >
   > Also uncovered: the **S3.1 comch bump `3 → 4` had never been deployed to either DPU.** Both DPU trees
   > were still at v3, so no `--homer-dpu` path could have worked. Resynced and rebuilt both.
@@ -1732,47 +1781,89 @@ constant and on the blind quota.
 - **S3.1** Doorbell protocol: add `DOORBELL_ATTACH` / `DOORBELL_ATTACH_ACK` / `SPAWN_DOORBELL` message
   kinds to `homer_dpu_comch_abi.h` (`:33`-`:36`) and bump `HOMER_DPU_COMCH_PROTOCOL_VERSION`. Default
   doorbell port **9728**, its own listener — *never* the setup listener, whose single `clientFd` serial
-  accept loop a persistent connection would starve (`homer_service_dpu_setup_tcp.c:48`, `:223`).
+  accept loop a persistent connection would starve (`homer_service_dpu_setup_tcp.c:48`, `:345`).
   ✅ **DONE — citus `c2ec17852`** (ABI only). ⚠ The bump was **not deployed to the DPUs until S3.0**; a
   comch bump means *both* DPU trees must be resynced and rebuilt or setup fails `BAD_PROTOCOL`.
-- **S3.1b — LISTENER LIFECYCLE ADMISSION.** *New stage, inserted July 10, 2026. Blocks S3.2.*
-  See **D10** below for the decision and its evidence. Applies to the **existing setup listener**, which
-  already has a live regression net; the doorbell then inherits the machinery for free.
+- **S3.1b — LISTENER LIFECYCLE ADMISSION. ✅ DONE — citus `84ac374ef` (July 10, 2026).**
+  See **D10** above and
+  [`dpu_scheduler_arm_execute_mismatch.md` §0c](../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md)
+  for the decision, implementation, and evidence. The existing setup listener now supplies the working
+  reference implementation that S3.2 must copy.
 
   Sub-steps, in order:
-  1. **Split the accept loop out of `DPU_PE_DRAIN`.** New `HOMER_PROGRESS_COLLECTOR_DPU_SETUP_LISTENER`,
+  1. ✅ **Split the accept loop out of `DPU_PE_DRAIN`.** New `HOMER_PROGRESS_COLLECTOR_DPU_SETUP_LISTENER`,
      new `HOMER_PROGRESS_ACTION_DPU_SETUP_LISTENER`, new `HOMER_PROGRESS_SOURCE_DPU_SETUP_LISTENER` with
-     its own `ProgressRegistry` feedback struct. Move the
-     `HomerServiceDpuSetupTcpServerProgress(...)` call out of `tuple_sink_service_process.c:41449` into
-     the new action handler. Touch list (each is a small `case`): the collector enum + `COUNT`, the action
-     enum, `HomerServiceMachineBaselineCollectorSource` (`:9719`),
-     `HomerServiceProgressCollectorFeedbackForKind` (`:38182`), the collector→action mapper, the registry
-     init, the candidate append, the plan (`:10769`+), the executor switch, and the action-name/class
-     switches. `-Wswitch` covers most of them; grep for `DPU_PE_DRAIN` and mirror.
-  2. **Durable poll-due obligation.** Copy the peer listener's shape exactly:
-     `HomerServiceDpuSetupTcpListenerPollInterval()` →
-     `HomerServiceArmDpuSetupListenerPoll(nextDuePass)` → a sticky `setupListenerPollDue` bit raised at
-     pass start → **cleared and rearmed ONLY inside the action handler, after the poll actually runs**.
-     Reference implementation: `remote_execution_peer_transport_rdma.c:1939` (interval), `:1954` (arm),
-     `:1987` (raise), `:10803` (clear+rearm); consumed at `tuple_sink_service_process.c:41081`.
-     `knownExpectedWork = setupListenerPollDue` — this is honest: *a poll is due*, not *an item is ready*.
-  3. **Reserved admission.** A due listener poll must not compete for the generic collector quota. Add a
-     reserved lifecycle line to `HomerMachineBaselinePlanBudget` (alongside the blind quota) that only
-     listener collectors may draw from. **This is the only construct that actually guarantees the poll
-     runs** — see D10, correction 3.
-  4. **Revert C′.** `setupTcpKnownWork` goes back to `setupTcpFacts.activeConnection`, and
-     `DPU_PE_DRAIN`'s `knownExpectedWork` returns to `peDrainReadyCount > 0` — honest again. `PE_DRAIN`
-     may now back off when idle, which is correct and which also removes the idle-pass `accept()` +
-     empty `doca_pe_progress()` + **two O(1024) import-table scans** (`:41625`, `:41634`).
-  5. **Add the listener collector to the backoff exemption** (`:9615`) next to `PEER_CM_SETUP` /
-     `PEER_CLOSE_LIFETIME`. With a due obligation, "due" must mean "will run"; that is what the exemption
-     is for, and it is why `PEER_CM_SETUP` is on the list despite already having its own feedback struct.
+     its own `ProgressRegistry.dpuSetupListenerSource` / `.dpuSetupListenerFeedback`
+     (`tuple_sink_service_process.c:3464`-`:3473`).
+     `HomerServiceExecuteDpuSetupListenerAction` (`:41821`) is now the only scheduler executor of
+     `HomerServiceDpuSetupTcpServerProgress`; `DPU_PE_DRAIN` contains no socket progress (`:41955`-`:41985`).
+     This is a **partial fix for defect B**: the listener is 1:1 collector→source; the eleven collectors at
+     `:38425`-`:38436` still alias `dpuDmaFeedback`.
+  2. ✅ **Durable poll-due obligation.** Listener-owned
+     `HomerServiceDpuSetupTcpListenerPollInterval` → `HomerServiceDpuSetupTcpArmPoll` →
+     `HomerServiceDpuSetupTcpServerBeginSchedulerPass` (`homer_service_dpu_setup_tcp.c:240`, `:256`,
+     `:282`) raises a sticky `pollDue`. It is cleared and rearmed **only** inside
+     `HomerServiceDpuSetupTcpServerProgress` (`:314`, `:401`), from the post-poll `clientFd` state.
+     The interval is 1 pass for an active exchange, otherwise
+     `HOMER_SERVICE_DPU_SETUP_TCP_IDLE_POLL_INTERVAL_PASSES = 512`
+     (`homer_service_dpu_setup_tcp.h:29`-`:48`). Candidate arming is
+     `pollDue || activeConnection`; both are `knownExpectedWork`
+     (`tuple_sink_service_process.c:40142`-`:40178`).
+  3. ✅ **Reserved admission.** `maxLifecycleCollectorGrants` defaults to 2 and is controlled by
+     `HOMER_MACHINE_BASELINE_MAX_LIFECYCLE_COLLECTOR_GRANTS`
+     (`tuple_sink_service_process.c:11703`-`:11721`). `HomerMachineBaselineBudgetTryReserve` bypasses the
+     total/collector/blind caps for a lifecycle grant (`:9778`-`:9816`), gated by
+     `HomerServiceProgressCollectorReservedLifecycleAdmission` (`:9709`-`:9727`). The listener is appended
+     first in the COLLECTOR phase so the fixed `actionGrants[64]` array cannot already be full
+     (`:10936`-`:10957`).
+  4. ✅ **Revert C′ without hiding reclaim demand.** `DPU_PE_DRAIN` is now armed from
+     `peDrainReadyCount > 0 || facts.detachedImportCount > 0`
+     (`tuple_sink_service_process.c:40272`-`:40307`). The listener is no longer an arming proxy.
+  5. ✅ **Name the backoff exemption.** `HomerServiceProgressCollectorBypassesBlindBackoff`
+     (`tuple_sink_service_process.c:9691`-`:9705`) contains `{PEER_CM_SETUP, PEER_CLOSE_LIFETIME,
+     DPU_SETUP_LISTENER}`. That set is deliberately broader than reserved admission: bypassing backoff
+     prevents feedback suppression; it does not guarantee a quota slot.
 
-  **Gate.** All three existing regressions green *with the agent on*: 4-role DPU-relay basebackup
-  (23.2 GB, `CLOSE_ACK`), `pgbench --homer` (1000/1000), six-leg TCP transport smoke. Plus, with the
-  `-DHOMER_DPU_SETUP_STARVE_DIAG=1` probe: the listener collector is granted on a **bounded cadence**
-  (not every pass, not never), and a setup `connect()` issued while the DPU is busy streaming is accepted
-  within one interval. Record the idle-pass syscall rate before and after.
+  > ### ✅ What it actually took — direct gate evidence
+  >
+  > - **512.0 passes/grant idle** across 127 windows; **510.2 passes/grant under load** while the same
+  >   windows contained 182k–246k `PE_DRAIN` grants. The listener held cadence while its former host
+  >   action was saturated.
+  > - `listener_grants == listener polls` exactly: `125987 == 125987`. No grant without a due poll, and
+  >   no obligation retired without polling.
+  > - **Zero `SETUP_LISTENER dropped` lines across 63M passes**: reserved admission never lost a grant.
+  > - Idle `accept()` fell from about 150k/s to **586/s (256×)**. At 300k passes/s, 512 passes add
+  >   **1.71 ms** to accept latency only; the kernel still completes `connect()` into the listen backlog.
+
+  **Gate passed, agent ON.** Probe: `pedrain_grants` stayed frozen at `428773` while passes advanced
+  45.0M → 46.5M (correct idle arming), and a bare mid-stream `connect()` was accepted (`accepted 1 → 4`,
+  `errs 0 → 1`). Final binary: 4-role DPU-relay basebackup delivered
+  `23,236,731,651 / 23,236,732,163 / 23,236,732,675` bytes with `CLOSE_ACK`, rc=0, wall
+  `13.89` warmup / `8.18` / `10.41` s; **do not compare this cache state to S3.0's 19.55/23.00 s band.**
+  `pgbench --homer`: 1000/1000, 0 failed, 5082 TPS, p99 0.224 ms, with a socketless backend observed under
+  the agent-enabled postmaster. Six-leg TCP transport smoke: `ok` on both ends, `distinct_va=YES`. All ten
+  citus make targets built; both DPUs were resynced/rebuilt (comch 4U, bridge 3U on all four nodes).
+
+  > ### ⚠ First-class caveat — the invisible reclaim demand
+  >
+  > `HomerDpuDmaReclaimDetachedImports` (`homer_service_dpu_dma.c:7439`) has two callers: the payload
+  > close/reclaim pump (`tuple_sink_service_process.c:33428`-`:33443`) and `DPU_PE_DRAIN`
+  > (`:42007`-`:42028`). The pump dies with its owning stream, so PE_DRAIN is the backstop. Before S3.1b,
+  > PE_DRAIN stayed armed whenever the setup listener was merely *started*; reclaim liveness was therefore
+  > an accidental side effect of an unrelated socket fact. A naive C′ revert would leak a detached import
+  > with zero in-flight tasks after its stream disappeared, with no log line. S3.1b exports
+  > `HomerDpuDmaSchedulerFacts.detachedImportCount` (`homer_service_dpu_dma.h:147`-`:164`), computed for
+  > free during the existing 1024-slot scan (`homer_service_dpu_dma.c:1024`-`:1089`), and arms PE_DRAIN
+  > from the actual demand. **General rule:** arming on a proxy hides the real obligation, and the proxy
+  > silently becomes load-bearing for work it has nothing to do with — the arm/execute mismatch in reverse.
+
+  > 🆕 **Post-S3.1b follow-up — citus `63b0df0a7` (comment-only): a second invisible demand.**
+  > `HOMER_SERVICE_DPU_SETUP_TCP_CLIENT_WAITING_CLOSE_DRAIN` is reachable at
+  > `homer_service_dpu_setup_tcp.c:592`-`:605`, and each listener poll in that phase drives
+  > `HomerDpuDmaDrainPeForClose` (`:610`-`:646`). Before the split, close-drain progress also rode on
+  > `DPU_PE_DRAIN` being armed by the unrelated `started` socket fact; it now rides on the listener's own
+  > reserved poll obligation. `HomerServiceDpuSetupTcpWriteAck` closes the transient setup socket as soon
+  > as the ack is complete (`:739`-`:776`), explaining why `activeConnection=0` is normal mid-stream.
 
 - **S3.2** Agent: connect the doorbell lazily with bounded backoff (the local DPU service may not be up
   at `_PG_init`), `DOORBELL_ATTACH`, then block in `recv()`. On readable: drain to `EAGAIN` **without
@@ -1781,11 +1872,19 @@ constant and on the blind quota.
   > ### ⚠⚠ THE DOORBELL LISTENER REUSES S3.1b. It gets its own collector/action/source + pollDue + reserved admission.
   >
   > It is a second listener with exactly the readiness profile that wedged the first one. **Do not fuse it
-  > into `DPU_PE_DRAIN` or into the setup-listener action**, and **do not copy C′
-  > (`knownExpectedWork = started`)** — that is a hotfix, and it does not even guarantee execution
-  > (D10, correction 3). Build it the way S3.1b builds the setup listener. If you get this wrong the
+  > into `DPU_PE_DRAIN` or into the setup-listener action**. Copy the working obligation mechanics — a
+  > doorbell-specific `BeginSchedulerPass` + `ArmPoll` pair — and the listener's reserved lifecycle line.
+  > Add the doorbell collector to **both**
+  > `HomerServiceProgressCollectorBypassesBlindBackoff` and
+  > `HomerServiceProgressCollectorReservedLifecycleAdmission` (`tuple_sink_service_process.c:9691`-`:9727`):
+  > the first prevents feedback backoff; the second guarantees admission, and neither substitutes for the
+  > other. **Do not copy C′ (`knownExpectedWork = started`)**, and do not copy the setup listener's exact
+  > interval rule: the doorbell connection is persistent, so `clientFd >= 0 ⇒ 1 pass` would spend one
+  > reserved grant and one `recv()/EAGAIN` on every pass forever. Poll hot only during attach, then use a
+  > bounded EOF cadence; arm outbound frames from exact queue depth (`homer_service_dpu_setup_tcp.c:240`,
+  > whose comment block records this warning; added post-S3.1b by `63b0df0a7`). If you get this wrong the
   > failure is **silent**: the agent hangs in `connect()` and the DPU logs nothing.
-  > See `dpu_scheduler_arm_execute_mismatch.md` §0/§0b.
+  > See `dpu_scheduler_arm_execute_mismatch.md` §0c.
 - **S3.2b** Agent idle loop: an **`ownerPid` reaper**. Walk the arena's `BOUND` slots and release any whose
   `ownerPid` is gone (`kill(pid, 0)` → `ESRCH`). Covers a hard-crashed backend and the crash-restart leak
   (`_PG_init` does not re-run, so `CreateArena`'s whole-arena `memset` does not either). A recycled pid can

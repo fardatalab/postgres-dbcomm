@@ -125,11 +125,25 @@ Three things about this smoke that each cost a cycle (validated July 9, 2026, ci
 # to 15 characters. `citus_tuple_sink_service` is `citus_tuple_sin` there, so `pkill -x
 # citus_tuple_sink_service` matches nothing and silently succeeds. Verify with `cat /proc/<pid>/comm`.
 #
-# What actually works: resolve the pid first and kill it --
-#   for p in $(pgrep -f 'homer/citus_tuple_sink_service'); do sudo -n kill -9 "$p"; done
-# -- run from a script file (so the caller's own argv does not contain the pattern), or filter the
-# caller out by pid. Note `sudo -n pkill` is also needed when the target runs as `dbcomm`; a plain
-# `pkill` reports "Operation not permitted" and leaves the process alive.
+# `pgrep -f` in a `$(...)` has the SAME defect as `pkill -f`: the pattern sits in the calling shell's
+# argv, so the pgrep matches its own parent and the kill takes the caller down. Writing the loop into a
+# script with a HEREDOC does NOT save you -- the heredoc body is part of the `bash -c` command string,
+# so the pattern is in the caller's argv anyway. (Both happened on July 10, 2026; each looked like a
+# silent no-output failure.) Create the script with a FILE-WRITE tool, then invoke it by path.
+#
+# The same trap makes the process PREFLIGHT lie in the other direction: `ps -eo args | grep -E '...'`
+# matches the calling `bash -c` and its own grep, so a clean machine reports three "leftover"
+# processes. Bracket tricks like `[c]itus_...` do not help -- the caller's argv contains the brackets.
+#
+# What actually works: resolve identity from `/proc/<pid>/exe`, which no shell can fake:
+#
+#   for d in /proc/[0-9]*; do
+#     exe=$(readlink -f "$d/exe" 2>/dev/null) || continue
+#     case "$exe" in */pg-citus/bin/citus_tuple_sink_service) sudo -n kill -9 "${d#/proc/}";; esac
+#   done
+#
+# Note `sudo -n` is required when the target runs as `dbcomm`; a plain kill/pkill reports "Operation
+# not permitted" and leaves the process alive.
 ./homer_dpu_tcp_transport_smoke --server \
   --dev-pci 0000:03:00.0 \
   --port 9727 \
@@ -359,17 +373,29 @@ CPPFLAGS='-D_GNU_SOURCE -DHOMER_SERVICE_PAYLOAD_STATS=1 -DHOMER_CLIENT_BASEBACKU
 
 When the DPU service "does nothing" — spins at 100% CPU, logs nothing, and stops accepting setup
 connections (`ss -ltn` on the DPU shows a nonzero `Recv-Q` on the `9727` LISTEN socket) — build the DPU
-service with the scheduler-starvation probe. It prints scheduler passes vs. actual `DPU_PE_DRAIN` grants,
-and names the exact gate that dropped the collector:
+service with the scheduler-starvation probe. It prints scheduler passes vs. the grants actually issued to
+the two collectors whose starvation is silent, and names the exact gate that dropped one:
 
 ```sh
 CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_SETUP_STARVE_DIAG=1'
-# [starve-diag] pass=2000001 pedrain_grants=812042 imported=1 rings=49 tcp{active=0 accepted=2 ...}
-# [starve-diag] PE_DRAIN dropped: feedback-backoff (count=2500001)
+# [starve-diag] pass=46500001 pedrain_grants=428773 listener_grants=90831 imported=1 rings=49 inflight=0 \
+#               tcp{due=0 active=0 polls=90831 accepted=4 acks=3 errs=1}
+# [starve-diag] SETUP_LISTENER dropped: budget (count=...)      <-- must NEVER print
+# [starve-diag] PE_DRAIN dropped: feedback-backoff (count=...)
 ```
 
-A frozen `pedrain_grants` while `pass` climbs means the setup listener is starved. See
-`docs/kb/future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md` §0.
+Read it like this (post-S3.1b, citus `84ac374ef`):
+
+- `listener_grants` must climb at **one grant per `HOMER_SERVICE_DPU_SETUP_TCP_IDLE_POLL_INTERVAL_PASSES`
+  (512) passes** when idle, and keep roughly that cadence while `pedrain_grants` is climbing fast. A frozen
+  `listener_grants` is the wedge.
+- `polls == listener_grants` exactly. Any drift means a grant retired the poll obligation without polling.
+- `SETUP_LISTENER dropped` must never print: the listener draws from the reserved lifecycle grant line.
+- `pedrain_grants` **frozen while idle is now correct** — PE_DRAIN is armed only by in-flight DOCA tasks or
+  a detached import awaiting reclaim. (Before S3.1b a frozen `pedrain_grants` was the bug, because the
+  accept loop lived inside it. Do not read old notes with the new meaning.)
+
+See `docs/kb/future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md` §0/§0b/§0c.
 
 For scheduler/action-grant diagnostics, include the service progress and peer
 transport stats switches:
@@ -382,6 +408,26 @@ Do not leave a stats-enabled `build/homer/citus_tuple_sink_service` behind befor
 performance runs. After a compile-only diagnostic check with stats switches,
 rebuild the service/client binaries again with only `CPPFLAGS='-D_GNU_SOURCE'`
 and reinstall.
+
+⚠ **A plain `make` does NOT undo a `make -B` stats build.** `-B` leaves every object
+newer than its source, so the next `make service-bin CPPFLAGS='-D_GNU_SOURCE'` finds
+nothing to do and relinks the *stats-instrumented* objects. `touch`ing the files you
+edited is not enough either — it misses the TUs you did not touch (e.g.
+`remote_execution_peer_transport_rdma.o` keeps `-DHOMER_SERVICE_PEER_TRANSPORT_STATS=1`).
+Always exit a diagnostic build with another **`make -B`**, then prove it:
+
+```sh
+strings build/homer/citus_tuple_sink_service | grep -c 'starve-diag\|progress_machine_baseline_stats'   # want 0
+```
+
+This is the same source-mtime trap as the `rsync -a` one on the DPUs, in a different
+costume: an artifact that is newer than its input is not evidence that it was built
+from that input *with the flags you now want*.
+
+Symmetrically, a `strings | grep` for a macro NAME proves nothing (it is compiled out
+of both variants). Grep for a **string literal that only the enabled build emits** — e.g.
+`starve-diag` — or, on the DPU, for a literal you know is in the new code
+(`DPU setup-listener action selected`) to prove the deploy actually landed.
 
 After rsyncing sources to a DPU tree (`~/dbcomm/citus-dbcomm`, a plain non-git
 rsync dir on BOTH DPUs), you must re-run configure before `make` — the copied
@@ -1300,6 +1346,22 @@ validation built ONE target and ran ONE workload. Cheap insurance:
   service still works afterwards." **An import being accepted proves nothing about the next connection.**
   Cheapest check: with the agent on, run the 4-role basebackup — its sender opens a *second* DPU setup
   connection, so it fails immediately if the listener is starved.
+
+  The frontend DPU env must be in the **postmaster's** environment, not just the client's:
+
+  ```sh
+  sudo -n -u dbcomm env \
+    HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.201 HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
+    HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
+    /data/dbcomm/pg-citus/bin/pg_ctl -D /data/dbcomm/pg-citus/data \
+    -l /data/dbcomm/pg-citus/data/postgres.log \
+    -o "-c citus.enable_homer_dpu_frontend_agent=on" start -w
+  ```
+
+  Confirm the import landed with two lines in the DPU service log:
+  `... mmap import accepted ... export_index=0 descriptor_first=0 descriptor_count=48` and
+  `... export_index=1 descriptor_first=48 descriptor_count=1`. Then check `ss -ltn | grep 9727` still
+  shows `Recv-Q 0` **after** running a workload — that, not the import line, is the liveness signal.
 - **Stamp every recorded baseline with a commit SHA, not just a date.** A dated
   baseline reads like a standing fact; it is a timestamped observation. The June-6
   COPY baseline above was cited as evidence against a correct diagnosis. With a SHA,
@@ -1307,6 +1369,19 @@ validation built ONE target and ran ONE workload. Cheap insurance:
 - **Verify a deployment through the installed HEADER, not by grepping a binary for a
   `#define`.** `strings <binary> | grep CITUS_TUPLE_SINK_PROTOCOL_VERSION` always
   returns nothing and looks like a pass in both directions.
+- **`-Wswitch` protects nothing in `tuple_sink_service_process.c`.** Nearly every
+  switch over `HomerProgressSourceKind` / `...CollectorKind` / `...ActionKind` has a
+  `default:` arm, so adding an enum member compiles clean while silently falling into
+  it. When you add one, enumerate the switches by hand:
+  `grep -n 'switch ((HomerProgressSourceKind)\|switch (sourceKind)' tuple_sink_service_process.c`
+  and repeat for the other two enums. S3.1b found a live instance this way:
+  `HomerServiceDefaultCpuClassForProgressSource` is the *only* thing that sets
+  `sourceCore->cpuClass`, and its default arm is `HOMER_PROGRESS_CPU_CLASS_INVALID`.
+- **`HOMER_SERVICE_ENABLE_DPU_DMA=1` requires the machine-baseline progress policy.**
+  No source-plan policy admits *any* DPU collector — `HomerServiceBuildCoarseProgressReadySet`
+  never appends a DPU source — so under any other policy the DPU service starts, binds
+  9727, and never accepts. A startup tripwire now exits(1); it cannot fire today because
+  `ProgressPolicy` is a compile-time static with no runtime selector.
 
 ## Quick validation checklist
 
