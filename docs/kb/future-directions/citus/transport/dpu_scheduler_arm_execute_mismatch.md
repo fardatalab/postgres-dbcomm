@@ -558,6 +558,43 @@ The shortcut has a consistent shape: **iterate everything and filter on a type t
 available locally and the identity is not.** The identity is one layer up. The fix is always to carry a
 handle down, never to teach the lower layer to guess.
 
+---
+
+## §0d — the mismatch, committed by this document's author (S3.3, July 10, 2026)
+
+The scheduler has **two** independent lists of collectors, and only one of them looks like a list.
+
+1. `HomerServiceBuildProgressCollectorCandidates()` — the arming side. Each collector has an
+   `HomerServiceAppend…CollectorCandidate()` that reads maintained facts and appends a candidate.
+2. `HomerMachineBaselineCompileExecutionPlan()`'s COLLECTOR phase — the granting side. It is a
+   **hand-enumerated straight-line sequence** of
+   `collector = HomerServiceMachineBaselineFindCollector(candidateSet, HOMER_PROGRESS_COLLECTOR_X);`
+   followed by `HomerServiceMachineBaselineAppendCollectorAction(...)`. There is no loop over candidates.
+
+S3.3 added `HOMER_PROGRESS_COLLECTOR_DPU_SPAWN`, wired all four enum switches, wired the collector→source
+and collector→action maps, and armed it correctly — and **never named it in (2)**. Result: armed on every
+one of ~300,000 passes per second, granted on none.
+
+**The symptom was silence.** The DPU logged `spawn begin`, logged `deferred peer response`, and then
+nothing — for seven minutes. Not even the spawn's own 60-second timeout fired, *because the timeout is
+checked inside the action that never ran*. An idle service and a wedged service produce identical output.
+The peer sat in `WAIT_PEER_OPEN` until its client gave up.
+
+This is precisely rule 1 of this document — **arming and executing are separate lists, and nothing checks
+that they agree** — and it was committed while writing the fix for the last instance of it. The lesson is
+not "be careful." It is:
+
+> **Rule 6. A new collector is FOUR edits, and the fourth is not a switch.** Enums, collector→source,
+> collector→action, *and* the phase body of `HomerMachineBaselineCompileExecutionPlan`. Verify with
+> `grep -n 'FindCollector(candidateSet, HOMER_PROGRESS_COLLECTOR_' tuple_sink_service_process.c`
+> and check that every collector kind you can arm appears there. Nothing else will tell you: the
+> candidate append compiles, every switch compiles (they all have `default:`), and the service starts.
+
+**A cheap structural fix exists and is not yet done:** at plan-compile time, assert that every
+*armed candidate* was either granted or explicitly dropped with a reason. The `HOMER_STARVE_DIAG_DROP`
+macro already reports drops; what is missing is a report for a candidate that was never even considered.
+That check would have converted seven minutes of silence into one line.
+
 ## Related
 - [`dpu_readiness_collectors_and_continuation_edges.md`](dpu_readiness_collectors_and_continuation_edges.md)
   — **the root cause of every finding here.** Why everything is polled, what a completion queue actually

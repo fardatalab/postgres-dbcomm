@@ -1747,6 +1747,98 @@ It is dishonest (`started` ≠ "work is due"), it does not guarantee execution, 
 
 ---
 
+## D11 — the peer responder DEFERS its response; it does not reply early (decided July 10, 2026)
+
+D9 folded S3.7's async responder into S3.3 with one sentence: *"the responder
+(`HandlePeerOpenCommandSessionRequest`, which handles and replies in one call) needs the equivalent
+built."* This section is that design, plus the read of the transport that justifies it.
+
+### The constraint, established by reading the code
+
+`TupleSinkServiceProcessIncomingMailboxRequest`
+(`remote_execution_peer_transport_rdma.c:7816`-`:7862`) does exactly four things:
+
+1. calls `requestHandler(...)` with a **stack-local** `CitusRemoteExecPeerResponseUnion response`;
+2. reserves a pooled, connection-owned `TupleSinkServicePeerControlResponsePublishSlot`;
+3. `TupleSinkServicePrepareResponseMessage(messageSequence, requestKind, opIndex, opGeneration, &response, …)`;
+4. RDMA-publishes it.
+
+**There is no deferral today.** Step 2 happens *after* the handler returns, so a handler cannot hold
+the slot; and the handler receives no identity it could save. The only deferral-shaped thing that
+exists is `HomerPeerResponsePostTicket` (`:7855`), which schedules work **after** the response is
+already sent (payload-close only). Confirmed by reading the drain, not by grep.
+
+**But nothing about the transport forbids deferral.** The response identity is four scalars taken
+from the inbound message — `messageSequence`, `requestKind`, `opIndex`, `opGeneration` — the response
+body is a POD union, and the publish-slot pool is already connection-owned with a send-CQ retirement
+path. Deferral is therefore *additive*, not surgery.
+
+### The two options, and why we are not taking the cheap one
+
+| | **A — defer the response** (chosen) | **B — reply OK immediately, spawn asynchronously** |
+|---|---|---|
+| Peer OPEN response means | "your backend is forked, pid=N" (**today's meaning**) | "a session object exists" |
+| Spawn failure surfaces | in the OPEN response, at `WAIT_PEER_OPEN` | one round later, as a synthesized command failure |
+| New session states | none | `spawnState ∈ {NONE, IN_FLIGHT, DONE, FAILED}`, checked by every command publisher |
+| New window | none | session open, backend absent, commands already in the mailbox |
+| Code | ~150 lines transport + ~200 service, mechanical, isolated | ~200 lines spread across the session state machine |
+| Kills the `WaitForCommandStartup` nested pump later | yes — it is the mechanism | no |
+
+**B looked smaller and is not.** `CitusRemoteExecPeerOpenCommandSessionResponse`
+(`remote_execution_peer_control_protocol.h:237`-`:255`) carries `peerServiceSessionId`,
+`peerCommandDoorbellToken` and `peerCommandMailboxDescriptor` — *nothing* derived from the spawn — so
+B **can** truthfully reply early. But then a spawn failure has no reader: the requester has already
+RDMA-written its command into the peer command mailbox, and a backend that never forks means nobody
+reads it. B must therefore build a *second* failure channel (`forcedCommandFailure`, `:20557`) and
+teach every `backendLoopActive` consumer about a session whose backend does not exist. It trades 350
+lines of isolated, mechanical machinery for 200 lines of semantic change in the part of the service
+we understand least — and it gives up a property D9 itself valued when it rejected the
+`SPAWN_RESPONSE`-over-doorbell alternative on *failure semantics*.
+
+### The design
+
+Additive, three pieces, no behaviour change for any handler that does not opt in.
+
+1. **Transport (`remote_execution_peer_transport_rdma.{c,h}`).**
+   `TupleSinkServicePeerRequestHandler` gains an out-parameter `HomerPeerDeferredResponseTicket *`.
+   `ProcessIncomingMailboxRequest` **pre-fills** it with the four identity scalars plus the
+   connection handle and its generation, then calls the handler. If the handler sets
+   `ticket->armed`, steps 2-4 are skipped. New entry point
+   `TupleSinkServicePostDeferredPeerResponseRdma(peerTransportState, ticket, response, &posted, err)`
+   re-resolves the connection by handle+generation (the same revalidation
+   `TupleSinkServiceResolveControlMailboxAction` already does, `:7864`), then runs steps 2-4.
+   A connection that died in between yields `posted=false` and a **loud log** — not an error.
+
+2. **Service: a deferred-peer-response queue**, small fixed array, each entry
+   `{ticket, requestKind, serviceSessionId, response}` plus a readiness predicate. Drained by a new
+   demand-armed collector `HOMER_PROGRESS_COLLECTOR_PEER_DEFERRED_RESPONSE` (exact work — **not** a
+   reserved lifecycle grant; it is armed by a count, never by a poll obligation, so D10's machinery
+   does not apply).
+
+3. **Service: the spawn phase machine** owns the readiness. It never learns about peers.
+
+**Why the queue is service-level and not a field on the session:** a spawn that fails must still post
+a response, and the failure path resets the session (`TupleSinkServiceResetSession`). Hanging the
+ticket off the session would make the reset silently drop the peer's reply — the requester would hang
+in `WAIT_PEER_OPEN` forever, which is precisely the silent-hang class this project keeps re-finding.
+
+### ⚠ A latent hazard this makes visible (do not "fix" it in S3.3)
+
+`TupleSinkServiceHandlePeerStartCommandRequest` already calls `TupleSinkServiceWaitForCommandStartup`
+(`tuple_sink_service_process.c:20485`), a **nested full `TupleSinkServicePumpOnce(...,
+PUMP_STARTUP_WAIT)` loop, with no timeout, from inside the granted `DRAIN_PEER_CONTROL_MAILBOX`
+action.** And the DPU collectors are appended **unconditionally** in the COLLECTOR phase
+(`:41661`-`:41663`) — they are *not* `pumpFlags`-gated. So on a DPU-resident service that nested pump
+would drive `doca_pe_progress()` and mutate engine state (staged command slots, `discoveredReady`,
+ready-queue entries) underneath an outer pass whose facts snapshot was already taken.
+
+That is **exactly the "cooperative spin that pumps progress" alternative D9 rejected**, already live
+in the tree on the peer START path. It is why D9's rejection is right, and it is a pre-existing
+defect, not one S3.3 introduces. S3.3 must not rely on it. Retiring it is the natural S4/S5 payoff of
+the deferral machinery — record it, do not widen it.
+
+---
+
 ### S3 — spawn trigger (D2′)
 - **S3.0** ✅ **DONE — citus `36a61a5a1`.** **D8** + **D8b**: reserved `hostPublishLines[48]` and
   `dpuCreditLines[48]` in the arena, pointed `bridgeHeader.hostPublishOffset` at the former, left
@@ -1952,11 +2044,164 @@ It is dishonest (`started` ≠ "work is due"), it does not guarantee execution, 
   `HomerFrontendAgentReleaseArenaSlot` with `on_proc_exit`. Fatal on a failed claim — a collision means the
   DPU and the host disagree about allocation.
 - **S3.3** DPU service: replace `TupleSinkServiceSubmitBackendSpawnRequest`'s `shm_open`
-  (`tuple_sink_service_process.c:18833`+) with a DMA write into the imported spawn region — **fields
-  first, then `REQUEST_READY` with a release barrier, each awaited** — then one `SPAWN_DOORBELL` frame.
-  Body in `homer_service_dpu_doorbell.c`; the 43k-line hub keeps only the call.
-  Per **D7** the DPU reserves from its own range `slots[16..31]` using a DPU-local free list; it never CASes
-  host memory (it cannot).
+  (now `tuple_sink_service_process.c:19160`) with a DMA write into the imported spawn region — **fields
+  first, then `REQUEST_READY`, each awaited** — then one `SPAWN_DOORBELL` frame.
+  Body in a **new TU `homer_service_dpu_spawn.{c,h}`** (not `homer_service_dpu_doorbell.c`: the doorbell
+  owns a socket, the spawn owns a DMA phase machine — one call links them); the 43k-line hub keeps only
+  the call. Per **D7** the DPU reserves from its own range `slots[16..31]` using a DPU-local free list;
+  it never CASes host memory (it cannot).
+
+  #### Facts settled by reading the code before implementing (July 10, 2026)
+
+  - **`HomerDpuDmaFindDescriptorRef` cannot find the spawn region.** It requires `serviceSessionId != 0`
+    and matches on `HomerDpuDmaRingBoundSessionId` (`homer_service_dpu_dma.c:1121`-`:1131`). Role 8 is a
+    per-node singleton and is never bound to a session. S3.3 needs a session-agnostic
+    `HomerDpuDmaFindSpawnRegionDescriptorRef(engine, bridgeGeneration, …)`.
+  - **The arena and the spawn region are ONE import, 49 descriptors.** `homer_frontend_agent.c:708`-`:724`
+    puts the spawn descriptor at ring index `HOMER_FRONTEND_ARENA_RING_COUNT` (48), export id 2. The DPU
+    log's `export_index=1 descriptor_first=48 descriptor_count=1` is that descriptor.
+  - **Spawn is gated on an ATTACHED doorbell**, and uses the doorbell's `bridgeGeneration`. The DPU cannot
+    `kill(spawnRegion->postmasterPid)`; the *only* way the postmaster learns of a `REQUEST_READY` is the
+    agent's `SIGUSR1`. A spawn into a generation with no attached doorbell is a silent hang by
+    construction, so it must be a loud refusal.
+  - The DPU's local DMA buffers live in dedicated registered mmaps (`localControlMmap`,
+    `localCommandMmap`, `localResponseMmap`, `localBackendCommandMmap`, `homer_service_dpu_dma.c:10852`+).
+    S3.3 adds `localSpawnMmap`.
+  - Task chaining is **completion-callback driven**: only the first task is `doca_task_submit`ed; the next
+    is left `PREPARED` and submitted from the previous task's completion callback (see
+    `publishTaskSlotIndex`, `:1868`-`:1871`). That is how "await, then next" is spelled in this engine.
+
+  ### ✅ S3.3 DONE — citus `455c7a556` (July 10, 2026). GATE PASSED.
+
+  > **The one line that is the gate.** On farnet1's DPU, with the frontend agent attached:
+  > ```
+  > tuple-sink service: DPU backend spawn begin handle=1 slot=16 session=1 db=5 user=10 bridge_generation=2558430997326443
+  > tuple-sink service: DEBUG deferred peer response requestKind=5 messageSequence=1
+  > tuple-sink service: DPU backend spawn COMPLETED handle=1 slot=16 session=1 launched_pid=616897 state_reads=4
+  > ```
+  > and, on farnet1's **host**, `postgres.log`:
+  > ```
+  > 2026-07-10 11:06:32.818 EDT [616897] ERROR: could not open Homer control region "/citus_remote_execution_control_v27"
+  > ```
+  > **The pids match.** The DPU asked, the postmaster forked, and the DPU read the child's pid back
+  > across PCIe with a two-phase DMA read. `slot=16` is the first slot of the DPU's D7 range.
+  > `state_reads=4` is the two-phase read polling `state` on its 256-pass cadence before
+  > `RESPONSE_READY` appeared.
+  >
+  > The client also printed `pgbench: client 0 opened selected-DPU Homer SQL command session id=1 index=0`
+  > — so the **deferred peer response was posted and consumed** (D11 end to end). pgbench then failed at
+  > `client_sql_tx_begin`, which is S3.2c/S4 work, not a regression.
+  >
+  > ⚠ **The spawned backend is EXPECTED to die**, with `could not open Homer control region`. S3.3 sets
+  > `backendChannelMode = HOST_SERVICE_SHM` deliberately (see the comment in
+  > `TupleSinkServiceFillBackendSpawnRequest`): an unbound arena slot is a *worse*, because silent,
+  > failure than a missing control region. S3.2c binds the slot; S3.3b/S4 flip the mode.
+
+  > ### 🔥 The gate failed twice first, and both failures are worth more than the pass
+  >
+  > **1. The collector was armed and never granted — the arm/execute mismatch, committed by the
+  > author of the document about the arm/execute mismatch.** `HomerServiceAppendDpuSpawnCollectorCandidate()`
+  > added a candidate on every pass; `HomerMachineBaselineCompileExecutionPlan`'s COLLECTOR phase is a
+  > **hand-enumerated list** of `FindCollector` + `AppendCollectorAction` calls, and nothing named the new
+  > collector. Symptom: `spawn begin` and `deferred peer response` printed, then **silence forever** — not
+  > even the 60 s timeout, because the timeout lives inside the action that never ran. Nothing warns you:
+  > the candidate append compiles, all four enum switches compile, `-Wswitch` is useless (every one has a
+  > `default:`), and an idle service looks exactly like a wedged one.
+  > **Rule:** adding a collector means editing FOUR places, and the fourth is not a switch — it is
+  > `HomerMachineBaselineCompileExecutionPlan`'s phase body.
+  >
+  > **2. `readlink -f /proc/<pid>/exe` returns `"<path> (deleted)"` after you rebuild the binary.**
+  > Our `case "$exe" in */citus_tuple_sink_service)` stopped matching, so the "clean baseline" silently
+  > left the OLD service running; the new instance died on `bind()` — but only after its `>` redirect had
+  > **truncated the log**, so the old process kept appending at its old offset and the log filled with NULs
+  > (`grep: binary file matches`). The tell was `handle=2 slot=17 session=2` on a supposedly fresh service.
+  > This is the same family as the `pkill -f` self-match and the `rsync -a` mtime trap: **an identity check
+  > that is exactly right for the case you thought about, and silently wrong for the one you didn't.**
+  > Match `*/citus_tuple_sink_service*`.
+
+  > ### Regression sweep on the final binaries (all green)
+  >
+  > - **`pgbench --homer`** (host arm, frontend agent **ON**): 1000/1000, 0 failed, **5070 TPS**,
+  >   p50 0.173 / p95 0.206 / p99 0.223 ms. The only working spawn regression net, and it exercises both
+  >   D7 bug fixes on the host arm.
+  > - **4-role DPU-relay basebackup**: `23,240,464,292` bytes, `CLOSE_ACK`, rc=0, **9.21 s**. Its sender
+  >   opens a **second** DPU setup connection while the doorbell holds a persistent one on the other port.
+  > - **Six-leg TCP transport smoke**: `ok` on both ends (`--export-posix-shm --fork-reader` + all six legs).
+  >   This is the only regression net for the ~1150 lines added to `homer_service_dpu_dma.c`.
+  > - All ten citus make targets build clean; installed service has **zero** stats-macro taint.
+
+  #### Sub-steps, in order (one commit at the gate — no TIER-2 landing)
+
+  1. **Engine primitives** (`homer_service_dpu_dma.{c,h}`): `…FindSpawnRegionDescriptorRef`;
+     `…SubmitSpawnRequestPublication` (two chained tasks: `request` body, then the offset-0
+     `state = REQUEST_READY` word); `…SubmitSpawnStateRead` (4 B @ offset 0); `…SubmitSpawnResponseRead`
+     (`sizeof(response)` @ `offsetof(slot, response)`); `…SubmitSpawnSlotRelease` (`state = FREE`);
+     `…GetSpawnSlotFacts`. Five new `HomerDpuDmaTaskKind`s. One `localSpawnMmap` + 16 buffers.
+  2. **`homer_service_dpu_spawn.{c,h}`** — the phase machine and the DPU-local free list over
+     `slots[16..31]`:
+     `WRITE_REQUEST → WRITE_READY → RING_DOORBELL → READ_STATE → (not ready ⇒ re-arm READ_STATE) →
+      READ_RESPONSE → WRITE_FREE → DONE|FAILED`. ⚠ **DMA-BEFORE-DOORBELL**: `RING_DOORBELL` is entered
+     only from the *completion* of `WRITE_READY`. Bug 3's generous timeout with a loud error attaches to
+     `READ_STATE`.
+  3. ✅ **Scheduler wiring**: `HOMER_PROGRESS_{SOURCE,COLLECTOR,ACTION}_DPU_SPAWN`, armed on
+     `pendingCount + completedCount + deferredPeerResponseCount > 0` as `knownExpectedWork`. **Not** a
+     reserved lifecycle grant — it is exact work, not a poll obligation (D10); it *does* bypass blind
+     backoff. Add the source to `HomerServiceDefaultCpuClassForProgressSource` (its `default:` arm is
+     `CPU_CLASS_INVALID` and `-Wswitch` will not tell you).
+     **⚠ AND name the collector in `HomerMachineBaselineCompileExecutionPlan`'s COLLECTOR phase.**
+     Arming a candidate that the phase body never enumerates grants it on no pass, ever. This was
+     missed on the first attempt; see the failure box above.
+     Placed **after** `DPU_PE_DRAIN` so the pass's DOCA completions are harvested before the spawn
+     machine reads the slot facts they wrote — one pass per phase, not two.
+  4. ✅ **Peer-responder deferral** (D11 above). Landed additively:
+     `HomerPeerDeferredResponseTicket` + `TupleSinkServicePostDeferredPeerResponseRdma`
+     (`remote_execution_peer_transport_rdma.c:7899`), a 16-entry service-level queue
+     (`HomerServiceDeferredPeerResponse`), and the `HOMER_PROGRESS_ACTION_DPU_SPAWN` executor that posts
+     it. A transient publish failure retries next pass (the 64-slot publish pool drains as send CQEs
+     retire); a **dead connection** yields `posted=false, return true` and the entry is dropped with a
+     loud log.
+  5. ✅ **`TupleSinkServiceSubmitBackendSpawnRequest` gains a loud refusal on the DPU arm**, selected by
+     `TupleSinkServiceDpuBackendSpawnArmActive()` = "a frontend agent is ATTACHED to our doorbell with a
+     nonzero `bridgeGeneration`". Call site 3 (`HandlePeerOpenCommandSessionRequest`) takes the new
+     `TupleSinkServiceBeginDpuBackendSpawn()` + deferral path instead. **Call sites 1, 2 and 4 fail
+     loudly** on the DPU arm — they are S4/S5 work and must not silently fall back to `shm_open`, which
+     on a DPU creates an empty region no postmaster ever reads.
+     Note the arm test is *doorbell attached*, not *am I a DPU*: a host service never creates a doorbell
+     server, so it correctly falls through to `shm_open` with no extra condition.
+  6. ✅ **D7 bugs 1 and 2**: CAS `FREE → CLIENT_OWNED` over `slots[0..15]` only (lost CAS ⇒ `continue`,
+     not `break`), and hoist the `int32 launchedPid` read above the release store.
+  7. ✅ **Deleted `HOMER_SERVICE_DPU_DOORBELL_TEST_FIRE_GRANTS`** — `HomerServiceDpuSpawnAdvanceOne()`'s
+     `PHASE_RING_DOORBELL` is its real producer.
+
+  #### Two design choices made inside the plan's direction (recorded per the "note your reasoning" rule)
+
+  1. **One collector, not two.** D11 sketched a separate `HOMER_PROGRESS_COLLECTOR_PEER_DEFERRED_RESPONSE`.
+     The spawn is the *only* producer of deferred responses, so a second source/collector/action triple
+     would have doubled the enum-switch surface (five hand-enumerated sites each, none protected by
+     `-Wswitch`) to buy nothing. `HOMER_PROGRESS_ACTION_DPU_SPAWN` advances the machine, reaps
+     completions, and posts. Split it the moment a second producer appears.
+  2. **The spawn machine lives in a new TU, not in `homer_service_dpu_doorbell.c`.** The doorbell owns a
+     socket; the spawn owns a DMA phase machine. One call (`HomerServiceDpuDoorbellPostSpawn`) links them.
+     `homer_service_dpu_spawn.{c,h}` knows nothing about sessions, peers, or responses — the 43k-line hub
+     binds a spawn handle to whatever it must answer.
+
+  #### ⚠ Caveats that will bite the next stage
+
+  - **A DPU-spawned backend dies immediately today** (`could not open Homer control region`). Intentional;
+     see the gate box. Do not "fix" it by flipping `backendChannelMode` before S3.2c binds an arena slot.
+  - **`HomerServiceDpuSpawnAbandon()` does not cancel the fork.** An abandoned spawn (queue-insert failure,
+     i.e. 16 deferrals outstanding) still forks a backend that nobody owns. It cannot happen with 16 slots
+     and one spawn per session open; if it ever can, the abandon path needs a real cancel.
+  - **The DPU spawn slot is freed only after the engine reports `opInFlight == false`.** Freeing it earlier
+     would let a DOCA completion callback write into a reused slot. `HomerDpuDmaClearSpawnSlot()` refuses
+     and logs loudly rather than trusting its caller.
+  - **`HomerDpuDmaFindDescriptorRef` still cannot find role 8** — it demands `serviceSessionId != 0`.
+     `HomerDpuDmaFindSpawnRegionDescriptorRef` exists for exactly that reason. Do not "unify" them.
+
+  **Gate driver:** `pgbench --homer --homer-dpu-command` from farnet0, which S1a already drove to the
+  exact failure `could not open backend spawn region /citus_remote_exec_backend_spawn_v14` on the
+  farnet1 DPU. That message is the S3.3 gate's before-picture; a forked `postgres: remote exec backend`
+  on farnet1 is its after-picture.
 
   **It does NOT wait.** See D9 below — the spin cannot work on the DPU, so S3.7's async responder is folded
   into S3.3. The DPU records `pendingSpawn{slotIndex, sessionId}` and returns "in progress". A demand-armed

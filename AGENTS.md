@@ -139,8 +139,16 @@ Three things about this smoke that each cost a cycle (validated July 9, 2026, ci
 #
 #   for d in /proc/[0-9]*; do
 #     exe=$(readlink -f "$d/exe" 2>/dev/null) || exe=$(sudo -n readlink -f "$d/exe" 2>/dev/null)
-#     case "$exe" in */pg-citus/bin/citus_tuple_sink_service) sudo -n kill -9 "${d#/proc/}";; esac
+#     case "$exe" in */pg-citus/bin/citus_tuple_sink_service*) sudo -n kill -9 "${d#/proc/}";; esac
 #   done
+#
+# ⚠ The TRAILING `*` in the pattern is NOT optional either. After you rebuild, the old process's
+# `/proc/<pid>/exe` reads `".../citus_tuple_sink_service (deleted)"`, so an exact-suffix `case` stops
+# matching EXACTLY the process you just replaced. On July 10, 2026 that left a stale DPU service holding
+# port 9727; the new instance died on bind() -- but only after its `>` redirect had TRUNCATED the log, so
+# the old process kept appending at its old file offset and the log filled with NULs (`grep: binary file
+# matches`, and `grep -a` needed to read it at all). The service looked freshly started and was seven
+# minutes old. Tell: internal counters that should start at 1 (`handle=2 slot=17 session=2`).
 #
 # ⚠ The `sudo -n readlink` fallback is NOT optional. `readlink /proc/<pid>/exe` on a process owned by
 # ANOTHER USER returns EACCES, and everything here runs as `dbcomm` while you are probably not. Without
@@ -150,6 +158,10 @@ Three things about this smoke that each cost a cycle (validated July 9, 2026, ci
 #
 # Note `sudo -n` is likewise required to kill a `dbcomm`-owned process; a plain kill/pkill reports
 # "Operation not permitted" and leaves it alive.
+#
+# The pattern behind all three traps (`pkill -f` self-match, `rsync -a` mtime, `(deleted)` exe): an
+# identity check that is exactly right for the case you thought about, and silently wrong for the one
+# you did not. Prefer checks whose failure mode is loud.
 ./homer_dpu_tcp_transport_smoke --server \
   --dev-pci 0000:03:00.0 \
   --port 9727 \
@@ -407,13 +419,21 @@ Read it like this (post-S3.2, citus `52fd1ab3d`):
 - `pedrain_grants` **frozen while idle is now correct** — PE_DRAIN is armed only by in-flight DOCA tasks or
   a detached import awaiting reclaim. (Before S3.1b a frozen `pedrain_grants` was the bug, because the
   accept loop lived inside it. Do not read old notes with the new meaning.)
+- `spawn_grants` and the `spawn{pend= done= hw= begun= ok= fail= rung= deferred=}` block are S3.3. All zero
+  is the correct idle state — the spawn collector is armed by an **exact** count, not by a poll obligation.
+  A nonzero `pend=` that never falls is a stuck phase machine; `deferred=` stuck above 0 is a peer that will
+  hang in `WAIT_PEER_OPEN` forever.
 
-The DPU service now binds **two** ports: `9727` (setup) and `9728` (spawn doorbell,
+The DPU service binds **two** ports: `9727` (setup) and `9728` (spawn doorbell,
 `HOMER_SERVICE_DPU_DOORBELL_PORT`). The frontend agent connects the doorbell after its setup export; look
-for `homer frontend agent: attached DPU spawn doorbell …` in `postgres.log`. To exercise the whole
-notification chain before S3.3 lands a real producer, start the DPU service with
-`HOMER_SERVICE_DPU_DOORBELL_TEST_FIRE_GRANTS=200` and run PostgreSQL with `-c log_min_messages=debug1`;
-the agent then logs `doorbell wake N -> SIGUSR1` roughly every 2.7 s.
+for `homer frontend agent: attached DPU spawn doorbell …` in `postgres.log`.
+
+Since S3.3 the doorbell has a **real producer** — the spawn phase machine rings it from
+`PHASE_RING_DOORBELL`, only after both request DMA writes have completed. (The old
+`HOMER_SERVICE_DPU_DOORBELL_TEST_FIRE_GRANTS` scaffolding was deleted with S3.3, as planned.) The whole
+chain is exercised by `pgbench --homer --homer-dpu-command` from farnet0; the DPU logs
+`DPU backend spawn begin …` then `DPU backend spawn COMPLETED … launched_pid=N`, and `postgres.log` on
+farnet1 shows pid `N`.
 
 See `docs/kb/future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md` §0/§0b/§0c.
 
@@ -1397,6 +1417,15 @@ validation built ONE target and ran ONE workload. Cheap insurance:
   and repeat for the other two enums. S3.1b found a live instance this way:
   `HomerServiceDefaultCpuClassForProgressSource` is the *only* thing that sets
   `sourceCore->cpuClass`, and its default arm is `HOMER_PROGRESS_CPU_CLASS_INVALID`.
+- **A new collector needs FOUR edits, and the fourth is not a switch.** Beyond the enums, the
+  collector→source map and the collector→action map, you must NAME it in
+  `HomerMachineBaselineCompileExecutionPlan`'s phase body — a **hand-enumerated** sequence of
+  `HomerServiceMachineBaselineFindCollector` + `...AppendCollectorAction` calls. A collector that
+  `HomerServiceAppend*CollectorCandidate()` arms but that body never names is armed on **every** pass and
+  granted on **none**. S3.3 shipped that bug: the DPU spawn began, the peer response deferred, and the
+  service then sat silent forever — not even its own 60 s timeout fired, because the timeout lived inside
+  the action that never ran. An idle service and a wedged one look identical. Grep before you trust:
+  `grep -n 'FindCollector(candidateSet, HOMER_PROGRESS_COLLECTOR_' tuple_sink_service_process.c`
 - **Never run a write-capable subagent concurrently with your own edits in the same tree.** On July 10,
   2026 a worker was told "do NOT touch `tuple_sink_service_process.c`", saw it dirty, and *restored* it —
   silently discarding ~30 hand-applied edits. The tell was `git status` reporting the file **unmodified**
