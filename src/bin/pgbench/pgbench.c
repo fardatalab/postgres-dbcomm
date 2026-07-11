@@ -693,6 +693,20 @@ typedef struct
 	uint64		homer_pending_drained_rows;
 	HomerClientResultDrainTarget homer_pending_drain_target;
 	const char *homer_pending_operation_name;
+
+	/*
+	 * Completion-wait deadline for the in-flight Homer command.  Every waiter
+	 * (the blocking HomerRunCommandAndWait adapter AND the measured
+	 * CSTATE_WAIT_RESULT path) funnels through receiveHomerCommand's not-ready
+	 * branch, so one deadline check there bounds them all.  Before this,
+	 * warmup/teardown waits spun FOREVER on a dead service/backend (run 16,
+	 * July 11, 2026): HomerClientWaitCommandCompletion's 10 s deadline is
+	 * unreachable because pgbench never calls it.  The clock read is amortized
+	 * (checked every HOMER_PENDING_DEADLINE_CHECK_INTERVAL not-ready polls) so
+	 * the measured hot path stays clock-free.
+	 */
+	pg_time_usec_t homer_pending_started_us;	/* stamped when the command is issued */
+	uint32		homer_pending_poll_count;	/* not-ready polls since last deadline check */
 	bool homer_stable_result_binding_valid;
 	uint64 homer_stable_result_drained_tail;
 	/*
@@ -4152,6 +4166,9 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 	st->homer_pending_result_mode = resultMode;
 	st->homer_pending_command_sequence = commandSequence;
 	st->homer_pending_drained_rows = 0;
+	/* Arm the completion-wait deadline (see the CState field comment). */
+	st->homer_pending_started_us = pg_time_now();
+	st->homer_pending_poll_count = 0;
 	memset(&st->homer_pending_drain_target, 0, sizeof(st->homer_pending_drain_target));
 	st->homer_pending_operation_name = operationName;
 
@@ -4170,6 +4187,17 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 	st->estatus = ESTATUS_OTHER_SQL_ERROR;
 	return false;
 }
+
+/*
+ * Completion-wait deadline (P2.T, July 11, 2026).  30 s is generous: the
+ * slowest legitimate wait is the FIRST command of a session, which rides the
+ * DPU backend spawn (fork + database attach, normally well under 10 s).
+ * The interval amortizes pg_time_now() to one call per 4096 not-ready polls,
+ * bounding deadline resolution error to well under a millisecond while
+ * keeping the measured polling loop free of per-iteration clock reads.
+ */
+#define HOMER_PENDING_COMPLETION_TIMEOUT_US	(30 * 1000000)
+#define HOMER_PENDING_DEADLINE_CHECK_INTERVAL	4096
 
 /*
  * receiveHomerCommand checks the per-session pushed-completion mailbox for the
@@ -4207,6 +4235,42 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 	if (peekStatus == HOMER_CLIENT_COMPLETION_PEEK_NOT_READY ||
 		peekStatus == HOMER_CLIENT_COMPLETION_PEEK_BODY_VISIBILITY_PENDING)
 	{
+		/*
+		 * Bounded wait: every Homer completion waiter funnels through this
+		 * branch, so this single amortized check is the deadline for both the
+		 * blocking adapter and the measured CSTATE_WAIT_RESULT path.  A dead
+		 * service/backend previously left pgbench spinning here forever.
+		 */
+		if (++st->homer_pending_poll_count >= HOMER_PENDING_DEADLINE_CHECK_INTERVAL)
+		{
+			st->homer_pending_poll_count = 0;
+			if (pg_time_now() - st->homer_pending_started_us >
+				HOMER_PENDING_COMPLETION_TIMEOUT_US)
+			{
+				pg_log_error("client %d timed out after %d s waiting for Homer completion of %s "
+							 "(kind=%u sequence=%llu)",
+							 st->id,
+							 (int) (HOMER_PENDING_COMPLETION_TIMEOUT_US / 1000000),
+							 st->homer_pending_operation_name ?
+							 st->homer_pending_operation_name : "unknown",
+							 st->homer_pending_command_kind,
+							 (unsigned long long) st->homer_pending_command_sequence);
+				st->estatus = ESTATUS_OTHER_SQL_ERROR;
+
+				/*
+				 * P2.T: after an abandoned command, the session state is
+				 * unknowable (the command may or may not have executed; the
+				 * backend may be gone).  Mark the session terminal so the
+				 * finish path stops submitting into it (no TX_ABORT recovery,
+				 * no role-1 CLOSE_SESSION) and goes straight to local/DPU
+				 * teardown.  See HomerClientSession.sqlSessionTerminal.
+				 */
+				st->homer_session.sqlSessionTerminal = true;
+				clearHomerPendingCommand(st);
+				return false;
+			}
+		}
+
 		if (st->homer_pending_result_sink_bound)
 		{
 			HomerCompletionApplyResult drainResult = HomerDrainPendingResultSink(
@@ -9468,12 +9532,23 @@ finishHomerSession(CState *st)
 		/*
 		 * A failed transaction path should not leave the backend attached to a
 		 * transaction while the explicit session-close command is being sent.
+		 *
+		 * P2.T exception: a TERMINAL session (postCommandState FAILED /
+		 * DO_NOT_REUSE, or an abandoned command) has no live backend by
+		 * contract -- the socketless backend exits on any failed command.
+		 * Submitting TX_ABORT there can never complete; in run 17 it collided
+		 * with the service's BACKEND_SLOT_RELEASE at the same sequence and
+		 * cost a 30 s timeout plus a busy-control-slot close failure.  Skip
+		 * it; the backend's own exit already aborted the transaction.
 		 */
-		if (!HomerRunCommandAndWait(st,
-									CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
-									NULL,
-									"tx_abort_during_session_finish",
-									CITUS_REMOTE_EXEC_SQL_RESULT_NONE))
+		if (st->homer_session.sqlSessionTerminal)
+			pg_log_info("client %d skipping session-finish abort: Homer session is terminal (backend exited)",
+						st->id);
+		else if (!HomerRunCommandAndWait(st,
+										 CITUS_REMOTE_EXEC_COMMAND_TX_ABORT,
+										 NULL,
+										 "tx_abort_during_session_finish",
+										 CITUS_REMOTE_EXEC_SQL_RESULT_NONE))
 			pg_log_error("client %d could not abort Homer transaction during session finish",
 						 st->id);
 		st->homer_transaction_attached = false;
