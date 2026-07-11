@@ -762,3 +762,37 @@ mmap/registration defect; all rungs proto=15 while the live task still fails →
 fully innocent, engine state at live-submission time is the axis (pre/post ctl-read-diag lines become
 the primary evidence). Ungated builds verified bit-identical (strings count 0). Deploy: gated build on
 farnet1 DPU only; farnet0 DPU + hosts unchanged from run 7.
+
+**RUN 8 RESULT → ROOT CAUSE FOUND (July 10, 2026).** All six ladder rungs read proto=15 — including
+`ctl-24-pool-persist`, the bit-exact one-shot replica — so every per-read property is exonerated. The
+decisive NEW datum was option B's pre-submit lines: **~100 successful live CONTROL_READs preceded the
+failing one** (acceptance is fatal-on-first-mismatch, so they all delivered proto=15). The bug is an
+EVENT, not a property: something transiently zeroes the mailbox header. Post-completion diag shows
+DOCA appended 24 bytes exactly at `&control` (dst data==addr, len==24) while the snapshot reads zero,
+and the host `od` at the failing offset showed `0000000f` immediately after the failure — the DMA
+faithfully copied memory that WAS zero at sampling time and was re-stamped nanoseconds later. The only
+writer in the codebase that zeroes that header is
+[HomerFrontendAgentInitArenaSlot](homer_frontend_agent.c) (`memset(&slot->completionMailbox, …)` then
+proto re-stamp), and `HomerFrontendAgentBindArenaSlot` called it as "belt-and-braces" right after the
+FREE→BOUND CAS — executed by the SPAWNED BACKEND during startup, while the DPU (which bound its ring
+at spawn time) polls the mailbox with ~100% read-in-flight duty cycle. The bind-site comment even
+warned "the DPU … may DMA-read this slot's completion mailbox at any time" but reasoned only about
+stale-VALUE regression, not the reset's own memset→restamp ZERO WINDOW. **This is the second bug
+behind one symptom**: pre-`ce31e63a1` the header was never stamped (round-1 zeros were truthful);
+`ce31e63a1` stamped at creation AND bind — fixing bug one while arming this race. The completion
+PUBLISH path only writes `publishedEpoch` (never proto), so no alternative writer exists; the backend
+was alive at failure (rules out release/reap).
+
+**FIX — citus `b29a90330`.** Bind now VERIFIES the invariant the code already documents ("a slot is
+always empty and ABI-initialized while it is FREE" — maintained by CreateArena + ReleaseArenaSlot +
+the S3.2b reaper) and fails the claim loudly on violation (`arena slot N violated the
+FREE-implies-initialized invariant …`, backend FATALs) instead of writing tenant-visible bytes over a
+live DPU poller. Host-only change (citus.so on the PostgreSQL node); no ABI bump, no DPU redeploy.
+Built + installed on farnet1 (citus install → postgres ninja relink → meson install; HomerDpuFrontend
+symbols verified). RESIDUAL (S3.4/S4 teardown scope, documented in the commit):
+`ReleaseArenaSlot`/reaper still memset while a DPU ring could poll — correct fix is teardown ordering
+(DPU unbinds ring BEFORE slot release), not weakening the FREE invariant. Not hit by current
+validation flows (kill -9 skips on_proc_exit; agent dies with postmaster before reaping). Run 9 in
+flight: same topology as run 8, farnet1 DPU keeps the gated build (instrumentation now serves as
+confirmation — expect pre-submit lines with NO zero read, completion pulled, and the benign
+`missing frontend completion event descriptor` P2-seam end state).
