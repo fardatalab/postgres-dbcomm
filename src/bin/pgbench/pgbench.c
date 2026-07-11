@@ -9686,28 +9686,18 @@ finishHomerSession(CState *st)
 	}
 
 	/*
-	 * --homer-dpu: tear down the role-7 DPU->host result receive stream before
-	 * closing the command session (the relay is a child of this session). This is
-	 * the sender's counterpart of the basebackup receiver close: it releases the
-	 * DPU-side ring and the exported host memory region. HomerClientCloseSession
-	 * does not know about this stream, so it is closed explicitly here.
-	 */
-	if (st->homer_session.sqlResultDpuStreamOpen)
-	{
-		/* Unbind the role-7 result ring from this session (reframe of the selected-DPU close). */
-		if (!HomerClientUnbindRing(&st->homer_session.sqlResultDpuStream,
-								   errorMessage,
-								   sizeof(errorMessage)))
-			pg_log_error("client %d could not unbind Homer DPU SQL result receive ring: %s",
-						 st->id, errorMessage);
-		st->homer_session.sqlResultDpuStreamOpen = false;
-	}
-
-	/*
 	 * Command-plane S1a: a selected-DPU command session has no host-service control
 	 * region and no backend mailboxes, so HomerClientCloseSession's shared-memory close
-	 * path does not apply. Its own closer submits CLOSE_SESSION over the role-1 control
-	 * slot, then performs the DPU setup-close handshake and DOCA teardown.
+	 * path does not apply.
+	 *
+	 * P5: the ENTIRE selected-DPU close order now lives inside
+	 * HomerClientCloseSqlSessionSelectedDpu -- semantic CLIENT_SQL_SESSION_CLOSE on the
+	 * direct mailbox, then the role-7 result-ring unbind, then the control-slot
+	 * CLOSE_SESSION, then the DPU setup-close + DOCA teardown.  pgbench used to unbind
+	 * the role-7 ring HERE, immediately before this call, which put the child ring's
+	 * unbind BEFORE the session's semantic close and left the remote backend running
+	 * (run 40's leak).  Do not re-add an unbind call here: the ordering is a library
+	 * invariant now, and a caller cannot express the wrong order any more.
 	 */
 	if (st->homer_session.commandDpuStreamOpen)
 	{

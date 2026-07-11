@@ -2284,3 +2284,148 @@ the three workloads stay green.
 **Why P4.2b lands AFTER the §10k measurement:** it deletes code the DPU path never executes, so it cannot
 be the stall, and blocking a perf number on a legacy-retirement decision would be backwards. It does thin
 shared dispatchers, so a cheap re-verify after it confirms the numbers did not move.
+
+---
+
+## 13. P5 runs 41a-41i — the LEAK IS FIXED; a slot-REUSE race is now the blocker (July 11, 2026)
+
+### 13.1 Status against the §12.2 acceptance bar
+
+| # | acceptance criterion | status |
+|---|---|---|
+| 1 | `teardown T1..T4` present, in order | **PASS** (`T3 staged RELEASE ... sequence=39`) |
+| 2 | `received BACKEND_SLOT_RELEASE for arena slot N` in postgres.log | **PASS** (slot 0) |
+| 3 | NO surviving `postgres: remote exec backend` | **PASS — THE LEAK IS GONE** |
+| 4 | TWO consecutive runs on the SAME postmaster/services | **FAIL** — run 2 dies (§13.3) |
+| 5 | ZERO `ABORTING`/`peer-reset-abort`/`committed ... failure` on a clean close | **FAIL** — 3 lines (P5.c, §13.4) |
+| 6 | pgbench exits 0 **with an empty error stream** | **PASS** |
+
+Run 41e/41h (the FIRST run on a fresh stack) is fully green: 5/5 transactions, empty error stream, and
+five DISTINCT decoded rows (`reached EOS: rows=1 abalance=5009 / -2132 / 10524 / 3648 / -4056`).
+
+### 13.2 What was actually wrong (both fixed, both were the same species)
+
+**P5.a — the client FABRICATED a service session id it did not own.** `HomerClientCloseBaseBackupStream`
+(homer_client.c:5638) already guards the control-plane close with
+`serviceSessionId != 0 && serviceSinkId != 0` — a guard that exists precisely to skip the close for a
+stream the service never registered. But `HomerClientOpenSqlResultReceiveStreamSelectedDpu` seeded those
+two fields from its OWN bridge generation, while the service answers this rendezvous open with a benign OK
+and **no session state at all** (tuple_sink_service_process.c, the `clientSqlResultOpen &&
+clientSqlResultDpuRelay && RECEIVE` branch returns `serviceSessionId/SinkId = 0`). The fabricated ids
+defeated the guard; the unbind closed a session that never existed. FIX: the descriptor ids are now
+BRIDGE-local (`bridgeDescriptorSessionId/SinkId`, byte-identical values — the DPU keys its mirror cache on
+`descriptor->serviceSinkId`), and `stream->serviceSessionId/SinkId` stay 0 unless the SERVICE hands ids
+back.
+
+**P5.b(1) — the selected-DPU close NEVER SENT `CLIENT_SQL_SESSION_CLOSE`.** The shm path sends it
+(homer_client.c:1693) and the service's close handler explicitly documents that the frontend does
+("The frontend sends CLIENT_SQL_SESSION_CLOSE over the direct command mailbox and waits for backend
+completion before calling this lifecycle close"). `HomerClientCloseSqlSessionSelectedDpu` just skipped it
+and went straight to the control-plane close, so the backend was never told to exit. FIX: the whole close
+order is now an INVARIANT OF THE LIBRARY, not of the caller — semantic close → role-7 unbind → lifecycle
+close → setup close. pgbench no longer unbinds the ring itself (it used to do so BEFORE the session close,
+i.e. in the wrong order, and a caller can no longer express that).
+
+> ⚠ FIRST ATTEMPT FAILED for an instructive reason: I copied the shm path's *precondition*
+> (`commandMailbox != NULL && (backendCompletionMailbox || completionMailbox)`) along with its call. A
+> selected-DPU session has **no direct mailbox** — it submits every command through the role-1 control slot
+> — so the guard was false and the close was silently skipped again (run 41a).
+> `HomerClientStartCommandWithCompletionFlags` already dispatches BOTH channels and needs no precondition.
+
+**P5.b(2) — `TupleSinkServiceCommandMailboxBusy` read a STRUCTURALLY-ZERO word.** The probe (added instead
+of a third guess) printed it outright:
+
+```
+branch=remote_sender published=0 != retired=37 (accepted=37 consumed=37 outstanding_writes=0)
+```
+
+`mailbox->publishedEpoch` is written only by a frontend that publishes DIRECTLY into a shared mailbox — the
+shm client. The selected-DPU client has no mailbox, so **nobody ever writes that word and it reads 0
+forever**, against a live retired frontier of 37. A perfectly idle session was "busy" permanently, so the
+lifecycle close was refused and `BACKEND_SLOT_RELEASE` never went out. **This, not a completion lease, was
+the leak.** (The KB's earlier P5.b hypothesis — "the terminal completion's lease is never released" — was
+WRONG. Codex refuted it by reading; only the probe found the truth.) FIX: the submission frontier is now
+`max(publishedEpoch, acceptedEpoch)` — exact, since sequences start at 1 so a never-written 0 can never
+mask a real submission, and on the shm path `published >= accepted` always holds so it degenerates to the
+old predicate. P4.1 should replace this with an explicit command-SOURCE kind so the unwritable word cannot
+be read at all.
+
+### 13.3 THE BLOCKER — arena slot REUSE poisons the DPU's grouped-control validator
+
+**This bug was UNREACHABLE until today.** Before P5 the backend leaked and never released its arena slot,
+so every new session got a virgin slot. The first-ever slot reuse hit this immediately.
+
+Run 41i, with the probes that localized it:
+
+```
+23:42:34.567  arena slot 0 ring 2 tenancy reset (forgetting accepted_epoch=5 accepted_tail=560 session=1)
+23:42:35.185  grouped-control semantic validation failed: host publication epoch regressed
+              [ring=2 role=5 bound_session=2 accepted_epoch=5 line_epoch=0 accepted_tail=560 line_tail=0]
+   -> DPU DMA engine is in fatal error state  -> run 2 times out at sql_execute sequence=5
+```
+
+**The sequence (each step evidenced):**
+1. T4 unbinds the slot. A NEW reset (`HomerDpuDmaResetRingTenancyState`, homer_service_dpu_dma.c) now
+   correctly forgets the tenancy — the probe shows it forgetting `epoch=5 tail=560`.
+2. **But the HOST's publish line still holds the old tenant's epoch 5** — nobody clears it on release. The
+   backend memsets its arena SLOT; the `HomerDpuBridgeHostPublishLine`s live in the bridge control block,
+   and the backend bridge never touches them.
+3. The DPU reads that stale line. Against the freshly-reset `accepted=0`, epoch 5 looks like a legitimate
+   ADVANCE, so it is accepted. **This is the poisoning.**
+4. The new backend binds the slot and zeroes its publish lines → the line now reads 0.
+5. Next read: `line_epoch=0` vs `accepted_epoch=5` → "regressed" → **engine fatal**, and every subsequent
+   session on that DPU is dead (run 3 cannot even open a session).
+
+**Root cause, stated generally:** *an arena slot's host content carries no tenancy stamp, so stale content
+from the previous tenant is indistinguishable from fresh content of the new one.* The DPU binds the slot at
+SPAWN time — before the new backend exists — and reads it during the window in which it still holds the
+dead tenant's bytes.
+
+**Why the tenancy reset alone cannot fix it:** the reset is correct and necessary, but it only makes the
+DPU forget. It does not stop the DPU from immediately RE-learning the same stale bytes off the wire.
+
+**Three options (OWNER DECISION NEEDED — do not improvise this inside the DMA engine):**
+
+- **(A) Release-ack.** The backend acknowledges RELEASE only *after* it has cleared the slot AND its publish
+  lines; the DPU marks the slot reusable only on that ack. Most correct; adds an ack to the P2.T handshake
+  and a wait state to the slot allocator.
+- **(B) DPU zeroes the slot's publish lines at BIND, before spawning the backend.** The DPU already has DMA
+  write capability into the arena. Race-free by construction: the only other writer of zeros is the old
+  backend's memset (also zeros), and the new backend cannot publish before it is spawned. Cheapest, and it
+  makes "the baseline is 0" a fact the DPU established itself rather than inherited. Cost: one DMA write +
+  completion in the spawn phase machine.
+- **(C) Tenancy generation in the ABI.** Add a tenancy counter to the publish line; the DPU compares
+  `(tenancy, epoch)` and treats a tenancy change as a fresh baseline instead of a regression. Most general,
+  and it kills the whole class — but it is an ABI bump on all four machines.
+
+Current lean: **(B)**, with (C) recorded as the eventual clean answer. (B) is local, needs no ABI change,
+and its failure mode is loud.
+
+### 13.4 P5.c still open — a clean close still routes through the FAILURE machinery
+
+```
+23:37:01.619 teardown T4 released backend; retained fenced service session=1
+23:37:01.621 peer transport ... CM event=DISCONNECTED status=0, resetting connection
+23:37:01.621 payload stream marked ABORTING for peer reset session=1 sink=1
+23:37:01.624 marked send byte-ring failed for sink=1 reason=peer-reset-abort
+23:37:01.624 committed service-owned DPU result failure ... reason=payload-failure-action
+```
+
+T4 retains a **fenced** service session and its payload binding, so the ordinary client disconnect that
+follows is routed as a peer FAILURE. A clean close and a real peer reset remain indistinguishable in the
+logs. Fix with the §12.2 P5.c plan (a disconnect on a stream with no live binding is a no-op; a disconnect
+WITH a live binding stays loud) — but note it likely needs T4 to drop the payload binding, which interacts
+with (A)/(B)/(C) above, so sequence it after that decision.
+
+### 13.5 Probe rules this run re-earned
+
+- **A branching guard must name its branch AND its operands.** `TupleSinkServiceCommandMailboxBusy` has
+  three branches over three frontier pairs and reported all of them as one opaque sentence. Making it
+  self-describing cost ~30 lines and solved P5.b in ONE run, after static reading had produced a confidently
+  wrong hypothesis.
+- **A validator that kills the engine must say WHICH ring.** "host publication epoch regressed" named
+  neither ring, role, nor values; it was consistent with three different bugs. With `[ring= role=
+  bound_session= accepted_epoch= line_epoch= ...]` the race fell out of a single run.
+- **A reset that silently does nothing looks exactly like a reset that ran.** The `tenancy reset
+  (forgetting ...)` line is what PROVED my own fix executed — and therefore that it was not the answer.
+- **`rc=0` is still not the verdict.** Run 41a exited 0 while silently skipping the semantic close.
