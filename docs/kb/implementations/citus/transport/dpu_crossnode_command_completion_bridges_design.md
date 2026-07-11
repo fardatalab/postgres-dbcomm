@@ -659,6 +659,34 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   > - If node A has no role-6 descriptor, the "missing … descriptor" error MOVES from node B to node A —
   >   still proving the completion traversed the bridge, but the client export is also needed.
   > Node B ceasing to spin on "missing … descriptor" (it egresses instead) is the invariant signal in both.
+  >
+  > **⏱ BACKEND-BRIDGE VALIDATION (run 11, July 11, 2026, citus `2b7e0052d`) — FAIL, but it RE-SEQUENCES
+  > the work: the client slice is a PREREQUISITE, not a follow-on.** Node B: `missing … descriptor` = 0
+  > (good — the fork took effect, no more local push), `fatal error state` = 0, AND zero egress
+  > log lines (success OR failure) — node B went SILENT right after `landed peer command session=1
+  > sequence=1`. Node A: only the CLIENT's own `CLOSE_SESSION` + full farnet0 import teardown, on the
+  > client's OWN bridge generation — within ~1 s of session open. ROOT CAUSE (agent-flagged, confirmed by
+  > code): the pgbench client's warmup does START then immediately PEEKs the completion; the peek fails
+  > synchronously at the `control==NULL` guard (`homer_client.c:6285`) → "invalid arguments while peeking
+  > Homer completion" → the client tears its whole session down in ~1 s — BEFORE the backend produces a
+  > completion / before egress can fire, and the teardown resets node B's peer session
+  > (`dpuPeerCommandLandingActive`→false via ResetSession) so the completion path never runs. So the
+  > backend bridge CANNOT be observed in isolation; the client peek-redirect must land FIRST so the client
+  > stays alive (polling role 6) long enough for backend→pull→egress→ingress→role-6 to complete. (The zero
+  > egress-failure lines + zero "missing descriptor" are consistent with "never exercised," not "wiring
+  > gap" — the 9 wiring sites + phase-body naming were review-verified present. A stats/log build can
+  > confirm arming later if the redirect run still stalls.) NOTE: deploy-proof literal is
+  > `HOMER_PROGRESS_COLLECTOR_DPU_PEER_COMPLETION_EGRESS` (count 1/DPU); `dpu-peer-completion-egress` is a
+  > runtime name string, absent from `strings`.
+  >
+  > **CLIENT PEEK-REDIRECT (in progress).** `HomerDpuBridgeFrontendCompletionEvent` (role 6) =
+  > `{publishedEpoch (DPU-owned, off 0), serviceSessionId, commandSequence, backendCompletionEpoch,
+  > commandCompletion}`. In `HomerClientPeekNextCompletionEvent` (+ Ack + the wait loop), when
+  > `session->commandDpuStreamOpen`: relax the `control==NULL` and `both-mailboxes-NULL` guards (mirror
+  > START `:6024`), load `dpuFrontendCompletionEvent->publishedEpoch` (acquire), lease `commandCompletion`
+  > when `publishedEpoch >= lastConsumed+1`, ACK by advancing the local epoch (no mailbox writeback — role
+  > 6 has no consumed word; synchronous `-M simple` serialization avoids single-slot overwrite, so no
+  > flow-control line needed for the checkpoint).
 
 **Phase P3 — results + client + gate.**
 - P3.1 Results — **REAL WORK ITEM** (corrected July 10, 2026; was "little/no new code" until the §2
