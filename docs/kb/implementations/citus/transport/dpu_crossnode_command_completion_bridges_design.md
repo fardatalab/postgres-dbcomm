@@ -577,6 +577,69 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   (reuse the role-6 push guts of `HomerServiceDpuPublishOneSelectedCompletionEvent` `:40405`).
 - **Checkpoint P2:** the client observes a role-6 completion for its command.
 
+  > **⏺ P2 GROUNDED + DESIGN RESOLVED (July 11, 2026, two codex-explore traces).** All the ring/mailbox
+  > machinery already exists; P2 is wiring + one recv-handler branch + a completion-drain fork. Resolved
+  > decisions (each replaces a plan sketch with the confirmed reality):
+  >
+  > - **Correlation = the LOCAL `serviceSessionId`, NOT a new `sessionUID` and NOT the §3.4 sessionUID
+  >   INDEX.** `sessionUID` already EXISTS (`tuple_sink_service_process.c:1399`) and is the cross-node
+  >   result-ring (role-7) identity threaded through result-SEND peer-opens — reserved for P3, unused by
+  >   P2. Both selected-session creators copy the local `serviceSessionId` (node-A START `:40443`, node-B
+  >   landed command `:40649`); `HomerServiceDpuFindSelectedSession(serviceSessionId)` (`:39874`) and
+  >   `TupleSinkServiceFindSessionById(serviceSessionId)` (`:22841`) both match on it. So the selected
+  >   session ↔ service session link is already there on each node; P2 adds NO identity plumbing.
+  > - **P2.1 allocation: NO new work.** Node A's completion landing mailbox is allocated automatically at
+  >   session create (`TupleSinkServiceEnsureClientCompletionMailbox` `:19204`, called from
+  >   `TupleSinkServiceCreateSession` `:23149`, reached by the DPU async OPEN path
+  >   `:38975`→`:37687`→`:36324`) and RDMA-registered during OPEN (`:36419`), with node B saving the
+  >   descriptor + doorbell token (`:38618`). It is a service-owned POSIX-shm mailbox — distinct from the
+  >   arena role-6 ring; P2.3 still must DMA from it into role 6.
+  > - **EOS guard is DORMANT in P2.** The arena backend leaves `resultServiceSinkId==0` until P3
+  >   (`remote_execution_backend_bridge.c:2846`), so no terminal completion carries `TUPLE_SINK_EOS`
+  >   (`:1815`), so `HomerServicePayloadStreamResultEosPosted` (`:18353`) returns ready immediately. P2.2
+  >   sources the EOS check from the QUEUED completion's own `resultFlags`/`resultServiceSinkId` (the slot
+  >   retains the full body) rather than the service session's `currentCommand*` fields (which node B's
+  >   role-3 accept path never populates) — correct-by-construction, becomes live only when P3 binds a
+  >   sink.
+  > - **Node-A ingress (P2.3): doorbell kind space is FULL** (2-bit, all 4 used —
+  >   `remote_execution_peer_transport_rdma.c:79`). Keep `CLIENT_COMPLETION`; BRANCH the recv handler
+  >   `TupleSinkServiceHandlePeerClientCompletionDoorbell` (`:28287`) on
+  >   `HomerServiceDpuFindSelectedSession(serviceSessionId)`: FOUND ⇒ enqueue a
+  >   `HomerServiceDpuCompletionEventSlot` for the existing `DPU_COMPLETION_PUSH` collector (`:41677`,
+  >   action `:44199`), NOT-FOUND ⇒ the legacy CPU-publish into `clientCompletionMailbox` (`:28398`). Per
+  >   the July-11 owner steer (host-service legacy is being retired right after this plan), the legacy arm
+  >   stays a thin, clearly-marked short-lived branch — delete it with the host-service teardown, do not
+  >   extend it.
+  > - **Node-B egress (P2.2): FORK the completion drain, don't replace it.** Today `DPU_COMPLETION_PUSH`
+  >   unconditionally drains queued completions via `HomerServiceDpuPublishOneSelectedCompletionEvent`
+  >   (`:40405`), which on node B fails "missing frontend completion event descriptor" because the remote
+  >   client's role-6 ring is not local. Fork on the selected session's service session (looked up by
+  >   `serviceSessionId`): if `clientSqlPeerReceiver`/`dpuPeerCommandLandingActive` (peer-landed, remote
+  >   client) ⇒ arm the NEW `DPU_PEER_COMPLETION_EGRESS`; else (local client) ⇒ the existing role-6 push,
+  >   unchanged. Implement as TWO ready-counts (local-destined vs peer-destined) so each collector is armed
+  >   by an EXACT count (AGENTS.md collector-arming rule), not one shared count both actions race. The
+  >   egress action reuses `TupleSinkServicePublishPeerClientCommandCompletion`'s send body (`:18485`)
+  >   retargeted to node B's saved `clientSqlPeerCompletionMailboxDescriptor` + token, fed the queued
+  >   completion body instead of reconstructing from `currentCommand*`.
+  > - **`DPU_PEER_COMPLETION_EGRESS` wiring — the 5 core + 4 operational sites** (mirror
+  >   `DPU_PEER_COMMAND_EGRESS`): collector enum `:2504`, action enum `:2553`, collector→source
+  >   `:10209`, collector→action+maxItems `:10436`, phase-body naming `:11366`; PLUS registry init
+  >   `:15720`, feedback map `:39255` (→`peerSendCqFeedback`), candidate arming `:41593`, and the DPU
+  >   action switch executor `:43654`. (AGENTS.md: a collector armed-but-never-named-in-phase-body is armed
+  >   every pass and granted never — the S3.3 silent-wedge bug. Enumerate by hand.)
+  >
+  > **CLIENT-SIDE scope (the second, legacy-retiring half).** `HomerClientPeekNextCompletionEvent`
+  > (`homer_client.c:6273`) reads the legacy host-service mailboxes (`backendCompletionMailbox` /
+  > `completionMailbox` `readyEpochSlots`), NOT role 6; the role-6 line (`dpuFrontendCompletionEvent`,
+  > `completionEventOffset`) is exported only on the BASEBACKUP stream (S4.1, `:3048`), never on the
+  > pgbench SQL session. So "client observes role-6" needs a client slice: export role-6 on the SQL
+  > session (apply S4.1's shape) + redirect the peek off the legacy mailbox onto role 6 (+ drop the
+  > `session->control==NULL` reject `:5944`). This IS the completion half of S4.2 and the first concrete
+  > host-service retirement. **SEQUENCING:** backend bridge FIRST (P2.2+P2.3 — legacy-free, checkpoint =
+  > the completion reaches node A's role-6 ring / the node-B "missing … descriptor" error disappears),
+  > then the client role-6 switch as a second increment. Symmetric to P1 pulling the minimal S4.2
+  > submission slice forward.
+
 **Phase P3 — results + client + gate.**
 - P3.1 Results — **REAL WORK ITEM** (corrected July 10, 2026; was "little/no new code" until the §2
   discovery correction). P0 leaves discovery armed but sink-less; P3.1 supplies the join:
