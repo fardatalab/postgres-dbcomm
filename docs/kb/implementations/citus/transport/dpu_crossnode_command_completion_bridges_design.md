@@ -673,3 +673,17 @@ since the pre-P0 green baseline, so a task-path regression is not formally exclu
 flight: a compile-gated engine cross-probe reading 24 B at ring 1's interior hostRingAddress once at
 arena import — zeros = depth-dependent (DOCA/kernel; go separate-small-exports workaround), proto=15 =
 task-path bug (small haystack).
+
+**CROSS-PROBE VERDICT (run 6, citus `d1cfa413b`): the address is INNOCENT.** Raw synchronous DMA at the
+exact failing address returned `proto=15` (`crossprobe completion-ring host=0x7f7df0e49700 bytes:
+0000000f 0000...`), with the arena-base sanity read showing the advisory header correctly. Both interior
+address computations agree. The bug is INSIDE the async backend-completion-control task machinery.
+**New lead (from the cross-probe implementation itself):** the engine's 3,072 task slots alias its
+1,024-buffer pools under MODULO mapping (the probe needed a special scratch-finder to avoid it). If any
+async step derives a buffer from the task-slot index by modulo while another step uses the owner-recorded
+index — or a concurrent submit memsets an aliased buffer between DMA completion and acceptance — the
+acceptance reads a freshly-memset (all-zero) buffer while the real data sits elsewhere. Timing fits:
+Tier-2 ran green with few in-flight tasks (indices in lockstep); S4.0b's enrolment of 16 role-5 rings
+adds 16 grouped tasks per sweep, desynchronizing slot/buffer counters exactly when the symptom appeared
+(the round-1 zeros were REAL — headers were genuinely unstamped pre-`ce31e63a1`; rounds 2/4 zeros are the
+aliasing). Audit in flight: the async completion-control path's buffer lifecycle end-to-end.
