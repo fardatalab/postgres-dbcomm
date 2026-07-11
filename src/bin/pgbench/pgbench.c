@@ -99,6 +99,18 @@
  */
 #define HOMER_PGBENCH_COMPLETION_SPINS 128U
 
+/*
+ * Run-39 diagnostic switch: pgbench is built by meson, which does not carry the
+ * citus tree's CPPFLAGS, so the HOMER_DPU_P2_DIAG-gated [p3trace] probes in this
+ * file would otherwise silently compile out of EVERY pgbench build (caught by the
+ * installed-binary string-literal check, not by the compiler). Define it locally
+ * while the P3 bring-up instrumentation is active; strip together with the rest
+ * of the p3trace scaffolding before any performance run.
+ */
+#ifndef HOMER_DPU_P2_DIAG
+#define HOMER_DPU_P2_DIAG 1
+#endif
+
 static inline void
 HomerPgbenchCpuRelax(void)
 {
@@ -325,11 +337,39 @@ static bool homer_dpu_mode = false;
  * carries commands and completions over the DPU, this flag folds into --homer-dpu and
  * disappears.
  *
- * Expect the run to fail at the first transaction with "invalid arguments while starting
- * ..." (session->control is NULL by design). That is the intended S1a stopping point, not
- * a regression.
+ * STALE AS OF P3 (July 11, 2026) -- the paragraph that used to live here said "expect the run
+ * to fail at the first transaction with 'invalid arguments while starting ...' (session->control
+ * is NULL by design); that is the intended S1a stopping point". That has not been true since the
+ * P2 cross-node command/completion bridges closed: the command now executes on a DPU-spawned
+ * backend on the far node and its completion comes back. Kept as a note because the old text is
+ * quoted in older KB sections.
  */
 static bool homer_dpu_command_mode = false;
+
+/*
+ * P3 hop 6: does this run need the DPU RESULT relay (client-exported role-7 DPU->host ring)?
+ *
+ * True under EITHER flag, but for different reasons -- and the --homer-dpu-command half is an
+ * IMPLICATION, not a coincidence:
+ *
+ *   --homer-dpu          the user explicitly asked for DPU result delivery while the COMMAND
+ *                        plane stays on the host service (the pre-P3 v17/v18 shape).
+ *   --homer-dpu-command  the command session runs against the local DPU, so the backend is
+ *                        spawned BY the far DPU -- and such a backend has NO host-shm result
+ *                        sink at all. Its only result egress is the arena role-5 byte ring,
+ *                        which only the DPU can drain and relay. So the result relay is
+ *                        STRUCTURALLY MANDATORY here, not an option the user may decline.
+ *                        Before this, --homer-dpu-command alone left the backend publishing
+ *                        result bytes into role-5 that nobody consumed, and the node-B service
+ *                        correctly refused to start a result peer-open the client never asked
+ *                        for -- which read as a service bug (validation run 20) but was really
+ *                        this missing client gate. See KB dpu_crossnode_command_completion_
+ *                        bridges_design.md section 10f.
+ *
+ * Derived once in the option-validation block below rather than repeating the disjunction at
+ * each of its four use sites, so the rule is stated in exactly one place.
+ */
+static bool homer_dpu_result_relay = false;
 static int	client_cpu = -1;
 static int	client_cpus[CPU_SETSIZE];
 static int	client_cpu_count = 0;
@@ -710,17 +750,23 @@ typedef struct
 	bool homer_stable_result_binding_valid;
 	uint64 homer_stable_result_drained_tail;
 	/*
-	 * --homer-dpu result relay state. When homer_dpu_mode is on, the measured
-	 * command's RESULT tuples arrive through the session's role-7 DPU->host ring
+	 * DPU result relay state. When homer_dpu_result_relay is on (--homer-dpu, or
+	 * --homer-dpu-command which implies it -- P3 hop 6), the measured command's RESULT
+	 * tuples arrive through the session's role-7 DPU->host ring
 	 * (session.sqlResultDpuStream) rather than a host-shm result sink. The
 	 * per-command tuple-view contract is captured from the command completion
 	 * (see HomerApplyCommandCompletion) so the DPU drain can finalize each
 	 * decoded tuple; homer_last_abalance holds the most recently decoded first
 	 * attribute (pgbench abalance) so the end-to-end decode is provably
-	 * exercised (logged under -d/debug).
+	 * exercised (logged under --debug -- NOT -d, which is --dbname; that mix-up has
+	 * already cost one validation cycle).
 	 */
 	CitusTupleViewContract homer_pending_result_contract;
 	bool		homer_pending_result_contract_valid;
+	/* Run-39 bounded P3 completion/drain diagnostics; counters exist in every build. */
+	uint64		homer_p3_completion_apply_calls;
+	uint64		homer_p3_drain_calls;
+	uint64		homer_p3_drain_spins_exhausted;
 	int32		homer_last_abalance;
 	bool		homer_last_abalance_valid;
 	int			id;				/* client No. */
@@ -1180,6 +1226,8 @@ usage(void)
 		   "  --homer                  submit simple SQL through the Homer service\n"
 		   "  --homer-dpu              deliver --homer SQL results via the DPU deform relay\n"
 		   "  --homer-dpu-command      open the --homer SQL command session on the local DPU\n"
+		   "                           (implies --homer-dpu: a DPU-spawned backend has no\n"
+		   "                           host-shm result sink, so results must use the relay)\n"
 		   "  --homer-client-cpu=CPU   alias for --client-cpu\n"
 		   "  --homer-database-oid=OID database OID for --homer sessions\n"
 		   "  --homer-peer-host=HOST   remote Homer backend-node service host\n"
@@ -3765,6 +3813,18 @@ HomerDrainPendingDpuResultRelay(CState *st, const char *operationName, bool term
 	const CitusTupleViewContract *contract = &st->homer_pending_result_contract;
 	uint32		spins;
 
+	st->homer_p3_drain_calls++;
+#ifdef HOMER_DPU_P2_DIAG
+	if (st->homer_p3_drain_calls <= 5U ||
+		(st->homer_p3_drain_calls % UINT64CONST(65536)) == 0)
+		fprintf(stderr,
+				"[p3trace] drain-entry client=%d calls=%llu terminal_completion=%u "
+				"contract_valid=%u drained_rows_cumulative=%llu\n",
+				st->id, (unsigned long long) st->homer_p3_drain_calls,
+				terminalCompletion ? 1U : 0U, st->homer_pending_result_contract_valid ? 1U : 0U,
+				(unsigned long long) st->homer_pending_drained_rows);
+#endif
+
 	/*
 	 * No result contract means this command published no tuple result (e.g. a
 	 * lifecycle BEGIN/COMMIT, or a row-producing command whose completion did not
@@ -3824,7 +3884,20 @@ HomerDrainPendingDpuResultRelay(CState *st, const char *operationName, bool term
 		 * On exhaustion hand control back to the state machine (RETRY).
 		 */
 		if (spins >= HOMER_PGBENCH_COMPLETION_SPINS)
+		{
+			st->homer_p3_drain_spins_exhausted++;
+#ifdef HOMER_DPU_P2_DIAG
+			if (st->homer_p3_drain_spins_exhausted <= 8U ||
+				(st->homer_p3_drain_spins_exhausted % UINT64CONST(65536)) == 0)
+				fprintf(stderr,
+						"[p3trace] drain-spins-exhausted client=%d exhausted=%llu calls_cumulative=%llu "
+						"drained_rows_cumulative=%llu\n",
+						st->id, (unsigned long long) st->homer_p3_drain_spins_exhausted,
+						(unsigned long long) st->homer_p3_drain_calls,
+						(unsigned long long) st->homer_pending_drained_rows);
+#endif
 			return HOMER_COMPLETION_NOT_APPLIED_RETRY;
+		}
 
 		HomerPgbenchCpuRelax();
 	}
@@ -3845,11 +3918,15 @@ static HomerCompletionApplyResult HomerDrainPendingResultSink(CState *st, const 
 	HomerClientResultDrainBudget drainBudget;
 
 	/*
-	 * --homer-dpu delivers RESULT tuples through the DPU two-ring relay, not the
-	 * host-shm result sink. Divert to the DPU relay drain, which keeps the same
+	 * The DPU result relay delivers RESULT tuples through the DPU two-ring relay, not
+	 * the host-shm result sink. Divert to the DPU relay drain, which keeps the same
 	 * apply-result control-flow contract the caller expects.
+	 *
+	 * P3 hop 6: keyed on homer_dpu_result_relay, not homer_dpu_mode -- under
+	 * --homer-dpu-command the backend is DPU-spawned and has no host-shm sink to drain,
+	 * so the relay drain is the ONLY correct path there too.
 	 */
-	if (homer_dpu_mode)
+	if (homer_dpu_result_relay)
 		return HomerDrainPendingDpuResultRelay(st, operationName, terminalCompletion);
 
 	memset(&drainBudget, 0, sizeof(drainBudget));
@@ -3918,11 +3995,16 @@ static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
 	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED ||
 		completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED)
 	{
-		if (homer_dpu_mode)
+		if (homer_dpu_result_relay)
 		{
+#ifdef HOMER_DPU_P2_DIAG
+			bool		contractValidBeforeCapture = st->homer_pending_result_contract_valid;
+#endif
+
 			/*
-			 * --homer-dpu: the RESULT tuples for this command are relayed through
-			 * the session's role-7 DPU->host ring, NOT a host-shm result sink. So
+			 * DPU result relay (P3 hop 6: either --homer-dpu or --homer-dpu-command;
+			 * see homer_dpu_result_relay): the RESULT tuples for this command are relayed
+			 * through the session's role-7 DPU->host ring, NOT a host-shm result sink. So
 			 * do not open/rebind/pre-arm a shm sink here. Instead, when this
 			 * command's completion first exposes a tuple result (TUPLE_SINK_READY),
 			 * capture the per-command tuple-view contract -- the same contract the
@@ -3947,6 +4029,21 @@ static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
 				st->homer_pending_result_contract_valid = true;
 				st->homer_pending_result_sink_bound = true;
 			}
+
+			st->homer_p3_completion_apply_calls++;
+#ifdef HOMER_DPU_P2_DIAG
+			if (st->homer_p3_completion_apply_calls <= 8U ||
+				(st->homer_p3_completion_apply_calls % UINT64CONST(4096)) == 0)
+				fprintf(stderr,
+						"[p3trace] completion-applied client=%d calls=%llu command_state=%u "
+						"result_flags=0x%x tuple_sink_ready=%u contract_valid_before_capture=%u "
+						"contract_valid_after_capture=%u\n",
+						st->id, (unsigned long long) st->homer_p3_completion_apply_calls,
+						completion->commandState, completion->resultFlags,
+						(completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0 ? 1U : 0U,
+						contractValidBeforeCapture ? 1U : 0U,
+						st->homer_pending_result_contract_valid ? 1U : 0U);
+#endif
 
 			if (st->homer_pending_result_contract_valid)
 			{
@@ -7978,8 +8075,18 @@ printResults(StatsData *total,
 	if (partition_method != PART_NONE)
 		printf("partition method: %s\npartitions: %d\n",
 			   PARTITION_METHOD[partition_method], partitions);
+	/*
+	 * The "transport:" line is the run's INTENDED-PATH confirmation -- it is what a
+	 * validation log is grepped for to prove which stack actually ran. It must therefore
+	 * name every mode combination distinctly. Before P3 hop 6 a --homer-dpu-command run
+	 * printed a bare "homer", i.e. it was indistinguishable in the log from a plain
+	 * host-service Homer run. Name all four combinations.
+	 */
 	printf("transport: %s\n",
-		   homer_mode ? (homer_dpu_mode ? "homer-dpu" : "homer") : "libpq");
+		   !homer_mode ? "libpq" :
+		   (homer_dpu_mode && homer_dpu_command_mode) ? "homer-dpu+dpu-command" :
+		   homer_dpu_command_mode ? "homer-dpu-command (implies dpu result relay)" :
+		   homer_dpu_mode ? "homer-dpu" : "homer");
 	printf("query mode: %s\n", QUERYMODE[querymode]);
 	printf("number of clients: %d\n", nclients);
 	printf("number of threads: %d\n", nthreads);
@@ -8887,6 +8994,17 @@ main(int argc, char **argv)
 			if (homer_peer_host[0] == '\0')
 				pg_fatal("--homer-dpu-command requires a remote peer (--homer-peer-host and --homer-peer-port and --homer-peer-node)");
 		}
+
+		/*
+		 * P3 hop 6: derive the result-relay predicate ONCE, here, where both flags have
+		 * just been validated. --homer-dpu-command IMPLIES the DPU result relay because a
+		 * DPU-spawned backend has no host-shm result sink -- see homer_dpu_result_relay's
+		 * declaration for the full rationale. Both flags require a remote peer (checked
+		 * just above), so the relay's own remote-peer precondition is already satisfied
+		 * whichever flag turned it on, and needs no separate check.
+		 */
+		homer_dpu_result_relay = (homer_dpu_mode || homer_dpu_command_mode);
+
 		if (!validateHomerScriptSupport())
 			exit(1);
 	}
@@ -9634,16 +9752,23 @@ openHomerSession(TState *thread, CState *st)
 	}
 
 	/*
-	 * --homer-dpu: tell the service (via the OpenSession request) that this SQL
-	 * session's result tuples must be relayed through the DPU two-ring deform
-	 * path into our client-exported role-7 ring, not the passive host-shm result
-	 * sink. This flag must be set BEFORE the session is opened so the peer
-	 * provisions the relay.
+	 * Tell the service (via the OpenSession request) that this SQL session's result
+	 * tuples must be relayed through the DPU two-ring deform path into our
+	 * client-exported role-7 ring, not the passive host-shm result sink. This flag must
+	 * be set BEFORE the session is opened so the peer provisions the relay.
+	 *
+	 * P3 hop 6: keyed on homer_dpu_result_relay, so --homer-dpu-command implies it. The
+	 * far service's result peer-open REFUSES to start unless this flag arrives on the
+	 * command-session open (it is captured there and inherited by every result SEND
+	 * peer-open), so a DPU-spawned backend with this unset publishes result bytes into
+	 * its arena role-5 ring that nobody will ever drain. Validation run 20 was exactly
+	 * that: the service's refusal was correct and looked like a service bug.
 	 */
-	if (homer_dpu_mode)
+	if (homer_dpu_result_relay)
 		sessionOptions.clientSqlResultDpuRelay = 1;
 
-	if (homer_dpu_mode || homer_dpu_command_mode)
+	/* Same predicate as the relay above (P3 hop 6 folded the two conditions into one). */
+	if (homer_dpu_result_relay)
 	{
 		/*
 		 * Binding: mint this session's UNIQUE sessionUID ONCE here, BEFORE the command
@@ -9708,8 +9833,15 @@ openHomerSession(TState *thread, CState *st)
 	 * setup handshake, and writes its state into st->homer_session.sqlResultDpuStream
 	 * (also setting session.sqlResultDpuStreamOpen). On failure the whole session
 	 * is torn down so pgbench does not run half-wired.
+	 *
+	 * P3 hop 6: keyed on homer_dpu_result_relay, so --homer-dpu-command binds it too.
+	 * This ring is the DESTINATION the relay flag above promised the service; binding it
+	 * is what makes the sessionUID rendezvous on the local DPU resolvable. The ring's own
+	 * OpenSession(RECEIVE) is a self-contained selected-DPU export (its own DPU setup
+	 * connection and control slot) bound to the command session ONLY by sessionUID --
+	 * which is why sessionUID is minted once, before the command open, under either flag.
 	 */
-	if (homer_dpu_mode)
+	if (homer_dpu_result_relay)
 	{
 		/* Bind the role-7 result ring to this session (reframe of the selected-DPU RECEIVE open). */
 		if (!HomerClientBindResultRing(&st->homer_session,

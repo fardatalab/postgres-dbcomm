@@ -847,6 +847,8 @@ host-relay fallback fails loudly instead of masquerading as a pass.
 > down, so a hard-clean baseline (which removes it) made the topology error visible where a dirty
 > baseline had masked it.
 
+See also: [Homer tuple DEFORM and the two-ring result relay](tuple_deform_two_ring_relay_overview.md).
+
 ## 7. P1 blocker investigation — Codex second opinion + arena poke probe (July 10, 2026)
 
 **Codex verdicts (file:line-proven):** Theory A (interior-address translation bug) REFUTED — Homer passes
@@ -1268,3 +1270,835 @@ Deferred by explicit choice: `HOMER_DPU_P2_DIAG` scaffolding STAYS through P3 �
 the command/completion chain P3's result path rides, and this arc exists because success-edge
 visibility was missing; strip it at P3 close instead. The fenced-session bounded leak stands as the
 S4-scoped open item (§9b).
+
+## 10. P3 grounding (codex trace, July 11, 2026) — decisions + corrections to §4's P3 plan
+
+**D-P3.1 (resolves §4's deferred decision): result-stream identity is minted EAGERLY at receiver-side
+OPEN — precisely inside `TupleSinkServiceBeginDpuBackendSpawn`, after the arena bind records
+`dpuArenaSlotIndex`/`dpuArenaBridgeGeneration` (~:19800-19808) and BEFORE
+`TupleSinkServiceFillBackendSpawnRequest` freezes startup data (:19810).** At that point
+serviceSessionId + slot + generation are all in hand; lazily creating at first START is too late
+(`HandlePeerStartCommandRequest` :39016+ finds an already-spawned session and cannot retrofit
+immutable startup data). CAVEAT: the tuple CONTRACT is unknowable at OPEN (the executor derives it in
+`RemoteExecSqlDestStartup` :1322/:1349) — so OPEN reserves the session-scoped stream IDENTITY
+(`HomerServiceCreatePayloadStreamEntry` :24640 allocates serviceStreamId; mirror-pool bind
+:17559/:17583 keys on (parentServiceSessionId, serviceStreamId)); contract/key finalization stays
+lazy at the first row-producing command.
+
+**Corrections to the plan (things simpler than §4 assumed):**
+- NO new spawn/startup ABI fields: `resultServiceSinkId` + `resultQueueDescriptor` already exist on
+  BOTH `CitusRemoteExecBackendSpawnRequest` (remote_execution_backend_protocol.h:210/228/229) and
+  startup data (:173/205/206), and `ProcessSpawnRequestSlot` already copies them
+  (remote_execution_backend_bridge.c:3345). Only `TupleSinkServiceFillBackendSpawnRequest` (:19622)
+  leaves them unfilled, and the backend must copy startupData->resultServiceSinkId into its session.
+- The arena branch ALREADY fills the role-5 source descriptor's physical geometry and maps
+  `resultQueueControlMappingAddress` (remote_execution_backend_bridge.c:2933/2957/2967/2979);
+  `queueShmName` stays deliberately empty — the :615 queue-name check is only hit because the plain
+  `OpenCitusTupleSink` (homer_tuple_queue_frontend.c:952, `MapTupleSinkQueue` by name :984/:1011)
+  cannot adopt an embedded mapping. The adopt variant binds the handle to the already-mapped address
+  and skips shm_open/munmap ownership; immediately after every adopted open/rebuild, call
+  `CitusTupleSinkAttachDpuPublishMirror` (decl homer_tuple_queue_frontend.h:124, def :164) with
+  `&arena->hostPublishLines[slot*3+2]`, `arena->bridgeHeader.bridgeGeneration` (validate nonzero —
+  the shared header is advisory, homer_frontend_agent.h:227), and the global role-5 ring index/id
+  (constants homer_frontend_agent.h:130; builder :803/:874).
+- NO new node-A data plane: incoming payload dispatch already routes flagged tuple streams into the
+  two-ring deform relay (tuple_sink_service_process.c:33420), which resolves the client's role-7 ring
+  by the stamped `sessionUID` (:32964, resolution :32331). The command session must carry the same
+  tuple family + relay flag + contract + peer payload connection + client sessionUID + bound role-5
+  sink id. Sender side: outgoing dispatch (:30817) → mirrored-range query by (session,stream) →
+  `HomerServicePumpOutgoingDpuMirrorByteRingPayload` (:30292+), with
+  `HomerDpuDmaMirroredRangeMatchesServiceSink` matching boundServiceSessionId+SinkId
+  (homer_service_dpu_dma.c:4500) and `HomerDpuDmaBindArenaResultSink` (:6021) as the join stamp.
+- Client: the role-7 drain/decode ALREADY exists (`HomerDrainPendingDpuResultRelay` pgbench.c:3761 →
+  `HomerClientPollSqlResultDpuReceive` homer_client.c:4850+). The gap is PATH SELECTION only: role 7
+  is opened (:9704) and drained (:3847/:3940/:3951) only under `homer_dpu_mode`; selected-DPU command
+  mode must open/drain role 7 itself (interim: require both flags; final: fold into
+  --homer-dpu-command). The old `control == NULL` START blocker is ALREADY GONE (post-P2:
+  homer_client.c:6046/:6202 submit via role 1). Known small gap: relayed ERROR records drain without
+  surfacing (:4963).
+
+**Hazards (P2.T interplay) — the first one moves into batch 1:**
+- Role-5 rings are ALREADY ENROLLED in grouped-control discovery (homer_service_dpu_dma.c:7034) and
+  `HomerDpuDmaSubmitGroupedControlReads` (:1293) does NOT consult `pollQuiesced`. Once a sink binds,
+  grouped reads perpetually refill role-5 in-flight counts → every T2 drain stalls into the 30 s
+  forced path. Batch-1 interim: grouped scan skips `pollQuiesced` rings, and T1 ALSO quiesces role 5
+  (accepting that an un-egressed result tail is dropped at teardown — fine while bring-up clients
+  abort on gap errors). The FINAL shape (hop 7) replaces T1's role-5 quiesce with a result-drained
+  subphase: wait for final role-5 publication discovery + payload EOS completion, THEN quiesce, THEN
+  the existing three-ring in-flight gate.
+- EOS ordering: terminal egress already blocks on `payloadEosPosted` + completed source frontier
+  (:18445/:18563/:40338); P3 must make that frontier mean "visible through node A's role-7 relay,"
+  not merely "pulled from role 5."
+
+**Implementation order (smallest observable hops):** 1 identity-only OPEN hop (allocate stream id,
+fill spawnRequest.resultServiceSinkId, backend logs nonzero id) + the batch-1 teardown interim;
+2 role-5 producer hop (adopt-mapping open + mirror attach; first publish epoch visible); 3 DPU mirror
+join (`BindArenaResultSink`; discovery resolves (session,stream)); 4 node-B egress hop (peer payload
+stream; mirrored bytes + EOS advance); 5 node-A relay hop (sessionUID resolves; role 7 advances);
+6 client gate (selected-DPU command mode opens/drains role 7; decoded values + ERROR propagation);
+7 terminal result-bearing completions with EOS ordering + the result-drained teardown subphase.
+
+### 10b. Run 19 (P3 batch 1) — every hop validated; stall = the EOS gate meeting the missing hops (July 11, 2026)
+
+**Attempt 1 (uncontaminated) — batch 1 works.** `reserved pending DPU result stream identity
+session=1 sink=1`; NO queue-name ERROR; the SELECT **executed and completed** (terminal epoch=6
+state=COMPLETED flags=3 sink=1); the backend **published 112 bytes into role-5**
+(`role-5 publication discovered before sink bind; deferring ready enqueue ... tail=112` — proves the
+adopted open AND the mirror attach armed the commit-site stamps, and the engine's sink-gate deferral
+fired exactly as designed with hop 3 absent). The terminal completion was ENQUEUED but never egressed:
+the §5 EOS-ordering gate (payload-before-completion, :18445/:18563/:40338) correctly refuses to egress
+a result-BEARING completion whose payload cannot flow (hops 3–5 missing). Client hit its 30 s deadline
+→ self-latched terminal → skipped TX_ABORT/CLOSE (deadline-latch path, as designed). **Consequence for
+sequencing: hops 3–5 are one atomic validation unit with batch 1 — a result-bearing command cannot
+complete client-visibly until payload egress exists.** (Run 16/18 never saw this because their SELECTs
+FAILED pre-publication, so those completions carried no payload gate.)
+
+**Attempt 2 (contaminated by the reap; findings still real):**
+- **Reaping a live `remote exec backend` with kill -9 mid-run = full postmaster crash-restart**
+  ("terminated by signal 9 ... reinitializing"). Runbooks must treat backend reaps as restarts. Bonus:
+  the crash-restart's frontend agent correctly reaped the leaked arena slot itself.
+- **Crash-restart hazard (new):** the surviving arena (crash-restart does not re-run _PG_init) keeps
+  STALE publish-line generation stamps from the old tenancy; after the new agent re-exports under a
+  new bridge generation, grouped-control reads fail
+  `host publication generation does not match descriptor` → `PE drain failed`. The
+  slot-body reset does not clear `hostPublishLines[]` (arena-level array, not slot body). Fix
+  candidates: re-zero publish lines at re-export/import-accept, or at slot release. S3.4/D-A
+  adjacent; not a batch-1 bug.
+- **`TupleSinkServiceResetSession`'s exit(1) guard is reachable from the spawn/OPEN-failure path**
+  (session=2's failed spawn → "refusing to reset peer CLIENT_SQL_SESSION before command-mailbox
+  writers quiesce" → silent service death — the run-17 crash CLASS via a different door; the T4 fix
+  only removed the teardown-machine callers). Every ResetSession caller reachable while the peer can
+  still write the session mailbox is a landmine; needs the same treatment (defer to peer-close
+  lifecycle) or writer-quiesce before reset on the failure paths.
+
+Named-string FAIL greps again all 0 through both incidents — silent process death remains the blind
+spot; future runbooks: add explicit service-liveness checks after every phase (run 18 had them; keep).
+
+**Batch 2 (next): hop 3 `HomerDpuDmaBindArenaResultSink` (bind at reservation time — the deferral
+gate already proved it holds publications safely) + hop 4 node-B peer payload egress for the pending
+stream (contract finalization at first result-bearing command; mirror-pool bind; peer payload
+connection) + hop 5 node-A sessionUID→role-7 relay. Then rerun; expected: attempt-1's stall point
+advances to the client's result-open (the original run-19 prediction, one batch late).**
+
+### 10c. Batch 2 partial land + the hop-4 STOP (July 11, 2026) — needs owner discussion
+
+Landed (uncommitted, tree = citus working dir): hop 3 sink bind at reservation (:19913, undoes cleanly);
+contract finalization at the first TUPLE_SINK_READY completion (`HomerServiceDpuFinalizePendingResultStream`
+:41106, called from acceptance :41447 — earliest honest point, the executor has derived the contract;
+key reconstructed as (timestamp=sessionId, txn=commandSequence, rel=InvalidOid); slot count =
+byteRingBytes/maxRecordBytes); hop-5 verification (node-A wiring EXISTS: relay/sessionUID captured at
+command OPEN :38993, propagated through peer payload OPEN :37237, soft-retry when role 7 absent
+:33157); ResetSession exit(1) guard fenced at 8 OPEN/spawn-failure sites via
+`TupleSinkServiceResetPeerOpenFailureIfSafe` (:23642) — failure paths never exit(1) again.
+
+**STOPPED (deliberately, per instruction): driving the peer payload OPEN from node B for a
+command-session result stream (:41201).** The proven basebackup/async flow requires three things the
+command session does not retain and the backend completion does not carry: the original
+`peerEndpoint`, a `placementAccessDescriptor`, and an owned local-control ASYNC slot. Options:
+(a) retain the peer endpoint on the command session at its OPEN + allocate an async slot for the
+payload open + pass an empty/NA placement descriptor (receiver must tolerate); (b) a lighter
+command-session "result stream announce" message on the existing peer control channel instead of the
+full payload OPEN; (c) extend the payload OPEN with a command-session variant. Node-A side already
+routes by relay-flag + sessionUID, so the receiver half is mostly indifferent. DECISION PENDING —
+brought to the owner before proceeding.
+
+### 10d. Owner review of batch 1/2 + hop-4 RESOLUTION (July 11, 2026)
+
+**Hop 4 RESOLVED — reuse the EXISTING v17/v18 result peer-open; none of §10c's (a)/(b)/(c) as framed.**
+The result peer-open already exists as a protocol message (`clientSqlResultDpuRelay` on the
+command-session AND result open requests since v17, `sessionUID` since v18 —
+remote_execution_peer_control_protocol.h:33-34), the --homer-dpu path drives it today (:37237 fills
+the outgoing result open from session state), and node A has a dedicated receiver branch
+(`clientSqlResultOpen && clientSqlResultDpuRelay`, :35334). Placement descriptors are the COPY/insert
+flavor's business (:21744+), not this one — the "empty placement" worry was an artifact of comparing
+against the BASEBACKUP open, the wrong template. What hop 4 adds is node-B DRIVER STATE only, both
+with precedent: (1) record the ORIGIN peer endpoint on the command session at its OPEN (it arrived
+over an established peer connection; the legacy path records its endpoint the same way); (2) drive
+the result open through a SERVICE-originated local-control async op — same pattern as option B's
+`RESPONSE_OWNER_DPU_STAGED_COMMAND` owner kind. No new wire messages, no extra round trips.
+
+**Adopt-mapping variant retained over a descriptor offset field (owner ok'd either).** Beyond the ABI
+bump: the descriptor travels CROSS-NODE inside completions, and a (name, offset) pair is host-local
+addressing that must never leak to node A (the client consumes via role-7, never by mapping node B's
+arena); the backend already holds the arena mapping (a by-name+offset open would double-map with a
+conflicting lifetime); and the variant is implemented + validated (run 19). The offset field remains
+an acceptable future option if a caller genuinely needs by-name+offset.
+
+**Two-phase stream bookkeeping confirmed as intended semantics:** identity at spawn (rides the
+immutable startup data), tuple contract on-demand at the first result-bearing command — nothing else.
+
+**Role-7 soft-retry: transient tolerance now, FAIL-trigger later.** After hop 6 the client exports
+role-7 during session open, BEFORE any command can run, so payload can never legitimately arrive
+first. The soft-retry mechanism STAYS (shared with --homer-dpu; covers the died-mid-run client whose
+ring vanishes with payload in flight — defer-then-teardown beats erroring the shared transport), but
+its run-gate meaning flips: once hop 6 lands, the retry/absence diagnostic joins the named
+FAIL-trigger greps — any firing with a live client is a bug to investigate, never tolerated.
+
+### 10e. Run 20 — chain advances to contract finalization; TWO batch-2 defects (July 11, 2026)
+
+Progress proven: identity + `finalized pending DPU result stream session=1 sink=1 sequence=5` (new vs
+run 19). Then:
+**Defect 1 — the service-owned result peer-open fails its own precondition:** `could not start
+service-owned P3 result peer-open sink=1: service result peer-open lacks a unique pending stream or
+captured origin endpoint`. Chain stops; terminal completion EOS-gated forever; client 30s
+timeout (same visible shape as run 19).
+
+> ⚠ **The hypothesis originally recorded here was WRONG and is superseded by §10f.** It read: "Either the
+> origin-endpoint capture at command-session OPEN (:39149) never populated, or the 'unique pending stream'
+> search runs AFTER finalization cleared `tupleContractPending` (ordering bug)." Both halves are false.
+> `TupleSinkServiceStartServiceResultPeerOpen` never *searches* for a stream — the `streamEntry` is an
+> argument — so there is no ordering to get wrong, and the capture is fine. See §10f for the real cause.
+> Kept verbatim because the *reason* it was believable is the actual lesson (see §10f's postmortem).
+**Defect 2 — failed-stream egress retry STARVES all sessions:** session 1's gated completion retried
+`egress publish result=2` ~2M/snapshot (egrg climbs, egrs frozen) and session 2's OWN warmup
+completion never egressed — cross-session starvation. Fix needs BOTH a terminal-failure path for a
+stream whose peer-open definitively failed (fail the completion rather than gate it forever) AND
+egress fairness (a stuck head must not monopolize the action).
+Positives: slot 16 reuse clean; all P2.T fail-triggers 0; service alive throughout; session-1 backend
+answered pg_ctl stop -m fast from the RELEASE await (CHECK_FOR_INTERRUPTS working; exited "leaving
+arena slot 0 BOUND"); session-2 backend (stuck pre-await) needed end-of-run reap as expected.
+NEXT: fix defect 1 (endpoint capture / pending-stream lookup ordering), add defect-2's
+failure+fairness policy, run 21 (same spec as run 20). Artifacts: scratchpad run20/.
+*(That "NEXT" is superseded — see §10f.)*
+
+### 10f. Run-20 defect 1 RE-DIAGNOSED — it is not a bug, it is the missing hop-6 client gate (July 11, 2026)
+
+**The real cause.** `TupleSinkServiceStartServiceResultPeerOpen`
+(`tuple_sink_service_process.c:38175`) does not search for anything; its `streamEntry` is a parameter.
+What it does is AND **nine** subconditions (`:38184-38195`) and, on any of them, emit **one** generic
+message. The subcondition that actually failed is **`!sessionState->clientSqlResultDpuRelay`**.
+
+Why that flag was false: pgbench sets `sessionOptions.clientSqlResultDpuRelay = 1` **only under
+`homer_dpu_mode`** (`postgres-citus src/bin/pgbench/pgbench.c:9643-9644`), i.e. only for `--homer-dpu`.
+Runs 19 and 20 passed `--homer --homer-dpu-command` and **not** `--homer-dpu`. So the client never
+*requested* a DPU result relay, and never *exported a role-7 ring* to receive one — the selected-DPU
+opener exports exactly two rings, role-1 control + role-6 completion
+(`citus-dbcomm src/bin/homer_client.c:87` `HOMER_CLIENT_DPU_COMMAND_SETUP_RING_COUNT 2U`;
+descriptors at `:3112` and `:3147`). Node B **refused correctly**. `sessionUID` was never the problem —
+S1a already mints it under either flag (`pgbench.c:9646-9665`).
+
+**So run 20 did not regress and did not expose a peer-open bug. It stopped at batch 2's designed
+stopping point** — one hop past run 19 — and what it was missing all along is **hop 6, the client gate**,
+which was always scheduled as batch 3.
+
+**Decision (owner directive: decide from the plan's direction, record the reasoning, proceed).**
+`--homer-dpu-command` now **IMPLIES** `clientSqlResultDpuRelay = 1` and a bound role-7 ring. Rationale,
+straight from P3's premise: a **DPU-spawned backend has no host-shm result sink at all** — its only result
+egress is the arena role-5 byte ring, which only the DPU can drain. So for a selected-DPU command session
+the result relay is **structurally mandatory, not optional**. The two flags remain independent in the
+other direction: `--homer-dpu` alone still means "host command plane + DPU result relay" (the pre-existing
+v17/v18 shape). Their CLI validation requirements are already identical (both demand a remote peer,
+`pgbench.c:8869/8878`), so composing them needs no new checks.
+
+**Hop 6 is therefore nearly free** — the client half already exists and is exercised by `--homer-dpu`:
+`HomerClientBindResultRing` (`homer_client.c:4715`, a reframe of
+`HomerClientOpenSqlResultReceiveStreamSelectedDpu`), the drain `HomerClientPollSqlResultDpuReceive`, and
+four pgbench sites that gate on `homer_dpu_mode`: the relay flag (`:9643`), the role-7 bind (`:9712`), the
+drain diversion (`:3852`), and the shm-sink skip + contract capture (`:3921`). Hop 6 = extend those four
+gates to `homer_dpu_mode || homer_dpu_command_mode`. The role-7 rendezvous is node-A-local and keys on
+`sessionUID`, and under `--homer-dpu-command` the command session ALSO lives on the client's local DPU
+(node A), so the two meet on the same service — which is exactly what hop 5 resolves.
+
+**Consequence for run 21:** the diagnosis is testable with **zero code changes** — run 20's spec plus
+`--homer-dpu`, on the already-deployed binaries. That configuration IS the intended hop-6 shape, reached
+through existing wiring. (Caveat: the `--homer-dpu` role-7 client path has itself never completed end to
+end — see `byte_ring_slot_capacity_regression.md` — so run 21 may find a *new*, further wall. That is
+still forward progress and a useful outcome.)
+
+**What IS genuinely defective in batch 2, and is being fixed regardless:**
+- **Fix A** — the nine-way compound guard must name the subcondition that failed, and must distinguish
+  "client did not request a relay" (an invalid *configuration* for an arena session — fail loudly, set
+  `dpuResultPeerOpenFailed`) from "client requested one but our origin-endpoint capture is broken" (a real
+  bug). One generic message across nine conditions is what cost run 20 a cycle.
+- **Fix B** — §10e's defect 2 stands and is independent of hop 6: a stream whose peer-open definitively
+  failed must have a **terminal arm** (fail the gated completion; do not gate forever), and egress must be
+  **fair** (a stuck head must not monopolize the action). Run 20's ~2M retries/snapshot starved a second
+  session's completion entirely.
+
+**What landed (July 11, 2026), reviewed line by line:**
+
+- **Fix A** — `tuple_sink_service_process.c:38182` `TupleSinkServiceStartServiceResultPeerOpen`. The
+  compound guard is replaced by per-subcondition rejects that NAME the failure and print its value
+  (`sessionUID=0`, `empty …peerHost`, `peerControlPort=0`, `…ConnectionGeneration=0`,
+  `clientSqlPeerConnectionHandle=NULL`, `RDMA generation mismatch … captured=… current=…`, already-pending,
+  already-ready). `clientSqlResultDpuRelay=0` is split out as a **terminal configuration failure** —
+  `invalid selected-DPU result configuration … client must request the DPU result relay` — and sets
+  `dpuResultPeerOpenFailed`, which is what arms Fix B's terminal arm. (The original compound `if` is kept
+  commented above it, per house rule.)
+- **Fix B1** — `:41926` in `HomerServiceDpuEgressOneSelectedCompletionEvent`. On
+  `dpuResultPeerOpenFailed && terminal && (resultFlags & TUPLE_SINK_EOS)`, the queued completion is
+  converted in place to `COMMAND_STATE_FAILED` / `RESULT_FLAG_TUPLE_SINK_FAILED` with a client-visible
+  `detail`. **Why that releases the gate:** the EOS gate at `:18581` fires only on
+  *terminal* ∧ *`resultFlags` has `TUPLE_SINK_EOS`* ∧ *EOS not yet posted*; dropping the EOS bit makes the
+  second conjunct false. Verified `FAILED` is both terminal (`:17797`) and push-visible (`:18182`), so the
+  publish does not degrade to `NOOP` (which the caller would turn into a hard error). The mutation is
+  idempotent across a `NOT_READY` retry — the EOS bit is already gone, so the block is skipped and the
+  already-`FAILED` event simply re-publishes.
+- **Fix B2** — `:40663` `HomerServiceDpuFindSelectedSessionWithCompletionEvent` + the new
+  `peerCompletionEgressScanCursor` (`:760`). Round-robin selection whose cursor advances **on selection,
+  not on success** (`:40682`) — that is the entire point: a session whose head then proves gated has
+  already yielded its turn. (Advancing only on success would reproduce the starvation exactly.) Per-session
+  FIFO is untouched; only the inter-session order rotates. Invariant: **one wedged session costs every
+  other session at most one wasted selection per rotation.** Wart: the cursor is named for peer egress but
+  is shared with the non-peer publish path (`:41766`); fairness still holds (each call scans all slots and
+  wraps), the name just undersells its scope.
+- **Fix C (hop 6, client)** — `postgres-citus src/bin/pgbench/pgbench.c`. New derived predicate
+  `homer_dpu_result_relay` (`:360`, derived once at `:8932`) replaces `homer_dpu_mode` at the four
+  result-path gates: relay flag (`:9693`), role-7 bind (`:9769`), drain diversion (`:3884`), shm-sink skip
+  (`:3953`). Two incidental log-integrity fixes found on the way: the **`transport:` line** — the very line
+  a validation log is grepped for to prove which stack ran — printed a bare `"homer"` for a
+  `--homer-dpu-command` run, i.e. indistinguishable from a plain host-service run; it now names all four
+  combinations. And a comment claiming the decode proof is logged under `-d/debug` was propagating the
+  `-d` (=`--dbname`) vs `--debug` mix-up that CLAUDE.md records as already having cost a cycle.
+
+**Two other indefinite gates exist and were deliberately NOT touched** (found while fixing B, recorded so
+they are not rediscovered as novel): completion-publication source-ring credit (`:18619`) and prior
+result-stream send-CQ retirement (`:18677`). Both have live recovery machinery and only become permanent
+if their CQ/credit progress itself fails — unlike the EOS gate, whose precondition had become *impossible*.
+
+**Postmortem — why the wrong hypothesis was believable, and the rule it yields.** The error message named
+a mechanism ("a unique pending stream") that the function does not implement, and it was written to cover
+nine unrelated failure modes at once. So the message *invited* a search for an ordering bug between the
+"pending stream" lookup and `FinalizePendingResultStream`, and both function names made that story
+coherent. **Rule: a guard that ANDs N conditions must report WHICH one failed. A single message shared by
+N conditions is not a diagnostic — it is a decoy, and it will send the next reader (human or model) down
+the wrong path with full confidence.** This is the same family as the traps in CLAUDE.md (`pkill -f`
+self-match, `rsync -a` mtime, `(deleted)` exe): *an identity check that is exactly right for the case you
+thought about, and silently wrong for the one you did not.*
+
+**Second lesson — the runbook is part of the system under test.** Run 21's first dispatch aborted because
+the brief told the validator to start postgres with only `-o "-c port=5433"`, silently dropping
+`-c citus.enable_homer_dpu_frontend_agent=on` **and** the `HOMER_FRONTEND_DPU_SETUP_*` postmaster
+environment that runs 17-20 all carried. Without the frontend agent the backend-spawn region is never
+exported to the farnet1 DPU, so a DPU-spawned backend cannot exist. The validator caught it and refused to
+proceed — correctly. A hand-retyped runbook is a silent re-derivation of preconditions that took many runs
+to establish: **diff a new runbook against the last one that passed, do not retype it.** The canonical
+sequence lives in `scratchpad/run17_runbook.md` (steps 1-9 + the RUN 18 DELTA).
+
+### 10g. Run 21 — hop 6 CONFIRMED; the byte-ring mirror geometry bug (July 11, 2026)
+
+**Run 21 validated §10f's re-diagnosis.** With Fix C the client requested the relay
+(`transport: homer-dpu-command (implies dpu result relay)`) and the chain advanced TWO hops past run 20:
+
+```
+reserved pending DPU result stream identity session=1 sink=1
+finalized pending DPU result stream ... sequence=5
+started service-owned P3 result peer-open op=0 session=1 sink=1 origin=10.10.1.200:9717   <- run 20's blocker, CLEARED
+service-owned P3 result peer-open ready session=1 sink=1 detail=peer stream bound          <- further still
+```
+
+Then node B aborted on:
+
+```
+DPU mirror position-preserving invariant broken session=1 sink=1
+    host_ring=262144  remote_ring=8388608  byte_posted=0 source_posted=0
+```
+
+#### The bug (not a sizing preference — a violated ABI rule)
+
+`homer_queue_abi.h:200-221` states the rule outright: *"Why a single constant instead of the old
+slotCount * slotCapacityBytes sizing: the sender DPU mirrors the host source ring … and the mirror wrap
+position (absolute % ringBytes) MUST coincide with the source wrap position … Deriving the storage of BOTH
+the source ring and the mirror from ONE constant guarantees the two moduli are identical. **'slots' (the
+count) is gone from the queue descriptor**; the surviving per-record knob is the max record size, which is
+**orthogonal to storage**."*
+
+The arena then **resurrected the abolished formula** (`homer_frontend_agent.h:156-160`):
+`ARENA_RESULT_RING_STORAGE_BYTES = SLOT_COUNT(256) * MAX_RECORD_BYTES(1024) = 262144`. So the source ring
+(arena role-5, 256 KiB) and its mirror (node-A receive ring / client role-7, a fixed 8 MiB) have different
+moduli, and the position-preserving relay cannot exist. Run 21 is simply the first run that got far enough
+for a result byte to move.
+
+`MAX_RECORD_BYTES = 1024` is NOT the bug and stays — the ABI says max-record is an orthogonal knob, and
+`262144 >= 2 * 1024` satisfies the 2x wrap-gap headroom rule. (It is, separately, a real cap on decoded
+tuple width; tracked apart from this.)
+
+#### Owner decision (July 11, 2026) — the rule is PER-PAIR, and we will prove it
+
+The mirror only ever needed **each source/mirror PAIR to agree**, not all rings globally. The single global
+constant was a *sufficient* condition the ABI adopted for safety, not a *necessary* one —
+`CitusHomerPayloadByteRingDescriptor` already carries a per-stream `ringBytes`. Decisions:
+
+1. **State the per-pair rule explicitly** in the ABI comment, in the relay's invariant comment
+   (`tuple_sink_service_process.c:30610-30630`), and here. A future reader must not re-derive "one global
+   constant" as a requirement.
+2. **Purge slot-based vocabulary from the byte-ring path entirely.** It is a byte ring: any size record,
+   no slots. The lingering `SLOT_COUNT`-style sizing/naming is what misled this implementation into the
+   bug, so it is deleted, not merely commented. (`requestedSlotCount` / `requestedSlotCapacityBytes` on the
+   OPEN path, arena `RESULT_RING_SLOT_COUNT`, and any "slot" wording on byte-ring descriptors/comments.)
+3. **Give the SQL-result chain its own geometry: 10 MiB (10 * 1024 * 1024 = 10,485,760).** All three rings
+   of the chain — arena role-5 (node-B source), node-A receive ring, client role-7 — use it; basebackup
+   keeps its 8 MiB. **The sizes are deliberately DIFFERENT between the two chains** so the run exercises
+   the per-pair rule instead of silently re-relying on a global constant.
+   - 10 MiB is deliberately **NOT a power of two** (2^21 * 5). Verified safe: the ring arithmetic is a true
+     `%` (`tuple_sink_service_process.c:7542` `absoluteOffset % ringBytes`), never a `& (ringBytes-1)` mask.
+     This is the STRONGER test: a power-of-2 test size would silently pass even if some path *did* assume a
+     mask. Cost is one 64-bit division per RDMA **chunk** (not per byte) — negligible.
+4. **Enforce the invariant at bind time**, not at first byte. A hard check that every ring in a relay chain
+   agrees on `ringBytes`, failing loudly at OPEN/bind. This re-establishes the ABI's safety property at the
+   granularity that is actually true. Run 21's abort fired only when data moved — far from the cause.
+5. **Split the arena across several DOCA mmap exports.** At 10 MiB role-5 the arena is
+   ~16 * (3.05 MiB + 264 KiB + 10 MiB) ~= 213 MiB, over the observed ~100 MB single-region DOCA ceiling.
+   This is the documented escape hatch and is already supported:
+   `HomerDpuComchSetupHeader.mmapExportCount`, the DPU already loops over exports, and the frontend agent
+   already ships TWO exports today (48-descriptor arena + 1-descriptor spawn region).
+   **Correction for the record:** an earlier note in this session called the >100 MB arena "structurally
+   dead". That was wrong — `homer_frontend_agent.h:110-116` documents the split as the intended way to grow.
+   A `_Static_assert` was read as a wall when the comment above it described the door.
+
+#### Second run-21 bug: payload-failure livelock (fixed, pending validation)
+
+After the geometry abort, BOTH DPU services spun at 100% CPU emitting
+`tuple-result payload failure had non-frontend owner ... reason=payload-failure-action` forever —
+3,181,008+ repeats, logs reaching 1.7 GB and 2.4 GB in UNDER A MINUTE. Cause: the tuple-result failure
+delivery path (`:28031-28052`) knew exactly TWO owners of a tuple-result stream (locally-initiated peer
+binding; `clientSqlRemoteSender` frontend). P3 introduced a **THIRD** — the service-owned DPU result stream
+— which is neither, so it fell into the `return HOMER_FAILURE_DELIVERY_FAILED` arm on every pass, and its
+caller re-armed it unboundedly.
+
+**This is the THIRD instance of one pattern in two runs** (the EOS gate in §10e was the first): *a state
+machine whose default arm is "fail", invoked from a scheduler loop with no terminal arm.* Fixes: recognize
+the P3 owner and commit its failure through Fix B1's terminal arm; give unknown owners a loud one-shot
+ABANDON so a future FOURTH owner cannot melt the CPU; rate-limit the diagnostics (an unconditional
+`fprintf` inside a retried action is a bug in its own right). A full inventory of every action that can
+return hard-failure and be re-armed unconditionally is recorded from the worker's audit — see the P4 item.
+
+**NEXT:** batch 4 = decisions 1-5 above, then re-run run 21's spec. Artifacts: scratchpad/run21/.
+
+### 10h. Runs 22-23 — batch 4 VALIDATED; the real defect is node-B payload egress never arming (July 11, 2026)
+
+**Batch 4 passed every goal it had (run 22).**
+- Arena **mmap split works**: 5 imports, arena descriptors tiling `0..47` exactly + the spawn export.
+  `/citus_homer_frontend_arena_v3`, 223,370,368 bytes, 16 slots.
+- **Per-pair geometry works.** SQL chain at 10 MiB and basebackup at 8 MiB *simultaneously*, with ZERO
+  `mirror position-preserving invariant broken` and ZERO `byte-ring bind rejected source/mirror geometry
+  mismatch`. The deliberately-different sizes are what make this a PROOF rather than an assumption: nothing
+  in the stack silently depended on a global constant. (Owner's call; it paid off.)
+- **Livelock gone.** DPU logs 5-15 KB, versus 1.7 GB / 2.4 GB in run 21.
+
+**The real defect: node B binds the result peer stream and then does NOTHING.**
+On node B the LAST LINE IN THE LOG is `service-owned P3 result peer-open ready session=1 sink=1 detail=peer
+stream bound`. After it: no role-5 mirror/pool registration, no byte-ring pull, no payload egress, no EOS, no
+error, not even a failed attempt. Everything upstream is proven: the SELECT lands
+(`landed peer command session=1 sequence=5`), is published to the backend, `finalized pending DPU result
+stream` fires, the DPU-spawned backend runs at 99.5% CPU. The peer-open handshake completes — and the
+role-5 -> peer payload egress is never armed.
+
+**The node-A symptom is FOUR STEPS DOWNSTREAM and its error message is actively wrong.** Node A logs
+`WARNING relay target unresolved ... no imported role-7 ring matches this sessionUID; ... Check that the
+client used the SAME sessionUID`. A one-shot diagnostic added to `HomerDpuDmaFindDpuToHostByteRingRef`
+(`homer_service_dpu_dma.c`, `[role7-diag]`, temporary) settled it:
+
+```
+[role7-diag] MISS for sessionUID=3269689567453114 -- dumping every import/descriptor
+  import[0] active=1 lifecycle=1 stale=0 gen=3269817316460527 ringCount=2 retirable=1
+    ring[0] role=1 (want 7) ...      ring[1] role=6 (want 7) ...          <- command session, correctly skipped
+  import[1] active=1 lifecycle=3 stale=0 gen=3269689567453114 ringCount=2 retirable=0
+    ring[1] role=7 (want 7) sessionUID=3269689567453114 (want 3269689567453114) gen=MATCH  <- MATCHES EVERYTHING
+```
+
+The role-7 ring matches role AND sessionUID exactly — and is never examined, because
+`HomerDpuDmaImportCanRetireOwnedWork()` rejects its whole import at the TOP of the scan
+(`lifecycle=3` = `HOST_DETACHED`, `retirable=0`). It is HOST_DETACHED because the client had already timed
+out at 30 s and closed it. **So node A never even ATTEMPTS to resolve the ring while it is alive** — node B
+sent no bytes, so node A's relay pump had no work and never ran. The whole causal chain:
+
+1. node B never arms role-5 -> peer egress  ->  2. no bytes cross  ->  3. node A's relay pump never runs
+->  4. client times out and closes role-7  ->  5. teardown finally arms the pump, which resolves against a
+HOST_DETACHED import, misses, and blames the client's sessionUID.
+
+**Lesson (a repeat of §10f's, in a new costume).** A `continue` at the TOP of a scan and a `continue` in the
+MIDDLE produce the identical observable outcome — "not found" — so the miss message attributed the failure to
+the last predicate its author had in mind. **A lookup that can reject at several stages must report WHICH
+stage rejected.** The message sent the reader to audit the client's sessionUID, which was correct all along.
+
+**Second lesson, and the one to actually design against:** node B's payload egress fails by *doing nothing
+and logging nothing*. **An un-armed collector and a healthy idle one are indistinguishable**, so the bug is
+invisible until something downstream times out — 4 hops away, with a misleading message. Silence must not be
+a valid state for a bound result stream; a bound-but-never-armed stream needs a one-shot warning.
+
+**NEXT:** wire node B's role-5 -> peer payload egress on the SERVICE_RESULT_OPEN completion path, following
+the **working basebackup DPU-sender reference** (same shape: DPU-side byte-ring payload egress from a host
+source ring to a peer DPU; validated in the 4-role DPU-relay basebackup topology). Add the missing
+observability. Fix the node-A miss message. Then re-run run 22's spec. Artifacts: scratchpad/run22/, run23/.
+
+### 10i. Runs 24-26 — both arms land; the result path still moves zero bytes (July 11, 2026)
+
+**Landed and PROVEN working across these runs:**
+- **Node B send arm** (`armed service-owned P3 result mirror egress ...`) — run 24.
+- **Node A receive arm** (`armed peer-provisioned P3 result receive relay ... landing_ring=10485760
+  role7_target=lazy`) — run 25.
+- **Terminal condition on consumer departure** — run 25. `terminating DPU relay after host consumer
+  detached ...`; the relay now quiesces instead of free-spinning. (Run 24 had filled a log to **323 MB**.)
+- **Watchdog no longer false-alarms** on terminally-torn-down streams — run 26.
+- Batch 4's geometry + arena split remain green in every run.
+
+**Still FAILING the gate:** no `homer_last_abalance` ever decodes; the SELECT times out at 30 s. Node B
+binds the peer stream and **moves zero result bytes**.
+
+#### Root cause found for run 25's zero bytes — and it was a fix of ours that caused it
+The persistent scheduler arm was made *unconditional* for BOTH P3 directions. On node B that made the
+SENDER permanently "ready", so it kept winning an empty semantic payload action **before** grouped-control
+discovery and the role-5 pull had produced a mirrored range — the stream **starved itself**. Fixed by
+restricting persistent eligibility to remotely-initiated RECEIVE relays (which need lazy role-7 rendezvous);
+the node-B sender is armed but runnable only when `HomerServicePayloadSendQueueHasReadyWork()` finds a real
+mirrored range, restoring the validated basebackup order:
+`grouped-control discovery -> role-5 pull -> mirrored range ready -> payload egress`.
+
+> **Review lesson (mine).** I reviewed that always-ready predicate when it landed, worried it would starve
+> *other* streams, verified the scheduler's source selection is round-robin, and passed it. The real failure
+> mode was one I never considered: it starved **its own** stream by pre-empting the pipeline stages that
+> would have produced its work. *Checking the hazard you thought of is not the same as checking the hazard.*
+
+> **Red herring, recorded so nobody re-chases it.** `published_tail=0 consumed_head=0` on node B is the
+> service-created fallback `sendQueue`, which selected-DPU egress **deliberately ignores** in favour of the
+> DPU mirror frontier. The backend WAS publishing correctly the whole time, through the arena partition
+> translator. Batch 4's restructure was innocent — I had wrongly flagged it as the prime suspect.
+
+#### Run 26 — OPEN, and the read of it is NOT settled
+Chain now: both arms fire, sender reaches `peer stream bound`. Then node A logs
+`setup import host-detached bridge_generation=<sessionUID>` and
+`terminating DPU relay after host consumer detached ... (matches=1 import=1 lifecycle=3
+skipped_imports=1023)`, and node B sees `CM event=DISCONNECTED` and aborts.
+
+The validator read this as the role-7 import detaching **immediately** after arming (hypothesising the
+cold-path TCP setup-socket close being misread as a permanent host detach). **That read is unverified and I
+doubt it.** `HomerDpuDmaDetachHostMmapForClose` (`homer_service_dpu_dma.c:8937`) is driven only by an
+explicit CLOSE handshake on the setup socket (`homer_service_dpu_setup_tcp.c:726`) — i.e. the client asked
+for it. The far likelier reading is that this teardown is the **normal 30 s-timeout close**, and the run
+looks different from run 25 only because the terminal-failure path now works and surfaces a FAILED
+completion. If so, **nothing about the zero-bytes problem changed** and the scheduling fix did not (or did
+not fully) fix it.
+
+**These two readings are distinguishable by TIMESTAMPS, which the small DPU logs do not currently carry.**
+Do not spend another run guessing:
+**NEXT STEP — settle the timeline first.** Either add timestamps to the DPU service log lines, or log the
+service-pass counter on the arm / detach / CM-disconnect lines. Then a single run answers: does node A's
+role-7 import detach at t~=0 (a real spurious-detach bug) or at t~=30 s (the client's timeout, meaning the
+zero-bytes defect is still upstream and untouched)? Everything downstream of that answer is a different
+investigation. Artifacts: scratchpad/run24/, run25/, run26/.
+
+## 11. P4 — paying off the band-aids (design of record, July 11, 2026)
+
+Owner raised the concern directly: *"are we applying band-aid solutions one at a time and spaghettifying the
+code and hiding the real issue?"* Partly yes. This section separates the real fixes from the band-aids, names
+the root, and states a **falsifiable** acceptance test so this cannot be quietly declared done.
+
+### 11.1 What was a real fix vs. what was a band-aid
+
+**Real** (would exist in any correct design; keep): byte-ring per-pair geometry + arena mmap split (§10g);
+the terminal arm on consumer departure; hard-fail when a DPU-relay stream is opened with no usable engine;
+the two missing arms *as behaviour*.
+
+**Band-aids** (three, all symptoms of one root):
+1. **The artificial "always-ready" scheduler predicate.** Invented to substitute for the re-arm a real owner
+   would have performed. It then caused its OWN bug — node B's sender became permanently eligible and
+   pre-empted the grouped-control discovery / role-5 pull stages that produce its work, starving *itself* —
+   and needed a second patch to narrow it. **A band-aid on a band-aid; the load-bearing smell.**
+2. **The two hand-wired arm calls** (send side, then receive side). One lifecycle hook, discovered twice,
+   bolted on at two call sites instead of existing once.
+3. **Order-dependent special cases.** The P3 branch in payload-failure delivery MUST precede the generic
+   locally-initiated case or it becomes dead code — which it already did once, silently.
+
+### 11.2 The root (per Codex's independent audit — and it CORRECTED an overreach of mine)
+
+I proposed making the service-owned stream "a first-class payload owner". **That was overstated.** Payload
+scheduling is already owned by the `HomerServicePayloadStreamEntry`, and `SERVICE_RESULT_OPEN` already exists
+as a typed owner kind with registration, matching and dispatch (`tuple_sink_service_process.c:36358` ff).
+
+The actual gap is narrower and **cold-path only**: the service-result async op retains **raw `sessionState` /
+`streamEntry` pointers with no generation stamp** (`tuple_sink_service_process.c:36410`), and its lifecycle
+transitions are hand-wired per call site rather than centralized. That is *why* each hook had to be
+rediscovered by hand, and why the compensating "always-ready" hack was needed at all.
+
+### 11.3 Plan
+
+**Phase 0 — finish the P3 gate first. DO NOT refactor on a red test.** With a byte still not moving, a
+refactor regression would be indistinguishable from the bug under investigation. This sequencing rule is not
+negotiable.
+
+**Phase 1 — the root fix.** Give the cold-path control owner a generation-stamped handle:
+`{ owner kind, session index + id + generation, stream index + id + generation }`, with **centralized hooks**
+for the five transitions currently hand-wired: OPEN completion, sender/receiver arm, terminal failure,
+detach/close cancellation, stale-owner validation. **Hot path keeps direct `streamEntry` ownership — no
+virtual dispatch, no indirection on the data path** (Codex was explicit; agreed).
+
+> **ACCEPTANCE TEST FOR PHASE 1 IS SUBTRACTIVE.** The refactor succeeds only if the three band-aids in §11.1
+> are **DELETED**: the always-ready predicate, both hand-wired arms, and the order-dependent failure branch.
+> **If it lands and those survive, it did not fix the root — it added a layer.** Falsifiable on purpose.
+
+**Phase 2 — convert the "no terminal arm" class into a scheduler invariant.** Hit 4 times (payload-failure
+livelock at 3.1M repeats; the 323 MB free-spin; the EOS gate; the consumer-departed relay), with ~25 more
+sites inventoried. Fixing them one by one IS the band-aid pattern. Structural fix: progress actions return a
+tri-state (`progressed` / `blocked-retryable` / `terminal`), and the **scheduler** enforces that anything
+re-armed N times without progress escalates to terminal. One invariant instead of 25 patches.
+
+**Phase 3 — liveness as a first-class assertion.** Every bug in this arc was invisible because *doing nothing*
+is indistinguishable from *idling healthily* (see §10h). The un-armed watchdog was an accidental first
+instance of the right idea. Generalize: **a bound stream that is neither progressing nor terminal is a bug and
+must say so itself.**
+
+**Open questions for the owner:** (a) should Phase 2 land BEFORE the remaining P3 hops? It is insurance
+against exactly the failure mode that has been costing runs. (b) Fix all ~25 inventoried sites, or only those
+a service-owned stream can actually reach?
+
+### 10j. Runs 27-38 — the result DATA PLANE is DONE; the last hop is the role-7 terminal (July 11, 2026)
+
+**METHOD CHANGE THAT MADE THE DIFFERENCE.** After runs 20-26 produced five patches (one of which *caused*
+the next bug), we STOPPED PATCHING and INSTRUMENTED. From run 27 on: **zero speculative fixes**; every fix
+landed on a cause visible in a log line. Probes added: 6 frontier probes (backend publish -> DPU accept ->
+discover -> pull -> mirrored-range -> payload post), a raw send-CQE observer, address probes, 3-latch pump
+probes, the EOS chain, `role7-write`, `role7-eos`, and **timestamped DPU logs via an `awk strftime` pipe at
+launch (zero code change)**.
+
+#### PROVEN WORKING, hop by hop (each a log line, not an inference)
+| hop | evidence |
+|---|---|
+| backend publishes result bytes + EOS into arena role-5 | `eos-1/4 ... eos_byte_tail=112` |
+| node B accepts, discovers, pulls into DPU mirror | `4/5 mirror-pull-completed ... completed=112` |
+| node B posts RDMA payload+tail to node A | `6/6 payload-posted remote_tail=112` |
+| the NIC confirms the write | `payload-send-cqe status=0` |
+| node B SEES the EOS (**fixed: bridge ABI v5**) | `eos-2/4 nodeB-saw-eos`, `eos-3/4 nodeB-posted-eos` |
+| the completion gate RELEASES (held >1M checks before) | `eos-4/4 gate_decision=released` |
+| terminal completion egresses in **2 s** (was 28 s) | `zero command sequence` count = **0** |
+| node A resolves role-7 and DMA-writes the tuples | `role7-write attempted=1 reason="submitted" bytes=104` |
+| node A submits the role-7 TERMINAL | `role7-eos check=1 terminal_submit_ok=1 submitted_tasks=1` |
+
+#### THE REMAINING HOP (run 38, OPEN)
+The client (`HomerClientPollSqlResultDpuReceive`, `homer_client.c:4962`) needs THREE things: a published
+role-7 credit epoch, all produced bytes drained, AND **`entryState == CLOSED|FAILED`**. Node A now SUBMITS
+that terminal (`terminal_submit_ok=1`) — but **nothing ever confirms the terminal DMA COMPLETED**, and the
+client still hangs in its drain (no longer a 30 s completion timeout — an indefinite tuple-drain hang, which
+is itself the proof the completion now arrives). **NEXT: instrument the terminal DMA's completion/CQE on node
+A. Is it posted-but-never-retired (cf. the send-owner claim/release pattern), or completed-but-not-observed?**
+
+#### Run-38 re-read (July 11, 2026) — the terminal chain RETIRED; the open question moved to WHERE the client blocks
+
+Re-reading run 38's existing logs (no new run needed) narrowed "posted-but-never-retired vs
+completed-but-not-observed" substantially, and killed one hypothesis before it became a patch:
+
+1. **The terminal chain RETIRED.** `role7-write check=5` (same second as the terminal submit) shows
+   `write_in_flight=1`; `check=1000000` shows `write_in_flight=0`. The only code that clears
+   `byteRingWriteInFlight` is the PRODUCED_TAIL_PUBLISH retire — success or failure — at
+   `homer_service_dpu_dma.c:10220`, or a failed-body retire (`:10182`, `:10203`).
+2. **It almost certainly retired SUCCESS.** Every failed DMA completion prints
+   `homer DPU DMA: memcpy task failed` (`homer_service_dpu_dma.c:13923`); run 38's node A log has zero
+   such lines. So the CLOSED credit line + gate word were most likely DMA'd into host memory.
+3. **The address-mismatch hypothesis is DEAD (checked statically, not patched).** The client advertises
+   `hostRingAddress = dpuExportBuffer` (export BASE) for both SQL-result descriptors
+   (`homer_client.c:3904`, `:3931`); the engine writes the credit line to
+   `hostRingAddress + dpuCreditOffset + ringIndex*64` (`homer_service_dpu_dma.c:11840-11850`); the client
+   polls `dpuExportBuffer + dpuCreditOffset + ringIndex*64` (`homer_client.c:3836` region). Congruent.
+4. **"The client hangs in its drain" was an INHERITED, UNPROVEN framing** (my own, from before the
+   context compaction — the verify-claims rule applies to my own summaries too). The pgbench log's last
+   line is `sending Homer SQL text SELECT ...` with no completed line — but
+   `HomerDrainPendingDpuResultRelay` (`pgbench.c:3794`) is reached only FROM
+   `HomerApplyCommandCompletion` (`pgbench.c:3942`), and the "completed" debug line prints only after a
+   FULLY applied completion. A completion that arrives but loops forever in `NOT_APPLIED_RETRY`
+   (bounded 128-spin drain, `pgbench.c:3858`) is log-indistinguishable from one that never arrived.
+   The run-38 UPDATE's completion DID arrive and apply, so the role-6 path works for plain completions;
+   the SELECT's differs in carrying TUPLE_SINK_READY + the drain requirement.
+
+So the block point is a genuine three-way ambiguity: (a) the SELECT's terminal completion never
+delivered node A → client (role-6 frontend completion event), (b) delivered but the role-7 drain never
+observes data/EOS/CLOSED, or (c) the drain observes data but neither `sawEos` nor `streamComplete` ever
+turns true (gate legs, `homer_client.c:4969-4976`). Run 39 instruments the WHOLE chain, numbered — the
+first silent frontier is the bug:
+
+| # | frontier | site |
+|---|---|---|
+| A1 | body CQE fired, next task armed (terminal vs data named by cell entryState) | `homer_service_dpu_dma.c` arming fn ~:9793 |
+| A2 | tail-body / tail-publish retire, success AND failure, with recomputed dst host addr | `HomerDpuDmaRetireTaskSlotInternal` :10189/:10210 |
+| A3 | role-6 frontend completion event submit + retire | `FRONTEND_COMPLETION_EVENT_*` sites |
+| C1 | pgbench applied a completion (BEFORE the drain call — placement load-bearing) | `HomerApplyCommandCompletion` pgbench.c:3942 |
+| C2 | drain entered / spins exhausted (the currently-silent negative case) | `HomerDrainPendingDpuResultRelay` pgbench.c:3794/:3858 |
+| C3 | client's role-7 poll observation: epoch/entryState/tails + the 3 gate legs SEPARATELY, change-latched | `HomerClientPollSqlResultDpuReceive` homer_client.c:4892-4977 |
+
+A2's `dst_host_credit_addr_recomputed` vs C3's `credit_line_addr` gives a direct written-vs-polled
+address comparison in one run (the provenance rule, applied to both ends). Ride-along for §10k: a
+service-pass counter on the node-B frontier lines, plus millisecond timestamps in the launch wrapper.
+
+#### ROOT-CAUSE FAMILY (this is the real finding — NOT the band-aids)
+**P3 introduced a stream shape the codebase did not have: persistent, service-owned, multi-command.** Every
+mechanism built for the older shape silently did NOTHING rather than failing:
+1. **slot vocabulary** on byte rings (purged, batch 4 — owner's call, and it was right);
+2. **`sendQueue.queueControl`** read on a byte ring — NULL by construction, so the EOS `if` never fired;
+3. **the DPU's control copy** carried `publishedTail` but not the later-added EOS fields (fixed: ABI v5);
+4. **command identity** stamped on the *selected* session, not the *owning* one — a LEGACY completion-mailbox
+   consumer set it 28 s late (fixed);
+5. **the role-7 terminal** published only on PEER CLOSE — but P3's peer stream is PERSISTENT, so a
+   per-command EOS never closes the binding (fix submitted; completion unconfirmed).
+Every one was invisible because **nothing errored**: a null pointer that made an `if` never fire; a control
+copy that read zero forever; a legacy path stamping a field far too late.
+
+#### SEVEN FALSE READINGS — all mine, none of them code bugs
+Six were **a number printed without naming the structure it came from** (`published_tail=0` from the wrong
+struct; `relay target unresolved` from a check that never ran; `remained unarmed` from a flag cleared by
+teardown; the fallback `sendQueue`'s tails; an "off-by-0x10 addressing bug" that was a FIELD address compared
+against a STRUCT BASE — I nearly "fixed" a correct address path). One was **a one-shot probe mistaking "not
+yet" for "never"** (`role7_resolved=0` was a pre-resolve snapshot; run 32's conclusion was wrong).
+
+**PROBE RULES, now mandatory (P4 Phase 3):**
+- **Name what you measured**, not just the value. A number without provenance is a trap.
+- **Never one-shot.** Sample repeatedly or latch on the STATE TRANSITION — a one-shot cannot distinguish
+  "not yet" from "never".
+- **Always bounded.** Two disk incidents (323 MB, 555 MB) came from my own probes; a third (286 MB) from an
+  unbounded retry log. A diagnostic that can fill a disk is a bug.
+
+### 10k. BLOCKER — the ~2 s stall between discovered-enqueued and mirror-pull-submitted (July 11, 2026)
+
+**Raised by the owner, and correctly.** I reported the terminal-completion egress improving from **28 s to
+2 s** as a win. **It is not.** On a busy-polling DPU pair over a 400G fabric the target for this path is
+MICROSECONDS. Comparing against the bug instead of against the target is how a performance defect ships.
+**No performance claim about P3 may be made until this is understood.** (Rule now in the global CLAUDE.md:
+*judge latency against the target, not against the bug*.)
+
+**First: my instrument cannot see it.** The DPU log timestamps come from an `awk strftime("%H:%M:%S")` pipe —
+**whole seconds**. So "2 s" means somewhere in [1.01, 2.99] s and cannot be refined. **Fix the instrument
+before diagnosing:** sub-second timestamps (gawk `%H:%M:%.S`, or stamp in-process), plus the service-pass
+counter on these lines.
+
+**But the logs already localize the stall.** Node B, run 33 (identical shape in runs 32/35/37):
+```
+18:50:54 [p3trace] 2/5 dpu-accepted        tail=112
+18:50:54 [p3trace] 3/5 discovered-enqueued tail=112 completed=0
+18:50:56 [p3trace] 4/5 mirror-pull-submitted            <- ~2 s later
+18:50:56 [p3trace] 4/5 mirror-pull-completed
+18:50:56 [p3trace] 6/6 payload-posted                   <- everything after is same-second
+```
+The work is **queued and then sits there**. Once the pull is granted, pull -> mirror -> RDMA post -> CQE all
+complete within the same second. **The entire latency is the wait for the mirror-pull collector's grant.**
+
+**It is VARIABLE:** in run 30 all of those lines landed in the SAME second. Sometimes fast, sometimes ~2 s.
+
+**Leading hypothesis (UNPROVEN — measure, do not assume):** the pull collector is armed on a **coarse
+periodic cadence** rather than by the **exact demand fact** (work was enqueued). The codebase already does
+this elsewhere by design — CLAUDE.md documents the setup listener granted once per 512 passes and the
+doorbell once per 4096 when attached. If so, **this is not a separate perf problem: it is the same
+arming/scheduling class that produced five correctness bugs in this arc, wearing a stopwatch.**
+
+**NEXT (blocking, before any P3 perf number):**
+1. Sub-second timestamps + service-pass counters on the p3trace lines.
+2. Identify which grant/arming rule the mirror-pull collector waits on, and whether it is demand-armed
+   (exact count) or interval-armed. Compare with `HomerMachineBaselineCompileExecutionPlan`'s hand-enumerated
+   phase body — a collector armed on every pass but granted on a coarse interval is exactly this signature.
+3. Only then quote any latency for the cross-node result path.
+
+### 10l. RUN 40 — P3 IS GREEN. The root cause was ONE RULE, violated in both directions (July 11, 2026)
+
+**THE GATE PASSED.** `pgbench --homer --homer-dpu-command -t 5` from farnet0, through the farnet0 DPU ->
+DPU-DPU RDMA -> farnet1 DPU -> DPU-spawned socketless backend on farnet1:
+
+```
+number of transactions actually processed: 5/5
+number of failed transactions: 0 (0.000%)
+client 0 Homer DPU result relay for sql_execute reached EOS: rows=1 abalance=3524
+   ... x5, five distinct decoded values, exit code 0
+```
+
+**Intended-path proof (anti-fallback):** the farnet0 HOST service log contains exactly ONE line — its
+startup policy banner — and zero session/command/payload activity. The farnet1 host service was DOWN.
+So the whole workload rode the DPU relay; nothing silently fell back.
+
+#### THE PERSISTENT-STREAM IDENTITY RULE (the actual root cause)
+
+P3's role-7 stream is **persistent and multi-command**: one physical byte ring carries every command of a
+client SQL session, and the peer binding does NOT close between commands. On such a stream, state splits
+in two, and **every component must split it the same way**:
+
+| | resets at each command boundary | absolute, monotonic, NEVER rewound |
+|---|---|---|
+| **what** | record identity: `recordOrdinal` (-> 0), `generationSequence` (-> 1), EOS latch, semantic frontier | the BYTE frontiers (published / consumed / posted tails) |
+| **who says so** | `ResetCitusTupleSinkSendHandle` (homer_tuple_queue_frontend.c:1219), called once per row-producing command with `resetSequence=true` (remote_execution_backend_bridge.c:1399) | that same function's comment: *"resetting the shared byte-ring frontiers here would make old and new command records indistinguishable to a frontend that is still catching up"* |
+
+**The producer already stated and obeyed this rule. Nobody else did.** Every run-39/40 bug is one component
+mixing the two halves — and they point in OPPOSITE directions, which is why they never looked related:
+
+| # | component | mistook | symptom |
+|---|---|---|---|
+| 1 | client validator (`HomerClientSqlResultDeliverDecoded`) | per-COMMAND field as per-STREAM: demanded `generationSequence == 0` forever (the BASEBACKUP convention — copied from the wrong sibling) | every well-formed tuple record silently rejected; drain hung with `consumedHead` pinned at 0 forever |
+| 2 | service (`HomerServicePrepareTupleResultStreamForCommand`) | per-STREAM field as per-COMMAND: seeded the source byte frontier from the completion descriptor | rewound a LIVE frontier (`posted_source` 112 -> 0), tripping the mirror's `range_start == posted_source` invariant one pass later -> binding aborted |
+| 3 | client `receiveExpectedOrdinal` | per-COMMAND field as per-STREAM: init once, `++` forever | **LATENT** — would have hit on the very next run (producer restarts ordinals per command). Found by *asking the code what the producer does* instead of running and waiting. |
+
+The fix is now **one named rule in one place**: `THE PERSISTENT-STREAM IDENTITY RULE` in `homer_client.c`
+(with `HomerClientSqlResultBeginCommandIdentity` / `...AdvanceCommandIdentity`), restated on the service
+side at the prepare's reset call. `HomerClientBaseBackupStream` backs BOTH families but basebackup is
+single-command and must NOT reset — that asymmetry is now documented at the struct field.
+
+#### The DPU-local `sendQueue` mapping: dead storage, live gates (sweep result)
+
+The command-plane bug (#2's sibling) came from a guard reading `sendQueue.byteRingControl->publishedTail`.
+On the DPU-mirror path that mapping is `shm_open`+`mmap` of a **DPU-LOCAL** object
+(tuple_sink_service_process.c:23242) while the real producer is a postgres backend **on another machine**
+publishing into the host arena. Empirically its `publishedTail` is pinned at 0 (the guard rejected every
+command after the first, then retried forever).
+
+An independent read-only sweep (Codex) of every `stream.sendQueue.*` access — all of them live in
+`tuple_sink_service_process.c`; no other file in either tree touches these fields — returned:
+
+- **The data region is DEAD on this path.** No reachable P3 code reads or writes `sendQueue.byteStorage`.
+  The real payload source is `mirroredRange.localAddress` (`HomerDpuDmaFillMirroredByteRange`,
+  homer_service_dpu_dma.c:4701), consumed by `HomerServicePumpOutgoingDpuMirrorByteRingPayload`
+  (tuple_sink_service_process.c:30959). The truthful frontier is the engine's `acceptedPublishedTail`
+  (homer_service_dpu_dma.c:12222).
+- **CORRECTION to my framing:** the control block is *not* literally never-written. The service itself
+  initializes `protocolVersion`/`flags`/`ringBytes` and later writes local flags, terminal status, and
+  sometimes `consumedHead`. What is **producer-stale** is specifically **`publishedTail`** — the one word
+  the broken guards read.
+- **No other live BROKEN-ON-MIRROR frontier reader remains**; the other ~8 mirror-reachable readers are
+  SAFE-BY-GUARD (they consult the mirrored-range API first) or SAFE-BY-SEMANTICS (diagnostics, local
+  flags, teardown bookkeeping).
+- **Deleting the mapping is NOT a one-liner.** Six live dependencies treat it as required bookkeeping:
+  queue-descriptor construction (`queueShmName`, `byteRingBytes`, :36650/:36671), async stream-open
+  validation (:38111), open-completion geometry (:38220), peer-open `requestedByteRingBytes` (:39288),
+  the prepare's NULL-control reject (:25918), and local failure routing's "has send control" test (:26502).
+
+**Decision (recorded, per the standing directive):** the broken guard is now **skipped on the mirror path**
+rather than rewired to consult the engine. Rationale: a guard whose input is structurally zero is a decoy,
+and there is no cheap local truth to swap in (the engine's snapshot lags by design, so any local bound
+built from it would false-reject a legitimately-ahead start tail). Divergence is still caught loudly one
+hop later by the mirror's own `range_start == payloadSourceBytePostedTail` invariant — which compares two
+frontiers that are BOTH real, and is exactly the check that surfaced this bug.
+
+**P4 task (scoped by the sweep):** remove the DPU-local sendQueue mapping on the mirror path, after
+replacing those six dependencies. Guiding principle: **a zeroed struct lies; a NULL pointer confesses.**
+If the mapping cannot be deleted outright, null the control pointer on the mirror path so any future
+reader faults loudly instead of silently reading zeros.
+
+#### Stage-5 ABI cleanup — DECIDED: defer, but do it FIRST in P4 (owner-raised)
+
+The owner asked why basebackup and tuple results disagree on `generationSequence` at all. They should not:
+
+- `CitusTupleSinkBatchHeader` **already carries `sinkSequence`** (homer_tuple_abi.h:192), the producer
+  already stamps it (homer_tuple_queue_frontend.c:1494), and three validators already check it. The
+  transport envelope's `generationSequence` is a **redundant duplicate** for the tuple family.
+- `homer_tuple_abi.h:242-248` says so itself: *"Tuple-result DATA/EOS records **still** use
+  generationSequence as their command-local sequence **until the Stage 5 EOS cleanup**. Other object
+  families must validate their semantic sequence in their own payload header, not in this common transport
+  envelope."* Basebackup already finished that migration; tuple-view did not.
+- **This duplication is what let two consumers of the SAME object family disagree** (bug #1). The
+  "consistency with the shm path" argument for keeping it is worthless — the shm path is one we are
+  retiring.
+
+**Why defer anyway:** the rule fix is **invariant** under this choice. Stage 5 changes only *which field*
+the rule reads (`decodedBatch->sinkSequence` instead of `header->generationSequence`) — nothing is thrown
+away — and it does NOT fix bug #3 (the ordinal), which needs the rule regardless. Doing an ABI change now
+would mean debugging it with no green multi-command baseline to regress against. We now HAVE that baseline.
+
+**Stage-5 shape (P4 item 0):** `HomerDecodedTupleBatchHeader` has a free `reserved0`
+(homer_decoded_tuple_abi.h:74) — so the sequence moves there with **no struct growth**. Node A stamps it,
+the client validates it there, the envelope's `generationSequence` becomes uniformly 0 across families, and
+the envelope-level checks in the shm sink and the service are **deleted**. Behavioral wire change ->
+version bump + all four machines rebuilt (stale = loud `BAD_PROTOCOL`, which is the failure mode we want).
+
+#### Open, NOT fixed by run 40
+
+1. **§10k's grant stall remains the perf BLOCKER.** Run 40's `latency average = 10.791 ms` is NOT a
+   result — it is a diag-instrumented build with `HOMER_DPU_P2_DIAG` on both DPUs and in pgbench. **No P3
+   performance claim may be made** until the probes are stripped AND the discovered->pull grant stall is
+   understood. The millisecond timestamps and the `pass=` service-pass counter are now in place to measure it.
+2. **Teardown routes a NORMAL disconnect through the FAILURE machinery.** At end of run the client's
+   `CM event=DISCONNECTED` produces `payload stream marked ABORTING ... reason=1`, `marked send byte-ring
+   failed ... reason=peer-reset-abort`, and `committed service-owned DPU result failure`. Functionally
+   harmless (it happens after the last completion; the run exits 0) but it means a clean close and a real
+   peer failure are indistinguishable in the logs. Fold into the P2.T teardown work.
