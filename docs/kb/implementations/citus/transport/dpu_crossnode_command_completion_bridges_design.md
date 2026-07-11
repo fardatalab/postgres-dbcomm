@@ -539,6 +539,23 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   > sequence=N" (not STARTED), the remote fork SHOULD manufacture the same accepted-response so the
   > client unblocks and learns the node-A-assigned sequence (resolving finding D's client-side half);
   > the role-6 STARTED/terminal completion remains strictly P2.
+  >
+  > **✅ P1 CLOSED — VALIDATED (July 11, 2026, run 10, citus `039f56b08`).** The completion-control
+  > zero-read blocker is fixed. Root cause was NOT on the DPU/DMA side (every layer there was verified
+  > across runs 4–8): it was a host-side race — `HomerFrontendAgentBindArenaSlot` re-ran
+  > `HomerFrontendAgentInitArenaSlot` (memset→restamp) on the completion mailbox that the DPU was
+  > already polling at ~100% read duty, so one DMA sampled the transient zero window and fatally failed
+  > proto validation. Fix: bind now VERIFIES the FREE-implies-initialized invariant instead of
+  > rewriting it (`b29a90330`), relaxed to accept the DPU-pre-published role-2 command
+  > (`cmd.publishedEpoch <= slotCount`, `039f56b08`). Run 10 evidence: 22 bounded control reads (not
+  > 300k+ spinning), zero mismatch/fatal strings, `remote exec backend` alive post-workload, engine
+  > advanced to the benign `missing frontend completion event descriptor` (session=1) — i.e. the
+  > backend consumed and RAN the command, and the chain reached the P2 seam (completion event has
+  > nowhere to go until P2 builds role-6 delivery). Full arc + the three latent bugs uncovered
+  > (unstamped headers → bind memset zero-window → bind memset destroying pre-published commands) are
+  > in §7. Deferred to S3.4/S4 teardown: (a) a "backend died pre-publish" give-up path (run 9 showed
+  > the DPU spins forever otherwise); (b) `ReleaseArenaSlot`/reaper memset vs. a live DPU poller needs
+  > DPU-unbind-before-release ordering; (c) crossprobe + `[ctl-read-diag]` scaffolding removal.
 
 **Phase P2 — completion bridge (node-B role-3 → node-A role-6).**
 - P2.1 ~~Add~~ **The completion landing ring likewise already exists** (same July-10 re-grounding as P1):
@@ -820,3 +837,34 @@ counters (cmd consumed, cpl published) and host-init-owned proto/geometry stamps
 10 in flight, same PASS criteria as run 9. Unrelated observation from run 9: a `dbcomm tpch_sf10`
 PostgreSQL instance appeared on farnet1 ~27 s after the run's cleanup — foreign to this workstream,
 left untouched; check ownership before preflighting future runs.
+
+**RUN 10 — PASS. P1 CLOSED (July 11, 2026, citus `039f56b08`).** Backend bound (no FATAL — the
+`FREE-implies-initialized` tripwire did not fire), the completion-control read that fataled in runs
+4–8 now succeeds, and the DPU's control-read poll loop TERMINATED after exactly **22** `[ctl-read-diag]`
+pre-submit iterations (run 9 spun 300k+ and climbing; the bounded count is the proof the completion
+was actually pulled, not merely non-fatal). `grep -c` over the full farnet1 DPU log: `backend
+completion control validation failed` = 0, `snapshot protocol mismatch` = 0, `fatal error state` = 0;
+`remote exec backend` (pid 1182603) was `Rs` (alive) after the workload. The engine then advanced to
+the documented P2 seam — `DPU frontend completion event publication failed: selected-DPU session is
+missing frontend completion event descriptor service_session_id=1`, repeating as its own retry loop
+(no client-side role-6 descriptor exists until P2). The pgbench client failed identically to runs 8/9
+(`invalid arguments while peeking Homer completion`) — the completion never reaches the client, which
+is precisely the P2 gap, not a regression. Intended end state: spawn → bind → command landing →
+**backend executes** → completion read/pull all work; only completion *delivery to the client* (P2)
+and results (P3) remain.
+
+**Closing tally — three latent bugs lived behind one symptom, peeled in order:**
+1. `ce31e63a1` (pre-P1): arena completion-mailbox control header was never stamped → round-1 zeros
+   were truthful. Fixed by stamping at slot init/recycle. (Symptom persisted → not the whole story.)
+2. `b29a90330`: that same stamp, re-run at BIND while the DPU polls, has a memset→restamp zero window
+   the DMA can sample → the deterministic blocker. Fixed by making bind verify, not rewrite.
+3. `039f56b08`: bind's verification was too strict — the DPU legitimately pre-publishes the role-2
+   command before the backend binds, so `cmd.publishedEpoch` is not zero. Relaxed to a window bound.
+   (Bonus: the OLD bind memset was silently destroying that pre-published command in runs 6–8 — a
+   fourth bug that would have surfaced next.)
+
+**Post-P1 cleanup queued (not blocking P2):** remove the `HOMER_DPU_ARENA_CROSSPROBE` crossprobe
+ladder + `[ctl-read-diag]` prints (spent scaffolding); add a backend-died-pre-publish give-up path in
+the spawn/teardown machine (run 9's infinite poll); reorder teardown so the DPU unbinds the ring
+before `ReleaseArenaSlot`/reaper memsets it; extend Fix-1 persistent-dst cursor hygiene to
+SLOT_READ/CONSUMED_EPOCH and the other five task builders.
