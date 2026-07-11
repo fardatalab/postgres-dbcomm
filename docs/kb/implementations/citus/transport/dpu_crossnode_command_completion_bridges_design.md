@@ -2148,8 +2148,16 @@ measurement would be taken on. So the order is **not** a preference:
 |---|---|---|
 | **P5** | **session lifecycle close + teardown** | Without it we cannot take a clean measurement at all (leaked busy-poller on the measured CPUs), and each run needs a hard reset. Also a real correctness leak. |
 | **P4.0** | Stage-5 ABI cleanup | Deletes a duplicated field. Cheap, and we now have the green baseline to regress it against. |
-| **P4.1** | mirror-path truth-source cleanup | The structural fix for the bug family that caused runs 39-40. Behavior-preserving. |
-| **§10k** | strip diag, measure, fix the grant stall | Measure ONCE, on the final code. Measuring instrumented, about-to-be-refactored code would just be re-done. |
+| **P4.1** | mirror-path truth-source: source-kind + accessors; **stop mapping** the producer shm on the mirror path | The structural fix for the bug family behind runs 39-40. Behavior-preserving. **TRANSITIONAL, not the end state — see P4.2.** |
+| **P4.2a** | **delete the already-dead producer-byte-ring code** | No dependency — deletable today (see §12.5). |
+| **§10k** | strip diag, measure, fix the grant stall | Measure ONCE, on the code the DPU path actually executes (final after P4.1). |
+| **P4.2b** | **COMPLETE REMOVAL of the producer-byte-ring mapping** | Gated on retiring the host-service local-byte-ring source (an existing owner directive), NOT on anything technical. It deletes code the DPU path never executes, so it lands after the measurement, followed by a cheap re-verify that the numbers did not move. |
+
+**OWNER CORRECTION, and it is right: "leave the pointer NULL" is NOT an acceptable END STATE.** Stopping at
+P4.1 would swap a lying struct for a half-dead field — precisely the species of vestige this entire arc has
+been paying for. The end state is that the mapping, its mapper, its shm object, and the `queueShmName`
+geometry plumbing **cease to exist**. P4.1 is only the safe intermediate step that makes the lie unreadable
+while the legacy source still legitimately needs the field.
 
 The one thing that would REORDER this: if the stall's cause turns out to BE a mirror-path truth-source lie
 (an arming predicate reading a structurally-zero word). Current evidence says no — the stall sits between
@@ -2229,3 +2237,50 @@ growth**), make the transport envelope's `generationSequence` uniformly 0 across
 **delete** the envelope-level checks in the shm result sink and the service. Version bump; all four
 machines rebuilt (stale = loud `BAD_PROTOCOL`). The identity RULE (§10l) does not change — only the field
 it reads.
+
+### 12.5 P4.2 — COMPLETE REMOVAL of the producer byte-ring mapping (the end state)
+
+P4.1 stops the mirror path from MAPPING the producer shm, so its `byteRingControl` is NULL there and any
+future reader faults instead of silently reading a plausible `0`. **That is a waypoint, not the destination.**
+The destination is that none of it exists. The removal splits by DEPENDENCY, and the split is sharp:
+
+#### P4.2a — already dead; delete NOW, no dependency
+
+`HomerServiceTupleViewEosAppendReady` (tuple_sink_service_process.c:13320) **returns `false`
+unconditionally** — *"Slice 4d makes EOS backend-owned and immutable. The service must no longer synthesize
+semantic terminal records because doing so creates a second delivery path that can race with the backend's
+explicit EOS record."* So both of its callers are dead code for **every** stream in **every** configuration:
+
+- `HomerServiceTupleViewNextEosSequenceFromProducerBytes` (:29941, :29979)
+- `HomerServiceAppendTupleViewEosRecordToProducerByteRing` (:30053-:30122)
+- and the gate itself (`HomerServiceAppendTupleViewEosForStream` exits on the predicate at :30141)
+
+These are among the **heaviest consumers of `sendQueue.byteStorage` and its control words** — so deleting
+them shrinks the P4.2b surface before we get there. Pure vestige; zero risk; no owner decision needed.
+
+#### P4.2b — the mapping itself; gated on the host-service retirement
+
+The producer byte-ring mapping is still LEGITIMATELY used when a stream is **not** mirror-sourced.
+`HomerServicePayloadStreamUsesDpuMirrorSource` (:6832) excludes: tuple-view streams that are not flagged
+`dpuRelayResultStream` (**Citus COPY**, non-DPU pgbench), and everything when the DMA scheduler is off (the
+**host service**). So full removal of the mapping **IS** the host-service local-byte-ring retirement —
+already a standing owner directive ("host-service legacy code paths are being retired soon; don't extend
+them"). It is gated on that decision, not on anything technical.
+
+What disappears when that lands:
+- `HomerServiceMapProducerByteRingQueue` (:23242) — the `shm_open` + `mmap` + geometry validation
+- the `sendQueue.byteRingControl` / `.byteStorage` / `.byteRingBytes` members and every NULL-test on them
+- the `queueShmName` plumbing that carries the shm name into queue descriptors (:36650, :36671) and into
+  peer-open's `requestedByteRingBytes` (:39288)
+- `HomerServicePumpOutgoingByteRingPayload` (:30204+), the local-blackhole pump (:32239+), and the
+  fixed-slot pump (:31663+)
+- the six existence/geometry gates P4.1 will have already routed through accessors — those accessors then
+  collapse to the mirror case and can be inlined away
+
+**Acceptance for the END STATE (falsifiable):** `grep -r 'sendQueue\.byteRingControl\|byteStorage\|queueShmName'`
+over the service returns **nothing**, no `/dev/shm/citus_res_*` object is created by any DPU-path run, and
+the three workloads stay green.
+
+**Why P4.2b lands AFTER the §10k measurement:** it deletes code the DPU path never executes, so it cannot
+be the stall, and blocking a perf number on a legacy-retirement decision would be backwards. It does thin
+shared dispatchers, so a cheap re-verify after it confirms the numbers did not move.
