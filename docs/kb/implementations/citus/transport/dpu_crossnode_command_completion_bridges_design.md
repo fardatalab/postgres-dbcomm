@@ -718,6 +718,48 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   > `client_sql_session_warmup_begin` (the `remote exec backend` was 100% CPU in run 11 — it could be stuck
   > pre-publish, so the pull waits on a completion that is never produced; that would explain "in neither
   > count" trivially — nothing is enqueued). If it does publish, instrument the enqueue→classify→count chain.
+  >
+  > **⏺ CODEX ANALYSIS (July 11, 2026) — REFRAMES the bug: it is UPSTREAM of the fork, in the
+  > publish→pull chain, and my "in neither count" was the wrong framing.** Findings, each file:line-backed:
+  > - **`warmup_begin` is a normal command, NOT special.** It is `CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_TX_BEGIN`
+  >   with `SQL_RESULT_NONE` (`pgbench.c:9662`); the backend runs it, creates NO result sink
+  >   (`remote_execution_backend_bridge.c:2163`), and publishes a normal terminal COMPLETED with
+  >   `resultFlags=NONE, resultServiceSinkId=0` (`:3018`, `:1804`). So the client correctly waits on role 6,
+  >   and P2 alone (no P3) should deliver it. Hypothesis #4 RULED OUT.
+  > - **EOS blocking RULED OUT for warmup.** `HomerServicePayloadStreamResultEosPosted` returns true for a
+  >   terminal record lacking TUPLE_SINK_EOS (`:18375`); warmup has no EOS bit. So IF enqueued+peer-classified,
+  >   the peer count MUST be nonzero. Hypothesis #2 RULED OUT for this command.
+  > - **Fork/egress collector wiring is COMPLETE and NOT starved.** Source/action/phase-body/executor all
+  >   present; feedback backoff is disabled by `knownExpectedWork=true` (`:10067`, armed true at `:41912`).
+  >   The only residual scheduler risk is the 6-grant/phase collector budget (`:170`) dropping a late
+  >   collector on a pass, but that cannot PERMANENTLY starve (47 s), and completion-egress is early in the
+  >   order. Hypothesis #3 WEAK.
+  > - **Pull/accept/enqueue NOT miswired by P2** (confirmed vs `039f56b08`): `selectedBackendCompletionWaitCount`
+  >   (`:40110`), the 3-way pull arming (`:41837`), `HomerServiceDpuAcceptOneBackendCompletion` (`:40950`), and
+  >   the pull action's submit+accept loop (`:44045`) are unchanged.
+  > - **KEY INSIGHT: `"landed peer command"` marks STAGING, not role-2 publication.** At that log point
+  >   `HomerServiceDpuLandOnePeerCommand` has only filled `backendCommandPublishSlots[]` + set `commandInFlight`
+  >   (`:40901`); the role-2 DMA that actually delivers the command to the backend's mailbox is a SEPARATE
+  >   later step, `DPU_BACKEND_COMMAND_PUBLISH` (armed `:41803`). So run 12's silence-after-"landed" is
+  >   consistent with the chain stalling BEFORE the backend ever sees the command. The 4 candidate break
+  >   points, in order: (1) `DPU_BACKEND_COMMAND_PUBLISH` never granted; (2) role-2 DMA submitted but not
+  >   completed; (3) backend never published role 3; (4) `DPU_BACKEND_COMPLETION_PULL` never granted/accepted.
+  >   Static diff cannot distinguish — needs a diagnostic build logging, per landed in-flight session:
+  >   `backendCommandPublishCount`, publish queue depth/in-flight, `selectedBackendCompletionWaitCount`,
+  >   backend completion ready/staged/in-flight, plus one-shot grant counters at the publish action (`:44121`),
+  >   the pull action (`:44045`), and accept (`:40950`). First missing transition = the break.
+  > - **SECONDARY bug ROOT-CAUSED: the client timeout is in the WRONG function.** pgbench warmup uses
+  >   `HomerRunCommandAndWait`'s unbounded `while (homer_command_pending)` loop over `receiveHomerCommand` →
+  >   `HomerClientPeekNextCompletionEvent` (`pgbench.c:4303`, `:4200`) — it NEVER calls
+  >   `HomerClientWaitCommandCompletion`, so the worker's 10 s selected-DPU deadline there is correct but
+  >   never reached. The bounded deadline belongs in `HomerRunCommandAndWait`/`receiveHomerCommand`.
+  >
+  > **OPEN PUZZLE for the diagnostic to resolve:** at `039f56b08` (run 10) this SAME warmup made node B
+  > enqueue a completion (local push spun 8.75 M×) — so back then the command WAS published, the backend ran
+  > it, and a completion was enqueued. At `4216b1cb8` node B apparently stalls before that. The publish/pull
+  > code is unchanged, so the difference is either a subtle side effect of the P2 candidate-builder change or
+  > the client now STAYING ALIVE (run 10 tore down in ~1 s; could a CLOSE_SESSION teardown have been what
+  > flushed the pending publish?). The diagnostic's first-missing-transition will tell.
 
 **Phase P3 — results + client + gate.**
 - P3.1 Results — **REAL WORK ITEM** (corrected July 10, 2026; was "little/no new code" until the §2
