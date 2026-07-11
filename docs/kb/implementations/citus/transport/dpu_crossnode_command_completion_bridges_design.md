@@ -2102,3 +2102,130 @@ version bump + all four machines rebuilt (stale = loud `BAD_PROTOCOL`, which is 
    failed ... reason=peer-reset-abort`, and `committed service-owned DPU result failure`. Functionally
    harmless (it happens after the last completion; the run exits 0) but it means a clean close and a real
    peer failure are indistinguishable in the logs. Fold into the P2.T teardown work.
+
+## 12. PLAN OF RECORD after run 40 — sequencing forced by a leak, not by preference (July 11, 2026)
+
+### 12.0 The run-40 postscript: the SESSION CLOSE is broken, and it leaks
+
+Run 40's DATA path is green (5/5, §10l). Its **lifecycle close is not**, and the owner was right to
+distrust the "harmless teardown" reading. Two error lines sit ABOVE pgbench's summary block (I tailed the
+summary and missed them — the same class of mistake as trusting an exit code):
+
+```
+error: could not unbind Homer DPU SQL result receive ring:
+       close selected-DPU basebackup stream failed: close request referenced an unknown compatibility session id
+error: could not close selected-DPU Homer SQL session:
+       close selected-DPU client SQL session failed: direct client SQL command mailbox is still busy during close
+```
+
+**The causal chain, end to end:**
+1. all 5 transactions complete correctly (rc=0, so the failure is INVISIBLE to the exit code);
+2. the role-7 unbind fails — the DPU does not recognize the close request's session id;
+3. the SQL session close fails — the client's command mailbox is still busy;
+4. therefore **`CLIENT_SQL_SESSION_CLOSE` never lands on node B** (its last landed command is sequence 37,
+   an ordinary one);
+5. therefore node B never observes a session-terminal completion, so **the P2.T teardown handshake
+   (T1 quiesce -> T2 drain -> T3 RELEASE -> T4 unbind) NEVER FIRES** — zero such lines in the log;
+6. therefore the backend never receives `BACKEND_SLOT_RELEASE`: **it survives, busy-polling, forever**
+   (confirmed: `pid 2098287, postgres: remote exec backend` alive long after the run exited), and its
+   **arena slot stays BOUND** (zero `BACKEND_SLOT_RELEASE` lines in postgres.log);
+7. only then does the RDMA connection drop, and node B — with a still-live binding — routes the ordinary
+   `CM event=DISCONNECTED` through the FAILURE machinery: `marked ABORTING`, `marked send byte-ring failed
+   reason=peer-reset-abort`, `committed service-owned DPU result failure`.
+
+**Why this is a blocker and not a cosmetic wart:** a leaked backend **busy-polls a pinned CPU**. Any
+warmed repeat run — which is exactly what a performance measurement requires — would run alongside one
+leaked spinner per prior session, on the same CPU set. **The leak contaminates the very measurement the
+§10k stall investigation needs.** It also burns one of 16 arena slots per session, so every run today
+requires a full hard clean baseline.
+
+### 12.1 SEQUENCING — and why it is forced
+
+The stall (§10k) cannot be measured cleanly until the leak is fixed, and the cleanup rewrites the code the
+measurement would be taken on. So the order is **not** a preference:
+
+| # | phase | why it must be here |
+|---|---|---|
+| **P5** | **session lifecycle close + teardown** | Without it we cannot take a clean measurement at all (leaked busy-poller on the measured CPUs), and each run needs a hard reset. Also a real correctness leak. |
+| **P4.0** | Stage-5 ABI cleanup | Deletes a duplicated field. Cheap, and we now have the green baseline to regress it against. |
+| **P4.1** | mirror-path truth-source cleanup | The structural fix for the bug family that caused runs 39-40. Behavior-preserving. |
+| **§10k** | strip diag, measure, fix the grant stall | Measure ONCE, on the final code. Measuring instrumented, about-to-be-refactored code would just be re-done. |
+
+The one thing that would REORDER this: if the stall's cause turns out to BE a mirror-path truth-source lie
+(an arming predicate reading a structurally-zero word). Current evidence says no — the stall sits between
+grouped-control DISCOVERY and the PULL grant, inside the DMA engine's collector arming, which the sweep
+found clean. But that is a hypothesis; if a probe implicates it, P4.1 becomes the stall fix and they merge.
+
+### 12.2 P5 — session lifecycle close (DO THIS FIRST)
+
+Two independent defects, both first reachable only now that commands actually flow to completion:
+
+- **P5.a — role-7 unbind: "close request referenced an unknown compatibility session id."** The SQL result
+  ring is unbound through the BASEBACKUP close path (`HomerClientUnbindRing` -> `HomerClientCloseBaseBackupStream`).
+  The identity the close sends does not match what the DPU registered at open. Note the smell: the SQL
+  family reusing the basebackup close path is the same "copied from the wrong sibling" pattern that caused
+  the generationSequence bug. Diagnose by naming BOTH ids at the reject site (which id was sent, which ids
+  are live) — an ANDed/lookup guard must say WHICH stage rejected.
+- **P5.b — SQL session close: "direct client SQL command mailbox is still busy during close."** A command
+  slot is still leased/unacked when the close runs. Suspect the terminal completion's lease is never
+  released on the DPU-relay path (the shm path releases it in the drain). Probe the mailbox occupancy and
+  the outstanding lease at close time.
+- **P5.c — a clean close must NOT route through the failure machinery.** Once P5.a/b land and
+  `CLIENT_SQL_SESSION_CLOSE` reaches node B, a subsequent `DISCONNECTED` must find the binding already
+  torn down. Add an explicit assertion/branch so that a disconnect on a stream with no live binding is a
+  no-op, and a disconnect WITH a live binding stays loud. **A clean close and a real peer failure must
+  never again be indistinguishable in the logs.**
+
+**Acceptance (falsifiable — the leak must be gone, not merely quieter):**
+1. `teardown T1 quiesced` .. `T4 released and destroyed` present, in order, for the session;
+2. `received BACKEND_SLOT_RELEASE for arena slot N` in farnet1 postgres.log;
+3. **NO surviving `postgres: remote exec backend`** after the run (checked by `/proc/<pid>/exe`);
+4. **TWO consecutive pgbench runs against the SAME postmaster and the SAME services both pass, with no
+   clean baseline in between** — this is the real test, and today it is impossible;
+5. ZERO `marked ABORTING` / `peer-reset-abort` / `committed ... failure` lines on a clean close;
+6. pgbench exits 0 **with an empty error stream** (rc=0 is NOT the verdict — run 40 exited 0 with two
+   errors; read the whole log).
+
+### 12.3 P4.1 — mirror-path truth-source cleanup (design, guided by the sweep)
+
+The sweep (§10l) established: on the DPU-mirror path the DPU-local `sendQueue` mapping's **data region is
+dead** (the real source is the engine's mirror), its `publishedTail` is **producer-stale by construction**,
+and **six live sites** still gate on the mapping existing. So the cleanup is not "delete the mmap" — it is
+**make the lie structurally unreadable**, then delete.
+
+**Design: give the payload SOURCE an explicit kind + accessors, and stop reading a mapped struct.**
+
+```c
+typedef enum {
+    HOMER_PAYLOAD_SOURCE_LOCAL_BYTE_RING,  /* shm ring this service can read directly (host service) */
+    HOMER_PAYLOAD_SOURCE_DPU_MIRROR,       /* host ring reachable ONLY through the DMA engine */
+    HOMER_PAYLOAD_SOURCE_FIXED_SLOT,       /* legacy slot ring */
+} HomerPayloadSourceKind;
+```
+
+- **Geometry moves out of the mapping.** The six dependencies (`queueShmName`/`byteRingBytes` at :36650/:36671,
+  async-open validation :38111, open-completion `ringBytes` :38220, peer-open `requestedByteRingBytes` :39288,
+  the prepare's NULL-control reject :25918, failure routing's "has send control" :26502) all want
+  **geometry or existence**, never a producer frontier. Store geometry in the stream entry (it already
+  carries peer ring descriptors) and replace the NULL-pointer existence tests with
+  `HomerServicePayloadSourceIsBound(streamEntry)`.
+- **One accessor for the frontier**, and it is allowed to say "not locally knowable":
+  `HomerServicePayloadSourcePublishedTail(streamEntry, uint64_t *out)` returns false on the mirror path.
+  A caller that cannot handle false must not ask — which is exactly the guard we deleted in §10l.
+- **Then stop mapping the shm at all on the mirror path, and leave `byteRingControl == NULL`.**
+
+**The principle, stated once:** *a zeroed struct lies; a NULL pointer confesses.* Today a mirror-path reader
+of `publishedTail` gets a plausible `0` and silently does the wrong thing. After this, it faults. That is
+the whole point — this bug family (5+ instances now) exists because **silence was a valid state**.
+
+**Acceptance:** the three workloads stay green, AND `grep` shows zero reads of
+`sendQueue.byteRingControl->publishedTail` outside a `SOURCE_LOCAL_BYTE_RING` branch, AND the mirror path
+maps no producer shm.
+
+### 12.4 P4.0 — Stage-5 ABI cleanup (shape settled in §10l)
+
+Move the tuple command-local sequence into `HomerDecodedTupleBatchHeader.reserved0` (free — **no struct
+growth**), make the transport envelope's `generationSequence` uniformly 0 across object families, and
+**delete** the envelope-level checks in the shm result sink and the service. Version bump; all four
+machines rebuilt (stale = loud `BAD_PROTOCOL`). The identity RULE (§10l) does not change — only the field
+it reads.
