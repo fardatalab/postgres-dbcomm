@@ -796,3 +796,27 @@ validation flows (kill -9 skips on_proc_exit; agent dies with postmaster before 
 flight: same topology as run 8, farnet1 DPU keeps the gated build (instrumentation now serves as
 confirmation — expect pre-submit lines with NO zero read, completion pulled, and the benign
 `missing frontend completion event descriptor` P2-seam end state).
+
+**RUN 9 (July 10, 2026): completion-zero race CONFIRMED DEAD — 318,660+ live control reads, zero
+mismatches, engine never fataled.** But the new bind verification FATALed the backend with
+`arena slot 0 violated the FREE-implies-initialized invariant (cmd proto=15 slots=64 pub=1 con=0,
+cpl proto=15 pub=0 con=0, res proto=12 bytes=262144)`. Reading it against the constants: `res
+proto=12` is CORRECT (12 IS `CITUS_TUPLE_SINK_PROTOCOL_VERSION` — homer_abi_version.h:29; the
+validation agent's stale-byte-ring theory was a red herring), `cpl` was pristine — the ONLY violated
+condition was **`cmd pub=1`: the DPU had legitimately published command sequence 1 into the role-2
+mailbox between spawn COMPLETED and the backend's bind** (`landed peer command session=1 sequence=1`
+in the DPU log; command landing overlaps backend fork/exec by design). The b29a90330 check was too
+strict on exactly that producer-owned field. **THIRD latent bug thereby exposed**: the OLD bind-time
+memset was also silently destroying that pre-published command (body + publishedEpoch) in runs 6–8,
+stranding the DPU's in-flight bookkeeping — the next blocker in line had the completion race not
+fataled first. Failure-cascade note for S3.4/S4: with the backend FATALed pre-bind, the DPU polled
+the completion mailbox FOREVER at 100% CPU (~1.2M diag lines) — "backend died before publishing
+anything" needs a give-up path (spawn-state machine can watch the pid) in the teardown stage.
+
+**REFINEMENT — citus `039f56b08` (built + installed on farnet1).** Bind verification now accepts the
+DPU-pre-published role-2 state: `cmd.publishedEpoch <= slotCount` (window bound; torn-read-safe since
+the DPU writes it as one aligned u64) with `cmd.consumedEpoch == 0` still strict; all backend-owned
+counters (cmd consumed, cpl published) and host-init-owned proto/geometry stamps remain strict. Run
+10 in flight, same PASS criteria as run 9. Unrelated observation from run 9: a `dbcomm tpch_sf10`
+PostgreSQL instance appeared on farnet1 ~27 s after the run's cleanup — foreign to this workstream,
+left untouched; check ownership before preflighting future runs.
