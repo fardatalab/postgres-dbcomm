@@ -495,6 +495,40 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   > a torn/short DMA read, a ref/generation mismatch steering the read, or the snapshot buffer not
   > being the task's actual destination.
   >
+  > **🔴 DIAGNOSTIC RESULT (run 4, citus `f5ad8a39a`) — DECISIVE, and STOPPED here for discussion:**
+  > `diag ring=1 role=3 gen=4128789413882223(=current) bound_session=1 host_ring=0x7f86d83d6700
+  > ctrl_off=0 ctrl_bytes=24 snapshot{proto=0 reserved=0 published=0 consumed=0}` — the DPU read the
+  > RIGHT ring (ring 1 = slot 0's completion mailbox), right generation, right bound session, right
+  > offset — and got ALL ZEROS from memory the host verifiably stamped proto=15 (fresh arena, fresh
+  > fixed citus.so, both verified). **The DMA read returns different bytes than the postmaster's
+  > mapping holds.**
+  >
+  > **Leading theory — arena EXPORT-1 DMA has NEVER been verified end-to-end.** Inventory of all DMA
+  > traffic through the arena mmap (export id 1): every READ before this one expected zeros (role-5
+  > publish lines pre-publication, grouped-control of unenrolled rings = none), and the one WRITE
+  > (P1's role-2 command publish) had no confirmation the backend ever saw it (the backend idles;
+  > execution was never proven — the p2 'landed' line proves publish STAGING, not arrival). The spawn
+  > region (export id 2) round-trips BOTH directions verifiably (DPU writes the spawn request, backend
+  > reads it; backend writes state, DPU state-reads see COMPLETED). So a broken export-1 window
+  > (reads return zeros / writes vanish) is consistent with EVERY observation across all four runs —
+  > and with the AGENTS.md lesson "an import being accepted proves nothing." This is the same class as
+  > the S0/S0b spikes: the export mechanics (posix-shm MAP_SHARED, fork-reader) were proven for a
+  > DEDICATED single-export region; the arena's TWO-EXPORT setup message (arena 57 MB + spawn region)
+  > has never had an arena-side DMA round-trip proof.
+  >
+  > **Next probes (cheapest-decisive first):**
+  > 1. HOST-side: hexdump /dev/shm/citus_homer_frontend_arena_v2 at offsetof(slots[0].completionMailbox)
+  >    during a live run → proves proto=15 is really in tmpfs (final elimination of host-side stamping).
+  > 2. DPU-side: one-shot diagnostic DMA read of the arena ADVISORY HEADER (offset 0 of export 1:
+  >    protocolVersion + slotCount=16, known nonzero) at import-accept time, and of a spawn-region word
+  >    (known-good export 2) → if the header reads zero, the whole export-1 window is broken
+  >    (import/translation bug in the two-export path: mmapExportId→doca_mmap selection, base-VA
+  >    translation, or export-descriptor handling); if it reads correctly, the fault is
+  >    offset/descriptor-specific to component-addressed slot rings.
+  > 3. Check the TCP transport smoke's two-export coverage: --export-posix-shm exercises ONE export;
+  >    whether any smoke imports TWO mmap exports in one setup message and DMA-round-trips the SECOND
+  >    is exactly the regression-net gap this would have slipped through.
+  >
   > **Checkpoint sequencing correction:** the checkpoint cannot run as phased — NO driver can submit a
   > cross-node START until S4.2's submission half exists (the client dies at warmup before writing
   > role 1; the SQL-UDF driver is single-node → local fork arm only). Resolution: pull the MINIMAL
