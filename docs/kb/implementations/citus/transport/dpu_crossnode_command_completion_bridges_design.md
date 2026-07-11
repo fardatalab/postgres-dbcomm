@@ -661,3 +661,15 @@ prints "role-5 publication discovered before sink bind" on exactly this event.
 - Nothing appears (or identity/frontier errors) → arena reads broadly broken → registration/size issue →
   adopt the separate-small-exports workaround (Tier-2-proven shape) to unblock P1; file the large-mmap
   + smoke-gap investigation separately.
+
+**PROBE RESULT (run 5): arena DMA reads WORK near base.** arena_poke stamped ring 2's publish line
+(arena+256) from a third process; the DPU's grouped-control sweep discovered it byte-exact
+("role-5 publication discovered before sink bind (session=0 ring=2 tail=64, occurrence=1)", zero
+validation errors). So: two-export import, cross-process tmpfs coherence, and the arena DMA window are
+all FINE — the broad-breakage theory is dead. Remaining confound: the working read differs from the
+failing one on BOTH task type (grouped-control vs backend-completion-control) AND depth (+256 vs
+~+800 KB, past slot 0's command mailbox). Note also the Tier-2 completion pull has not been re-run
+since the pre-P0 green baseline, so a task-path regression is not formally excluded. FINAL SPLIT in
+flight: a compile-gated engine cross-probe reading 24 B at ring 1's interior hostRingAddress once at
+arena import — zeros = depth-dependent (DOCA/kernel; go separate-small-exports workaround), proto=15 =
+task-path bug (small haystack).
