@@ -717,3 +717,20 @@ the per-ring in-flight rule + async windows). P1 checkpoint re-run in flight; pa
 `missing frontend completion event descriptor` for session 1 (backend-executed proof, P2 seam). After
 P1 closes: remove the crossprobe scaffolding, extend cursor hygiene to remaining builders (queued with
 fix B before any S6 number).
+
+**RE-RUN AFTER `a1f0d016c` (run 7): STILL FAILS, bit-for-bit** — same all-zero snapshot, unaffected by
+the persistent-dst cursor fix. f2/f4/f5 unchanged-good (grouped free-list tripwire silent under real
+churn — Fix 2 behaves). Subsequent line-by-line read of `HomerDpuDmaSubmitOneBackendCompletionTask`
+verified CORRECT: src/dst addresses, per-kind mmap selection, (src,dst) task-init order, persistent-dst
+wiring, geometry checks. **Every software layer is now verified; the DMA completes successfully yet
+delivers zeros from memory a raw synchronous read shows as proto=15.** Determinism (identical across 4
+runs, immune to 3 fixes) argues a systematic property of THIS path, not state decay. REMAINING
+UNTESTED DELTAS vs. every working read: (1) the DMA CONTEXT — backend-completion tasks are plausibly the
+only user of dmaContexts[COMPLETION class] in the cross-node flow (spawn/grouped/pulls ride other
+classes); (2) the 24-byte copy size (working reads are 64 B); (3) the gated 4th crossprobe read
+(completion-pool dst) was NEVER RUN — run 7 used the normal build. NEXT INSTRUMENTATION OPTIONS:
+(A) run the gated crossprobe round (collects the pool-dst datapoint; extend it to also submit one read
+on the COMPLETION-class context and one 24-B read — three discriminators in one run); (B) instrument
+the failing task itself: print doca_buf_get_data()/data_len of src+dst immediately before submit and
+after completion, plus a host-side hexdump of the mailbox header AFTER the failure. STOPPED for
+discussion per the multi-shot rule.
