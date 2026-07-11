@@ -630,15 +630,35 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   >
   > **CLIENT-SIDE scope (the second, legacy-retiring half).** `HomerClientPeekNextCompletionEvent`
   > (`homer_client.c:6273`) reads the legacy host-service mailboxes (`backendCompletionMailbox` /
-  > `completionMailbox` `readyEpochSlots`), NOT role 6; the role-6 line (`dpuFrontendCompletionEvent`,
-  > `completionEventOffset`) is exported only on the BASEBACKUP stream (S4.1, `:3048`), never on the
-  > pgbench SQL session. So "client observes role-6" needs a client slice: export role-6 on the SQL
-  > session (apply S4.1's shape) + redirect the peek off the legacy mailbox onto role 6 (+ drop the
-  > `session->control==NULL` reject `:5944`). This IS the completion half of S4.2 and the first concrete
-  > host-service retirement. **SEQUENCING:** backend bridge FIRST (P2.2+P2.3 — legacy-free, checkpoint =
-  > the completion reaches node A's role-6 ring / the node-B "missing … descriptor" error disappears),
-  > then the client role-6 switch as a second increment. Symmetric to P1 pulling the minimal S4.2
-  > submission slice forward.
+  > `completionMailbox` `readyEpochSlots`) and hard-requires `session->control != NULL` (`:6285`) — so a
+  > selected-DPU session (which sets `control == NULL`) fails the peek immediately (that IS run-10's
+  > "invalid arguments while peeking Homer completion").
+  >
+  > **CORRECTION (July 11, 2026, re-verified):** an earlier draft here said role 6 is exported "only on
+  > the basebackup stream, never on the pgbench SQL session." That was WRONG. `HomerClientOpenSqlSessionSelectedDpu`
+  > (`homer_client.c:2908`) ALREADY exports the role-6 completion-event line on the SQL session's
+  > `commandDpuStream` (`dpuFrontendCompletionEvent` `:3049`, `HOMER_CLIENT_DPU_COMPLETION_EVENT_RING_INDEX`),
+  > and node A's DPU `HomerServiceDpuPublishOneSelectedCompletionEvent` DMA-writes a
+  > `HomerDpuBridgeFrontendCompletionEvent` into it. So the client slice does NOT need a new export — it is
+  > only a PEEK REDIRECT: mirror the START path's already-shipped selected-DPU branch (`:6013-6054`, which
+  > relaxes the guard to `(session->control == NULL && !session->commandDpuStreamOpen)` and drives
+  > `session->commandDpuStream`) inside `HomerClientPeekNextCompletionEvent`/`WaitCommandCompletion`: when
+  > `session->commandDpuStreamOpen`, read/parse `commandDpuStream.dpuFrontendCompletionEvent` (role 6)
+  > instead of requiring `control` and reading the legacy mailbox. This is the completion half of S4.2 and
+  > the first concrete host-service retirement — MODERATE, pattern already established, no design fork.
+  >
+  > **SEQUENCING:** backend bridge FIRST (P2.2+P2.3 — legacy-free), then the client peek-redirect
+  > (BLOCKED on the backend-bridge validation — no point consuming role 6 until the DPU proves it writes
+  > it). Symmetric to P1 pulling the minimal S4.2 submission slice forward. The backend-bridge checkpoint
+  > has TWO possible shapes, and the validation distinguishes them (both PROVE egress+ingress):
+  > - If run-10's client opened via `HomerClientOpenSqlSessionSelectedDpu` (its `control==NULL` peek
+  >   failure strongly implies so), it ALREADY exported role 6 to node A's local DPU, so after egress node
+  >   A's `HomerServiceDpuPublishOneSelectedCompletionEvent` FINDS the descriptor and the role-6 DMA
+  >   SUCCEEDS — no "missing … descriptor" on EITHER node, the completion sits in the client's role-6 ring,
+  >   and ONLY the client peek-redirect remains. (Most likely.)
+  > - If node A has no role-6 descriptor, the "missing … descriptor" error MOVES from node B to node A —
+  >   still proving the completion traversed the bridge, but the client export is also needed.
+  > Node B ceasing to spin on "missing … descriptor" (it egresses instead) is the invariant signal in both.
 
 **Phase P3 — results + client + gate.**
 - P3.1 Results — **REAL WORK ITEM** (corrected July 10, 2026; was "little/no new code" until the §2
