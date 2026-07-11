@@ -396,23 +396,77 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   TEST_FIRE precedent) can light discovery up early — deferred unless P3 debugging needs it.
 
 **Phase P1 — command bridge (node-A role-1 → node-B role-2).**
-- P1.1 Add the **command landing ring** on node B (fixed-record, WIMM, reverse credit), registered as an
-  RDMA target; advertise its descriptor in the `OPEN_COMMAND_SESSION` response; node A saves it beside
-  `clientSqlPeerConnectionHandle`.
-- P1.2 **Refactor consumer A's core** (`HomerServiceDpuStageOneBackendCommandForPublish` `:40050`) to take a
-  plain command record source, so it can be fed by (i) engine staging [legacy single-node] or (ii) a landed
-  record. No behavior change for existing callers.
-- P1.3 Add `DPU_PEER_COMMAND_EGRESS` (node A) per §3.1: it is a new **consumer** of the existing
-  staged-command queue (no new queue), armed off a per-role `peerCommandEgressDepth` counter maintained at
-  enqueue, executed like the `DPU_BACKEND_COMMAND_PUBLISH` case. It resolves the peer connection by
-  `sessionUID` (§3.4) and RDMA-sends to the node-B command landing ring. Add the recv-doorbell handler on
-  node B that re-lands the record into consumer A's staged-command path so `_STAGE`/`_PUBLISH` publish role 2.
-- **Checkpoint P1:** a cross-node START reaches consumer A and DMA-publishes role 2; the backend runs the
-  command (observable in the DPU log + backend behavior). Completion/result not yet returned.
+
+> **⏺ P1 RE-GROUNDED (July 10, 2026, codex trace of the real call paths) — three corrections that
+> SIMPLIFY the plan below; the P1.x items are restated to match. Key evidence anchors:**
+> - **The landing ring already exists — do NOT invent one.** The `OPEN_COMMAND_SESSION` response already
+>   advertises a command mailbox: node B registers a `CitusRemoteExecLocalCommandMailbox`
+>   (`tuple_sink_service_process.c:38410`) and returns it as `peerCommandMailboxDescriptor` (`:38431`);
+>   node A saves descriptor + doorbell token (`:36026`/`:36041`). In the DPU service that mailbox lives in
+>   DPU RAM — it IS the command landing ring. The immediate encoding already has `CLIENT_COMMAND` (2-bit
+>   kind space is FULL — a fifth kind is impossible; reuse `CLIENT_COMMAND`,
+>   builder `remote_execution_peer_transport_rdma.c:10116`), and the old host-path pump already posts
+>   compact `CitusRemoteExecLocalCommandRecord` bytes + `readySeq` into exactly this mailbox
+>   (`:20719`/`:20737`, fixed-slot variant `:20767`). **No handshake change, no peer-protocol bump for
+>   P1** (v19 stays; the request/response structs have no room anyway — appending fields + a bump is only
+>   needed if a future phase truly needs new descriptors).
+> - **The wire unit is the materialized record, not the raw START.** No compact command struct exists;
+>   "compact" = a valid prefix of `CitusRemoteExecLocalCommandRecord`
+>   (`remote_execution_backend_protocol.h:299`; finalize `:17856`; RDMA bytes `:17928`). Node A already
+>   owns the materializer (`HomerServiceDpuMaterializeBackendCommandRecord` `:39962`). The record carries
+>   NO serviceSessionId — the remote mailbox is per-session, so the node-B session id is implied by the
+>   TARGET mailbox (node A must use `peerCommandServiceSessionId`-scoped state, saved at `:36013`).
+> - **Routing lookup + wedge.** The staged START carries the node-A `serviceSessionId`; the egress lookup
+>   is `TupleSinkServiceFindSessionById` (`:22648`) → a `clientSqlRemoteSender` session holding the peer
+>   connection, remote descriptors, doorbell token, and the registered command scratch region. (The §3.4
+>   `sessionUID` plan is unnecessary for this direction — there is no sessionUID session index, and none
+>   is needed.) TODAY a remote-session START **wedges** consumer A: `StageOneBackendCommandForPublish`
+>   fails the local role-2 lookup (`:40148`) and never releases the engine-staged command — P1's fork
+>   replaces this failure path. Also: the local stager manufactures a frontend START ack tied to the
+>   role-1 slot (`:40163`) — for remote sessions node A must NOT manufacture it; STARTED flows back
+>   end-to-end via P2.
+> - **One FIFO, one drainer.** Engine staged commands are a strict FIFO; two collectors cannot drain it
+>   safely. The FORK therefore lives INSIDE the single stage drainer (peek head → resolve session → local
+>   publish OR hand to egress); the egress SEND remains its own scheduler-granted collector
+>   (`DPU_PEER_COMMAND_EGRESS`, armed off `peerCommandEgressDepth`), fed by a small egress queue the
+>   stage fills. §3.1's shape survives with the fork one level deeper.
+> - **Node B has no selected-session at peer OPEN** (`FindOrCreateSelectedSession`'s only caller is the
+>   local pulled-START path `:40117`; peer OPEN creates only the regular receiver session `:38361`; spawn
+>   completion marks it backend-active `:42885`). The landing consumer must create/sync the node-B
+>   selected-session and fill a publish slot DIRECTLY (record + role-2 ref + sequence — the publish-slot
+>   shape at `:614`, fill `:40206`), NOT reuse the role-1-coupled stager verbatim.
+
+- P1.1 **Node-B landing consumer** (was "add the landing ring" — the ring exists): a new collector that
+  drains peer-receiver sessions' local command mailboxes (readySeq protocol, as the backend consumes at
+  `remote_execution_backend_bridge.c:2856`), demand-armed by sessions with `clientSqlPeerReceiver` + a
+  spawned arena backend + an unconsumed `readySeq`. Per record: find-or-create the node-B selected
+  session, resolve role-2 via the bound arena refs, fill a `HomerServiceDpuBackendCommandPublishSlot`,
+  install in-flight sequence/kind/flags (mirror `:40199`), advance `consumedEpoch`. The existing
+  `DPU_BACKEND_COMMAND_PUBLISH` then DMA-publishes role 2 unchanged. The recv-side `CLIENT_COMMAND` WIMM
+  currently only validates the token (`remote_execution_peer_transport_rdma.c:6725`, mailbox state is
+  scheduler-discovered per `:1058`) — readiness may stay poll-based first; doorbell-driven arming is an
+  optimization.
+- P1.2 **Node-A fork in the stage drainer**: in `HomerServiceDpuStageOneBackendCommandForPublish`, after
+  `FindSessionById`, route a `clientSqlRemoteSender` session's START to the egress queue (materialize via
+  the existing materializer, enqueue, release the engine stage, bump `peerCommandEgressDepth`) instead of
+  the local role-2 lookup; keep the local path byte-identical for local sessions. This kills the wedge.
+- P1.3 **`DPU_PEER_COMMAND_EGRESS`** (node A): scheduler collector (4+1 edits) armed off
+  `peerCommandEgressDepth`; action drains the egress queue up to `maxItems`: respect remote mailbox slot
+  accounting, reserve/post via the send core REFACTORED OUT of `TupleSinkServicePumpRemoteClientSqlCommands`
+  (record+readySeq posts `:20719`/`:20737` + `CLIENT_COMMAND` doorbell), shared by both callers.
+- **Checkpoint P1:** a cross-node START reaches node B's landing consumer and DMA-publishes role 2; the
+  arena backend consumes and RUNS it (observable: backend's consumedEpoch advances / command executes).
+  Completion/result not yet returned (P2/P3).
 
 **Phase P2 — completion bridge (node-B role-3 → node-A role-6).**
-- P2.1 Add the **completion landing ring** on node A (fixed-record, WIMM, reverse credit); advertise its
-  descriptor in the OPEN request; node B saves it on the receiver session.
+- P2.1 ~~Add~~ **The completion landing ring likewise already exists** (same July-10 re-grounding as P1):
+  the OPEN request already carries node A's completion-mailbox descriptor + doorbell token
+  (`localClientCompletionMailboxDescriptor`, built `:36237`, saved on node B `:38387`), and the existing
+  sealed-completion publish (`TupleSinkServicePublishPeerClientCommandCompletion` `:18168`) RDMA-writes
+  into it with the `CLIENT_COMPLETION` immediate. In the DPU service that mailbox is node-A DPU RAM — the
+  landing ring. P2's work is the node-A DRAIN of that mailbox into the role-6 push (plus the node-B
+  egress fed from consumer B's events), not a new ring. Ground the details (who allocates the node-A DPU
+  session's completion mailbox; the drain's readiness) with a P2-opening trace before coding.
 - P2.2 Add `DPU_PEER_COMPLETION_EGRESS` (node B) per §3.1: a new **consumer** of the existing
   completion-event queue (no new queue), armed off `HomerServiceDpuSelectedCompletionEventReadyCount`
   **gated by the EOS-ordering guard** (`:18252`/`:18162` — a terminal completion whose result bytes have
