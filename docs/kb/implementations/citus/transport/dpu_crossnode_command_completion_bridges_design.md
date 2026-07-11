@@ -836,6 +836,17 @@ ABSENCE of `DPU backend spawn begin/COMPLETED` on the farnet1 DPU. The DPU-relay
 DMA env. For cross-node validations of THIS design, also leave the two HOST services DOWN so a silent
 host-relay fallback fails loudly instead of masquerading as a pass.
 
+> **⚠ "Both host services down" SUPERSEDED IN PART by the P3.2 client-dependency note (§4) — cost
+> run 17 a cycle (July 11, 2026).** It is only achievable after S4.2 makes the client's
+> control-region open conditional; until then `pgbench --homer` cannot BOOT without a local control
+> shm (`HomerClientOpenControl` per thread, before any DPU logic). Standing arrangement: CLIENT-side
+> host service UP (control-region hosting only — verify its log shows no session/command activity),
+> BACKEND-side host service DOWN (the loud-failure guard that matters), positive DPU-relay proof from
+> the lifecycle/p2diag lines on BOTH DPU logs. Runs 13–16 ran this way partly by ACCIDENT: a stale
+> `/citus_remote_execution_control_v27` shm satisfied the client even with the farnet0 host service
+> down, so a hard-clean baseline (which removes it) made the topology error visible where a dirty
+> baseline had masked it.
+
 ## 7. P1 blocker investigation — Codex second opinion + arena poke probe (July 10, 2026)
 
 **Codex verdicts (file:line-proven):** Theory A (interior-address translation bug) REFUTED — Homer passes
@@ -1052,3 +1063,208 @@ ladder + `[ctl-read-diag]` prints (spent scaffolding); add a backend-died-pre-pu
 the spawn/teardown machine (run 9's infinite poll); reorder teardown so the DPU unbinds the ring
 before `ReleaseArenaSlot`/reaper memsets it; extend Fix-1 persistent-dst cursor hygiene to
 SLOT_READ/CONSUMED_EPOCH and the other five task builders.
+
+## 8. P2 execution record — runs 13–16: three stacked root causes, then the bridge closed (July 11, 2026)
+
+Run 12 ended in a STOP: node B silent after "landed peer command", static inspection exhausted.
+The way out was an **evidence-quality correction**, not more code reading:
+
+**The absence-of-evidence error (found via owner nudge "was it ever granted?").** `HOMER_SERVICE_LOG`
+compiles to `((void) 0)` unless `HOMER_SERVICE_VERBOSE_LOGGING`; every SUCCESS path in the
+publish→pull→egress chain logs through it, while failures use raw `fprintf`. So "0 egress lines in the
+log" had only ever meant "no egress FAILURE" — Codex and I spent runs 11–12 debugging a node B that was
+(mostly) working. Countermeasure: `p2diag` (`HOMER_DPU_P2_DIAG`, citus `349f4d58a`) — counters +
+prints at every chain edge on BOTH nodes (publish grants/submitted, pull, accepted, enqueued, egress,
+ingress landed/queued, role-6 push) + a throttled `snap#N ARM{...} DID{...}` snapshot. Lesson recorded:
+**instrument the success edges before debugging silence; a missing log line in this codebase proves
+nothing.**
+
+With eyes on, three latent defects fell in three runs:
+
+1. **Run 13 — node A never creates a selected session** (`INGRESS ... selected=no(legacy path)`).
+   P1's egress fork in `HomerServiceDpuStageOneBackendCommandForPublish` returns early ABOVE the local
+   path's `HomerServiceDpuFindOrCreateSelectedSession`, so the cross-node client's completions had no
+   selected-session to land in. Fix `820b66ba2`: create + stamp the selected session in the fork
+   (currentCommandSequence, commandInFlight, bridgeGeneration, inFlight* fields) after the egress slot
+   commits.
+2. **Run 14 — role-6 descriptor never found (7,087,703 misses).** The client stamped its command-session
+   descriptors' `serviceSessionId` with an OWNER TAG (its `dpuBridgeGeneration`); the import seeded
+   `boundServiceSessionId` from it; lookups keyed by the REAL session id could never match. Latent since
+   S4.1 — no consumer of role 6 existed until the P2 peek-redirect. First fix attempt (`f1ab6c094`)
+   keyed the lookup by the tag instead — **dead end**:
+3. **Run 15 — the tag leaked into the payload.** `HomerDpuDmaFindDescriptorRef` fills the resolved ref's
+   `serviceSessionId` from the BINDING, so keying by tag pushed the tag into the client-visible event
+   body → `selected-DPU completion identity mismatch: session=1 event_session=2433107406503011`.
+   Proper fix = **option B** (`553774131`): the client declares the rings UNBOUND (`serviceSessionId=0`,
+   the D5 arena convention), and the service stamps the REAL id at OPEN hand-out via new
+   `HomerDpuDmaBindFrontendSessionRings` (homer_service_dpu_dma.c) — the direct twin of
+   `HomerDpuDmaBindRingSession` for client command-session exports. `serviceSessionId` now means what it
+   says on every export; basebackup paths (which legitimately REQUEST an id) untouched.
+
+**Run 16 — P2 CLOSED, new blocker exposed.** The client completed **five full command round-trips**
+(sequences 1–5: both warmups + three transaction commands), each showing the complete chain on both
+DPUs (`PUBLISH submitted → ENQUEUED terminal → EGRESS SENT` on node B; `INGRESS selected=YES → QUEUED →
+role-6 push SUBMITTED` on node A), then failed at exactly the predicted P3 gap:
+`Homer sql_execute failed: tuple-sink queue descriptor did not include a queue name`
+(backend-side ereport at homer_tuple_queue_frontend.c:615 — no result-queue descriptor exists until
+P3). Identity mismatch gone; `missing frontend completion event descriptor` = 0 on both nodes.
+
+**But:** on command 6's error exit the ORIGINAL P1-shaped fatal recurred on node B —
+`backend completion control ... snapshot{proto=0 reserved=0 published=0 consumed=0}` → engine sticky
+fatal → node A spun forever. This is NOT a P1 regression: it is the **documented teardown residual**
+(see `b29a90330` commit notes and §7 closing) firing for the first time, because run 16 was the first
+run in which a backend ever exited GRACEFULLY (every prior run ended in `kill -9`, which skips
+`on_proc_exit`). Chain: backend `ereport(ERROR)` → PG_CATCH publishes FAILED completion
+(remote_execution_backend_bridge.c:3033) → `proc_exit(1)` (line 3076) → `on_proc_exit` →
+`HomerFrontendAgentReleaseArenaSlot` → `HomerFrontendAgentInitArenaSlot` memset
+(homer_frontend_agent.c:576) **while the DPU still DMA-polls role 3** → zero-window read → fatal.
+Sharper than noise: on other timings the memset can destroy the terminal completion BEFORE the DPU
+pulls it — the client would hang with no error. Fix design in §9 (P2.T).
+
+## 9. P2.T — arena-slot teardown handshake (design of record, July 11, 2026)
+
+**Invariant to establish:** the host never memsets an arena slot while any DPU ring bound to it can
+still issue DMA against it. (`ReleaseArenaSlot`'s reset stays load-bearing — FREE-implies-initialized
+— the fix is strictly an ORDERING protocol in front of it.)
+
+**Alternatives considered:**
+- **D-A (agent-reclaimed):** backend exits without reset; DPU notifies the frontend agent over the
+  doorbell TCP connection when it has unbound; agent reclaims. Architecturally the endgame (it also
+  covers crash paths), but needs a new DPU→host control message + agent reclaim walk. Deferred to
+  S3.4; residuals below point at it.
+- **D-B (tombstone in the control word):** backend writes a detach sentinel into the role-3 control
+  header; DPU treats it as clean detach and acks by DMA. Rejected: overloads the snapshot-protocol
+  validation that is our only corruption canary, and still needs a new ack write path.
+- **D-C (service-ordered RELEASE command) — CHOSEN:** the node-B service already learns the exact
+  moment a session is over (it pulls and egresses the terminal completion), already has an exact-order
+  write channel into the slot (role-2 command publish), and the backend already sits in a command
+  loop. Teardown becomes one more command. Zero new DMA paths, zero new collectors, and it doubles as
+  the socketless backend's missing clean-shutdown signal (the S3.4 gap).
+
+**Protocol (D-C):** on accepting a completion whose `postCommandState ∈ {DO_NOT_REUSE, FAILED}`
+(session-terminal — NOT merely `TupleSinkServiceCommandStateIsTerminal`, which is true of every
+completed command) for a selected-DPU session with a bound arena slot, the node-B service runs a
+per-session teardown phase machine:
+
+- **T1 QUIESCE** — new engine API sets a new per-ring runtime flag `pollQuiesced` on the slot's role-3
+  ring; `HomerDpuDmaSubmitBackendCompletionPulls`'s scan skips quiesced rings (next to the existing D5
+  unbound-skip, homer_service_dpu_dma.c:1520ff). Bindings stay intact — a partial UNBIND would both
+  break the role-2 publish and trip the "partially bound = allocator bug" refusal in
+  `HomerDpuDmaBindRingSession` (:5689).
+- **T2 DRAIN** — advance when (a) the session's completion-event queue is empty (terminal completion
+  egressed) AND (b) the slot's three rings have zero in-flight DMA tasks. Requires a new per-ring
+  `inFlightTaskCount` on `HomerDpuDmaRingRuntime` (submit++ / completion-- for every task addressing
+  the ring: control read, slot read, consumed-epoch credit write, command publish). Class-level
+  counters are too coarse under multi-session; per-ring is the honest gate. This also guarantees the
+  final credit write (`HomerDpuDmaSubmitBackendCompletionCreditPublication`, submitted at accept time,
+  asynchronous) lands BEFORE the release — otherwise it could dirty a freshly reset slot.
+- **T3 RELEASE_PUBLISH** — publish new command kind `CITUS_REMOTE_EXEC_COMMAND_BACKEND_SLOT_RELEASE`
+  (9U, homer_control_abi.h) to role-2 through the EXISTING
+  `backendCommandPublishSlots` + `HomerDpuDmaSubmitBackendCommandPublication` machinery, sequence =
+  next command sequence, marked fire-and-forget (no completion expected → `commandInFlight` NOT set,
+  the accept path never sees it).
+- **T4 FINISH** — when role-2 in-flight drains (RELEASE landed), full
+  `TupleSinkServiceReleaseDpuArenaBinding` (unbind also clears `pollQuiesced`) + destroy the selected
+  session + service session.
+
+**Driver:** NO new collector (the S3.3 armed-but-never-named trap). The phase machine arms and pumps
+through the existing `HOMER_PROGRESS_COLLECTOR_DPU_BACKEND_COMMAND_PUBLISH`: its ready-count gains a
+"teardown pending" term and its action advances the phases.
+
+**Backend side (arena arm ONLY — legacy arms keep exiting immediately; no DPU polls their mailboxes):**
+- Command loop: a RELEASE command → release the slot (existing checked release = memset + FREE), mark
+  granted (slot index → INVALID so the exit callback no-ops), `proc_exit(0)`. No completion published,
+  no consumedEpoch writeback (nobody is listening; the slot is being wiped anyway).
+- Terminal commands (`shouldExitAfterCommand`): do NOT break-and-exit; keep consuming — the next
+  command is the RELEASE. Bounded await (~10 s, CLOCK_MONOTONIC).
+- PG_CATCH: after publishing FAILED + advancing consumedEpoch, await RELEASE (same bound) BEFORE the
+  munmaps, then release + `proc_exit(1)`. On timeout: leave the slot BOUND (loud stderr), exit WITHOUT
+  memset — a loud leak beats a racy wipe.
+- `RemoteExecBackendReleaseArenaSlotOnExit`: gate the release on the granted flag; un-granted exits
+  leave BOUND + log.
+
+**Protocol bump:** `CITUS_REMOTE_EXEC_BACKEND_PROTOCOL_VERSION` 15→16
+(remote_execution_backend_protocol.h:28) so any stale binary anywhere fails FAST at the proto check
+instead of silently never sending/understanding RELEASE. Consequences: both DPUs must resync+rebuild;
+the stale `/dev/shm/citus_homer_frontend_arena_v2` (stamped 15) must be removed at clean baseline
+(already SOP).
+
+**Residuals (documented, deliberately NOT fixed here):**
+- Backend FATALs before the command loop (bind failure etc.) and hard crashes leave the slot BOUND;
+  the agent reaper's later memset can still race a DPU that never quiesced. Real fix is D-A (S3.4).
+- A session that dies WITHOUT a terminal completion (client vanishes mid-command) has no teardown
+  trigger — existing "backend-died / give-up path" backlog item.
+- Node A's spin-forever when the peer goes silent (run 16's `pullg` 2M→22M) is untouched; separate
+  client-deadline fix is queued (pgbench `HomerRunCommandAndWait` has no deadline).
+
+**Validation gate (run 17):** two back-to-back cross-node pgbench attempts with NO restarts between.
+PASS = attempt 1 reaches the P3 gap error AND node-B DPU log shows quiesce→RELEASE→unbind with zero
+completion-control fatals AND the backend exits with the slot cycling to FREE; attempt 2 binds a slot
+again (REUSE proof — the first-ever second tenancy of an arena slot) and reaches the same P3 gap.
+`snapshot{proto=0` count must be 0 on both DPUs.
+
+### 9b. Run 17 — handshake works, two teardown-boundary defects (July 11, 2026)
+
+**Run 17a (INCONCLUSIVE, runbook bug):** my runbook said "both host services down" (§6's old rule) and
+omitted `--homer-dpu-command`; the client cannot boot without a local control shm (§4 P3.2 note — see
+the superseded-in-part banner added to §6). Runs 13–16 had passed this precondition partly by ACCIDENT
+via a stale `/citus_remote_execution_control_v27`. Corrected topology: client-side host service UP
+(control hosting only, log must stay activity-free), backend-side host service DOWN.
+
+**Run 17b (FAIL, both diagnosed same-day):** the handshake core WORKED — T1→T2→T3 in order,
+`received BACKEND_SLOT_RELEASE for arena slot 0` in postgres.log, backend exited cleanly, zero
+P1-style fatals, zero accounting underflows. Then two defects at the teardown BOUNDARY:
+
+1. **T4 killed the service via a deliberate guard.** T4 called `TupleSinkServiceResetSession` directly;
+   that function is the peer-close lifecycle's "single funnel" and `exit(1)`s
+   (tuple_sink_service_process.c ~23150) if the peer can still RDMA-write the session's registered
+   command mailbox (`TupleSinkServiceClientSqlPeerCommandMailboxMayDeregister`) — which it could, the
+   client having just written a TX_ABORT. Three independent confirmations: node-B log silence after the
+   "refusing to reset" print, node-A `CM event=DISCONNECTED` at the same sequence, postmaster
+   doorbell-down. **Fix:** T4 tears down ONLY the DPU/backend half (arena unbind + selected-session
+   reset) and RETAINS the service session, fenced, until the peer-close lifecycle ends it (bounded,
+   documented leak — see "open items" below). The service must NEVER exit(1) out of teardown; that
+   guard now stays where it belongs, in the peer-close funnel.
+2. **No post-terminal fencing, and a sequence collision.** On the FAILED completion the client's error
+   recovery sent TX_ABORT as sequence 6 while the teardown machine allocated sequence 6 for its
+   RELEASE. The RELEASE won the mailbox slot; the TX_ABORT vanished; the client burned its (new) 30 s
+   deadline, then failed CLOSE_SESSION on the busy role-1 slot. **Fixes:**
+   - Service: persistent `dpuBackendTeardownStarted` on the service session (set at T1, survives T4);
+     the peer-command landing path consumes-and-REJECTS commands for fenced sessions (advances the
+     landing frontier exactly like the normal path — otherwise the record re-lands forever — but never
+     stages, never touches selected-session state; loud stderr per reject). A post-teardown
+     CLIENT_SQL_SESSION_CLOSE is logged specially; synthesized close-acks are deliberately NOT built.
+   - Client: `HomerClientSession.sqlSessionTerminal`, latched at the completion-lease convergence point
+     when `postCommandState ∈ {DO_NOT_REUSE, FAILED}` (the socketless backend exits on any failed
+     command, so FAILED IS session-fatal by contract), and set by pgbench on a wait timeout. Terminal
+     sessions skip the session-finish TX_ABORT and the role-1 CLOSE_SESSION submit, going straight to
+     DPU setup-close (which still tears down the client's import on its local DPU).
+
+**Open item (needs owner discussion, deliberately not improvised):** node-B service-session
+END-OF-LIFE when the client cannot CLOSE through a dead backend. Current state: the fenced session +
+its registered MRs linger until service restart (each pgbench attempt uses a fresh session, so
+validation is unaffected). Options: (i) accept the leak until the S4 session-lifecycle work (current
+choice); (ii) teach node B to handle a landed CLIENT_SQL_SESSION_CLOSE post-teardown service-side —
+synthesize the close completion, mark `peerCloseCommandObserved`, and let the peer-close funnel run
+`ResetSession` legally. (ii) is the natural endgame but is new plumbing on the close path; it also
+interacts with which side allocates close completions once the backend is gone.
+
+Run 18 gate: as §9's run-17 gate, plus the farnet1 DPU service must be ALIVE after each attempt, the
+fence line must NOT fire (a firing fence means a client sender was missed), and the client must exit
+promptly with the two new "skipping" lines instead of the 30 s stall.
+
+**RUN 18 — PASS. P2 + P2.T CLOSED (July 11, 2026).** Two back-to-back cross-node pgbench attempts,
+zero restarts between them. Both attempts: full T1→T2→T3→T4 (`teardown T4 released backend; retained
+fenced service session=N`), `received BACKEND_SLOT_RELEASE for arena slot 0` exactly once per attempt
+(grep -c = 2), backend exits by itself, client hits the P3 gap then exits promptly with
+`skipping session-finish abort` + `skipping CLOSE_SESSION submit` (no 30 s stall, no busy-slot close
+failure). **Slot-REUSE gate proven:** session 2 spawn `COMPLETED`, re-bound the SAME arena slot 0 with
+no bind FATALs — the first second tenancy of an arena slot. farnet1 DPU service alive after both
+teardowns; every fail-trigger grep 0, including the fence (`rejected peer command after DPU backend
+teardown` = 0 — the client fix held, the fence remains pure insurance). Anti-fallback guard held: the
+farnet0 host service log stayed startup-only for the whole run. Artifacts: scratchpad `run18/`.
+
+Deferred by explicit choice: `HOMER_DPU_P2_DIAG` scaffolding STAYS through P3 — it instruments exactly
+the command/completion chain P3's result path rides, and this arc exists because success-edge
+visibility was missing; strip it at P3 close instead. The fenced-session bounded leak stands as the
+S4-scoped open item (§9b).
