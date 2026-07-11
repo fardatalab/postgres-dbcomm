@@ -687,6 +687,37 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   > when `publishedEpoch >= lastConsumed+1`, ACK by advancing the local epoch (no mailbox writeback — role
   > 6 has no consumed word; synchronous `-M simple` serialization avoids single-slot overwrite, so no
   > flow-control line needed for the checkpoint).
+  >
+  > **⏱ FULL-P2 VALIDATION (run 12, July 11, 2026, citus `4216b1cb8`) — FAIL, STOPPED for discussion.**
+  > The client fix WORKED partially: `invalid arguments while peeking Homer completion` is GONE (the client
+  > now polls role 6). But the completion still never flows, and this rules out my run-11 teardown theory:
+  > with the client staying ALIVE (busy-spinning in the wait loop, 98% CPU, 47 s+), node B's log STILL ends
+  > at `landed peer command session=1 sequence=1` — no egress, no "missing descriptor" (0 on BOTH nodes),
+  > no fatal (0 on both). role 6 is never written, so the client polls forever.
+  >
+  > **TWO bugs, both need attention:**
+  > 1. **P2 completion never egresses (primary).** Static inspection is EXHAUSTED and contradictory: the
+  >    pull-arming is unchanged (`HomerServiceDpuSelectedBackendCompletionWaitCount` counts `commandInFlight
+  >    && completionEventCount==0`, armed at `:41846`); landing sets `commandInFlight=true` (`:40831`);
+  >    accept→enqueue is unchanged from run 10 (where a completion WAS enqueued — it spun the local push on
+  >    "missing descriptor" 8.75M×); and the fork's peer path (`IsPeerDestined = clientSqlPeerReceiver &&
+  >    dpuPeerCommandLandingActive`, both sticky-true on node B) + the EOS-prefix count return ready for a
+  >    warmup completion (terminal, no TUPLE_SINK_EOS ⇒ `EosPosted`=true). Yet a queued completion is in
+  >    NEITHER the peer ready-count (→ egress) NOR the local ready-count (→ "missing descriptor"). Since
+  >    those two are exhaustive over `IsPeerDestined`, a queued completion MUST land in one — so either it
+  >    is not enqueued (pull/accept silently not happening — the production build logs neither), or a count
+  >    has a runtime bug static reading misses, or the collector arms but never gets granted (source/
+  >    scheduling). REQUIRES a diagnostic build: log pull/accept/enqueue, `completionEventCount`,
+  >    `IsPeerDestined`, and both ready-counts per pass on node B. Candidate: a small compile-gated block in
+  >    `HomerServiceAppendDpuDmaCollectorCandidates` + the accept path, or `-DHOMER_SERVICE_PROGRESS_STATS=1`.
+  > 2. **Client selected-DPU wait timeout never fires (secondary).** `HomerClientWaitCommandCompletion`'s
+  >    `HomerClientMonotonicMillis() >= selectedDpuDeadline` (10 s) did not trigger at 47 s — a real bug in
+  >    that comparison/reset (so a hung client spins forever instead of erroring cleanly). Fix regardless.
+  >
+  > Cheapest thing to check FIRST: whether the backend even PUBLISHES a terminal completion to role 3 for
+  > `client_sql_session_warmup_begin` (the `remote exec backend` was 100% CPU in run 11 — it could be stuck
+  > pre-publish, so the pull waits on a completion that is never produced; that would explain "in neither
+  > count" trivially — nothing is enqueued). If it does publish, instrument the enqueue→classify→count chain.
 
 **Phase P3 — results + client + gate.**
 - P3.1 Results — **REAL WORK ITEM** (corrected July 10, 2026; was "little/no new code" until the §2
