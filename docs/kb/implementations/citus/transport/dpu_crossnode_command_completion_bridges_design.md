@@ -634,3 +634,30 @@ ABSENCE of `DPU backend spawn begin/COMPLETED` on the farnet1 DPU. The DPU-relay
 (`HOMER_SERVICE_PEER_BIND_HOST=10.10.1.201/10.10.1.200`, `HOMER_SERVICE_PEER_PORT=9717`) on top of the
 DMA env. For cross-node validations of THIS design, also leave the two HOST services DOWN so a silent
 host-relay fallback fails loudly instead of masquerading as a pass.
+
+## 7. P1 blocker investigation — Codex second opinion + arena poke probe (July 10, 2026)
+
+**Codex verdicts (file:line-proven):** Theory A (interior-address translation bug) REFUTED — Homer passes
+full exporter VAs straight to `doca_buf_inventory_buf_get_by_addr` (`homer_service_dpu_dma.c:11067`,
+role-2 write `:10898`, spawn `:10136`, grouped `:10277`); the TCP smoke ALREADY exercises
+interior-addressed role-2/3 DMA (`homer_dpu_tcp_transport_smoke.c:735/:758/:1537`). Corollary: rebasing
+roles 2/3 to arena-base = numerically identical address = NOT a fix. Theory B's wrong-mmap-selection
+REFUTED — export→mmap wiring validated at three layers (`homer_dpu_comch_abi.h:664/:694`,
+`homer_service_dpu_setup_tcp.c:885`, `homer_service_dpu_dma.c:6911/:6997/:7036`, lookup by ids `:8327`).
+Local completion-buffer aliasing also checked (by hand): pool sizing deliberately shares
+`commandPullBufferCount`; submit and acceptance use the same slot-carried index; DMA completed → a
+successful 24-B copy delivering zeros means the SOURCE reads zero in the DPU's view. Remaining suspect:
+the 57-MiB arena mmap itself (size and/or two-export combination — no smoke covers real two-export DMA
+or a large region; the only two-export check is parse-only `homer_dpu_comch_abi_check.c:111/:220`).
+
+**Probe (zero Homer code changes):** a standalone host tool mmaps the LIVE arena shm, reads
+`hostPublishOffset` + `bridgeGeneration` from the in-region advisory header, and hand-crafts a VALID
+publish line into `hostPublishLines[2]` (ring 2 = slot 0's role-5 ring, grouped-control-ENROLLED since
+S4.0b): body fields matching every acceptance check (identity vs descriptor, ACTIVE, flags subset,
+monotonic), epoch release-stored LAST. Detector already exists in the DPU service: the S4.0b sink gate
+prints "role-5 publication discovered before sink bind" on exactly this event.
+- Line appears → arena interior reads WORK through this mmap → fault is specific to the
+  completion-control task path → hunt there.
+- Nothing appears (or identity/frontier errors) → arena reads broadly broken → registration/size issue →
+  adopt the separate-small-exports workaround (Tier-2-proven shape) to unblock P1; file the large-mmap
+  + smoke-gap investigation separately.
