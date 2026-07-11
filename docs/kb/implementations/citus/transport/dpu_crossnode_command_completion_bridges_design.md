@@ -687,3 +687,20 @@ Tier-2 ran green with few in-flight tasks (indices in lockstep); S4.0b's enrolme
 adds 16 grouped tasks per sweep, desynchronizing slot/buffer counters exactly when the symptom appeared
 (the round-1 zeros were REAL — headers were genuinely unstamped pre-`ce31e63a1`; rounds 2/4 zeros are the
 aliasing). Audit in flight: the async completion-control path's buffer lifecycle end-to-end.
+
+**AUDIT (Codex, round 2): completion-path Homer bookkeeping CLEAN end-to-end** — index consistency
+(submit :2332/:2350 → builder :11241/:11261, owner stores same index :11344, dst acquired against
+localBackendCompletionMmap :11369), acceptance-BEFORE-release ordering (retire path :9890-:9904, buf
+refs freed only at :10105), pools separately allocated (:12391-:12448). TWO takeaways:
+(1) 🐛 REAL SEPARATE BUG filed: grouped-control derives its buffer as taskSlotIndex %
+groupedControlBufferCount (:10547, init :12550) while 3,072 task slots exist (:12311) vs 1,024 buffers
+(:1002) — live slots i / i+1024 / i+2048 collide. Fix with a groupedControlBufferInUse[] free list +
+owner-carried index (the backend-completion model). Concurrency-sensitive corruption; NOT the cause of
+the completion zeros (distinct allocations).
+(2) LAST UNTESTED VARIABLE found by cross-referencing: every WORKING read (grouped sweeps + the
+cross-probe, which borrows a grouped buffer) uses the GROUPED local mmap as DMA destination; the failing
+path is the ONLY user of localBackendCompletionMmap. Probe extension in flight: same source, dst = a
+completion-pool buffer via the exact same mmap/inventory/address math. Zeros → completion pool's local
+mmap/registration is the culprit; proto=15 → DOCA inventory recycling confirmed, adopt the
+persistent-per-buffer doca_buf fix (create once from localBackendCompletionMmap per staging buffer,
+retain for engine lifetime, keep the inUse free list).
