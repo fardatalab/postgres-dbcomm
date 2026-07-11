@@ -468,6 +468,20 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   > (D) the START request carries no client sequence — authority is node-A-service-assigned,
   > documented at the fork.
   >
+  > **⏱ P1 CHECKPOINT RUN (July 10, 2026, citus `1ec4a2db1` + slice): the bridge WORKS end-to-end —
+  > p1 PASS (farnet0 DPU: "routed selected-DPU command to peer egress session=1 sequence=1" +
+  > "posted peer command ... remote_epoch=1", targeting 10.10.1.201), p2 PASS (farnet1 DPU:
+  > "landed peer command session=1 sequence=1" with code-confirmed publish-slot staging), p4 PASS
+  > (client past the old warmup boundary; now fails at completion PEEK — the expected P2/P3 edge).
+  > ONE REGRESSION (p3 FAIL): the first-ever arena role-3 completion pull hit "backend completion
+  > control snapshot protocol mismatch" → sticky engine fatalError. Diagnosis: the arena slot's
+  > completionMailbox CONTROL HEADER is never initialized (agent slot init sets only
+  > resultRingControl; Tier-2 lifecycle mailboxes got headers from their creator; the arena
+  > completion mailbox was never pull-read before P1) — an S3.2c-era latent gap. Fix in flight:
+  > initialize arena mailbox headers at slot init + recycle, replicating the legacy creator
+  > field-for-field. NOTE ALSO: p3's error firing does NOT prove the backend executed BEGIN (the
+  > control-header read fails regardless); backend execution proof moves to the re-run.**
+  >
   > **Checkpoint sequencing correction:** the checkpoint cannot run as phased — NO driver can submit a
   > cross-node START until S4.2's submission half exists (the client dies at warmup before writing
   > role 1; the SQL-UDF driver is single-node → local fork arm only). Resolution: pull the MINIMAL
