@@ -482,6 +482,19 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   > field-for-field. NOTE ALSO: p3's error firing does NOT prove the backend executed BEGIN (the
   > control-header read fails regardless); backend execution proof moves to the re-run.**
   >
+  > **⚠ RE-RUN (citus `ce31e63a1`): the header-init fix did NOT resolve it** — same mismatch with a
+  > VERIFIED-fresh arena (removed from /dev/shm, recreation logged) and VERIFIED-fresh citus.so
+  > (maps inode + md5). r2/r4/r5 unchanged-good. Layouts confirmed identical
+  > (`CitusRemoteExecLocalCompletionMailbox` header == `HomerDpuDmaBackendCompletionControlSnapshot`,
+  > both {u32 proto, u32 reserved, u64 published, u64 consumed}); control-read source =
+  > `hostRingAddress + hostControlOffset` = the mailbox header; validator is a plain proto==15 check.
+  > (The validator's `slot=16` lead is a red herring — AGENTS.md's stale-service example
+  > `handle=2 slot=17 session=2` implies slot=16 is the normal FIRST-spawn value.) Next: diagnostic
+  > `f5ad8a39a` dumps ring identity + raw snapshot words at the failure; a focused farnet1-DPU-only
+  > redeploy run is collecting the evidence. Candidate space now: wrong-ring read via the D6 scan,
+  > a torn/short DMA read, a ref/generation mismatch steering the read, or the snapshot buffer not
+  > being the task's actual destination.
+  >
   > **Checkpoint sequencing correction:** the checkpoint cannot run as phased — NO driver can submit a
   > cross-node START until S4.2's submission half exists (the client dies at warmup before writing
   > role 1; the SQL-UDF driver is single-node → local fork arm only). Resolution: pull the MINIMAL
