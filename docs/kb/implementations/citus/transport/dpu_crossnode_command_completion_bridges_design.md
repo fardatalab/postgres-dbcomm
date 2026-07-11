@@ -704,3 +704,16 @@ completion-pool buffer via the exact same mmap/inventory/address math. Zeros →
 mmap/registration is the culprit; proto=15 → DOCA inventory recycling confirmed, adopt the
 persistent-per-buffer doca_buf fix (create once from localBackendCompletionMmap per staging buffer,
 retain for engine lifetime, keep the inUse free list).
+
+**FIXES LANDED — citus `a1f0d016c` (July 10, 2026).** Fix 1: persistent dst doca_bufs + explicit
+zero-length `set_data` cursor reset before every completion CONTROL_READ submission (mechanism — DOCA
+inventory recycling returning bufs with unreset append cursors — identified by the project owner;
+SLOT_READ/CONSUMED_EPOCH follow after hardware validation, then the other five builders). Fix 2:
+grouped-control free-list ownership replaces the modulo (which also fixed the SECOND latent grouped bug:
+the late snapshot re-read via `lastControlBufferIndex` was itself alias-corruptible;
+`CopyGroupedControlSnapshot` now returns the ring-owned `acceptedHostPublishLine`;
+`lastControlBufferIndex` removed; exhaustion = loud deferred tripwire, unreachable by ~2 orders under
+the per-ring in-flight rule + async windows). P1 checkpoint re-run in flight; pass = the benign
+`missing frontend completion event descriptor` for session 1 (backend-executed proof, P2 seam). After
+P1 closes: remove the crossprobe scaffolding, extend cursor hygiene to remaining builders (queued with
+fix B before any S6 number).
