@@ -734,3 +734,31 @@ on the COMPLETION-class context and one 24-B read — three discriminators in on
 the failing task itself: print doca_buf_get_data()/data_len of src+dst immediately before submit and
 after completion, plus a host-side hexdump of the mailbox header AFTER the failure. STOPPED for
 discussion per the multi-shot rule.
+
+**RUN-8 PREP (citus `4cf2505a2`, July 10, 2026): DMA-CONTEXT THEORY KILLED at the desk — user approved
+the probe round, and re-reading run 6's probe source (`git show d1cfa413b`) eliminated remaining delta
+(1) without a run: `HomerDpuDmaArenaCrossprobeRead64` selected its context via
+`ClassIndexForWorkload(descriptors[ringIndex].workloadClass)`, and ring 1's arena descriptor class is
+COMPLETION (enforced at homer_service_dpu_dma.c:2300), so run 6's proto=15 read at the failing address
+ALREADY rode `dmaContexts[COMPLETION]`. Submit flavor is likewise non-discriminating (the working
+grouped sweep :10717 uses the same `doca_task_submit_ex(FLUSH)` as the failing :2378). Also nailed:
+arena role-3 `hostControlOffset = 0` (homer_frontend_agent.c:771), so the failing address IS
+`hostRingAddress` and the old 4th probe read was already aimed at it. SURVIVING per-read deltas: (a)
+copy size 24 vs 64, (b) dst pool/mmap — the failing path is the only user of
+`localBackendCompletionMmap`. Committed ladder (one flip per rung, all at the failing address, all
+gated by `HOMER_DPU_ARENA_CROSSPROBE`): `ctl-64-grouped` (run-6 re-baseline) / `ctl-24-grouped` (size
+flip) / `ctl-64-pool` (dst flip) / `ctl-24-pool` (both) / `ctl-24-pool-persist` (bit-exact live
+replica: real Fix-1 persistent dst buf + set_data(addr,0) cursor pin + submit_ex FLUSH; caveat: rung 5
+vs 4 flips buf-object AND submit flavor together — a follow-up single run splits that cell if needed).
+Option-B instrumentation ships in the SAME build: `[ctl-read-diag] pre-submit` prints live src/dst
+doca_buf data ptr+len in `HomerDpuDmaSubmitOneBackendCompletionTask` (expect src{data=addr len=24},
+dst{data=&control len=0}; any drift = cursor bug caught red-handed) and a post-completion dst-buf
+state line in the acceptance fail dump (len=24 at &control while the snapshot reads zero = DOCA claims
+it wrote exactly where we read nothing). Host-side leg: after the failure, `od` the arena mailbox
+header at offset = (ctl-* host VA − arena-base host VA), both printed by the ladder; proto=15 there
+completes the contradiction. DECISION TABLE: zeros first at `ctl-24-*` → 24-byte-copy quirk
+(workaround: widen control reads to 64); zeros first at `ctl-*-pool` → completion-pool
+mmap/registration defect; all rungs proto=15 while the live task still fails → per-read properties
+fully innocent, engine state at live-submission time is the axis (pre/post ctl-read-diag lines become
+the primary evidence). Ungated builds verified bit-identical (strings count 0). Deploy: gated build on
+farnet1 DPU only; farnet0 DPU + hosts unchanged from run 7.
