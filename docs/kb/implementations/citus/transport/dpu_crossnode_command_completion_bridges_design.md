@@ -458,6 +458,27 @@ cross-node farnet0(client)→farnet1(backend) topology through both DPUs.
   arena backend consumes and RUNS it (observable: backend's consumedEpoch advances / command executes).
   Completion/result not yet returned (P2/P3).
 
+  > **⏺ P1 IMPLEMENTED (citus `df2f81979`, July 10, 2026)** — codex-worker build, reviewed with four
+  > findings fixed: (A) the CLIENT_COMMAND doorbell immediate is opt-in and OFF for both send-core
+  > callers (unconditional WIMM would have changed the validated legacy pump's recv-WQE accounting for
+  > zero benefit — both receivers are poll-armed); (B) dead-session egress entries are dropped, not
+  > retried forever; (C) verified with evidence that DPU-opened sessions DO allocate the command
+  > mailbox + scratch registration the egress stages through (session create ensures mailboxes
+  > `:23156`, assignment `:19370`, scratch registration `:36384`, all before remote-sender marking);
+  > (D) the START request carries no client sequence — authority is node-A-service-assigned,
+  > documented at the fork.
+  >
+  > **Checkpoint sequencing correction:** the checkpoint cannot run as phased — NO driver can submit a
+  > cross-node START until S4.2's submission half exists (the client dies at warmup before writing
+  > role 1; the SQL-UDF driver is single-node → local fork arm only). Resolution: pull the MINIMAL
+  > S4.2 slice forward into P1 validation — client submits START through the same DPU control slot it
+  > already uses for OPEN; the completion WAIT stays unimplemented (client timeout after submission is
+  > the expected P1 boundary). Design nuance to settle while building the slice: what the LOCAL path's
+  > control-slot START response actually asserts (`:40163` region) — if it is merely "accepted/queued,
+  > sequence=N" (not STARTED), the remote fork SHOULD manufacture the same accepted-response so the
+  > client unblocks and learns the node-A-assigned sequence (resolving finding D's client-side half);
+  > the role-6 STARTED/terminal completion remains strictly P2.
+
 **Phase P2 — completion bridge (node-B role-3 → node-A role-6).**
 - P2.1 ~~Add~~ **The completion landing ring likewise already exists** (same July-10 re-grounding as P1):
   the OPEN request already carries node A's completion-mailbox descriptor + doorbell token
