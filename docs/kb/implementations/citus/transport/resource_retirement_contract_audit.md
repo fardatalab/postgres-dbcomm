@@ -1183,7 +1183,7 @@ owners, explicitly recording what it discarded** (`:4278`, `:4290`).
 | **P0-b** | ready | self-contained |
 | **P0-c** | ready | needs the transport-helper API change (return the slot indices) + WOULD_BLOCK backpressure |
 | **P0-d** | ✅ **LANDED + VALIDATED** (citus `9a6f68257`) | §15. NOT what §8 thought: two premises were refuted, and the real hole was the `ResetSession` FUNNEL releasing with no drain (reachable from shutdown). Fixed by enforcing the drain IN the funnel — every path correct by construction. |
-| **P0-e** | **DECIDED — Option A** (§12) | quarantine until postmaster restart. No protocol. |
+| **P0-e** | ⛔ **DROPPED** (§19) | the bug was REFUTED (the role-3 header is self-describing: it carries `consumedEpoch` too, so a cleanly-torn-down slot reads CREDITED, not stale) **and** the design was unbuildable (the DPU cannot address role-5 control; the backend legitimately owns it). Crash paths dropped by owner decision (§18). **What survives: §19.3's premature-re-nomination race (real, unlikely, loud — recorded not fixed) and §19.4's optional header-only-memset perf item.** |
 | **P0-f** | ✅ **LANDED + VALIDATED** (citus `64050e0dd`) | the certifier's `bool` could not express NOT_FOUND. §14. Was load-bearing for P0-d/P0-e; both are now unblocked. |
 | **P1-f** | ready, **FREE** | **TWO invariants, not one** (§11.1) — one per resource, each with its own proof |
 | **P7b.1/.2/.3** | **BLOCKED on P0** | and P7b.1 must NOT use `ResetPeerConnection` as its release mechanism — that is CANCELLATION (§9.4) |
@@ -2263,3 +2263,90 @@ I was reading.* **Trace to the CONSUMER before you claim a producer's mistake re
 by construction, still deletes the 13.7 MB session-close `memset`, and the universal `tenancyBaselinePending`
 gate is still what closes the window. **It changes the JUSTIFICATION (liveness, not integrity) and the
 ACCEPTANCE CRITERIA (a concurrent run must not produce that error).**
+
+---
+
+## 19. ⛔ P0-e′ IS DROPPED. The bug was REFUTED and the design was broken. What survives is better.
+
+### 19.1 The bug does not exist — and my error is precise
+
+**REFUTED (L7, the load-bearing link):** the role-3 control read takes **BOTH `publishedEpoch` AND
+`consumedEpoch`** from the host header in ONE snapshot (`homer_service_dpu_dma.c:12325-12344`), and the polling
+loop computes `nextCompletionEpoch = consumedEpoch + 1`; if `publishedEpoch < nextCompletionEpoch` it
+**discards the snapshot with no slot read** (`:1697-1712`). And **every accepted completion publishes
+`consumedEpoch` back** (`tuple_sink_service_process.c:42831-42845`), a role-3-counted write that **P0-d's drain
+now guarantees retired before unbind**.
+
+> **A cleanly-torn-down slot's header therefore reads `publishedEpoch == consumedEpoch` — CREDITED, not
+> "stale with 39 unread completions". A fresh control read sees nothing to pull. THE BUG IS NOT REAL.**
+
+**MY ERROR, EXACTLY: I compared a HOST field against a DPU field.** I assumed the DPU checks the host's
+`publishedEpoch` against its own freshly-reset `ringRuntime->acceptedPublishedEpoch`. It does not — it checks
+the host's `publishedEpoch` against the **host's own `consumedEpoch`**, both from the same snapshot.
+**The header is SELF-DESCRIBING.** I invented a cross-reset comparison the code never makes.
+
+**L6 also refuted:** binding makes role-3 *eligible* in the engine but does not *schedule* it. The collector
+takes demand only from a selected session with `commandInFlight` (`tuple_sink_service_process.c:41765-41793`,
+`:44099-44136`). A freshly-bound, still-spawning session has none.
+
+### 19.2 The design was broken independently (so it would have failed even if the bug were real)
+
+- **The DPU CANNOT ADDRESS role-5's `resultRingControl`.** The role-5 descriptor is rebased to
+  `HomerFrontendArenaExport`: its `hostControlOffset` addresses the **publish line**, and its `hostRingOffset`
+  points at **`resultRingStorage`** (`homer_frontend_agent.c:949-992`). The control struct has **no descriptor
+  address at all**. The DPU could only reconstruct it by implicit layout arithmetic — **ABI-dishonest**.
+- **The backend still WRITES role-5 control**, at startup (`remote_execution_backend_bridge.c:3027-3033` →
+  `RemoteExecResetResultQueueControl`, `:633-641`) **and again on tuple-shape changes** (`:1110-1129`). The
+  latter is **semantic**, not initialization. **The DPU could never have been the sole owner.**
+- My field list was incomplete: role-5 control also needs `flags = CITUS_HOMER_PAYLOAD_BYTE_RING_FLAG_PRODUCER_OWNED`.
+
+### 19.3 ⚠ THE REAL RACE — and it is the SOURCE-vs-TARGET rule (§0.3) at a new layer
+
+**VERIFIED:** T4 unbinds the DPU-side rings once the RELEASE **WRITE RETIRES**
+(`tuple_sink_service_process.c:43818-43842`) — **not** once the backend has **CONSUMED** it.
+`HomerDpuDmaBindRingSession` then selects a slot purely from DPU ring state and **never reads the host
+`slot->state`** (`homer_service_dpu_dma.c:5947-6080`).
+
+> **So the DPU can RE-NOMINATE a slot before the old backend has published host `FREE`. The newly spawned
+> backend's `FREE → BOUND` CAS then FAILS and it FATALs** (`homer_frontend_agent.c:552-557`,
+> *"arena slot %u is already bound"*).
+
+**This is §0.3's SOURCE-vs-TARGET distinction, exactly:** *"my CQE retired" proves the bytes LANDED — it does
+NOT prove the peer ACTED on them.* The DPU released the slot on the strength of **its own** retirement, when
+what it needed was the **backend's acknowledgement**. **The contract caught it; my bug hunt did not.**
+
+**Reachability: REAL but UNLIKELY.** The new backend must be forked *and started* before the old one drains its
+mailbox — fork + backend startup is **milliseconds**, the old backend's poll loop is **microseconds**. The old
+backend wins almost always. **And it fails LOUDLY** (`FATAL`, named slot), never silently.
+
+**NOT FIXED, recorded.** The cheap fix, if it ever fires: the DPU must not nominate a slot until it has the
+backend's host-`FREE` acknowledgement (a `slot->state` DMA read on the cold spawn path, or T4 deferring unbind).
+**A ~400-byte re-init does not close it** — the missing fact is *"the backend consumed RELEASE and published
+FREE"*, not *"my DMA writes retired"*.
+
+### 19.4 What actually survives: C1, and a cheap perf option
+
+**C1 is the one durable finding** (§17.1, confirmed on four independent readers): the 13.7 MB of slot **bodies**
+are **provably unreachable** — the command mailbox is epoch-indexed, the result ring frontier-based.
+
+That licenses a **tiny, safe, architecture-free change** if we ever want it:
+**`HomerFrontendAgentInitArenaSlot` need only re-init the ~200 B of ABI headers, not `memset` 13.7 MB of
+bodies.** The host keeps ownership; no ABI change; no DPU involvement.
+
+**Payoff, honestly stated:** ~1–3 ms off each **session close**. That is **NOT the hot path** — for `-t 2000`
+it is 1–3 ms out of ~6.3 s. It only matters for **session-churn** workloads. **Logged as an optional perf item;
+not doing it now.**
+
+### 19.5 Rules earned — the expensive ones
+
+- **Trace to the CONSUMER before you claim a producer's mistake reaches anyone.** (I caught this myself on the
+  first pass — see §18.5 — and it *still* was not enough, because the real refutation was one layer further
+  down.)
+- **When a struct carries both a producer and a consumer frontier, IT IS SELF-DESCRIBING.** Do not reason about
+  it by comparing one of its fields to a variable you happen to be holding. **Read what the code compares.**
+- **A design can be dead twice.** Even had the bug been real, P0-e′ could not have been built: the DPU cannot
+  address role-5 control, and the backend legitimately owns it. **Check that the fix is IMPLEMENTABLE before
+  arguing about whether it is NEEDED.**
+- **Six refuted inferences in one subsystem is not bad luck — it is a signal about the method.** Every single
+  one was a forward chain from a mechanism I had just read, with no check of who was reading downstream. The
+  adversarial pass is not a formality here; it is the only thing that has been reliably right.
