@@ -1136,3 +1136,144 @@ gives P1-f's proof for free). **P7b.1/2/3 land only after P0.**
 > **A quiesce that does not stop EVERY producer is not a quiesce. A drain that does not count EVERY consumer is
 > not a drain. And if you are writing code to handle a stale reference, you have found a missing phase 2 or 3 —
 > go fix that instead.**
+
+---
+
+## 10. SECOND REVIEW — SETTLED, with four corrections (and one of them is mine, badly)
+
+### 10.1 ⚠ P0-d: I BUILT §8 ON A STALE COMMENT. The fix is MOSTLY ALREADY IMPLEMENTED.
+
+**VERIFIED against the code, not the comment:**
+- grouped-control discovery **DOES honour `ringRuntime->pollQuiesced`** (`homer_service_dpu_dma.c:1408`);
+- grouped-control submission **DOES count into the ring** via `HomerDpuDmaRingTaskSubmitted(import, ringIndex)`
+  (`:11462`, with its own comment: *"Grouped discovery may address an enrolled arena role-5 result ring"*);
+- T1 sets `pollQuiesced` (`:6188`); T2 sums `inFlightTaskCount` across all three arena rings (`:6246`);
+- every other arena-ring task builder also calls the same per-ring accounting (`:12071`, `:12291`, `:12582`).
+
+**THE COMMENT AT `:4533` IS STALE.** It asserts *"those reads are not counted against the ring"* — which **was**
+true and **has since been fixed**. **I built §8's entire root cause on it.**
+
+**In a document whose central thesis is that this codebase's comments lie, I trusted a comment over the code.**
+The comment even ends *"Do not restore that reasoning"* — and I restored a *conclusion drawn from* it. This is
+the §29.1 decoy-guard failure in a new costume, and it cost a whole section.
+**ACTION: fix that comment as part of P0-d — it is actively misleading and it has now claimed a victim.**
+
+**WHAT ACTUALLY REMAINS FOR P0-d (small):**
+1. **The forced-teardown deadline still bypasses the drain** (`tuple_sink_service_process.c:43569`). That part of
+   §8 stands: **the deadline may abandon the BACKEND HANDSHAKE; it may NEVER abandon the DMA DRAIN.**
+2. `tenancyGeneration` can then become a **LOUD ASSERTION**.
+3. **Open (inferred-safe, verify):** a spawn / arena-publish-line-clear task family is tracked by **spawn
+   runtime**, not ring `inFlightTaskCount` (`:6814`). Grouped discovery refuses to read while
+   `tenancyBaselinePending` is set (`:11328`, `:10459`), so admission ordering *appears* to prevent it being
+   outstanding at T1. **Verify rather than assume.**
+4. **Note the role-2 command ring is DELIBERATELY not quiesced at T1** — teardown publishes the RELEASE command
+   *through* it. The service drains once before RELEASE and re-checks after (`:43638`, `:43689`). **This is
+   correct; do not "fix" it.**
+
+### 10.2 ⚠ THE ALARM RULE IS TOO BROAD AS I STATED IT — narrow it
+
+My claim that the alarm "finds exactly our list and nothing else" is **FALSE**. There are legitimate
+generation/epoch/stale checks that are **NOT** missing drains, and my rule would have wrongly condemned them:
+
+| legitimate check | why it is NOT a missing drain |
+|---|---|
+| **Scheduler action snapshots** (`remote_execution_peer_transport_rdma.c:497`, `tuple_sink_service_process.c:46945`) | a PLAN can go stale between planning and execution. Optimistic scheduler validation, not an unretired WR. |
+| **Connection generation after cancellation** (`:1060`, `:2276`) | after Scenario-E cancellation, external handles legitimately outlive the destroyed connection. **Needed even with perfect clean drains.** |
+| **DPU bridge/process restart identity** (`tuple_sink_service_process.c:43451`) | a restarted agent is not a clean tenant release; phases 2-3 cannot make this impossible. |
+| **Task-slot callback integrity** (`homer_service_dpu_dma.c:14500`) | an internal ownership ASSERTION against double-callback/corruption. |
+| **Protocol epochs / duplicate detection** (`:42748`) | idempotency against protocol re-observation, not physical retirement. |
+
+**CORRECTED RULE — narrow, and now true:**
+
+> **The alarm applies when a staleness check protects a RELEASED PHYSICAL RESOURCE from an OUTSTANDING PHYSICAL
+> OPERATION.** *That* is always a missing phase 2 or 3.
+> It does **NOT** apply to plan staleness, restart identity, idempotency/duplicate detection, or
+> post-cancellation handle validation. Those are legitimate and must be kept.
+
+### 10.3 ✅ P1-f IS SETTLED — AND IT IS FREE. No new message.
+
+**VERIFIED:**
+- every cross-node client completion is published by `TupleSinkServicePublishPeerClientCommandCompletion`
+  (`:18684`), and **all** descriptor/body/WIMM writes go through `sessionState->clientSqlPeerConnectionHandle`
+  + `clientSqlPeerCompletionMailboxDescriptor` (`:18744`, `:19011`, `:19036`) — **one QP**;
+- the **backend-FAILURE cleanup path SYNTHESIZES a `CLIENT_SQL_SESSION_CLOSE` completion** through that same
+  publisher (`:24052`, `:24150`) — **so even the failure path produces the terminal completion**;
+- completion publication is held until earlier tuple-result EOS source WRs have retired (`:18603`);
+- session close is **rejected while another command/completion publication is in flight** (`:39518`).
+
+**THE CERTIFIER IS THE TERMINAL `CLIENT_SQL_SESSION_CLOSE` COMPLETION.** When node A observes that WIMM, RC
+in-order delivery **on that same QP** proves every earlier completion-mailbox write has arrived, and it is the
+"no future completion writes" boundary.
+
+**And it confirms the SOURCE-vs-TARGET distinction (§9.2):** node A does **not** need the sender's CQE.
+**Delivery proves arrival** — that is the right proof for a **TARGET** MR. The sender's local CQE is **P0-a's
+source-buffer obligation**, a different thing entirely.
+
+**P1-f is therefore: write the invariant down + ASSERT that no publication is permitted after the terminal
+close completion.** Zero protocol change, zero round-trips. **`CLOSE_SINK` was the wrong message; this is the
+right one.**
+
+### 10.4 P0-a — the abort-without-close path is still not convergent. FIX IT GENERICALLY.
+
+Force-signalling the `CLIENT_SQL_SESSION_CLOSE` completion converges the clean path (and, per §10.3, the
+backend-failure path synthesizes one). **But a teardown that goes straight to reset without a close completion
+still leaves unsignaled owners with no guaranteed checkpoint.**
+
+**CORRECTED FIX — do not key convergence on a close completion existing.** Phase 3 is *"finish AND drain"*, so:
+
+> **At QUIESCE, if any unsignaled owner is outstanding on the lane, POST A SIGNALED FENCE.**
+
+The lane FIFO retires cumulatively through a later signaled checkpoint (`:5934`), so **one** signaled WR flushes
+everything before it. This converges on **every** path, not just those that happen to emit a close. Keying the
+signal on `CLIENT_SQL_SESSION_CLOSE` remains a good *optimization* (it usually IS the last publish), but the
+**fence is the correctness mechanism**.
+
+**Still routes to Scenario E (correct):** a **partial post** leaves the source `FAILED_OR_INFLIGHT` (`:19043`)
+and **no CQE can identify it** — it is owned until the QP cutoff. It **cannot** be part of an ordinary
+live-QP drain.
+**Not a problem (verified):** a close checkpoint also retires *other sessions'* older unsignaled owners on the
+shared lane. That is correct RC-lane ordering, not a wedge.
+
+### 10.5 P0-c — my drain is at the WRONG LAYER (it would not even work)
+
+Convergence is fine: every current staging-pool WR **is** covered by an already-signaled checkpoint (`:9828`,
+`:10054`; both production receiver-head publishers pass `signaled=true`, `:32802`, `:35370`). **So the pool can
+never fill with an unsignaled prefix awaiting a fence we are refusing to post.** My deadlock worry was unfounded.
+
+**But "the reservation drains the send CQ and retries" CANNOT be implemented where reservation happens.**
+Reservation is inside the **transport** helpers (`:9782`, `:10055`), and **payload CQEs require a SERVICE-owned
+callback** — the transport drain **rejects** a payload CQE when no callback is supplied (`:3730`). Owner
+retirement updates service stream state, mirror/source ranges and credit owners (`:16579`, `:32550`), which the
+transport allocator **cannot** do.
+
+**CORRECTED FIX: reservation must report BACKPRESSURE, not poll.** Return `WOULD_BLOCK` (the existing
+`HomerPeerPostResult` idiom, `:10080`) and let the **service** layer — which owns the callbacks — drain and
+retry. **Copying the response-slot allocator pattern was wrong-layered**; that pool's CQEs are transport-owned,
+these are not.
+
+### 10.6 SCENARIO E IS NOT THE ONLY NON-DRAINING OUTCOME — classify before you cancel
+
+Bounded non-convergence must be **CLASSIFIED**, not blanket-cancelled:
+
+| cannot drain | correct handling |
+|---|---|
+| accepted **partial post**, no signaled checkpoint (`:19043`) | owned until **QP cutoff** -> E |
+| **peer/QP failure** (failed send CQE, `:4044`) | reset **cancels and reconciles** -> E |
+| **remote semantic non-progress** — sender close waits on `senderVisibleRemoteConsumedHead >= finalTail` (`:27086`); a **live but stuck** peer blocks it | bounded wait -> classify as **peer failure** -> E |
+| **peer dies before certifying** a target MR | connection cutoff -> E |
+| **DOCA engine failure/hang** | **FATAL** (this is the engine-broken boundary) |
+| **persistent notification RECV WQEs** (`:5000`) | **NEVER include in a tenant "zero outstanding" predicate** — they are connection-lifetime by design |
+
+### 10.7 Rules earned
+
+- **A stale comment is a decoy that outlives its author.** `:4533` asserted a fact that had since been FIXED,
+  and I built a whole section on it — in the very document arguing that this codebase's comments cannot be
+  trusted. **Verify a comment's claim against the code EVERY time, especially when it is the load-bearing
+  premise of your fix.** And **fix the comment when you catch it**, or it will claim another victim.
+- **A rule that condemns everything explains nothing.** My alarm was too broad; narrowing it to *"a stale check
+  guarding a RELEASED PHYSICAL RESOURCE against an OUTSTANDING PHYSICAL OPERATION"* makes it true AND keeps it
+  sharp. Plan staleness, restart identity, and idempotency are legitimate and must survive.
+- **Convergence must not depend on a message that a failure path might not send.** Key phase 3 on a **fence you
+  can always post**, not on an event you merely usually get.
+- **A drain must live at the layer that owns the completion callbacks.** Otherwise it cannot retire what it
+  polls.
