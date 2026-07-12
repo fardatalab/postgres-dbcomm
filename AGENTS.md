@@ -450,14 +450,19 @@ done
 
 ## Workloads
 
-| workload | status | validates |
-|---|---|---|
-| **DPU TCP transport smoke** | ✅ | the **only** single-node host↔DPU DMA regression net |
-| **`pgbench --homer`** (local) | ✅ | local control path, `CLIENT_SQL_SESSION`, backend spawn, local result sink |
-| **`pgbench --homer`** (remote RDMA) | ✅ | + farnet0 startup, artifact sync, RDMA setup, peer control, remote command/result transport |
-| **basebackup, 4-role DPU relay** | ✅ | the **only** validated basebackup topology |
-| **backend-to-backend COPY** | 🔴 **BROKEN at HEAD** | hangs; unbisected since citus `7a2eaed53` |
-| **`pgbench --homer-dpu`** | 🔴 **never completed e2e** | DPU result-tuple relay |
+| workload | path | status | validates |
+|---|---|---|---|
+| **`pgbench --homer --homer-dpu-command`** | **DPU** | ✅ **THE GATE** | the full cross-node DPU command plane: farnet0 DPU → DPU↔DPU RDMA → farnet1 DPU → **DPU-spawned** backend |
+| **basebackup, 4-role DPU relay** | **DPU** | ✅ | the **only** validated basebackup topology |
+| **DPU TCP transport smoke** | **DPU** | ✅ | the **only** single-node host↔DPU DMA regression net |
+| `pgbench --homer` (local) | host | ✅ | local control path, `CLIENT_SQL_SESSION`, backend spawn, local result sink |
+| `pgbench --homer` (remote RDMA) | host | ✅ | host-service peer RDMA: farnet0 host service ↔ farnet1 host service |
+| backend-to-backend COPY | host | 🔴 **BROKEN at HEAD** | hangs; unbisected since citus `7a2eaed53` |
+| `pgbench --homer-dpu` (alone) | DPU result only | 🔴 **never completed e2e** | DPU result relay **without** the DPU command plane |
+
+**If you only run one thing, run the gate.** `pgbench --homer --homer-dpu-command` is the workload that
+exercises the DPU path end to end. The two `pgbench --homer` rows are the **host-service** path — useful as a
+cheap smoke and as the libpq-comparable baseline, but they do **not** touch a DPU.
 
 Broken command shapes — and why each *looks* plausible — are kept in
 `docs/kb/operations/farnet_diagnostics_and_baselines.md` §4, deliberately **out** of this runbook so nobody
@@ -504,7 +509,11 @@ process start, not from accept), pass **every leg flag to BOTH ends** (the serve
 
 Both ends print `homer_dpu_tcp_transport_smoke: ok` on a real pass.
 
-### `pgbench --homer`
+### `pgbench --homer` — the HOST-service path (not a DPU test)
+
+> ⚠ **This section's `--homer-peer-host 10.10.1.101` is a HOST address on purpose.** Carry it into the
+> DPU-command gate below and you silently validate the wrong path — the DPU is never touched and the run
+> still "passes". The gate needs `10.10.1.201`, the farnet1 **DPU**.
 
 Two modes, and they are **different validation tiers**:
 
@@ -547,6 +556,97 @@ sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench -h /tmp -p 5433 -U dbcomm \
 Before a remote run: sync artifacts to farnet0, run the preflight on both hosts, start both services.
 
 Current numbers and their caveats: `docs/kb/operations/farnet_diagnostics_and_baselines.md` §3.2–§3.3.
+
+### `pgbench --homer --homer-dpu-command` — THE DPU GATE ✅
+
+The workload that proves the **cross-node DPU command plane**. Validated July 11–12, 2026 (P3 green; the
+~1.5 s per-connection RNR stall fixed by P7, citus `d33f6ded3`). `--homer-dpu-command` **implies** the DPU
+result relay — a DPU-spawned backend has **no host-shm result sink at all**, so its only egress is the arena
+role-5 byte ring, which only the DPU can drain. The relay is structurally mandatory, not optional.
+
+Do **not** confuse this with `pgbench --homer-dpu` alone (result relay on a *host* command plane) or with
+`citus_remote_exec_pgbench_transaction` + `citus.enable_experimental_homer_dpu_frontend` (the SQL-UDF
+single-node engine smoke — a cheap check, **not** the gate).
+
+| role | what runs there |
+|---|---|
+| **farnet0 host** | `pgbench` client, **plus the host service UP** — see the caveat below |
+| **farnet0 DPU** (node A) | Homer service: DMA env **+ peer-bind** `10.10.1.200:9717` |
+| **farnet1 DPU** (node B) | Homer service: DMA env **+ peer-bind** `10.10.1.201:9717` |
+| **farnet1 host** | PostgreSQL with `citus.enable_homer_dpu_frontend_agent=on`. **Host service DOWN.** |
+
+#### ⚠ Two traps that each cost a validation cycle
+
+**1. `--homer-peer-host` SELECTS THE TOPOLOGY, and the wrong value silently validates the wrong path.**
+It must be **`10.10.1.201`** — the farnet1 **DPU**. With `10.10.1.101` (the farnet1 *host* service — the
+value in the plain `--homer` recipe above) the farnet0 DPU relays the OPEN to the farnet1 **host service**,
+which spawns a backend through the deprecated host-service arm. **Everything "passes"** while the farnet1
+DPU, the arena spawn, and the arena backend arm are **never touched**. The only tell is the *absence* of
+`DPU backend spawn begin`/`COMPLETED` in the farnet1 DPU log.
+
+**2. The farnet0 (client-side) host service must be UP; the farnet1 (backend-side) one must be DOWN.**
+Not symmetric, and not what you would guess. `pgbench --homer` cannot **boot** without a local control
+region (`HomerClientOpenControl`, per thread, before any DPU logic), so the client-side host service must run
+— **for control-region hosting only.** Verify its log shows the startup banner and **zero** session/command/
+payload activity. The **backend-side** host service stays DOWN: that is the loud-failure guard that stops a
+silent host-relay fallback from masquerading as a pass.
+
+> Runs 13–16 passed this way **by accident**: a stale `/citus_remote_execution_control_v27` satisfied the
+> client even with the farnet0 host service down. A **hard clean baseline** (which removes it) is what made
+> the topology error visible. Do the hard clean baseline.
+
+#### Run it
+
+```sh
+# farnet1 host: PostgreSQL with the frontend agent (env must be in the POSTMASTER's environment)
+sudo -n -u dbcomm env \
+  HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.201 HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
+  HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
+  /data/dbcomm/pg-citus/bin/pg_ctl -D /data/dbcomm/pg-citus/data \
+  -l /data/dbcomm/pg-citus/data/postgres.log \
+  -o "-c citus.enable_homer_dpu_frontend_agent=on" start -w
+
+# BOTH DPUs: DMA env + peer-bind env. (farnet1 DPU shown; farnet0 DPU uses 10.10.1.200.)
+env HOMER_SERVICE_ENABLE_DPU_DMA=1 HOMER_SERVICE_ENABLE_DOCA_DMA=1 \
+    HOMER_SERVICE_DPU_SETUP_PORT=9727 HOMER_SERVICE_DOCA_DEV_PCI=0000:03:00.0 \
+    HOMER_SERVICE_PEER_BIND_HOST=10.10.1.201 HOMER_SERVICE_PEER_PORT=9717 \
+    ~/dbcomm/citus-dbcomm/build/homer/citus_tuple_sink_service
+
+# farnet0 host: the client. Note the frontend points at farnet0's OWN DPU (10.10.1.200),
+# while --homer-peer-host names the REMOTE DPU (10.10.1.201). Those are different things.
+ssh farnet0 "sudo -n -u dbcomm sh -c 'env \
+  HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.200 HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
+  HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
+  /data/dbcomm/pg-citus/bin/pgbench -h /tmp -p 5433 -U dbcomm \
+    --homer --homer-dpu-command \
+    --homer-database-oid $DBOID --homer-user-oid $USEROID \
+    --homer-peer-host 10.10.1.201 --homer-peer-port 9717 --homer-peer-node 1 \
+    --debug -n -M simple -c 1 -j 1 -t 5 postgres'"
+```
+
+#### What a real pass looks like — FOUR proofs, not one
+
+1. **`transport:` line names the mode.** It must read `homer-dpu-command (implies dpu result relay)`.
+   ⚠ It used to print a bare `homer` — *indistinguishable in the log from a plain host-service run*. That is
+   the very line a validation log gets grepped for.
+2. **Decoded values, from `--debug`:** `client 0 Homer DPU result relay for sql_execute reached EOS: rows=1
+   abalance=<N>` — one per transaction, **five distinct values**, `5/5` processed, `0` failed.
+   ⚠ `-d` is `--dbname`, **not** `--debug`.
+3. **farnet1 DPU log:** `DPU backend spawn begin …` then `DPU backend spawn COMPLETED … launched_pid=N`, and
+   pid `N` appears in farnet1's `postgres.log`. **Absence of these = trap 1 fired.**
+4. **Anti-fallback:** the farnet0 host service log holds its startup banner and **nothing else**; the farnet1
+   host service is **down**.
+
+#### After the run — MANDATORY
+
+The DPU-spawned `postgres: remote exec backend` **survives** and does **not** respond to `pg_ctl stop -m
+fast` (socketless backends have no clean-shutdown path until S4). **Reap it by `/proc/<pid>/exe` + `kill -9`
+at end-of-run**, or the next preflight trips on a stale backend. Never `kill -9` it *mid-run* — that
+crash-restarts the postmaster (Non-negotiable #3).
+
+Warmed steady state after P7: **3.14 ms/tx, 318 tps** (`-t 2000`), on a fully stripped stack. That is
+≈450 µs/command and **still far from the microsecond target** — an open performance question, not a pass/fail
+criterion (diagnostics §3.3).
 
 ### Basebackup — the validated 4-role DPU relay (USE THIS)
 
@@ -673,8 +773,12 @@ Three regressions landed July 6–8, 2026 and went unnoticed for days because ea
 target and ran one workload**. Cheap insurance:
 
 1. **Build every target** — all seven smokes (recipe above), not just `service-bin`.
-2. **Run all three workloads** — basebackup (4-role relay), `pgbench --homer`, backend-to-backend COPY. Two of
-   the three are currently broken; fix or re-check them before trusting a "no regression" claim.
+2. **Run the DPU workloads, and lead with the gate.** In order:
+   **(a) `pgbench --homer --homer-dpu-command`** — the cross-node DPU command plane. If you run only one
+   thing, run this. **(b) basebackup, 4-role DPU relay.** **(c) the DPU TCP transport smoke** (before *and*
+   after any DPU DMA / byte-ring / bridge-ABI change).
+   Then the host-service path: `pgbench --homer`, and backend-to-backend COPY (**currently broken** — do not
+   let its failure be read as "no regression").
 3. **Run at least one workload with `citus.enable_homer_dpu_frontend_agent=on`.** The agent puts a **permanent
    49-ring mmap import** into the local DPU service — a state no default-off run ever reaches, and one that
    **wedged the DPU setup listener for four days without a single log line.**
