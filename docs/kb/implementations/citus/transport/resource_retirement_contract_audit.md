@@ -832,3 +832,90 @@ is what makes it unbounded.
   retirement callback is rarely one assignment; here it was flags, buffers, epochs, and a successor submission.
 - **Destruction is CANCELLATION, not retirement.** A teardown that abandons owners and *records what it
   discarded* is not satisfying the contract — it is declaring an exception to it. Never let it stand in as proof.
+
+---
+
+## 8. P0-d SUPERSEDED — the "until" condition was MISSING, and the guard was the wrong layer
+
+**Owner, on the three-way partition (§7.5):** *"I don't see the 'until condition' of 'don't leave until you have
+retired your own work'. If a tenant truly only leaves until it retires all its own work, we will never be in a
+situation where we see a stale generation, no? The point is, we should NOT see a stale thingy. The whole fix
+here is to uphold this principle?"*
+
+**Yes. And that invalidates BOTH my §7.5 partition AND the code's existing generation guard.** Both are
+mechanisms to *survive* a stale completion. Under the contract, a stale completion is **impossible**. I was
+building a better guard for a category I should have been deleting — the exact anti-pattern §0.3 and §5 name.
+
+### 8.1 The code already tells the whole story — including the wrong turn
+
+`homer_service_dpu_dma.c:4533`:
+
+> *"⚠ THE RESET ALONE IS NOT ENOUGH, and run 41k proved it. A grouped-control READ that was already in flight
+> when we reset completed 5 ms later carrying the OLD tenant's line, and wrote accepted_epoch=5 straight back
+> into the runtime we had just cleared -- after which the (correctly zeroed) host line read as a REGRESSION and
+> killed the engine. **Forgetting is not sufficient when something can still remind you.** Hence the tenancy
+> generation: we bump it here, every read stamps it, and a completion whose stamp no longer matches is
+> **DROPPED**."*
+>
+> *"The old note here claimed T1 quiesce + T2 drain made in-flight tasks impossible. **That was WRONG -- they
+> quiesce the ring's own pull/publish work, not the engine's grouped-control discovery reads, and the unbind's
+> `inFlightTaskCount` warning never fired because those reads are NOT COUNTED against the ring.**"*
+
+**We hit this exact bug (run 41k), diagnosed it correctly, and then fixed the WRONG LAYER.** The comment states
+the root cause outright: **the drain does not count all the work.**
+
+### 8.2 THE MISSING "UNTIL" CONDITION
+
+`HomerDpuDmaArenaSlotTasksInFlight` (`:6246`) sums `ringRuntime[...].inFlightTaskCount`. **Grouped-control
+discovery reads are never counted into it** (`:4533`). So a tenant can PASS the drain and LEAVE while work
+touching its ring is still in flight. **"Retire all your own work" was never actually enforced — the accounting
+could not see the work.**
+
+### 8.3 THE REAL FIX (supersedes §7.5 and §4/P0-d)
+
+1. **T1 quiesce must stop EVERY source of new work on the ring** — including the **engine's grouped-control
+   discovery**, not merely the ring's own pull/publish. (Today discovery ignores the quiesce, so new reads keep
+   being armed and the count could never settle.)
+2. **`inFlightTaskCount` must COUNT grouped-control reads**, so T2's drain actually covers them.
+
+With both, the drain **converges** (nothing new is armed; in-flight DOCA tasks always complete, success or
+error, because the ENGINE is alive and independent of the backend), the tenancy flips with **ZERO outstanding**,
+and **a stale generation becomes IMPOSSIBLE**.
+
+Consequences — all subtractive:
+
+- **The tenancy generation STAYS, but becomes a LOUD ASSERTION that must never fire**, not a mechanism. If it
+  fires, the contract was broken, and it names the ring.
+- **The §7.5 three-way partition EVAPORATES.** It existed only to survive stale completions.
+- **The `DROPPED` path goes away** — and good riddance: it was never even complete. A "dropped" grouped-control
+  completion still cleared the **NEW** tenant's `controlReadInFlight` flag (`:10565`). The guard did not
+  actually guard.
+
+### 8.4 This also resolves the forced-teardown deadline cleanly
+
+The 30 s deadline exists because **T3/T4 wait on the BACKEND** to ack `BACKEND_SLOT_RELEASE` — and a dead
+backend never will. But **DMA tasks do not depend on the backend at all**; they complete regardless, because
+the **engine** is alive.
+
+> **The deadline may legitimately ABANDON THE BACKEND HANDSHAKE. It may NEVER abandon the DMA DRAIN.**
+> The drain is an **unconditional precondition of unbind, on every path**. FATAL only if the DRAIN ITSELF fails
+> to converge — which would mean the DOCA engine is broken, i.e. a real bug we want to see.
+
+**Same logic fixes P0-e:** the DPU's tasks drain fine even with the backend dead, so QUARANTINE -> DPU drains ->
+DPU certifies zero -> slot goes FREE. No stale completion can ever reach a new tenant, because **the slot is not
+handed out until the drain says zero.**
+
+### 8.5 The rule this earns
+
+> **When you find yourself designing a mechanism to SURVIVE a stale reference, the real bug is almost always
+> that SOME WORK IS NOT BEING COUNTED.**
+
+Run 41k produced a *correct diagnosis* — *"forgetting is not sufficient when something can still remind you"* —
+and then reached for a **generation stamp** instead of asking **why the drain let us leave in the first place**.
+The answer was **one uncounted task class**. The guard cost a generation field, a stamp on every read, a compare
+on every completion, and a `DROPPED` path that was itself incomplete — **and it left the category alive**, to be
+rediscovered here.
+
+**Corollary:** a quiesce that does not stop *every* producer of new work on a resource is not a quiesce, and a
+drain that does not count *every* consumer is not a drain. **Enumerate the producers and the consumers, or the
+gate is theatre.**
