@@ -1374,3 +1374,65 @@ pressure or a long-lived postmaster demands it. **Either way, (d) is fixed.**
   the far side, the query loops forever. **Name who executes each phase, not just who observes it.**
 - **A certifier that cannot say "I DON'T KNOW" is not a certifier.** `ArenaSlotTasksInFlight` collapses
   NOT-FOUND into ZERO-IN-FLIGHT. The safety primitive itself had the bug family in it.
+
+---
+
+## 12. P0-e DECIDED — Option A (quarantine until postmaster restart). Owner, July 12, 2026.
+
+**Owner:** *"P0-e is for a crash-recovery case, meaning we don't expect to hit it normally, correct? If so,
+let's do option A and we don't care for option B really (this is a research project)."*
+
+**Confirmed, with one nuance that matters for sizing:**
+
+- A backend that exits **cleanly** — **including `ereport(FATAL)`** — releases its own arena slot via
+  `on_proc_exit` -> `HomerFrontendAgentReleaseArenaSlot` (`homer_frontend_agent.c:658`). **The reaper NEVER runs
+  in normal operation.**
+- It fires **only** for a backend that dies without running `on_proc_exit`: **SIGKILL / SIGSEGV**.
+- **⚠ But our own runbook hits it deliberately.** CLAUDE.md mandates `kill -9` on surviving
+  `postgres: remote exec backend` processes after every `--homer-dpu-command` run (socketless backends do not
+  answer `pg_ctl stop`), and that `kill -9` drives a postmaster **crash-restart**, which does **not** re-run
+  `_PG_init` — so the arena keeps its stale BOUND state and the reaper exists precisely to clean it up.
+  **The APPLICATION never hits this path; our DEV LOOP does, at teardown.**
+
+**Why Option A is nevertheless safe here — and this is the sizing argument, not a hand-wave:**
+
+- Quarantine can only accumulate **within a single postmaster lifetime**.
+- Our validation runs 3-6 pgbench runs per postmaster with **CLEAN session closes** between them (the `kill -9`
+  happens at the clean baseline, when everything is torn down anyway).
+- A clean postmaster start re-runs `_PG_init` -> `HomerFrontendAgentCreateArena` -> **zeroes the whole arena**
+  (`homer_frontend_agent.c:295`). **So the leak resets every cycle.**
+- **FATAL at 16 quarantined slots** therefore only fires if something genuinely pathological is happening —
+  which is exactly when we want it to.
+
+### 12.1 THE DESIGN (Option A)
+
+1. **New slot state `HOMER_FRONTEND_ARENA_SLOT_QUARANTINED`** (today the enum is only `FREE=0`, `BOUND=1`,
+   `homer_frontend_agent.h:157`).
+2. **`HomerFrontendAgentReapDeadArenaSlots` (`:689`) must NOT zero the bodies and must NOT publish FREE.** It
+   publishes **QUARANTINED**, and **logs loudly** (pid, slot, session).
+3. **A QUARANTINED slot is NEVER handed out.** The binder takes only `FREE`.
+4. **FATAL when QUARANTINED slots exhaust the arena (16).** Not fatal in the reaper itself — it is on the
+   ROUTINE teardown path of our own dev loop, and a FATAL there would crash the postmaster on every run.
+5. **The slot returns to FREE only via the whole-arena zero on the next clean `_PG_init`.**
+
+**This is fail-SAFE (leak a slot) rather than fail-SILENT (corrupt host memory), and it is impossible to fool:
+there is no certification primitive to get wrong, because there is no certification.**
+
+**Option B (a bidirectional DPU request that INITIATES quiesce+drain and ACKs DRAINED/IN_FLIGHT/NOT_FOUND) is
+recorded as the upgrade path** should a long-lived postmaster or real slot pressure ever demand it. **Owner has
+explicitly deprioritized it: this is a research prototype.**
+
+### 12.2 STILL MANDATORY — the false-certification bug is fixed REGARDLESS
+
+**`HomerDpuDmaArenaSlotTasksInFlight()` (`homer_service_dpu_dma.c:6268`) returns `true` with `*inFlightOut = 0`
+when the import lookup FAILS (`:6280`) — "NOT FOUND" is indistinguishable from "FOUND AND DRAINED".**
+`HomerDpuDmaUnbindRingSession` (`:6303`, `:6327`) has the same shape.
+
+**This is the bug family INSIDE the primitive whose entire job is to certify safety**, and it is a live defect
+independent of P0-e. **FIX IT:** it must distinguish **`DRAINED` / `IN_FLIGHT` / `NOT_FOUND`**, and
+**`NOT_FOUND` must NEVER be treated as safe for host memory reuse.**
+
+> **A certifier that cannot say "I DON'T KNOW" is not a certifier.**
+
+Option A does not *use* this primitive — but every other caller does, and the next person to reach for it as a
+safety gate would be silently misled. Fix it now, while we know.
