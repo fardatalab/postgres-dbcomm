@@ -100,15 +100,24 @@
 #define HOMER_PGBENCH_COMPLETION_SPINS 128U
 
 /*
- * Run-39 diagnostic switch: pgbench is built by meson, which does not carry the
- * citus tree's CPPFLAGS, so the HOMER_DPU_P2_DIAG-gated [p3trace] probes in this
- * file would otherwise silently compile out of EVERY pgbench build (caught by the
- * installed-binary string-literal check, not by the compiler). Define it locally
- * while the P3 bring-up instrumentation is active; strip together with the rest
- * of the p3trace scaffolding before any performance run.
+ * Diagnostic switch for the HOMER_DPU_P2_DIAG-gated [p3trace] probes in this file.
+ *
+ * pgbench is built by meson, which does not carry the citus tree's CPPFLAGS, so
+ * these probes cannot be enabled the way the service's are. During the P3 bring-up
+ * this block DEFAULTED THE PROBES ON (`#define HOMER_DPU_P2_DIAG 1`) so they were
+ * reachable at all -- and that quietly meant every pgbench measurement taken on
+ * this branch was taken on an INSTRUMENTED client. The bring-up is over (KB section 23:
+ * the peer-connection RNR stall is fixed), so the default is now OFF, which is what
+ * the original note said to do "before any performance run".
+ *
+ * To re-enable for debugging, build pgbench with -DHOMER_DPU_P2_DIAG=1, e.g.
+ *   meson configure build -Dc_args=-DHOMER_DPU_P2_DIAG=1 && ninja -C build
+ * Verify which way it went with the installed binary, NOT the source -- a macro name
+ * greps the same in both variants, so grep for a literal only the enabled build emits:
+ *   strings /data/dbcomm/pg-citus/bin/pgbench | grep -c p3trace
  */
 #ifndef HOMER_DPU_P2_DIAG
-#define HOMER_DPU_P2_DIAG 1
+/* #define HOMER_DPU_P2_DIAG 1 */ /* was: forced ON for P3 bring-up; see above */
 #endif
 
 static inline void
