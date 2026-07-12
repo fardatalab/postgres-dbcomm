@@ -3524,3 +3524,159 @@ the code already says so. Fix both; Defect 1 first, separately validated.
 - Codex's analysis asserted the peer-open "posts it on the already-established payload-class RDMA
   connection". The log says `NEW outgoing` + a fresh QP. **Do not inherit a subagent's mechanism** — one
   grep of the run log refuted it.
+
+---
+
+## 23. P7 LANDED — the §10k stall was an RNR-NAK race in peer connection setup (citus `d33f6ded3`)
+
+### 23.1 The bug
+
+The accepting side created its QP/CQs/MRs, called `rdma_accept()`, and posted its bootstrap **RECV two
+scheduler phases later** (in `INCOMING_BOOTSTRAP_POST`). But `rdma_accept()` drives the QP to RTS, so the
+instant it returns the initiator may put its bootstrap **SEND** on the wire — and the initiator does exactly
+that the moment it sees `ESTABLISHED` (`remote_execution_peer_transport_rdma.c:6003`/`:6019`, recv then send
+in the same phase).
+
+That window lets a SEND land on a QP with an **empty receive queue**. The HCA answers **RNR NAK**, and
+because `connParam.rnr_retry_count == 7` (**infinite** retry, set on both ends at `:5960`/`:6388`) the
+transfer does **not fail** — it is silently retried after the default `min_rnr_timer` (~655 ms).
+
+**So the defect expressed itself ONLY as latency and NEVER as an error.** Its signature is the tell:
+**strictly bimodal — 0 ms (won the race) or ~1.3–1.8 s (one or more RNR intervals), never anything between.**
+
+### 23.2 The fix (citus `d33f6ded3`)
+
+The canonical librdmacm ordering rule: **post receives BEFORE `rdma_accept()` / `rdma_connect()`.** The QP,
+both CQs and both bootstrap MRs already exist by then (`TupleSinkServiceInitConnectionResources`), and
+`ibv_post_recv()` on a QP in INIT is legal, so the receive queue is armed before the peer can reach it.
+`INCOMING_BOOTSTRAP_POST` keeps an **idempotent** late-post as a fallback and now **WARNS** if it ever fires.
+
+Also added, **always-on and NOT behind a diag macro** — an **RNR tripwire** on both `BOOTSTRAP_WAIT` phases
+(`HOMER_PEER_BOOTSTRAP_SLOW_WARN_MS = 100`). A healthy bootstrap exchange takes microseconds; 100 ms is three
+orders of magnitude past healthy and is essentially always this bug. It is deliberately a **warning, not a
+failure**: RNR still completes, so failing would turn a latency bug into an outage.
+
+### 23.3 Validation
+
+Six consecutive pgbench runs, one stack, no baseline reset: 5/5 tx, five decoded rows, empty error streams.
+Every bootstrap-wait on **both nodes** and **both traffic classes**:
+
+```
+before:  ms_in_phase = 1428 / 1251 / 1795     (bimodal)
+after:   ms_in_phase = 0 or 1                 (every connection, both nodes)
+RNR tripwire: 0 firings on both nodes
+peer connection setup: ~1450 ms  ->  ~10 ms
+```
+
+Measured on a **fully stripped** stack (no `cmtrace`, no `p3trace`, no `p2diag` — both DPUs, both hosts, and
+pgbench), which is the **first uninstrumented measurement this branch has ever taken** (see §23.5):
+
+| run | latency avg | tps | note |
+|---|---|---|---|
+| `-t 5` | **7.5–7.8 ms** (was 290–435 ms) | 128 | setup-dominated |
+| `-t 200` | 3.26 ms | 306 | mostly amortized |
+| **`-t 2000`** | **3.14 ms** | **318** | **steady state** |
+
+**§10k is CLOSED.** The steady-state 3.14 ms/tx (~450 µs per command, 7 commands/tx) is still far from the
+microsecond target — that is a **NEW and separate** performance question and is NOT part of this claim.
+
+All seven smoke targets build; `homer_tuple_deform_smoke` ALL PASS.
+
+### 23.4 How it was found — the two steps that mattered
+
+- **An EXTERNAL CONTROL, before any instrumentation.** `rping` does a raw `rdma_cm` connect + ping + teardown
+  between the SAME two DPU ports over the SAME fabric in **31 ms**, against our **~1500 ms**. One command, no
+  rebuild, no code change — and it eliminated the fabric, ARP, RoCE/GID config, and the DPU kernel outright.
+  Everything left was our code. **Reach for an external control before instrumenting your own.**
+- **A probe whose ONE line answers the whole question.** On each setup phase transition, print **both**
+  `calls_in_phase` **and** `ms_in_phase`. `calls=383991 / ms=1428` says the pump ran ~270k times/second
+  throughout — so it was **NOT starved** (which **refuted my own leading hypothesis**), and the 1.4 s sits
+  entirely inside `BOOTSTRAP_WAIT`. **Elapsed time alone could not have told those apart**, and a probe that
+  only logged elapsed time would have reproduced the silence we already had.
+
+### 23.5 Two false trails, and a measurement that was lying the whole time
+
+- **§10k was localized WRONG TWICE.** First to "the DMA engine's per-command grant arming"; then (§19.4) to
+  "the result peer-open". Both were downstream symptoms. The peer-open was late because the connection it
+  rides on did not exist yet. **A stall localized to the last hop before the symptom is not localized.**
+- **The Heisenbug that wasn't.** Adding the probe appeared to *fix* the bug (435 ms → 9.4 ms). It had not:
+  the stall is a **race**, and that run simply won it. Four runs exposed the bimodality. **A single
+  post-change run cannot distinguish "fixed" from "got lucky" when the defect is a race** — which is a
+  special case of the standing rule that one sample cannot tell *"not yet"* from *"never"*.
+- **Every pgbench number on this branch had been measured on an INSTRUMENTED client.** `pgbench.c` carried
+  `#ifndef HOMER_DPU_P2_DIAG / #define HOMER_DPU_P2_DIAG 1` — it **defaulted the probes ON**, because meson
+  does not carry the citus tree's `CPPFLAGS` and that was the only way to reach them. Its own comment said
+  "strip before any performance run"; nothing enforced it. Now **opt-in** (postgres `0021633a44a`).
+  **A diagnostic that defaults ON is not a diagnostic, it is the build.**
+
+---
+
+## 24. P7b — DECOUPLE CONNECTION LIFETIME FROM SESSION LIFETIME, AND POOL (design of record)
+
+### 24.1 This is a REPAIR of a stated invariant, not a new feature
+
+`docs/kb/future-directions/citus/transport/homer_transport_scheduler_and_payload_streams.md:174` already
+states the rule:
+
+> "Logical queues and physical RDMA resources must remain decoupled. A per-session logical queue is the
+> semantic abstraction; **one QP per session is only one possible mapping policy and should not be baked into
+> the session abstraction.** The scheduler should be able to map logical queues onto: one shared control QP /
+> one control QP per traffic class / **a QP pool per traffic class** / a per-session QP policy."
+
+Today's behaviour is *exactly* the policy that rule forbids — **one class-2 QP per session, destroyed at
+session close** — and it was baked in **by accident** (via the close path), not chosen.
+
+The peer transport says so too. `ownerServiceSessionId` (`remote_execution_peer_transport_rdma.c:577-588`):
+
+> "release only flips OWNED-READY -> FREE (owner -> 0) **while keeping the RDMA connection established for
+> immediate reuse**"
+
+`TupleSinkServiceReleaseOutgoingPeerConnectionsForSessionRdma()` (`:8545`) implements the release, and Find's
+prefer-own-then-adopt-free pass (`:6330`, logging `adopted FREE outgoing slot` at `:6405`) implements the
+reuse. **Both already exist.** They just never get the chance, because the session close **disconnects the
+QP**, so the slot goes inactive and the next session must allocate a new one. Evidence (three sequential
+sessions, node B):
+
+```
+payload connection allocate: session=1 NEW outgoing slot index=0 class=2
+payload connection allocate: session=2 NEW outgoing slot index=0 class=2
+payload connection allocate: session=3 NEW outgoing slot index=0 class=2
+   -> three NEW allocations, ZERO 'adopted FREE'
+```
+
+The class-1 (command) connection is allocated **once** and correctly reused, which proves the machinery works
+when nothing tears the connection down.
+
+### 24.2 Owner directive (July 12, 2026), and the three parts
+
+1. **Decouple** connection lifetime from session lifetime. The session close must **release** ownership
+   (owner -> 0), never **disconnect** the QP.
+2. **Pool** connections — pre-provision some number at startup, so even the **FIRST** session reuses rather
+   than connects. This is deliberately the same shape as the ring/arena pooling: a pre-warmed resource
+   claimed by identity at open, released (not destroyed) at close.
+3. **Always be able to create one on demand** when the pool has nothing free. The pool is a **cache, not a
+   cap** — `CITUS_REMOTE_EXEC_PEER_MAX_OUTGOING_CONNECTIONS` is 64, and a pool sized below demand must
+   *degrade*, never *fail*.
+
+### 24.3 Why P7 had to land first
+
+With the RNR bug present, a connect cost ~1.5 s, so pooling would have looked like a **necessity** and would
+have been sized/justified against a number that was pure bug. With P7 landed a connect costs ~10 ms, so
+pooling is an **optimization with an honest baseline** — and the remaining question ("is 10 ms worth
+pre-warming away?") can be answered on evidence. At `-t 5` the connect is still ~25% of the run; at `-t 2000`
+it is noise. **Judge the pool against the workload, not against the bug we just removed.**
+
+### 24.4 Open questions to settle before implementing
+
+- **Who disconnects today?** The teardown line *"a later peer disconnect on this session is expected and
+  benign"* says the close path drives an RDMA disconnect. Find that edge and establish whether the
+  disconnect is *necessary* (does the receiver need it to reclaim recv-CQ credit?) or merely *incidental*.
+- **The recv-CQ contamination constraint is REAL and must be preserved.** The `ownerServiceSessionId` comment
+  records why a payload connection is bound to exactly one live session: two concurrent sessions sharing one
+  recv CQ caused *"cross-session consumed-head credit contamination and a defensive RECV_CQ_FAILURE reset"*.
+  So pooling must hand a pooled connection to **one session at a time** (claim/release), not multiplex it —
+  unless the credit accounting is made per-session first. **Do not "simplify" this away.**
+- **Pool geometry and warm-up cost**: how many per traffic class, per peer? Pre-connecting at startup makes
+  service start slower and holds QPs open against peers that may never be used.
+- **Staleness**: a pooled connection whose peer restarted is dead but looks FREE. Needs a liveness check or a
+  generation stamp on adopt.
