@@ -2966,3 +2966,177 @@ Reviewed every edit personally. Three defects found and fixed by hand before val
   have been unobservable during its own validation.
 
 **Commits:** citus `81593cdf9`, kb `02d220a26d0`.
+
+---
+
+## §23 — P0-c: the RDMA payload staging pools have NO accounting
+
+**Status: SPEC (2026-07-12).** Unlike P0-b, this one **is** a live bug — but the audit's one-line diagnosis
+(*"no inUse, no generation, no frontier"*) is right about the symptom and silent about the mechanism. The
+mechanism is what makes it exploitable, and it is not where you would look.
+
+### 23.1 The two pools, and why only ONE of them is broken
+
+Both are per-**connection** (i.e. per-**lane**) arrays inside `TupleSinkServicePeerConnectionState`, both are
+registered RDMA source memory, and both are handed out by a **blind modulo cursor** with no accounting at all:
+
+- `TupleSinkServiceReservePayloadPublishTailSlot` (`remote_execution_peer_transport_rdma.c:760`) →
+  `payloadPublishTailBuffers[128]` (`:704`) — one 64-bit staging word per **batch** (the tail value).
+- `TupleSinkServiceReservePayloadFragmentHeaderSlot` (`:784`) → `payloadFragmentHeaderBuffers[1024]` (`:715`) —
+  one generated transport header per **payload write**.
+
+Both carry a comment asserting they are safe. **Do the arithmetic** (all VERIFIED):
+
+| constant | value | where |
+|---|---|---|
+| `CITUS_REMOTE_EXEC_PEER_SEND_QUEUE_DEPTH` | **256** WRs | `..._rdma.c:101` |
+| `CITUS_REMOTE_EXEC_PEER_PAYLOAD_BATCH_MAX_WRITES` | **32** | `..._rdma.h:54` |
+| `payloadWriteCount == 0` | **REJECTED** → a batch is **≥ 2 WRs** (≥1 write + 1 tail) | `..._rdma.c:10028` |
+| `HOMER_SERVICE_PAYLOAD_MAX_INFLIGHT_OBJECTS` | **63** batches — **PER STREAM** | `tuple_sink_service_process.c:326` |
+| `HOMER_SERVICE_PAYLOAD_MAX_OUTSTANDING_WRS` | **192** WRs — **PER STREAM** | `tuple_sink_service_process.c:338` |
+
+**HEADER pool — SAFE, and P0-c must not churn it.** Live headers ≤ outstanding payload WRs ≤ **256** (the send
+queue is the hard cap; `ibv_post_send` returns `ENOMEM` → `WOULD_BLOCK` when the SQ is full). Pool is **1024**.
+**4× headroom; the cursor cannot wrap onto a live header.** Its comment claims it is sized `32 batches × 32
+writes`; the *real* bound is 4× smaller. Safe — but, once again, **by an argument nobody wrote down.**
+
+**TAIL pool — BROKEN.** One slot per batch. Live batches are bounded by the *per-stream* caps (63 objects,
+192 WRs) — but the **pool is per-LANE, shared by every stream bound to it.** Nobody computes the lane-wide sum:
+
+- 1 stream: ≤ 63 live batches. Pool 128. Safe.
+- 2 streams: ≤ 126. Safe **by two slots**.
+- **3+ streams: the per-stream caps permit 189 live batches against a 128-slot pool.**
+
+The send queue claws that back — 256 WRs ÷ 2 WRs/batch = **128 batches** — which is **exactly the pool size**.
+**Zero margin.** The cursor collides on the very next reservation.
+
+### 23.2 THE MECHANISM — the backpressure path is itself the corruption trigger
+
+This is the part the audit's one-liner misses, and it is what turns "zero margin" into a live defect:
+
+```c
+tailSlotIndex = TupleSinkServiceReservePayloadPublishTailSlot(connectionState);   /* :10138 -- blind */
+tailSource    = &connectionState->payloadPublishTailBuffers[tailSlotIndex];
+*tailSource   = tailValue;                                                        /* :10141 -- UNCONDITIONAL */
+...
+ibv_post_send(...)                                                                /* may fail WOULD_BLOCK */
+```
+
+**The staging word is overwritten BEFORE the post is attempted, and the cursor advances even when the post
+fails.** So at 128 live batches — precisely the moment the send queue is full — the next publish attempt:
+
+1. reserves slot 0, which is **still live**;
+2. **scribbles a much-later tail value into the RDMA source word of an in-flight WR**;
+3. *then* posts, and fails `WOULD_BLOCK`.
+
+The already-posted WR for batch 0 then writes **the wrong tail** to the peer. The peer reads that tail as
+*"every byte below this is committed"* — for bytes that were never written. **Silent remote data corruption,
+triggered by the backpressure path, i.e. exactly under load.** No error, no ALARM, no crash.
+
+### 23.3 THE FIX — a frontier, not an `inUse` bit
+
+Retirement here is **FIFO**, and that is a gift:
+
+- posts are single-threaded (the service loop);
+- the RC QP completes **in order**;
+- every batch's tail WR is **`IBV_SEND_SIGNALED`** (`:10156`) — a CQE is **guaranteed** (P0-i's substrate rule);
+- the batch's unsignalled payload WRs are retired by that same tail CQE (the lane FIFO).
+
+So reservation order == retirement order, and the pools need **no per-slot `inUse` bit and no scan** — they need
+**two counters**:
+
+- `payloadPublishTailReserved` (monotonic) and `payloadPublishTailRetired` (monotonic).
+- **Reserve:** if `reserved - retired == CAPACITY` → **return `WOULD_BLOCK` BACKPRESSURE. Do NOT drain
+  internally** (the owner drains; the reserver reports — same rule as P0-b's op table). Otherwise hand out
+  `reserved++ % CAPACITY`, which is now **provably free**, so writing `*tailSource` is safe.
+- **Retire:** on the batch's tail CQE, `retired++` (and `retired += headerCount` for the header ring).
+- **Roll back on a failed post:** a zero-WR failure must **un-reserve** (`reserved--`), or the frontier never
+  advances for a slot that has no WR and the pool bleeds capacity. Safe because nothing was posted and the loop
+  is single-threaded.
+- **PARTIAL POST:** the tail WR may not have been posted → **its CQE will never come** → the frontier can never
+  advance → the lane would wedge. Partial post already forces a connection reset; **the reset must reset both
+  frontiers.** (Same shape as P0-b's classifier zeroing `outstandingControlOps`.)
+
+**Apply the frontier to the HEADER ring too**, even though it is safe today at 4× headroom — its safety is an
+unwritten argument about the send-queue depth, and P7b pooling plus any change to `SEND_QUEUE_DEPTH` or
+`PAYLOAD_BATCH_MAX_WRITES` invalidates it silently. Cost is two more counters on a path that already exists.
+
+### 23.4 Falsifiable claims — REFUTE THESE BEFORE BUILDING
+
+- **F1.** The header pool is safe today (live ≤ 256 vs capacity 1024). *If false, it is a second live bug.*
+- **F2.** The tail pool's real bound is per-LANE while its flow control is per-STREAM, so ≥3 concurrent payload
+  streams on one lane can drive live batches to the 128-slot boundary. *If false, P0-c is latent, not live.*
+- **F3.** `*tailSource = tailValue` executes before `ibv_post_send`, so a **failed** publish still corrupts a
+  live slot. *This is the load-bearing mechanism. If false, the bug needs 129 SUCCESSFUL posts and is much
+  harder to reach.*
+- **F4.** Reservation order == retirement order (single-threaded post + RC in-order + always-signalled tail), so
+  a two-counter frontier is sufficient and no per-slot `inUse` is needed. *If false, the whole fix is wrong.*
+- **F5.** Consequence is a bogus tail published to the peer → the peer advances its consumed frontier past
+  unwritten bytes → **silent data corruption**, not a crash.
+
+### 23.5 ADVERSARIAL REVIEW — §23's DESIGN IS DEAD. Both sides recorded.
+
+Round 1 (codex, read-only, falsifiable targets). **It broke the design.** Every load-bearing claim below was
+**re-verified by me in the code** before being accepted (the standing rule: a wrong correction costs exactly as
+much as a wrong original).
+
+| my claim | verdict | why |
+|---|---|---|
+| **F1** header pool is SAFE (4× headroom) | **REFUTED** | I assumed the cursor only advances on **successful** posts. It doesn't. A header is reserved and `*headerSource` **written** at `:9865-9868`, and the very next block can still `return false` (`:9879`), as can the post itself. **Failed attempts lap the 1024-slot cursor independently of send-queue occupancy.** The header pool has the SAME defect as the tail pool. |
+| **F2** flow control is per-STREAM, pool is per-LANE | **materially refuted** | Directionally right, but I missed a **second consumer**: the **ACK path also reserves tail slots** (`:10338`), with **64 per-stream ACK owners** (`tuple_sink_service_process.c:393`). My arithmetic was incomplete. |
+| **F3** reserve+overwrite happens BEFORE the post, and a FAILED post still corrupts | **VERIFIED** | And it is **worse than I found** — the same shape at `:10138`, `:10171`, `:10338`, `:10356`. No path rolls back. |
+| **F4** a two-counter FRONTIER suffices (FIFO retirement) | **REFUTED — THIS KILLS THE DESIGN** | The fixed-slot path (`:9912`) and the byte-ring path (`:10045`) encode the tail WR-ID with the **SAME** kind (`TUPLE_SINK_SERVICE_PEER_PAYLOAD_COMPLETION_DATA`), and the decoder (`:3451`) yields only `(kind, streamIndex, streamGeneration, completionToken)`. **The CQE carries NO discriminator for how many staging slots the batch consumed** — and only the byte-ring path reserves a tail slot at all. A frontier cannot be advanced from a completion that does not say what it is freeing. |
+| **F5** consequence is SILENT data corruption | **REFUTED** | The receiver **validates** generation, ordinal, framing, sizes and object semantics (`tuple_sink_service_process.c:33234`, `:34918`, `:34979`). A bogus tail produces a **stall, a reset, or wrong credit** — loud-ish, not proven silent object corruption. **Severity drops.** |
+| **F6** reset must zero the frontiers | **already handled** | Reset memsets the **entire** connection state after QP/CQ/MR teardown (`:5566`). Any new counters are covered for free. |
+
+**Lesson (mine):** I computed a capacity bound from the **send-queue depth** and never asked *"what advances
+the cursor?"* — the answer is **every attempt, including the ones that never post a WR.** A capacity argument
+that only counts successes is not a capacity argument. This is the same failure mode as the previous refutations:
+**I reasoned about the mechanism I had just read and not about its callers.**
+
+### 23.6 ⚠ NEW, SEPARATE BUG FOUND BY THE REVIEW — "CQE THEFT" in the blocking wait
+
+**Not P0-c. Independent, and it must be decided on its own.**
+
+`TupleSinkServiceWaitForSendCompletion` (`:3922`) passes **NULL callbacks** to
+`TupleSinkServiceHandleTaggedSendCompletion` (`:3962`).
+
+- **Tagged CONTROL CQEs** are retired **internally** — safe (this is what makes P0-a/P0-b sound; I verified it).
+- **Tagged PAYLOAD / COMMAND / peer-client CQEs require a service CALLBACK.** With NULL, the handler logs
+  *"send-CQ drain received payload completion without payload owner callback"* and **returns false** (`:3796`,
+  `:3810`, `:3832`, `:3846`, `:3890`, `:3905`) — **but `ibv_poll_cq` has ALREADY consumed the CQE** (`:3938`).
+
+**The CQE is destroyed. Its owner never receives its retirement event.** The wait then fails → connection reset,
+so it is loud rather than silent — but a resource that was waiting on that CQE is retired by **cancellation**
+(Scenario E), not by completion.
+
+**Reachable:** tuple/COPY command completion stores the **payload** connection in
+`peerCommandCompletionConnectionHandle` (`tuple_sink_service_process.c:27898`, `:38667`), so the blocking epoch
+write at `:19461` runs on a QP that **also carries payload batches**. (The SQL-command path uses the
+`CRITICAL_CONTROL` lane (`:37991`), whose CQEs *are* retired internally — which is why the DPU gate never sees
+this.) **Backend-to-backend COPY is 🔴 already broken at HEAD; this is a candidate contributor.**
+
+Also latent (recorded, no current caller): the singleton `inlineWriteBuffer` has an exported **unsignalled**
+posting API (`:9171`), is overwritten at `:9205`, and can be **deregistered and freed during resize** (`:4517`).
+That is the P1 `EnsureInlineWriteBuffer` landmine, now with a mechanism.
+
+### 23.7 P0-c REDESIGN — three options, none free
+
+The real constraints, now that F1/F2/F4 are corrected:
+
+1. **Every reservation must be rolled back or accounted, including the ones whose post never happens** (F3, and
+   F1's refutation). *This alone fixes a large part of the bug and is cheap.*
+2. **A completion CQE does not say what it frees** (F4). Retirement must therefore be attributed some other way.
+3. **The tail pool has two producers** (batch tails and ACKs) with different WR shapes (F2).
+
+| option | mechanism | cost |
+|---|---|---|
+| **A — per-connection FIFO of reservation records** | push `{tailSlots, headerSlots}` at **successful** post; pop one per DATA CQE; advance both frontiers. Retirement is FIFO, so a ring works. | Must push a record for **every** batch that yields a DATA CQE (even zero-slot fixed-slot batches) or the FIFO desynchronizes. **Requires enumerating EVERY producer of a DATA CQE** — including the ACK path. A desync is silent and catastrophic. |
+| **B — make the CQE self-describing** | encode the slot counts / a reservation id into the payload WR-ID. | Needs spare WR-ID bits (`kind`, `streamIndex`, `streamGeneration`, `completionToken` are already allocated — **budget unverified**). But it is the P0-e lesson applied: *a self-describing record removes the need for a side table.* |
+| **C — block-allocate slots per batch** | reserve a whole fixed block per batch: slot = `(batchIndex % capacity) * MAX_WRITES + writeIndex`. Ownership is **derived** from a single monotonic batch counter; retirement frees the block implicitly. | No side table, no WR-ID change, trivially correct. **But it caps outstanding batches at `1024/32 = 32`** (vs ~128 today) unless the header pool grows. **A throughput ceiling — needs a perf decision.** |
+
+**Recommendation: C, with an enlarged header pool** — it is the only one whose correctness does not depend on
+enumerating a set of call sites exhaustively (the exact thing that has burned this audit repeatedly). But it
+trades memory for concurrency and that is a **decision for the owner, not an improvisation.**
+
+**STOPPED HERE FOR DISCUSSION.**
