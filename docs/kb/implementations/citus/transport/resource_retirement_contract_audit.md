@@ -1496,3 +1496,91 @@ independent of P0-e. **FIX IT:** it must distinguish **`DRAINED` / `IN_FLIGHT` /
 
 Option A does not *use* this primitive — but every other caller does, and the next person to reach for it as a
 safety gate would be silently misled. Fix it now, while we know.
+
+---
+
+## 13. P0-e REVISED to Option A′ — the review broke Option A, and handed us the certifier
+
+### 13.1 Option A as specified is memory-safe but OPERATIONALLY UNSOUND (verified)
+
+1. **The DPU keeps polling the quarantined slot.** Host quarantine changes only
+   `HomerFrontendArenaSlot.state`. The DPU's `boundServiceSessionId` / `pollQuiesced` / import are **untouched**,
+   and grouped-control discovery is **perpetual while the import is ACTIVE**
+   (`homer_service_dpu_dma.c:1334`, `:1418`). A dead backend does **not** set `pollQuiesced` — that is
+   session-teardown driven (`:6190`). So Option A traded host corruption for a **host-slot leak AND a DPU
+   polling/slot leak.**
+2. **The DPU can RE-NOMINATE the quarantined index** after its own unbind, so the backend FATALs on the
+   `FREE -> BOUND` CAS (`homer_frontend_agent.c:552`, `remote_execution_backend_bridge.c:2833`) — **repeatedly**,
+   because the DPU cannot see host quarantine state. **No graceful capacity degradation.**
+3. **Quarantines survive crash-restart.** Only a fresh postmaster **process** re-runs `_PG_init` ->
+   `CreateArena` -> whole-arena memset (`:299`, `:338`). **16 legitimate crashes in a long-running postmaster
+   is NOT pathological**, so my sizing argument was wrong.
+4. **FATAL-at-16 was broken anyway.** The reaper runs in a **background worker**; `ereport(FATAL)` there
+   restarts the **worker**, not the postmaster (`:1404`) — a restart/log loop with the 16 slots still
+   quarantined.
+
+### 13.2 THE FIX FALLS OUT OF OBJECTION 2 — the nomination IS the certificate
+
+**VERIFIED:** `HomerDpuDmaBindRingSession` (`homer_service_dpu_dma.c:5940`) counts rings whose
+`boundServiceSessionId != 0` (`:6009`) and **REFUSES a slot whose rings still hold a session binding** (`:6015`).
+
+> **Therefore a DPU NOMINATION of slot N is a CERTIFICATE that the DPU has UNBOUND slot N's rings — and once
+> P0-d lands (unbind requires a completed drain), unbind ⇒ DRAINED.**
+>
+> **The certifier I said did not exist was there all along, riding an EXISTING message: the spawn request's
+> slot index.** Zero protocol, zero round-trip, zero new carrier.
+
+### 13.3 OPTION A′ (this replaces §12.1)
+
+```
+1. Reaper: BOUND -> QUARANTINED.  Do NOT zero the bodies.  Log loudly (pid, slot, session).
+2. The HOST never hands out a QUARANTINED slot on its own initiative.
+3. A DPU NOMINATION of that index IS the certificate.  The backend's bind may then CAS
+   QUARANTINED -> BOUND -- zeroing the bodies FIRST (the FREE-state ABI init the reaper deferred).
+4. NO FATAL-at-16 needed: slots RECYCLE.  Keep the loud log + a quarantine counter.
+```
+
+**The key realization: EVERY bind is already DPU-nominated** (`tuple_sink_service_process.c:20113` ->
+`:19880` -> `remote_execution_backend_bridge.c:2829`). So quarantine is **not** "never reuse" — it is
+**"DEFER THE ZEROING until the party that can SEE the DMA certifies it is drained."**
+
+**That is exactly the Scenario-D rule (§9.2): the actor who can see the completions is the one who must certify
+them.** The host cannot see DOCA task completions; the DPU can; so the DPU certifies — and it already does, by
+the act of nominating.
+
+**Answers all four objections:** DPU polling is bounded by session teardown (peer close, or the forced deadline)
+rather than forever; **divergence BECOMES the certificate**; accumulation **does not happen**; and the broken
+FATAL-at-16 is **no longer needed**.
+
+### 13.4 ⚠ NEW DEPENDENCY: P0-e now REQUIRES P0-d
+
+**Without "unbind requires a completed drain", a nomination certifies NOTHING.** Sequence P0-d **before** P0-e.
+Also carry forward the review's caveat: the agent's clean shutdown destroys host exports even if the DPU close
+FAILS (`homer_frontend_agent.c:1740`) — so *"a fresh `_PG_init` zeroed the arena"* is only physically safe if
+the old DPU import was **actually** cut off. **Do not treat a fresh host start as proof the DPU forgot the old
+mapping.**
+
+### 13.5 ✅ P0-f IS CONFIRMED A LIVE BUG (not merely latent)
+
+Both executable callers of `HomerDpuDmaArenaSlotTasksInFlight()` are in `HomerServiceDpuAdvanceArenaTeardowns`:
+
+| caller | not-found behaviour | verdict |
+|---|---|---|
+| **T2 drain query** (`tuple_sink_service_process.c:43640`) | not-found returns success with `inFlight=0`; if `completionEventCount==0`, **teardown ADVANCES to RELEASE publication** | **LIVE BUG.** A wrong/stale generation is **indistinguishable from safely drained**, so teardown can falsely advance while the service still holds ring refs. |
+| **T4 release-write retirement** (`:43706`) | not-found + no queued RELEASE is accepted as **physically retired** | **falsely finalizes teardown** on an identity mismatch |
+
+And `HomerDpuDmaUnbindRingSession()` (one caller, `TupleSinkServiceReleaseDpuArenaBinding`, `:19971`): on
+not-found it returns success, and the service then **unconditionally clears its cached binding** (`:19982`) —
+so on an identity mismatch **the service forgets its ownership while the DPU rings remain bound FOREVER.**
+
+**P0-f is therefore mandatory and load-bearing for P0-d/P0-e both.** Fix it FIRST.
+
+### 13.6 Rules earned
+
+- **A review that breaks your design often contains the better one.** Objection 2 — *"the DPU may re-nominate a
+  quarantined slot"* — read as a defect. It is the **certificate**. The fact that the DPU refuses to nominate a
+  slot whose rings are still bound is exactly the proof the host needed, and it was already on the wire.
+- **When you cannot find a carrier, ask what the OTHER SIDE ALREADY TELLS YOU.** I went looking for a new
+  message. The existing message already carried the fact — I just had not asked what its precondition PROVED.
+- **`FATAL` in a restartable background worker is not a fatal.** It restarts the worker and loops, leaving the
+  condition intact. Know which process your `FATAL` actually kills.
