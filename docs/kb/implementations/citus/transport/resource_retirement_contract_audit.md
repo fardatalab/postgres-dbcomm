@@ -1179,7 +1179,8 @@ owners, explicitly recording what it discarded** (`:4278`, `:4290`).
 
 | item | state | note |
 |---|---|---|
-| **P0-a** | ready | self-contained; phases 2-3 are local |
+| **P0-a** | ✅ **LANDED + VALIDATED** (citus `71b523757`) | §20. The blind clear was a SYMPTOM of a signal policy with no terminal case. **But the fix is PER-SITE — see §21 (P0-i), which generalizes it into a substrate invariant and may have found a LIVE HANG in the payload lane.** |
+| **P0-i** | **NEW — HIGHEST PRIORITY after the audit** | §21. *A lane that defers retirement to a later signalled WR must guarantee one exists.* Substrate fence at quiesce. §21.4 may be a live hang. |
 | **P0-b** | ready | self-contained |
 | **P0-c** | ready | needs the transport-helper API change (return the slot indices) + WOULD_BLOCK backpressure |
 | **P0-d** | ✅ **LANDED + VALIDATED** (citus `9a6f68257`) | §15. NOT what §8 thought: two premises were refuted, and the real hole was the `ResetSession` FUNNEL releasing with no drain (reachable from shutdown). Fixed by enforcing the drain IN the funnel — every path correct by construction. |
@@ -2449,3 +2450,88 @@ not a locally-inferred one — today it is set merely on OBSERVING the close"*).
 
 *Rule earned: two resources whose guards print similar-sounding refusals are still two resources. **Before you
 adopt a log line as an acceptance criterion, find the function that emits it and check WHAT it is protecting.***
+
+---
+
+## 21. P0-i — THE UNSIGNALLED-TAIL INVARIANT. A substrate property, not a per-policy habit.
+
+**Owner, July 12, 2026, on P0-a:** *"The optimization is fine; it was adopted without its end-of-stream case…
+`'A signalled WR always eventually follows'` — that IS the understated invariant that the RDMA substrate relies
+on and should uphold — **a publication gate**."*
+
+**Correct, and it exposes the limit of P0-a's fix.** P0-a is a **per-site** repair: it taught ONE signal policy
+about `CLIENT_SQL_SESSION_CLOSE`. **That is the same scar-tissue pattern this audit exists to end** (§3.0) —
+the command-write lane had already been fixed the same way, once, by hand.
+
+### 21.1 The invariant, stated
+
+> **A lane that DEFERS retirement to a later signalled WR must GUARANTEE that a later signalled WR exists.**
+
+Selective signalling is safe because RC QPs complete **in order**, so one CQE retires the whole unsignalled tail
+behind it (the "lane FIFO"). **The scheme is sound while traffic continues and breaks exactly at the end — which
+is also the moment you release the resource.**
+
+### 21.2 Why P0-a's fix does NOT generalize
+
+Force-signalling a **terminal message** works only if the lane HAS one:
+
+- an **ABORT** path may never send a close → **no terminal message to force-signal**;
+- a lane that simply **goes quiet** (a payload stream that finishes) has **no "last command" at all**.
+
+### 21.3 THE SUBSTRATE FIX — a signalled FENCE at quiesce
+
+**At quiesce, if a lane has ANY unsignalled WR outstanding, POST A SIGNALLED ZERO-LENGTH WR on that QP.**
+RC in-order completion then retires the entire tail.
+
+> **This is phase 3 in its LITERAL form — *"finish AND drain"*. Sometimes draining requires EMITTING something,
+> not merely waiting for it.** One fence per lane per close, on the **cold** path. No hot-path cost, no protocol
+> change, no new message on the wire that the peer must understand (a zero-length RDMA write to an already-valid
+> remote address is invisible to the peer's software).
+
+Then the per-policy terminal cases (P0-a's, and the command-write lane's) become **optimizations**, not
+correctness — they merely avoid the fence in the common case. And the invariant becomes an **assertion**: at
+release, a lane with unsignalled WRs and no fence posted is an **ALARM**.
+
+### 21.4 ⚠ THE SECOND INSTANCE — and this one may be a LIVE HANG (UNVERIFIED — verify FIRST)
+
+The **payload lane also uses selective signalling** — a **byte-interval** policy
+(`payloadBytesPerSignaledCqe`, `payloadSignaledCqes`, `tuple_sink_service_process.c:2225`, `:31105`, `:32411`).
+
+Its close gate (`:25845`, `:27270`) requires `finalPayloadSendRetired`, which requires
+`payloadSendOwnerCount == 0 && payloadSendOwnerOutstandingWrs == 0` (§2.1 records this as HOLDS).
+
+**I found NO force-signal on its final payload send.**
+
+> **If the last payload WR lands UNSIGNALLED, its owner never retires, `finalPayloadSendRetired` never goes
+> true, and `CLOSE_SINK` NEVER FIRES — the stream close HANGS.**
+
+**Same shape as P0-a — but where P0-a's failure mode was a LEAK (and a blind clear), this one's is a HANG.**
+
+**Why we may never have seen it:** our payload workload is basebackup, where a *byte*-interval policy over
+hundreds of MB almost certainly forces a signal close to the end. **A short stream (few KB, one WR) is exactly
+where it would bite.** ⚠ **UNVERIFIED. This is an INFERENCE, and inference has a 0-for-6 record in this
+subsystem (§19.5). VERIFY BEFORE BUILDING — trace the final payload send and find out whether anything signals
+it.**
+
+### 21.5 Scope
+
+1. **AUDIT every lane that posts with a runtime `signaled` flag** and record, per lane, *what guarantees a
+   signalled WR follows*. Known sites: `TupleSinkServicePeerClientCompletionPublishShouldSignal` (fixed, P0-a),
+   `TupleSinkServiceClientSqlCommandWriteShouldSignal` (fixed long ago, by hand), the **payload lane** (§21.4),
+   and every `signalCompletion` parameter through `remote_execution_peer_transport_rdma.c:9258-9427`, `:5116`,
+   `:9640`.
+2. **Add the fence primitive** to the peer transport: `PostSignalledFence(connectionHandle)`.
+3. **Call it at quiesce** from every lane whose tail may be unsignalled.
+4. **Assert the invariant at release** — unsignalled tail + no fence = ALARM.
+
+### 21.6 Priority
+
+**Above P0-b and P0-c.** Those are leaks and latent races; **§21.4 may be a live hang.** But the FIRST
+deliverable is the **audit**, not the fence: *find out whether the payload lane is actually exposed before
+building anything.*
+
+### 21.7 Rule earned
+
+> **Any deferred or cumulative acknowledgement scheme needs a terminal flush.** Batching is safe *while traffic
+> continues* and breaks *exactly at the end* — which is precisely when you release the resource. **Whenever you
+> see "we'll retire this later, when the next one completes," ask what happens when there is no next one.**
