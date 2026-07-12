@@ -297,12 +297,38 @@ These are in the KB, **not** the runbook, precisely so nobody copy-pastes them. 
 -t 'homer:mode=rdma,host=10.10.1.100,port=9717,node=2'
 ```
 
-`pg_basebackup` is now **mandatorily a selected-DPU producer**. On byte-ring wrap it writes a pre-wrap
-transport header whose advertised length **deliberately exceeds** the trailer — that *is* its wrap signal to
-the DPU relay. The **host** service's receiver reads that identical condition as **corruption** and aborts at
-the first wrap with `byte-ring record unexpectedly crossed ring boundary`; the client then **hangs with no
-error**. (Confirmed July 9, 2026 on both the current and the reverted tree. "Problem 3" in
-`../implementations/citus/transport/byte_ring_slot_capacity_regression.md`.)
+⚠ **Read the direction of causation carefully — it is the opposite of what it looks like.** This is **not** a
+stale path that the DPU work has yet to reach. It is a path that the DPU work **broke**, and the *host
+service* is the leftover.
+
+`pg_basebackup` is now **mandatorily a selected-DPU producer** (`HomerClientOpenBaseBackupStreamSelectedDpu`,
+unconditional, from `bbsink_homer_begin_backup`). So the producer **always** speaks the DPU-relay wrap
+protocol now, no matter who the receiver is. On wrap it writes a pre-wrap transport header whose advertised
+record length **deliberately exceeds** the trailer — that overlong length *is* the wrap signal
+(`homer_client.c:4576-4583`).
+
+Two receivers, opposite readings of the **same bytes**:
+
+| receiver | rule | verdict |
+|---|---|---|
+| **DPU relay** | `recordBytes > trailerBytes` ⇒ wrap proven, re-parse at offset 0 | ✅ |
+| **host service** `HomerServicePumpIncomingByteRingPayload` (`tuple_sink_service_process.c:32357`) | `recordBytes > contiguousBytes` ⇒ **fatal** | ❌ |
+
+The host service only takes its skip-trailer path when `!headerReady` — and the pre-wrap header makes
+`headerReady` **true**, so it falls into the fatal arm instead. It aborts at the first wrap with
+`byte-ring record unexpectedly crossed ring boundary session=… sequence=128`, emits a peer reset and
+`CM event=DISCONNECTED`, and the client then **hangs with no error** (`rc=124` under `timeout`; needs a manual
+kill).
+
+**The bitter part:** a **shared** drain core, `HomerByteRingSinkDrain` (`homer_byte_ring_sink.h:217-224`),
+already implements the *correct* geometric rule —
+`gap iff contiguousBytes < maxRecordBytes && consumedHead + contiguousBytes <= producedTail` — and
+**neither receiver uses it.** Both rolled their own.
+
+Confirmed July 9, 2026 by A/B on both the current and the reverted tree, so it is **not** from the byte-ring
+pool refactor; it dates to whenever basebackup became mandatorily selected-DPU. "Problem 3" in
+`../implementations/citus/transport/byte_ring_slot_capacity_regression.md`, where the fix shape is recorded
+(teach the host service the shared rule) but **not yet implemented**.
 
 **Use the 4-role DPU-relay topology** (`host=10.10.1.200`, the farnet0 **DPU**) in `CLAUDE.md`.
 

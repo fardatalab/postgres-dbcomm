@@ -643,9 +643,19 @@ The intended network-interference shape: transactions as the foreground workload
 background traffic. The shape is: launch the basebackup in the background, `sleep 0.5`, run the pgbench in the
 foreground, `wait` for the basebackup, then report **both** return codes and keep **both** logs.
 
-> ⚠ **The two scripts that used to live here (c1 and c4) both drove basebackup at
-> `host=10.10.1.100` — the farnet0 HOST service — which hangs above ~8 MiB** (diagnostics §4.1). They cannot
-> run today and were deliberately not carried over.
+> ⚠ **The two scripts that used to live here (c1 and c4) cannot run today and were deliberately not carried
+> over.** They were written in June, when the host-service basebackup target still worked; the selected-DPU
+> migration rotted them. They carry **two independent defects**, and the one that actually fires is not the
+> famous one:
+>
+> 1. **`bytes=8388608` fails FAST, at stream open** — `basebackup record footprint 8388848 too large for byte
+>    ring storage 8388608` (`homer_client.c:3655`, a 2× headroom guard that deliberately rejects "before
+>    setup"). Not a hang: a loud, immediate error. **This is what you would actually see.**
+> 2. **`host=10.10.1.100`** (the farnet0 **host** service) is the one that *hangs*, at the first wrap
+>    (~8 MiB) — but only if you fix (1) first, since nothing moves until the stream opens.
+>
+> *(Status: INFERRED from the target strings, not observed — nobody re-ran these scripts. Both guards are
+> confirmed in code; see diagnostics §4.1–§4.2.)*
 >
 > Re-deriving this against the **4-role DPU-relay** topology is **open work**: that topology needs a
 > `--homer-receive` consumer on the farnet0 host, while the foreground pgbench *also* runs from farnet0. So
