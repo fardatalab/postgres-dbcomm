@@ -2711,3 +2711,131 @@ garbage), zero failure publications, zero engine fatals. `homer_tuple_deform_smo
 
 **CAVEAT:** the basebackup producer's `reserved1` fix is NOT exercised by pgbench — it needs the 4-role
 DPU-relay basebackup workload. Correct by inspection (memset before fill), but unvalidated at runtime.
+
+---
+
+## 17. P4.2a + P4.1 — the mirror-path truth-source cleanup (design of record, July 12, 2026)
+
+### 17.0 SEQUENCING CHANGE: P4.2a moves AHEAD of P4.1 (decided, not improvised)
+
+§12.1 ordered these `P4.1 -> P4.2a`. Reversed, for two reasons found while scoping P4.1:
+
+1. **P4.1's real surface is 115 `sendQueue.*` accesses**, not the six the sweep named (§10l counted only the
+   *hard* dependencies — the geometry/existence gates that block deletion. The frontier readers, the
+   diagnostics and the pumps sit on top).
+2. **P4.2a deletes a chunk of that surface, has zero dependencies, and is bigger than §12.5 recorded.**
+
+Doing the free deletion first strictly shrinks the refactor. Nothing in P4.2a depends on P4.1.
+
+### 17.1 P4.2a is not just dead code — it is a scheduler action that can NEVER be granted
+
+`HomerServiceTupleViewEosAppendReady` returns `false` unconditionally (the body is
+`(void) streamEntry; (void) requireCapacity; return false;`). Following its callers UPWARD:
+
+- it is the **sole producer** of the ready bit `HOMER_PROGRESS_REASON_PAYLOAD_EOS_READY` (one site), and
+- that bit is the **sole arming input** for the entire scheduler action `HOMER_PROGRESS_ACTION_PAYLOAD_EOS`,
+  which is wired through ~8 switches, an action-mask helper, a priority chain and the reason->action map.
+
+So the service carries a **complete, permanently un-armable scheduler action**. That is this arc's bug family
+in scheduler form, and CLAUDE.md already names the hazard: *an un-armable collector and a healthy idle one
+look identical.* It goes.
+
+**Deleting an enum member is a better refactoring tool than grep here.** CLAUDE.md warns that `-Wswitch`
+protects nothing in this file (nearly every switch over the progress enums has a `default:` arm, so ADDING a
+member compiles clean and falls through silently). Removing one inverts that: every `case ...PAYLOAD_EOS:`
+and every hand-enumerated `AppendCollectorAction` naming it becomes a HARD COMPILE ERROR. The compiler
+enumerates the removal sites — the completeness check the `default:` arms deny us in the other direction.
+
+Deleted: the predicate + its 5 call sites, `HomerServiceTupleViewNextEosSequenceFromProducerBytes`,
+`HomerServiceAppendTupleViewEosRecordToProducerByteRing`, `HomerServiceAppendTupleViewEosForStream` + caller,
+the reason bit, and the action kind. The reason bits are explicit `(1U << N)` values — the deleted one leaves
+a HOLE and the others are NOT renumbered (renumbering would be a silent change to every mask).
+
+### 17.2 THE FINDING THAT SHAPES P4.1: the source kind is a process-CONSTANT, re-derived ~25x per pass
+
+`HomerServicePayloadStreamUsesDpuMirrorSource` (tuple_sink_service_process.c:6867) ends in:
+
+```c
+dpuDmaState = HomerServiceDpuDmaSchedulerStateForProgress();
+return HomerServiceDpuDmaSchedulerEnabled(dpuDmaState) && dpuDmaState->engine != NULL;
+```
+
+But `dpuDmaState.enabled` is read ONCE from env at startup (:48009), `engine` is created ONCE (:48031) with
+`exit(1)` on failure, and destroyed only at :48212 AFTER the main loop. **`enabled && engine != NULL` is
+therefore invariant for the entire life of the main loop.** The predicate re-computes a constant, from a
+global, at ~25 call sites, every scheduler pass.
+
+That is not merely waste. It is *why* the source kind reads as a derived opinion rather than a stored fact —
+and it hides a latent instance of the very bug family: **if `engine` were ever NULL, every mirror stream would
+silently reclassify as LOCAL_BYTE_RING and begin reading the structurally-zero `sendQueue.byteRingControl->
+publishedTail`.** Freezing the kind at bind deletes the failure mode outright.
+
+### 17.3 P4.1 design
+
+**(a) `HomerPayloadSourceKind`, stored on the stream entry, stamped at bind.**
+
+```c
+typedef enum {
+    HOMER_PAYLOAD_SOURCE_INVALID = 0,   /* a zeroed struct must NOT read as a valid kind */
+    HOMER_PAYLOAD_SOURCE_FIXED_SLOT,    /* legacy slot ring                                */
+    HOMER_PAYLOAD_SOURCE_LOCAL_BYTE_RING, /* shm ring this process can read directly       */
+    HOMER_PAYLOAD_SOURCE_DPU_MIRROR,    /* host ring reachable ONLY through the DMA engine */
+} HomerPayloadSourceKind;
+```
+
+`INVALID = 0` is deliberate and is the §12.3 principle applied to the new field itself: a memset-zeroed entry
+must not accidentally read as a valid source.
+
+Classified by `HomerServiceClassifyPayloadSource(objectFamily, dpuRelayResultStream)` against the
+process-constant `HomerServiceProcessOwnsDpuDmaEngine()`; stamped at BOTH construction sites
+(`HomerServiceCreatePayloadStreamEntry` :25188 and the identity shell
+`TupleSinkServiceReserveDpuResultStreamIdentity` :20037). The two existing predicates KEEP their names and
+signatures and become pure field reads — so their ~40 call sites are untouched. Minimal diff, maximal safety.
+
+**(b) Geometry moves OUT of the mapping.** Four sites read the ring size from INSIDE the mapped control block
+(`sendQueue.byteRingControl->ringBytes`, :38456 and :39524) or from the mapper's own copy (:17720, :36907).
+Geometry is known at create (`producerRingBytes`) and does not need a mapping to exist. Add
+`stream.payloadSourceRingBytes`, set at create, and read it everywhere. Note :39524 feeds
+`requestedByteRingBytes` into the peer OPEN — leaving it to read a NULL mapping would silently send `0`.
+
+**(c) Existence tests -> one accessor.** `HomerServicePayloadSourceIsBound(streamEntry)` replaces the
+`sendQueue.queueControl != NULL || sendQueue.byteRingControl != NULL` disjunction (:26646). On DPU_MIRROR it is
+TRUE — the engine mirror IS the source; there is no local struct to point at. Getting this wrong silently
+disables failure marking on every mirror stream.
+
+**(d) ONE frontier accessor, allowed to answer "not locally knowable".**
+
+```c
+static bool HomerServicePayloadSourcePublishedTail(const HomerServicePayloadStreamEntry *e, uint64_t *out);
+/* returns FALSE on DPU_MIRROR. A caller that cannot handle false MUST NOT ASK. */
+```
+
+**(e) Then stop mapping the producer shm on the mirror path** (skip `HomerServiceMapProducerByteRingQueue` when
+kind == DPU_MIRROR), leaving `byteRingControl == NULL` there. *A zeroed struct lies; a NULL pointer confesses.*
+
+**Sites that MUST be converted before (e) is safe** — each is a real breakage, not a theoretical one:
+
+| site | today | after |
+|---|---|---|
+| prepare's NULL-control reject (:26084-26091) | rejects a stream for lacking a struct it **never uses** — its only reader (:26145) is already skipped on the mirror path | move the NULL check INSIDE the non-mirror branch |
+| `hasSendControl` (:26646) | would become FALSE on mirror -> **failure marking silently disabled** | `HomerServicePayloadSourceIsBound()` |
+| blackhole reclaim log (:39956) | **UNGUARDED deref** of `byteRingControl->publishedTail` | frontier accessor; print `n/a` when not knowable |
+| geometry (:17720, :36907, :38456, :39524) | reads the mapping; :39524 would send `requestedByteRingBytes=0` on the wire | `stream.payloadSourceRingBytes` |
+| peer-bind frontier seed (:26003-26026) | seeds from the dead struct (reads 0,0) | accessor; mirror falls to the existing `else` -> 0,0 (identical) |
+| abort source release (:28617) | stores `consumedHead` into a struct nobody reads | accessor; skip on mirror |
+
+Already safe, verified, needs no change: the mirror branch is taken FIRST at the frontier facts (:7071) and the
+completion apply (:14985, whose comment already says a mirror source has no sendQueue control word to credit);
+and legacy sendQueue RDMA registration ALREADY rejects the mirror path outright (:17693). `queueShmName` turned
+out to be a non-dependency: its only uses are `shm_unlink` (:25163) and one log line (:36886).
+
+**(f) Land in TWO steps, validated separately.** Step 1 = (a)-(d), mapping still created: behavior-identical,
+isolates "did the refactor break something". Step 2 = (e): isolates "did removing the mapping break something".
+One extra validation cycle, and it means a hang in step 2 has exactly one possible cause.
+
+### 17.4 Acceptance (falsifiable)
+
+1. The three workloads stay green (pgbench --homer-dpu-command is the gate; 3 consecutive runs, one stack).
+2. Zero reads of `sendQueue.byteRingControl->publishedTail` outside a LOCAL_BYTE_RING branch.
+3. **No `/dev/shm/citus_res_*` object is created by a DPU-path run.** This is P4.2b's end-state proof, and
+   step (e) makes it checkable ALREADY — the mirror path stops creating the shm object at all.
