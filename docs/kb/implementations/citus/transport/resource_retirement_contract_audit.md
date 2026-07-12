@@ -919,3 +919,220 @@ rediscovered here.
 **Corollary:** a quiesce that does not stop *every* producer of new work on a resource is not a quiesce, and a
 drain that does not count *every* consumer is not a drain. **Enumerate the producers and the consumers, or the
 gate is theatre.**
+
+---
+
+## 9. THE PROTOCOL — the merged, step-by-step plan of record
+
+**Owner, July 12, 2026 — this supersedes the per-item ad-hoc fixes in §4/§7 and is the plan of record:**
+
+> **1. DECIDE** — realize I need to leave.
+> **2. QUIESCE** — stop new work: **mine AND everyone else's**. *Every source of new work.*
+> **3. DRAIN** — finish and drain what remains, **until there is none left**.
+> **4. RELEASE** — only now: final cleanup, and actually leave.
+>
+> **THE ALARM: if we find ourselves needing to handle STALENESS, that is a BUG in phases 2-3, not a case to
+> handle.** A stale reference is only reachable if someone left while work was still outstanding.
+
+### 9.1 THE ALARM RUN BACKWARDS — it is an AUDIT TOOL, and it finds exactly our list
+
+Every existing staleness handler in the codebase should point at a missing phase. It does:
+
+| existing staleness handler | the missing phase |
+|---|---|
+| arena **tenancyGeneration** + `DROPPED` (`homer_service_dpu_dma.c:4533`, `:12644`) | **2 and 3** — quiesce does not stop grouped-control discovery; the drain does not COUNT it |
+| payload **doorbell-token generation** -> connection reset (`tuple_sink_service_process.c:29647`, `:29671`) | **3** — the peer never certifies its writes are retired |
+| control-op **generation guard** (`remote_execution_peer_transport_rdma.c:3699`, **dead code**) | **3** — the send CQE is never waited for |
+| staging pools — **no handler at all** (`:743`, `:760`) | **3** — nothing is counted, so nothing can be waited for |
+| **sender-head mirror MR** kept registered "because a late ACK can still arrive" (`:25071`) | **3** — the SAME missing certification as the doorbell token |
+| control-**RESPONSE** slot, freed only by its own CQE (`:3684`, `:7950`) | **none — this one ALREADY follows the protocol** |
+
+**The rule finds exactly the audit's list and nothing else.** It also shows the response slot is **already
+correct**, so **§27's proposed generation check was solving a non-problem** — the right action there is an
+ASSERT that nothing else may clear `inUse`, not a generation.
+
+**Two items COLLAPSE:** the doorbell-token staleness and the mirror-MR leak are the **same** missing peer
+certification. Fix phase 3 for the peer once and **both disappear**.
+
+### 9.2 A key distinction the protocol forces (and which we had blurred)
+
+**What phase 3 must prove depends on what the resource IS to the actor:**
+
+- **A SOURCE buffer** (the NIC reads it): I need **"my own CQE is retired"**. Only I can see it.
+- **A TARGET MR** (someone writes into it): I need **"no further write will ARRIVE"**. I do **not** need the
+  writer's CQE — that is the writer's own phase 3, for the writer's own source.
+
+This is why the **command mailbox is genuinely safe today**: RC delivery is in-order on one QP and the close is
+the last command, so observing the close **proves no further write will arrive**. That is a real phase-3 proof,
+not luck. **Write it down; do not "fix" it.**
+
+### 9.3 THE PER-ITEM MERGED PLAN
+
+---
+
+#### P0-a — peer-client completion publish (source MR deregistered under a live WR)
+
+| phase | what |
+|---|---|
+| **1 DECIDE** | session close observed (exists) |
+| **2 QUIESCE** | **NEW:** set `completionPublishQuiesced` on the session; refuse any new completion publish |
+| **3 DRAIN** | **The blocker: the last publish may be UNSIGNALED, so no CQE is coming.** A lane FIFO (`:5934`) retires cumulatively **only** when a LATER signaled publish occurs — and after quiesce there is none. **So the drain must FINISH the work, not merely wait for it** (the owner's phase 3 is "finish AND drain"): **force a signal on the terminal publish**, keyed **ONLY** on `commandKind == CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_SESSION_CLOSE` — **NOT** `TupleSinkServiceCommandStateIsTerminal` (`:17927`), which means `COMPLETED\|\|FAILED`, i.e. **every command**, and would put a signaled WR on the hot path. Then poll the send CQ and **wait for `active == 0`, retrying across passes.** |
+| **4 RELEASE** | clear owners, deregister the MR, reset the session |
+
+**No `exit(1)`** — a signaled post can legitimately still be un-polled at reset (CQ retirement is async).
+**FATAL only on bounded non-convergence.** The blind clear at `:6604` disappears.
+**Also:** a **partial post** leaves a slot `FAILED_OR_INFLIGHT` (`:19043`) that a terminal checkpoint does NOT
+repair — that slot is owned until the connection-reset cutoff (Scenario E), and phase 3 must say so.
+
+---
+
+#### P0-b — control op (source buffer memset before its CQE)
+
+| phase | what |
+|---|---|
+| **1 DECIDE** | the response is matched |
+| **2 QUIESCE** | n/a — a single WR; there is no new work to stop |
+| **3 DRAIN** | **wait for the request's own send CQE.** It is always signaled (`:9602`), so it always arrives (or the connection fails -> Scenario E). |
+| **4 RELEASE** | memset the slot |
+
+**Fields:** `bool sendCompletionRetired;` + phase `..._OP_RETIRING` on `TupleSinkServicePeerControlOpState`
+(`:263`). Release fires from **whichever of {response consumed, CQE retired} happens LAST** — the CQE usually
+arrives FIRST, so it cannot simply move to the CQE handler. The allocator (`:7790`) already takes only `UNUSED`.
+**The dead guard (`:3699`) becomes the real retirement site + a LOUD assertion.** Delete its decoy comment.
+**TEACH the reset abort classifier (`:4290`-`:4315`) about `RETIRING`** (verified: it clears every non-`UNUSED`
+phase, so no leak — but it would misfile it as unknown).
+**NOT closed by this:** the response slot is an independent pool. Per §9.1 it **already follows the protocol** —
+so **ASSERT** that only its own CQE may clear `inUse`. No generation needed.
+
+---
+
+#### P0-c — staging pools (no accounting at all).  ⚠ LIVE BUG TODAY, not just a pooling landmine
+
+Reuse **is** "someone left": the previous WR must have retired before the slot is handed out.
+
+| phase | what |
+|---|---|
+| **1 DECIDE** | a reservation is requested |
+| **2 QUIESCE** | n/a |
+| **3 DRAIN** | **the reservation must not hand out a slot whose WR has not completed.** Add per-slot `inUse`. If the pool is full: **drain the send CQ, retry, and LOUD ERROR if still full** — exactly the pattern `controlResponsePublishSlots` already uses (`:7955`). Reuse it; do not invent. |
+| **4 RELEASE** | clear `inUse` **at the owner's existing retirement site** (`:16579` payload send, `:32550` ACK) |
+
+**IMPLEMENTATION GAP (from the review):** the helpers **select the slot INSIDE and do not return the index**
+(`:9676`, `:9890`). **The API must change** — the helper takes/returns the owner so it can record the slot(s).
+For fragment headers, record **first-index + count** (they are unsignaled but chained to the batch's signaled
+tail WIMM, so they retire with the same owner).
+**Two edges the review caught:** `PostPeerUint64WithImmediateResultRdma()` supports `signaled=false` (tail slot
+with **no owner** — no production caller, but the API allows it: **forbid it or give it an owner**); and
+`ibv_post_send()` can **partially accept** a chain (`:10080`) — the **accepted prefix keeps its slots owned**
+until the reset cutoff. Clearing them as if nothing posted **recreates the original bug**.
+
+---
+
+#### P0-d — arena tenancy (SUPERSEDES §7.5's three-way partition entirely)
+
+| phase | what |
+|---|---|
+| **1 DECIDE** | teardown begins (T1) |
+| **2 QUIESCE** | **THE MISSING PIECE.** Today T1 quiesces the ring's own pull/publish but **NOT the engine's grouped-control discovery reads** (`:4533`). **Quiesce must stop EVERY producer on that ring.** |
+| **3 DRAIN** | **`inFlightTaskCount` must COUNT grouped-control reads** — today they are excluded (`:4533`), which is exactly why the drain could pass with work outstanding. Then wait for zero. **It converges**: nothing new is armed, and in-flight DOCA tasks always complete (success or error) because the **engine** is alive and independent of the backend. |
+| **4 RELEASE** | unbind, reset tenancy |
+
+**Consequences, all subtractive:** stale becomes **impossible**; `tenancyGeneration` survives **only as a LOUD
+ASSERTION that must never fire**; the three-way partition **evaporates**; the `DROPPED` path goes away — and it
+never worked anyway (a "dropped" completion still cleared the **NEW** tenant's `controlReadInFlight`, `:10565`).
+
+**The 30 s deadline:** it exists because **T3/T4 wait on the BACKEND**, which may be dead. **DMA tasks do not
+depend on the backend.** So the deadline **MAY abandon the backend handshake; it MAY NEVER abandon the DMA
+drain.** The drain is an **unconditional precondition of unbind on every path.** FATAL only if the DRAIN fails
+to converge — which would mean the DOCA engine is broken, i.e. a real bug we want to see.
+
+---
+
+#### P0-e — dead-PID arena reaper
+
+This is simply **phases 2-4 executed by the DPU, with the host WAITING.** The backend is dead, but **the DPU is
+ALIVE and its tasks drain fine** — the actor exists; there is merely no certification path.
+
+| phase | what |
+|---|---|
+| **1 DECIDE** | the host reaper sees `kill(pid,0) == ESRCH` |
+| **2 QUIESCE** | the host **cannot** quiesce the DPU — so it must **NOT PROCEED**. It publishes **`QUARANTINED`** (new slot state) and **does not zero the bodies**. A QUARANTINED slot is **never handed out**. |
+| **3 DRAIN** | the **DPU** quiesces and drains that slot's rings (its own P0-d machinery), then **CERTIFIES zero** |
+| **4 RELEASE** | only on that certification does the slot become `FREE` |
+
+**FATAL only when QUARANTINED slots exhaust the arena** (16) — that is the point at which it *is* our bug.
+**Not fatal in the reaper**: it is on the ROUTINE cleanup path (our own runbook `kill -9`s backends every run),
+so a FATAL there would crash the postmaster on every run. **Fail-SAFE (leak a slot), never fail-SILENT.**
+**OPEN — needs a decision:** the DPU->host certification carrier (spawn doorbell / an arena field the DPU
+already DMAs / the setup socket). **Until picked, the "no new round-trip" claim is UNVERIFIED.**
+
+---
+
+#### P1-f — remote-writable MRs (and it SUBSUMES P1-g and the mirror-MR leak)
+
+**Command mailbox: ALREADY CORRECT** (§9.2) — RC in-order on one QP + close-is-last proves *"no further write
+will arrive"*, which is the right phase-3 proof for a **target** MR. **Verified single writer** (`:21143`), one
+connection handle, no credit/completion/payload/alternate-class writer. **Write the invariant down + assert it.
+Do not change it.**
+
+**Completion mailbox (`:23613`) and peer completion ring (`:23618`): NOT covered** — they are written by the
+**opposite** party in the **opposite** direction, so "I sent my close" proves nothing.
+
+| phase | what |
+|---|---|
+| **1 DECIDE** | session close |
+| **2 QUIESCE** | the peer stops issuing writes (it observes the close) |
+| **3 DRAIN** | **THE PEER drains ITS OWN send CQEs** (only it can see them) **and then CERTIFIES**. `peerWritersQuiesced` must become a **RECEIVED FACT**, not a locally-inferred one (today it is set merely on OBSERVING the close, `:23945` — logical, not physical). |
+| **4 RELEASE** | I deregister only after that certification |
+
+**⚡ THE EFFICIENT ANSWER TO CHECK FIRST — it may cost NOTHING:** *if the peer's close RESPONSE travels the SAME
+QP as its completion writes, then RC in-order delivery ALREADY proves every prior completion write landed* —
+exactly the command-mailbox argument, in reverse. **Then there is no protocol change at all, only an invariant
+to write down and assert.** **VERIFY THIS BEFORE DESIGNING ANY CERTIFICATION.** Only if the response rides a
+different QP/lane do we need to change what an existing message means (still **zero new round-trips** — we
+change *when* it is sent, never add one).
+**OPEN:** I previously named `CLOSE_SINK` — **wrong lifetime** (that is payload-stream; these MRs are
+client-SQL critical-control). The correct session-level certifier must be identified.
+
+**P1-g DISSOLVES.** My "count and drop a stale payload WIMM" **contradicted the contract** (its consumer
+advances **sender credit** — someone was waiting). Under the protocol the stream is not released until the peer
+certifies, so **the stale WIMM cannot exist**. The doorbell-token generation becomes a **LOUD ASSERTION**.
+(If a stale one somehow arrives: **ATTRIBUTE it to the old stream**, never drop; and it must **never** reset a
+SHARED connection. A **malformed** token stays a reset.)
+
+**The sender-head mirror MR leak DISSOLVES too** — it is kept registered *"because a late ACK can still
+arrive"*, which is the same missing certification. With phase 3 in place it can be deregistered at stream close.
+
+---
+
+#### P2-i — `HomerDpuDmaDestroy` on CLEAN exit
+
+1 DECIDE: shutdown. 2 QUIESCE: stop arming. 3 DRAIN: progress the PE until the **global** outstanding count is
+zero (bounded; FATAL on non-convergence). 4 RELEASE: destroy. **Violent teardown on a FAILURE exit is
+unchanged** — see §9.4.
+
+---
+
+### 9.4 THE ONE LEGITIMATE EXCEPTION — and it must be named as such
+
+**Scenario E (violent teardown) is CANCELLATION, not phase 3.** It is what we do when **we CANNOT drain** — the
+QP or engine is broken, so the work will never complete. It destroys the CQ/QP and then **ABANDONS software
+owners, explicitly recording what it discarded** (`:4278`, `:4290`).
+
+- **CORRECT for a real failure. Keep it exactly as it is.**
+- **NEVER a substitute for a clean leave.** Using it as the release mechanism is precisely the substitution this
+  whole audit exists to end — and it is what P7b.1 must stop doing.
+- **Any resource whose phase 3 cannot converge must route HERE explicitly**, not silently (e.g. the partial-post
+  slot in P0-a).
+
+### 9.5 SEQUENCING
+
+**P0-a, P0-b, P0-c** are self-contained (phases 2-3 are local). **P0-d** is self-contained on the DPU.
+**P0-e** and **P1-f** each have ONE open question (the certification carrier; and whether RC ordering already
+gives P1-f's proof for free). **P7b.1/2/3 land only after P0.**
+
+### 9.6 The rule
+
+> **A quiesce that does not stop EVERY producer is not a quiesce. A drain that does not count EVERY consumer is
+> not a drain. And if you are writing code to handle a stale reference, you have found a missing phase 2 or 3 —
+> go fix that instead.**
