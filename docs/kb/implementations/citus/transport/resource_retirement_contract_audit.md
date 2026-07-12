@@ -655,3 +655,180 @@ this whole audit exists to end.
 - `dpu_crossnode_command_completion_bridges_design.md` §25–§29 — the derivation, the consumer inventory, and
   the control-op finding that opened this audit.
 - `selected_dpu_session_rings_and_lifecycle.md` §6b — the contract as a standing rule (architecture of record).
+
+---
+
+## 7. ADVERSARIAL REVIEW — NINE DEFECTS IN THE PLAN ABOVE (July 12, 2026)
+
+The plan in §4 was reviewed adversarially and **it was wrong in nine places**, two of them severe enough to have
+broken correct runs. Corrections below **SUPERSEDE** the corresponding text above. Both sides are kept, per KB
+convention: the reasoning that produced the error is as instructive as the fix.
+
+### 7.1 THE MODEL (§0.3) — three corrections
+
+**(a) "Four scenarios" is five, and D is not distinct from C.** Both C and D answer *"can I observe their
+completion?"* with **no**. The real axis is **completion OWNERSHIP**, not the machine boundary. D is C with the
+owner on another machine — an *operational* difference (who certifies, and can I reach them), not a taxonomic
+one. Keep the labels, but stop treating "cross-machine" as its own failure mechanism.
+
+**(b) SCENARIO E IS NOT RETIREMENT — IT IS CANCELLATION.** My claim that destruction *"makes further
+completions impossible"* is **too strong and materially misleading**. Reset destroys the QP/CQs and then
+**synthetically ABORTS software owners** — `TupleSinkServiceAbortConnectionSoftwareOwnersOnReset`
+(`remote_execution_peer_transport_rdma.c:4278`) **explicitly records the completed/waiting operations it
+DISCARDED** (`:4290`). So E does not *satisfy* the contract; it is a **failure-containment EXCEPTION** to it:
+cancel, cut off, reconcile. Successful completions are **lost**, not retired.
+
+**(c) "EVERY violation is E standing in for the others" IS FALSE.** Several violations occur **while the QP and
+engine are fully alive** and have nothing to do with pooling:
+- the staging-pool lap (`:743`, `:760`) — **reachable TODAY with enough concurrent streams**;
+- control-op release — masked by **RC ordering**, not by QP destruction;
+- forced arena unbind (`homer_service_dpu_dma.c:6353`) — the engine stays live;
+- the dead-PID reaper (`homer_frontend_agent.c:689`) — the DPU stays live.
+
+**This RAISES the urgency:** some of these are **live bugs now**, not merely pooling landmines. The honest claim
+is: *E has been MASKING several lifetime bugs (chiefly the MR deregistrations and remote-writer cases), and
+pooling removes that mask — but it is not the universal cause.*
+
+**(d) The model omits ABORT/CANCELLATION ownership.** A local send CQE can report **failure**
+(`remote_execution_peer_transport_rdma.c:4044`), which is neither normal A-retirement nor E. It is
+**A transitioning into explicit abort reconciliation**, and the model must name it.
+
+### 7.2 P0-a — TWO SERIOUS ERRORS. Do NOT implement as written.
+
+**(a) MY PREMISE WAS TOO STRONG — an existing retirement mechanism was omitted.** A per-lane FIFO
+(`TupleSinkServiceRetirePeerClientCompletionPublishCompletionsThrough`, `tuple_sink_service_process.c:5934`)
+lets a **later signaled** publication **cumulatively retire all preceding owners** on that lane. So *"no CQE is
+ever coming"* holds **only** when no later signaled publication occurs — i.e. for a **short or final** session.
+The defect is real; my description of it was not.
+
+**(b) ⚠ THE PROPOSED PREDICATE IS A HOT-PATH REGRESSION.** I wrote "terminal for the session
+(`TupleSinkServiceCommandStateIsTerminal`...)". **`TupleSinkServiceCommandStateIsTerminal` means `COMPLETED ||
+FAILED` (`:17927`) — i.e. EVERY completed SQL command**, not session close. Using it would force a signaled WR
+**on every command** — in a plan whose own rule is "no new hot-path work".
+**CORRECTION: key the forced signal ONLY on `commandKind == CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_SESSION_CLOSE`**,
+exactly as the command-write path does (`:6638`).
+
+**(c) ⚠⚠ `exit(1)` IS NOT SAFE, EVEN WITH THE FORCED SIGNAL. IT WOULD KILL CORRECT RUNS.** A **signaled** post
+can legitimately still be `active` at reset — **the CQE simply has not been polled yet.** CQ retirement is
+asynchronous; the lane FIFO exists *because* of that. A single non-blocking drain followed by `exit(1)` will
+therefore crash a **healthy** run.
+**CORRECTION: DEFER, do not die.** If any owner is still active: **do not clear, do not reset — retry on a
+later pass.** FATAL **only** after a bounded deadline (non-convergence is then a real bug). This is the same
+trap I warned about and then walked into.
+
+**(d) Omission:** a **partial post** deliberately leaves a source slot `FAILED_OR_INFLIGHT` because no final
+WIMM CQE will retire it (`:19043`). **A terminal checkpoint does NOT repair an already-partial chain** — that
+case needs its own treatment.
+
+### 7.3 P0-b — the "closes the response-slot hazard by construction" claim is WRONG
+
+`controlOps[]` and `controlResponsePublishSlots[]` are **independent source pools with separate CQE tags and
+separate retirement branches** (`:3664`). **Fixing request-op lifetime does not touch response-slot lifetime.**
+The response slot needs its **own** treatment (either the same retire-before-reuse discipline, or the
+generation check §27 proposed). My "by construction" was a conflation.
+
+**Also:** the reset's abort classifier (`:4290`-`:4315`) does not know a `RETIRING` phase and would file it
+under a default/unknown-phase branch. It must be **taught** the new phase, so "post-failure behaviour is
+unchanged" is not true as written. (The good news, verified: the abort path *does* clear every non-`UNUSED`
+phase, so a `RETIRING` op does **not** leak on connection failure.)
+
+### 7.4 P0-c — the premise holds, but the plumbing does not exist
+
+**Verified good news:** every *current production* poster of a tail slot or fragment-header slot **does** go
+through a tracked owner. No control, smoke, EOS-only, or unowned caller exists today. The premise stands.
+
+**But the proposed implementation cannot be written as described:**
+- **Slot selection happens INSIDE the transport helpers, AFTER the service owner is reserved, and the helpers
+  DO NOT RETURN the slot indices** (`:9676`, `:9890`). So "record the slot index in the existing owner" is
+  **impossible without changing that interface.** The helpers must return the indices (or take an owner handle).
+- `TupleSinkServicePostPeerUint64WithImmediateResultRdma()` **publicly supports `signaled=false`**, in which
+  case the tail slot has **no tagged owner** at all (`:10214`, `:10265`). No production caller today — but the
+  *general* ownership rule I asserted is **false for the API as written**.
+- **`ibv_post_send()` can PARTIALLY accept a chain** (`HomerPeerPostResult`, `:10080`). Any slot-owner scheme
+  **must keep ownership of the ACCEPTED prefix's slots** until the connection-reset cutoff. Clearing all
+  recorded slots as though the batch never posted **recreates the original violation.**
+
+### 7.5 P0-d — MY SPEC WAS BADLY INSUFFICIENT (the largest substantive defect)
+
+I wrote "retire the task's resources but do not apply its frontier". **Arena task retirement has far more
+tenant-sensitive side effects than a frontier**, verified at `homer_service_dpu_dma.c:10565`ff:
+- it clears **per-ring in-flight FLAGS** — `controlReadInFlight`, `commandPullInFlight`, `byteRingPullInFlight`,
+  `byteRingCreditInFlight`, `byteRingWriteInFlight` — which after a tenancy flip **belong to the NEW tenant**;
+- it sets `controlSnapshotValid`, `lastCompletedTaskGeneration`, `lastCommandBufferIndex`, publication epochs;
+- the **success callback can ARM A SUCCESSOR TASK** (`HomerDpuDmaSubmitPreparedDpuToHostPublish`, `:14500`);
+- and `HomerDpuDmaResetRingTenancyState` **preserves `inFlightTaskCount`** while bumping `tenancyGeneration`
+  (`:4521`).
+
+**CORRECTED SPEC — partition the retirement side effects into THREE classes:**
+
+| class | example | on a STALE generation |
+|---|---|---|
+| **ENGINE-OWNED** (the task's own resources) | `doca_buf`, `groupedControlBufferInUse[i]`, `inFlightTaskCount` | **ALWAYS apply** — this IS "retire your own work" |
+| **TENANT-SCOPED** (belongs to whoever owns the ring NOW) | `*InFlight` flags, `controlSnapshotValid`, `lastCompletedTaskGeneration`, accepted frontiers/epochs | **NEVER apply** — would corrupt the new tenant |
+| **SUCCESSOR ARMING** | `SubmitPreparedDpuToHostPublish` | **SUPPRESS** — never arm an old chain into a new tenancy |
+
+That partition is the actual spec. "Suppress the frontier" was one third of one row of it.
+
+### 7.6 P0-e — framing error
+
+*"The backend is dead, so there is nobody to hand-shake with"* is **FALSE**. The **completion-owning actor is
+the DPU, and the DPU is alive.** The problem is **not** that the actor is gone — it is that **no certification
+path from the DPU to the host reaper exists**. (The plan then relies on the DPU certifying, which quietly
+contradicts my own framing.) The QUARANTINE design stands; the justification was wrong. And because the carrier
+is still unpicked, **the "no new round-trip" claim for P0-e is UNVERIFIED**.
+
+### 7.7 P1-f — I named the WRONG MESSAGE
+
+**Verified good:** the command-mailbox "safe today" claim **holds**. Only
+`TupleSinkServicePostRemoteClientSqlCommandRecord` (`:21143`) writes through that descriptor; all variants use
+the session's single `clientSqlPeerConnectionHandle`; no credit/completion/payload/alternate-class writer
+targets it. RC in-order delivery + close-is-last is a real guarantee.
+
+**But:** `CLOSE_SINK` is the **payload-stream** protocol, while the session command/completion MRs live on the
+**client-SQL critical-control** lifetime. **Those are two different lifetimes and I conflated them.** The
+existing session-level message that can certify the opposite-direction completion writers **has not been
+identified**. That must be done before P1-f is implementable.
+
+### 7.8 P1-g — MY FIX CONTRADICTS THE CONTRACT, in the document that states it
+
+I proposed that a known-stale payload WIMM be *"counted and dropped at the stream level"*. **That is exactly the
+prohibited operation.** The WIMM's consumer advances **sender credit and close state**
+(`HomerServiceApplyPayloadSenderCreditDoorbell`, `:29572`) — **someone may still be waiting on it.** Calling it
+"known stale" and dropping it **abandons its consumer**, which is the precise thing §0's corollary forbids.
+
+**CORRECTED FIX — ATTRIBUTE, never discard:** on a stale-but-well-formed token, **look up the OLD stream**. If
+it still exists, **apply the credit to IT**. Only if the old stream is **provably fully reclaimed** (i.e. it is
+proven that nobody awaits that credit) may it be counted and dropped — and that proof is precisely *"name who
+was waiting for it"*. A **malformed** token remains a connection reset.
+
+### 7.9 Omission — the sender-head mirror MR LEAKS under pooling
+
+Marked HOLDS (correctly, for *safety*): deregistration is deliberately deferred because a late consumed-head ACK
+can still arrive (`:25071`). **But stream reset then memsets the handle away while the MR stays linked to the
+connection** (`:25130`, `remote_execution_peer_transport_rdma.c:4204`). On a **long-lived pooled QP**,
+registrations and storage **accumulate until connection reset**. Safe, but not lifecycle-complete — and pooling
+is what makes it unbounded.
+
+### 7.10 "HOLDS" entries needing qualification
+
+- **Host export destroy:** the client's `CLOSE_ACK` proves the DPU reached its close *point*; the DPU's own
+  reclaim separately checks import/task/frontier state (`homer_service_dpu_dma.c:9526`). **The ACK alone is not
+  the complete physical-retirement proof** — the pair is.
+- **Notification RECV slots:** hold for the *connection's* lifetime, but they do **not** make *stream* reuse
+  safe — a late old WIMM still hits the mismatch/reset path (`:29671`). See §7.8.
+- **Grouped-control reads (P2-j):** safe because the task's private staging is retired by the **engine** after
+  generation rejection. **The correct classification is that the ARENA TENANCY IS NOT THE OWNER — the DPU ENGINE
+  IS.** Stated that way it is not an exception to the contract at all; stated my way it was one.
+
+### 7.11 Rules earned
+
+- **Ask for disagreement explicitly, and tell the reviewer not to defer to your framing.** This review found a
+  proposed fix that would have **crashed correct runs** (`exit(1)`), one that would have added a **signaled WR
+  per command** on the hot path, and one that **violated the contract the very document defines**. None of the
+  three would have been caught by a reviewer trying to be agreeable.
+- **A predicate's NAME is not its MEANING.** `CommandStateIsTerminal` sounds like "the session ended"; it means
+  `COMPLETED || FAILED` — every command. **Read the body before you build a plan on the name.**
+- **When you propose "suppress X on a stale generation", ENUMERATE EVERY SIDE EFFECT OF THAT PATH FIRST.** A
+  retirement callback is rarely one assignment; here it was flags, buffers, epochs, and a successor submission.
+- **Destruction is CANCELLATION, not retirement.** A teardown that abandons owners and *records what it
+  discarded* is not satisfying the contract — it is declaring an exception to it. Never let it stand in as proof.
