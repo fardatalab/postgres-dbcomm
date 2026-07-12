@@ -3419,3 +3419,127 @@ are reset for free — **verify, do not assume.**
 **Severity, corrected (§23.5 F5):** the receiver **validates** framing/generation/sizes, so a bogus tail causes a
 **stall, a reset, or wrong credit** — not silent object corruption. Still a real bug; **not** the catastrophe I
 first claimed.
+
+---
+
+## §26 — ADVERSARIAL REVIEW ROUND 2 (2026-07-12): §24/§25/§23 CORRECTED. We now agree.
+
+Round 2 of the review. **It broke the F7 fix, re-ordered the work, and SIMPLIFIED P0-c.** Load-bearing claims
+re-verified by me in the code before acceptance.
+
+### 26.1 ⚠ THE WORK ORDER IS WRONG — it is §25 → §24 → §23, not §24 → §25 → §23
+
+I claimed §25 (F7) needed §24 (the WR-ID contract) first. **REFUTED.** The synchronous WRs that the blocking
+wait cares about already carry an **exact identity** — their source-buffer address (`:5231`). So F7 can match on
+`wr_id` **today**, with no layout change at all.
+
+**Land the delivery guarantee FIRST, on the smallest possible diff.** §24 is a *hardening* change (I verified the
+exclusion chain is correct today, §24.1.1), so it must not be entangled with a *correctness* fix — otherwise a
+validation failure has two candidate causes.
+
+### 26.2 ⚠ §25's FIX IS BROKEN AS DESIGNED — the context is a STACK LOCAL
+
+I proposed *"register the send-completion callbacks persistently, like `lifecycleObserver`."* **REFUTED, and this
+was the claim I flagged as least certain.**
+
+`HomerServiceExecuteCqDrainProgressPlan` builds **both** structs as **stack locals**, fresh per call
+(`tuple_sink_service_process.c:15218-15219`). **Persisting a pointer to `drainContext` would DANGLE.**
+
+But the *contents* say exactly how to fix it:
+
+| member | lifetime | disposition |
+|---|---|---|
+| `callbacks.*` (4 fn ptrs) | **static functions — stable forever** | make the struct a **file-scope `static const`**, register once |
+| `drainContext.sessionStates` | **long-lived** service table | safe to register |
+| `drainContext.streamEntries` | **long-lived** service table | safe to register |
+| `drainContext.progressResult` | ⚠ **PER-CALL** — points at the caller's stack | **NEVER register this.** Register a **service-owned fallback** progress result instead. |
+
+**Corrected fix:** register a service-owned, long-lived `HomerServiceCqDrainContext` whose two table pointers are
+the real tables and whose `progressResult` points at a **service-owned accumulator**, never at a caller's frame.
+A retirement that happens *inside a blocking wait* has no caller progress-result to report into — and that is
+fine; it must still RETIRE, which is the whole point.
+
+**Also REFUTED:** `TupleSinkServiceWaitForPeerSendCompletionRdma` (`:10397`) **takes no expected WR-ID**, so
+"match on identity" cannot cover it without an API change. Add the parameter.
+
+### 26.3 ✅ P0-c GETS SIMPLER — the HEADER pool needs ROLLBACK ONLY
+
+**The single most useful correction.** Once reservations that never post are **rolled back**, the header pool is
+safe **by capacity**: ≤ 256 accepted WRs (the send-queue depth) against **1024** slots. **It needs no frontier,
+no WR-ID field, no retirement tracking.**
+
+This retro-fits §23.5's F1 refutation into its proper place: the header pool was never broken *by capacity* — it
+was broken **only** by the un-rolled-back reservations. Fix the rollback and the capacity argument becomes true.
+
+**So P0-c splits cleanly:**
+- **HEADER pool (`[1024]`) — ROLLBACK ONLY.**
+- **TAIL pool (`[128]`) — rollback **AND** capacity/retirement tracking** (128 slots vs up to 128 accepted
+  batches: zero margin, so it genuinely needs the frontier + `WOULD_BLOCK`).
+
+**And `RESERVED_HEADER_SLOTS` DISAPPEARS from the WR-ID** (§24.3), which frees a byte.
+
+### 26.4 ⚠ PARTIAL POST MUST NOT ROLL BACK
+
+I said "roll back any reservation that does not post." **Too broad.** On a **PARTIAL** post some WRs *are* live
+and *are* reading their staging slots. The existing callers already **retain** partially-posted ownership for the
+reset path (`tuple_sink_service_process.c:31111`, `:31652`, `:32427`).
+
+**Corrected:** roll back **only on a ZERO-WR failure.** On PARTIAL, **retain** the reservation and let the
+connection reset retire it — exactly the rule P0-b already follows for its control op (§22.9 part 5).
+
+### 26.5 ACK gets a HANDLE too — it has its own authoritative table
+
+I left this open (§24.3.1). **Resolved:** `RECEIVER_HEAD_ACK` completions have their **own 64-slot authoritative
+token/tail/state table** (`tuple_sink_service_process.c:1994`). So ACK must **also** carry an **ACK-owner handle
+selected by `KIND`**, not a value — uniform with `DATA`, and its 64-bit token likewise stops riding in the WR-ID.
+
+### 26.6 ⚠ THE SWITCH CONVERSION IS **NOT** MECHANICAL — three sites, and one is a trap
+
+| site | why it is not a drop-in |
+|---|---|
+| `:3485` diag ladder | It deliberately **falls through** to the untagged **pointer-description** arm. The switch needs an explicit `UNTAGGED` case that preserves that. |
+| `:3779` `HandleTaggedSendCompletion` | It returns **success with `handled = false`** for untagged IDs (`:3912`). The `UNTAGGED` arm must preserve *"not handled"* — **not** treat untagged as invalid. |
+| **`:4078`** | ⚠ **This is FAILURE INSTRUMENTATION, not owner dispatch.** It invokes the payload **probe** *before* the CQE-success check, passing status/vendor error (`:4088`); **failed** CQEs then exit **without retirement** (`:4095`), and only successful ones reach dispatch (`:4106`). **A naive single switch could suppress failure telemetry, or RETIRE FAILED WORK.** Correct shape: **decode once**, probe `PAYLOAD` *regardless of success*, retire **only after** success. |
+
+**And my site inventory was incomplete: there are FOUR posting guards, not two** — command at `:9363`, `:9449`
+**plus client-completion at `:9411`, `:9484`.**
+
+### 26.7 ⚠ RECEIVE WR-IDs ARE A SEPARATE NAMESPACE — name the decoder accordingly
+
+**The catch I would have shipped a bug over.** Receive WR-IDs do **not** use the tag scheme at all: bootstrap
+receive expects **zero** (`:3234`), and notification receives encode **`slotIndex + 1`** (`:5028`, decoded at
+`:6960`).
+
+**A "universal" `HomerPeerDecodeWrId` would classify those small numeric receive IDs as UNTAGGED SENDS.**
+The decoder must be named and documented as a **SEND-WR decoder** (`HomerPeerDecodeSendWrId`), and the receive
+namespace must be stated as separate and disjoint.
+
+### 26.8 Smaller corrections accepted
+
+- **`HomerPeerDecodeWrId` is NOT known-free (G9).** The decoded object may be **24 bytes**, not 16; an x86-64
+  aggregate > 16 bytes commonly uses caller-provided return storage. The sketch already uses an **out-param**,
+  which sidesteps it — **but do not claim "free". MEASURE on the gate.**
+- **The decoder stays PRIVATE (G10).** Nothing outside `remote_execution_peer_transport_rdma.c` decodes a raw
+  WR-ID; the service receives **already-decoded fields** (`tuple_sink_service_process.c:15032`). So masks,
+  shifts, layout and asserts remain `static` in the `.c`; only narrow **encoder** APIs stay exported.
+- **Control's encoder silently MASKS its fields** (`:3283`) while command's and client's **range-check** theirs
+  (`:3380`, `:3422`). **Control needs the range checks + asserts** — a silent mask is how an over-large index
+  becomes a mis-routed CQE.
+- **The untagged-pointer assumption (§24.1.1) must be enforced ALWAYS, not only under `DIAG`.** Otherwise a
+  future *numeric* untagged caller silently enters a typed class. Check it at **every untagged send encoder /
+  post helper**.
+- **G11 clean:** no production steady-state send WR-ID is a non-pointer untagged value. The assumption holds
+  today.
+
+### 26.9 AGREED PLAN OF RECORD
+
+1. **§25 — F7, the delivery guarantee.** Service-owned stable context + `static const` callbacks; the blocking
+   wait dispatches typed CQEs to their real owners instead of destroying them; match on `wr_id` (add the missing
+   param to `:10397`); ALARM naming any lost retirement event. **Smallest diff, foundational, no layout change.**
+2. **§24 — the WR-ID contract.** `HomerPeerDecodeSendWrId` + `HomerPeerWrClass` discriminated union (of decoded
+   fields, NOT bitfields); byte-aligned layout; `SEND_OWNER_SLOT`/ACK-owner **handles** replace the 40-bit token
+   (removing the wrap limit); the capacity↔width `_Static_assert`s; the three non-mechanical switch sites done
+   carefully; control's range checks; the always-on untagged-pointer check.
+3. **§23 — P0-c.** Header pool: **rollback only**. Tail pool: rollback (zero-WR failures only) + frontier +
+   `WOULD_BLOCK` backpressure, retired by the completion's `RESERVED_TAIL_SLOTS`. ACK path (`:10338`) gets the
+   same treatment.
