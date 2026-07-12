@@ -1277,3 +1277,100 @@ Bounded non-convergence must be **CLASSIFIED**, not blanket-cancelled:
   can always post**, not on an event you merely usually get.
 - **A drain must live at the layer that owns the completion callbacks.** Otherwise it cannot retire what it
   polls.
+
+---
+
+## 11. THIRD REVIEW — P1-f SETTLED (with a split); P0-e NOT SETTLED (the carrier does not exist)
+
+### 11.1 ✅ P1-f — SETTLED, but it is TWO invariants, not one
+
+**Client completion mailbox — FREE. Verified:**
+- The QP is **stable for the session**: the handle is assigned **once** (`tuple_sink_service_process.c:37682`
+  requester; `:40283` responder) and **never re-pointed**. Connection reset matches the exact old
+  handle/generation and marks the peer session reset-complete (`:29122`) — **failure ENDS the session, it does
+  not migrate it.** No reconnect/rebind, no traffic-class migration (`:37620` pins CRITICAL_CONTROL).
+  **So RC ordering is not broken by a hidden connection swap.**
+- **The terminal close completion IS the last remote write.** `TupleSinkServicePublishPeerClientCommandCompletion`
+  (`:18684`) is the **sole** remote publisher through `clientSqlPeerCompletionMailboxDescriptor`. The sender
+  **does not** write `readyEpochSlots`/`readyVersion` — the RECEIVER's CPU publishes those after WIMM validation
+  (`:18980`), so they are **local stores, not later remote writes**. Session close is refused while any command
+  or completion publication is outstanding (`:39518`); the backend-FAILURE path synthesizes the terminal close
+  completion through the same machinery (`:24052`, `:24150`); duplicate publication is suppressed (`:18729`).
+- **The ASSERT has a real home:** every remote publication passes through `:18684`, which sees the session's
+  command kind/state before reserving or posting. **A genuine single enforcement point** for *"no publication
+  after the terminal session-close publication."*
+
+**⚠ BUT THE PEER COMMAND-COMPLETION RING IS **NOT** COVERED BY THAT ARGUMENT — I had lumped them together.**
+It is a **different op** (`CITUS_REMOTE_EXEC_OP_SQL_COMMAND`, not `CLIENT_SQL_SESSION`), a **different connection
+handle** (`peerCommandCompletionConnectionHandle`, `:40421`), a **different descriptor**
+(`peerCommandCompletionRingDescriptor`, `:19258`), and its publisher **explicitly excludes client-SQL sessions**
+(`:19231`).
+
+**It is ALSO free — but for its OWN reason:** its publication is an unsignaled record write followed by a
+**SYNCHRONOUS signaled `publishedEpoch` write that WAITS for its own CQE** (`:19292` ->
+`TupleSinkServiceWritePeerUint64PreparedRdma`, which blocks on the CQE at
+`remote_execution_peer_transport_rdma.c:10195`). **It fences its own source synchronously.**
+
+> **P1-f is TWO invariants, each with its own proof. Write them separately.** One says *"delivery of the
+> terminal close completion orders everything before it on this QP."* The other says *"each publication
+> synchronously fences its own source."* Merging them would have documented a proof that does not apply to
+> half the thing it claims to cover.
+
+### 11.2 ❌ P0-e — NOT SETTLED. My carrier does not exist, and my design skips phase 2.
+
+Three verified blockers:
+
+**(a) The doorbell socket is ONE-WAY in steady state.** After the one-time `DOORBELL_ATTACH`/`_ACK` handshake
+(`homer_frontend_agent.c:1315`, `:1326`), the agent **"never parses"** steady-state frames — it drains all bytes
+to `EAGAIN`, **discards them**, and signals the postmaster (`:62`, `:1367`). Its event loop waits only for
+readability; there is **no request state and no response parser** (`:1675`). The DPU side reads only the attach
+frame and has a single outbound `SPAWN_DOORBELL` slot (`homer_service_dpu_doorbell.c:446`, `:878`), and the ABI
+defines only those three message kinds (`homer_dpu_comch_abi.h:65`, `:186`).
+**"Use the existing doorbell socket" = a NEW bidirectional framed protocol + changes to BOTH event loops.**
+
+**(b) The setup socket is NOT persistent.** The agent's setup exchange completes **before** it enters the
+doorbell loop (`:1576`, `:1614`); no setup connection is retained for later queries. A **fresh cold setup-port
+request/response** is structurally closest to the design — but the query message does not exist.
+
+**(c) ⚠ NOTHING INITIATES THE DPU-SIDE QUIESCE FOR A DEAD BACKEND — my design SKIPS PHASE 2.**
+`HomerDpuDmaQuiesceArenaCompletionPolling` (`homer_service_dpu_dma.c:6190`) is **session-driven** — it needs
+`bridgeGeneration` + `arenaSlotIndex` + `serviceSessionId` and validates the rings are still bound to **that
+session**. The service invokes T1/T2 only from the **selected-session teardown state machine** (`:43638`).
+**With the backend gone, nothing runs T1.** So repeated *"is it drained?"* queries can be **false forever**,
+because producers keep arming work. **Adding a QUERY does not execute PHASE 2.** The request must **INITIATE**
+the quiesce, not merely ask about it. This is the deepest error in my design: I assumed the DPU would drain on
+its own. **It will not.**
+
+**(d) ⚠ `HomerDpuDmaArenaSlotTasksInFlight()` CAN SILENTLY FALSE-CERTIFY — and this is a BUG IN ITS OWN RIGHT.**
+`HomerDpuDmaFindArenaSlotImport` (`:5894`) requires an ACTIVE import with an **exactly matching**
+`bridgeGeneration` (`:5917`). When lookup FAILS, `HomerDpuDmaArenaSlotTasksInFlight` (`:6268`) **returns `true`
+with `*inFlightOut = 0`** (`:6280`) — **"NOT FOUND" is indistinguishable from "FOUND AND DRAINED."** After an
+agent restart mints a new generation (`homer_frontend_agent.c:1529`) while old BOUND slot state survives in the
+shared arena, the query **misses the old import and reports DRAINED.**
+
+**That is the bug family again — a missing thing read as a definite negative — in the very primitive meant to
+CERTIFY safety.** `HomerDpuDmaUnbindRingSession` (`:6303`) has the same shape (`:6327` treats a missing import
+as idempotent success). **FIX THIS REGARDLESS OF WHICH P0-e OPTION WE TAKE:** a certifier must distinguish
+`DRAINED` / `IN_FLIGHT` / `NOT_FOUND`, and **`NOT_FOUND` must NEVER be treated as safe for host memory reuse.**
+
+### 11.3 P0-e — the two real options
+
+| | option | cost | risk |
+|---|---|---|---|
+| **A** | **QUARANTINE until postmaster restart.** The reaper marks the slot `QUARANTINED` and it is **never reused for this postmaster's lifetime**. **FATAL** if quarantine exhausts the 16 slots. | **ZERO new protocol, ZERO carrier, ZERO false-certification surface** | leaks a slot per crashed backend |
+| **B** | **DPU handshake.** A new bidirectional request that **INITIATES** quiesce+drain on the DPU (phase 2!) and ACKs `DRAINED` / `IN_FLIGHT` / `NOT_FOUND`. | a new framed protocol on **both** event loops, **plus** the (d) fix | correct and reusable |
+
+**RECOMMEND A, with B as the documented upgrade path.** A clean postmaster start **zeroes the whole arena**
+(`homer_frontend_agent.c:295`), and our workflow restarts between runs — **so the leak never accumulates in
+practice.** A is **fail-safe, loud, and impossible to fool**; B is the proper fix and should be taken when slot
+pressure or a long-lived postmaster demands it. **Either way, (d) is fixed.**
+
+### 11.4 Rules earned
+
+- **One invariant per proof.** I nearly wrote a single P1-f invariant covering two resources whose safety rests
+  on **completely different mechanisms** (RC delivery ordering vs a synchronous per-publication fence). A
+  correct-sounding invariant applied to something it does not actually cover is worse than none.
+- **A query is not a phase.** "Ask if it is drained" does not DRAIN it. If phase 2 (quiesce) has no initiator on
+  the far side, the query loops forever. **Name who executes each phase, not just who observes it.**
+- **A certifier that cannot say "I DON'T KNOW" is not a certifier.** `ArenaSlotTasksInFlight` collapses
+  NOT-FOUND into ZERO-IN-FLIGHT. The safety primitive itself had the bug family in it.
