@@ -15,6 +15,7 @@ This is the living knowledge base (KB) for this repo. The directory tree is the 
 - `future-directions/`: Forward-looking design notes, open questions, and research directions cross-linked to the grounded KB.
 - `implementations/`: Implementation-progress notes for landed and in-flight prototypes, including current behavior, validation, caveats, and milestone history.
 - `instrumentation/`: Timing/custom-stats instrumentation spots, call sites, and log aggregation tooling.
+- `operations/`: Operating the farnet rig: the checks that LIE (and the incident behind each), the diagnostic instruments, and the measurement history. The backing store for the repo `CLAUDE.md` runbook.
 - `postgres/`: PostgreSQL-side workflows and hot paths (query loop, libpq IO, COPY, etc.) with code pointers.
 <!-- kb-subdirs:end -->
 

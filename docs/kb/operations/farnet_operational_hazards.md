@@ -357,7 +357,7 @@ the `--debug` `homer_last_abalance` line is the end-to-end decode proof (note `-
 
 ## Related
 
-- `../../../../CLAUDE.md` (→ `AGENTS.md`): the machine setup, the runbook, and the one-line form of every rule
+- `../../../CLAUDE.md` (→ `AGENTS.md`): the machine setup, the runbook, and the one-line form of every rule
   here.
 - `farnet_diagnostics_and_baselines.md`: the diagnostic batteries (RDMA link checks, `starve-diag`, stats
   builds) and the historical measurement records these rules were learned from.
