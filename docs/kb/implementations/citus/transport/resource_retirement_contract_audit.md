@@ -43,6 +43,114 @@ that converts them into silent corruption.
 
 ---
 
+## 0.3 THE MODEL — four scenarios, three mechanisms (READ THIS FIRST)
+
+There are not fifteen problems. There are **four scenarios**, distinguished by exactly two questions:
+
+> **1. Who can still touch this after I let go?** (my NIC / the remote peer / the DPU engine)
+> **2. Can *I* observe their completion?**
+
+### Scenario A — I posted work touching MY memory, and I CAN see the completion
+
+**Involved:** source/target buffer + MR, the WR, my send CQ, the slot that owns them.
+**Contract:** do not free / overwrite / deregister / reuse until **my own CQE is retired**.
+**Efficient solution: an OWNER + a COUNT.** Reserve at post, release at CQE, gate release on `count == 0`.
+O(1), no blocking, no allocation, control path only.
+
+| instance | status |
+|---|---|
+| payload DATA send (`payloadSendOwnerOutstandingWrs`) | **HOLDS** |
+| receiver-head ACK (`receiverHeadAckOutstandingCount`) | **HOLDS** |
+| client SQL command scratch MR (`:6550`) | **HOLDS — THE EXEMPLAR** |
+| peer-client completion publish (`:6604`) | **VIOLATED** — clears an ACTIVE owner, then deregisters the MR |
+| control request op (`:7825`) | **VIOLATED** — memsets the registered SOURCE BUFFER before its CQE is polled |
+| `payloadPublishTailBuffers` / `payloadFragmentHeaderBuffers` | **VIOLATED — no owner exists at all** |
+
+For the two staging pools the cheap fix is not per-slot owners but **two cursors**: reserve against
+`posted - completed < POOL_SIZE`, advance `completed` at the signaled checkpoint. (The fragment headers are
+unsignaled but chained to a signaled tail WIMM, so the frontier advances in bulk.) No per-slot state at all.
+
+### Scenario B — a slot IDENTITY is reused and a late completion could be MISATTRIBUTED
+
+**Involved:** the slot, a generation/token, the completion still naming the old occupant.
+**Contract:** either do not reuse until retired (best), or make the late completion **ATTRIBUTABLE** —
+**never droppable**.
+**Efficient solution: reuse-after-retire** — i.e. Scenario A's counter again. A generation is the *fallback*
+for when you genuinely cannot wait, and it must **route the completion to its original owner**, not discard it.
+
+Instances: control op slot (**VIOLATED**); payload stream slot + doorbell token (generation works, but a late
+event punishes with a **connection-wide reset** — fine today, unacceptable on a SHARED pooled connection);
+control response slot (**BY ACCIDENT**).
+
+### Scenario C — the REMOTE PEER writes into my memory. I CANNOT see their completion.  ← the hard one
+
+**Involved:** an MR I registered as a remote-write target (command mailbox, completion mailbox, receive byte
+ring), the peer's WR, and **the peer's CQ, which I cannot poll**.
+**Contract:** do not deregister/reuse until **no further remote write can arrive** — which I **cannot prove
+locally**. Only two sources of proof exist:
+  **(a)** the peer TELLS me — but its ack must mean **"my writes are PHYSICALLY RETIRED"**, not "I stopped
+  issuing"; or
+  **(b)** I destroy a fence it cannot write through — **the QP**.
+
+**Today we lean on (b), implicitly.** The gate is `peerWritersQuiesced || connectionResetComplete`, and
+`peerWritersQuiesced` is set when the **close command is OBSERVED** (`:23945`) — *logical*, not *physical*.
+**Pooling deletes option (b).**
+
+**Efficient solution — and it is the elegant one: this scenario is NOT special.** The peer CAN see its own
+CQEs. So make the peer uphold **Scenario A for its own writes**, and make its "quiesced" ack MEAN
+physically-retired. The `CLOSE_SINK` quiesced response already exists; it merely has to promise the right thing.
+
+> **Every actor retires its own work; cross-actor safety then follows for free, because an ack means
+> "physically retired", not "logically done".**
+
+Nobody ever has to reason about a completion they cannot see. *(Interim, without a protocol change: DEFER
+deregistration to connection reset — exactly what the sender-head mirror MR already does deliberately,
+`:25071`.)*
+
+### Scenario D — CROSS-MACHINE. The party releasing is not the party acting.
+
+**Involved:** a host arena slot; the DPU's import + per-ring `inFlightTaskCount`; DOCA tasks the host **cannot
+see at all**.
+**Contract:** the HOST may not zero/free a slot the DPU may still be DMA-ing into.
+**Efficient solution: the release must be a HANDSHAKE, not a local decision.** The count already exists on the
+DPU — the host simply has to ask. **This is Scenario C's principle again: the actor who can SEE the completions
+is the one who must CERTIFY them.**
+
+| instance | status |
+|---|---|
+| arena T1-T4 normal release | **HOLDS — this is the model** (quiesce -> all three ring task counts zero -> RELEASE -> re-check -> unbind) |
+| forced-teardown deadline (`:43569` / `homer_service_dpu_dma.c:6353`) | **VIOLATED** — reads the count, PRINTS the danger, resets anyway |
+| dead-PID reaper (`homer_frontend_agent.c:689`) | **VIOLATED, worst blast radius** — host zeroes + frees with zero DPU knowledge |
+
+On the **crash** path there is **nobody to hand-shake with**. So the efficient answer is not a protocol but
+**QUARANTINE: do not reuse the slot until the DPU confirms zero.** Costs one arena slot, not a hot-path
+round-trip — and converts silent corruption into a slot you can see.
+
+### Scenario E — destroying the ENGINE itself
+
+**Involved:** the QP + CQs; the DOCA DMA engine + progress engine.
+**Contract:** destruction **IS** a legitimate fence — it makes further completions *impossible*.
+**Efficient solution: keep it exactly as-is for FAILURE, and never use it for anything else.**
+
+- violent QP teardown on failure — **CORRECT, do not touch**
+- using it as the mechanism for **clean** release — **exactly what P7b.1 must stop doing**
+- `HomerDpuDmaDestroy` on clean exit — no drain, and it says so itself
+
+### THE WHOLE MESS IN ONE LINE
+
+| | mechanism | cost |
+|---|---|---|
+| **A + B** (I can see the completion) | **owner + count + zero-gate** (or two cursors for a ring) | O(1), control path only |
+| **C + D** (someone else acts) | **they certify their OWN retirement** — their ack must mean *physically* retired | one field's meaning, or one handshake; **QUARANTINE** where there is nobody to ask |
+| **E** (the fence) | violent teardown, **for FAILURE ONLY** | free |
+
+> **Scenario E has been silently standing in for A, B, C and D.** QP destruction annihilates every outstanding
+> completion, so nothing else *had* to be right. **Every violation in this document is Scenario E leaning on
+> the others' behalf.** Pooling removes it — which is why this audit is a PRECONDITION for P7b.1, not a
+> follow-up, and why all the fixes look the same.
+
+---
+
 ## 1. THE THREE FAILURE SHAPES
 
 1. **Storage reused under a live engine.** Free/overwrite/zero a buffer the NIC or the DMA engine is still
