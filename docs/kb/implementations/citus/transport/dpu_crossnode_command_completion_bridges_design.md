@@ -2644,3 +2644,29 @@ stale "free" claim.
    `receiveExpectedCommandSequence` to match.
 
 Version bumps mean a stale binary fails LOUDLY (`BAD_PROTOCOL`), so all four machines must be rebuilt.
+
+### 16.5 P4.0 LANDED and VALIDATED (citus 879d6d1bc)
+
+Versions: `CITUS_TUPLE_SINK_PROTOCOL_VERSION` 12 -> 13, `HOMER_DECODED_TUPLE_BATCH_PROTOCOL_VERSION` 1 -> 2.
+All four machines verified to agree at v13 before the run.
+
+**Two places where 16.2's "pure duplicate" claim was FALSE**, found during implementation. In both, deleting
+the envelope check alone would have LOST a real validation, so payload validation was ADDED:
+- `HomerClientDrainResultSinkUntil` had no `sinkSequence` check -> one added.
+- `HomerServiceTupleViewNextEosSequenceFromProducerBytes` derived its sequence solely from the envelope ->
+  now reads the packed batch header. (This function is itself dead code -- see P4.2a -- but it was fixed
+  rather than left in a broken half-state.)
+
+**The reserved-is-zero check is ENFORCED, not merely documented.** The client's basebackup receive lost its
+zero-check in the first cut; it was restored, and the SQL-decoded envelope guard gained one, with the leg
+named in the reject probe. A "MUST be zero" that nobody checks is aspirational, and these 8 bytes have
+already acquired a meaning once.
+
+**Validated:** full smoke matrix builds; `homer_tuple_deform_smoke` ALL PASS; three consecutive pgbench runs
+on one stack -- all 5/5, **five decoded rows each**, empty error streams, zero reject probes, zero failure
+publications, zero engine fatals. The decoded-row count is the real proof: reading the wrong field rejects
+every row, which is exactly what run 39 did.
+
+**Remaining P4 sequence:** P4.1 (mirror-path truth-source) -> P4.2a (delete the already-dead producer
+byte-ring code) -> section 10k (strip diag, measure, fix the grant stall) -> P4.2b (complete removal, gated
+on the host-service local-byte-ring retirement).
