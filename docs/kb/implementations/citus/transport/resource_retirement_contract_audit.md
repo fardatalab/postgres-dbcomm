@@ -1743,3 +1743,92 @@ demonstrated itself. *(This is the same refusal that P0-e turns into its certifi
 - **A sibling with the same shape is a sibling with the same bug.** The audit enumerated three sites; the
   fourth (`QuiesceArenaCompletionPolling`, a **phase-2** gate) was found only by asking *"who else is built on
   this lookup?"* rather than *"who else did the audit name?"* **Enumerate by MECHANISM, not by memory.**
+
+---
+
+## 15. P0-d — INVESTIGATION FIRST, AND IT MOVED THE FIX
+
+**Status: IN PROGRESS.** Three claims in §8/§10.1 were **inferred**. I verified all three before designing.
+**Two were wrong, and the one real hole is somewhere I never looked.**
+
+### 15.1 What the verification found
+
+| claim (from §8 / §10.1 / my own suspicion) | verdict |
+|---|---|
+| *"The `DROPPED` grouped-control path was never even complete — it still cleared the NEW tenant's `controlReadInFlight`"* (§8.3) | ❌ **REFUTED.** `HomerDpuDmaResetRingTenancyState` **explicitly PRESERVES** `inFlightTaskCount`, `controlReadInFlight`, `commandPullInFlight` and every other per-ring in-flight counter across its `memset` (`homer_service_dpu_dma.c:4585-4600`, restored `:4616-4625`). It does **not** forget outstanding physical work — *that is the contract being UPHELD.* And because the flag survives as `true`, the **next** tenant **cannot arm** a grouped-control read (`:11387` refuses) until the old physical read retires. **The guard is complete.** Clearing the flag in the completion (`:10634`) is correct accounting, not a leak. |
+| *"`HomerServiceDpuSpawnBegin` may arm the `ARENA_PUBLISH_LINE_CLEAR` DMA and then fail, so the undo at `:20178` releases a slot with an uncounted write in flight"* (my leading suspicion) | ❌ **REFUTED.** `SpawnBegin` submits **NO DMA** — it only reserves software state and sets phase `CLEAR_ARENA_LINES` (`homer_service_dpu_spawn.c:221-251`). **Every** spawn-family submission happens in `HomerServiceDpuSpawnAdvanceOne` (`:320`, `:347`, `:443`, `:461`, `:506`). All four undo sites (`:20140/60/70/78`) are therefore **vacuously safe**. |
+| *"The spawn / arena-publish-line-clear family is tracked by spawn runtime, not ring `inFlightTaskCount` — verify rather than assume"* (§10.1 item 3) | ✅ **CONFIRMED as a real accounting gap, but UNREACHABLE on the normal path.** `ARENA_PUBLISH_LINE_CLEAR` is the **ONLY** uncounted task kind that touches arena-slot host memory or its `ringRuntime` (it zeroes the 3 publish lines, `:11218`, and clears `tenancyBaselinePending` in its completion, `:10528`). It cannot be outstanding at T1, because the phase machine will not spawn the backend until `arenaLinesCleared` (`homer_service_dpu_spawn.c:335-342`), and T1 only begins on a **terminal backend completion** — so the backend ran, so the CLEAR retired. |
+
+### 15.2 🔴 THE REAL HOLE — and it is bigger than the deadline
+
+**`TupleSinkServiceResetSession` (`tuple_sink_service_process.c:23664`) releases the arena binding with NO
+drain check, NO T1, NO T2 — and it is THE FUNNEL.** Reachable from session close, client disconnect, peer
+failure, `TupleSinkServiceHandleCloseSession` (`:39590`), and — worst — **service shutdown**, which resets
+every session (`:48060-48067`) and only *then* destroys the DMA engine (`:48072`).
+
+Its own comment is the tell:
+
+> *"ResetSession being the single teardown funnel is **exactly what makes this the one correct unbind site**."*
+
+**Being the single funnel makes it the right PLACE. It says nothing about the right TIME.** Release-site
+uniqueness and release-time correctness are different properties, and the comment silently conflates them —
+which is how *"we unbind in exactly one place"* came to feel like *"we unbind safely."*
+
+**Full classification of every arena-release path:**
+
+| path | drains first? |
+|---|---|
+| T4 clean teardown (`:43792`) | ✅ yes — `DRAINED` + no queued RELEASE |
+| P2.T abandon / 30 s deadline (`:43645`) | ❌ no — deliberate Scenario E (now at least *records* what it discards, P0-f) |
+| **`ResetSession` (`:23664`) — THE FUNNEL** | ❌ **NO. Reachable from shutdown.** |
+| spawn undo (`:20140/60/70/78`) | ✅ vacuously (no DMA armed yet — VERIFIED, §15.1) |
+| `:40473` deferred-response failure | ⚠️ safe **by accident** — relies on no scheduler pump running between `SpawnBegin` and the release |
+| `:45901` async spawn failure | ✅ gated by spawn-slot `opInFlight` |
+
+### 15.3 THE FIX — enforce the drain IN THE FUNNEL, not in each caller
+
+The hole and the fix arrive together: **there is exactly one unbind funnel, so putting the drain inside it
+covers every path by construction — including the ones I never enumerated.** That is the whole point of the
+contract being a property of the RESOURCE, not of each caller's discipline.
+
+1. **New engine primitive `HomerDpuDmaDrainArenaSlot()`** — query `HomerDpuDmaQueryArenaSlotDrainState()`, and
+   while `IN_FLIGHT`, pump the existing bounded `HomerDpuDmaDrainPeInternal()` (`:5395`) and re-query, up to a
+   total budget. Returns the tri-state.
+   - ⚠ **`harvestEvenIfFatal = true` is MANDATORY here.** Its comment records that refusing to harvest under a
+     latched `fatalError` **strands every submitted task forever and deadlocked the setup close-drain**. A
+     teardown drain that will not harvest under fatal is a hang, not a drain.
+   - **Re-entrancy is safe (VERIFIED):** the DOCA completion callback `HomerDpuDmaTaskMemcpyComplete`
+     (`:14626`) never calls into service code — it returns task/buf ownership and at most arms an
+     already-prepared publication task. So the funnel can never be reached from inside a callback, and a
+     synchronous pump there cannot recurse into `doca_pe_progress()`.
+   - This deliberately **deviates from the scheduler's "a drain grant is bounded and never spins"** invariant.
+     That invariant governs *scheduler grants on the hot loop*. This is a **control-path** synchronous drain
+     that runs once per session close. Documented at the definition.
+2. **`TupleSinkServiceReleaseDpuArenaBinding` drains before unbinding.** One edit; every path covered.
+3. **`HomerDpuDmaUnbindRingSession` gains an explicit `bool force`.** `force = false` (the contract path)
+   **REFUSES** while `inFlightTaskCount != 0`. `force = true` is **Scenario E only** and proceeds, recording
+   what it discarded. Today that site merely *warns* (`:6422`, *"a late completion can re-poison the tenancy
+   reset"*) **and resets anyway** — a textbook decoy: it detects the violation, names it exactly, and proceeds.
+   Making the exception a NAMED PARAMETER turns an implicit violation into a greppable, deliberate one.
+4. **`tenancyGeneration` stays — as the Scenario-E backstop, with an ALARM.** It is NOT deleted: on a broken
+   engine (`fatalError`, tasks that never retire) the drain legitimately cannot converge, and the generation
+   guard is what keeps that from poisoning the next tenant. But on the contract path it must **never fire**, so
+   the drop now prints an ALARM naming the broken drain. *Do not delete a safety net in the same change that
+   makes it unnecessary.*
+5. **The ABANDON_DRAIN phase I had designed EVAPORATES.** Once the funnel drains, the abandon path drains too,
+   for free. The deadline keeps abandoning the **backend handshake** (correct — the backend may be dead and can
+   never ack) and now never abandons the **DMA drain** (which converges, because the engine is independent of
+   the backend). **§8.4 satisfied without a new state.**
+
+### 15.4 Rules earned
+
+- **A "single funnel" comment is about PLACE, not TIME.** One release site is a precondition for correctness,
+  never a proof of it. When a comment argues for its own correctness from uniqueness, check what it is unique
+  *about*.
+- **Enforce a contract at the RESOURCE, not at the CALLER.** I had enumerated two violating call paths and was
+  about to fix both. Verification found a third (the funnel), which I would have missed — and putting the drain
+  *in the funnel* fixes all of them plus the two I'd rated "safe by accident". **If a contract needs every
+  caller to remember it, it will be forgotten; if it lives in the primitive, forgetting is impossible.**
+- **Verify inferred claims BEFORE designing on them, not after.** Two of the three premises I was about to
+  build on were false, and one of them was mine. This is the *third* time an inferred claim about this file was
+  refuted by the code (see §10.1, §14.8). **In this codebase, "I reasoned it must be so" has a losing record.**
