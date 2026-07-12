@@ -2220,3 +2220,46 @@ where it bites, and that is on the roadmap.**
 > **Interrogating a "this is out of scope" premise is not wasted work.** The owner was right that the crash paths
 > do not matter — and checking *why* they did not matter is what exposed the race that does. **The scoping
 > question and the bug hunt are the same question asked twice.**
+
+### 18.5 ⚠ SELF-CORRECTION — I OVERSTATED THE BUG. It is a LIVENESS failure, not data corruption.
+
+**Before the reviewer could, I traced §18.1's link L7 to its consumer and it does not hold.**
+`HomerServiceDpuAcceptOneBackendCompletion` guards at `tuple_sink_service_process.c:42784-42795`:
+
+```c
+if (!selectedSession->commandInFlight ||
+    selectedSession->inFlightCommandSequence != stagedCompletion.completion.commandSequence)
+{
+    ... return false;   /* a service ERROR -- not a silent acceptance */
+}
+```
+
+A brand-new session has `commandInFlight == false`, so a stale record carrying the dead tenant's
+`commandSequence = 39` is **REJECTED**. The completion record carries **no session id**
+(`homer_completion_abi.h:35-55`) — `commandSequence` + `commandInFlight` is what saves us. **There are two more
+guards behind it**: `commandKind` must match the in-flight kind (`:42796`), and the completion epoch must exceed
+`lastAcceptedBackendCompletionEpoch` (`:42816`).
+
+> **So the previous session's completions are NOT delivered to the new one. My "silent data corruption" framing
+> was WRONG.**
+
+**But the race does not evaporate — it changes shape.** The DPU still reads the stale `publishedEpoch = 39`,
+still submits a slot read, still stages the dead tenant's record — and the guard then **fails the entire
+progress action** (`return false`), killing a **legitimate new session** with
+`"backend completion does not match selected-DPU in-flight command"`.
+
+| | before | after |
+|---|---|---|
+| **severity** | silent wrong-data delivery | **spurious HARD FAILURE of a legitimate session, under concurrency** |
+| **detectability** | silent | **loud** (a specific error string) |
+| **the fix** | unchanged | unchanged — a stale header must not be READABLE at all |
+| **acceptance** | — | **that error string must never appear in a concurrent multi-session run** |
+
+**Rule earned (the fifth time this subsystem has caught me):** *I keep reasoning FORWARD from a mechanism and
+forgetting to ask who is checking DOWNSTREAM. The guard that saves us here is three functions away from the code
+I was reading.* **Trace to the CONSUMER before you claim a producer's mistake reaches anyone.**
+
+**This does NOT change the P0-e′ design** (§18.2): the DPU owning the re-init still removes the stale-header read
+by construction, still deletes the 13.7 MB session-close `memset`, and the universal `tenancyBaselinePending`
+gate is still what closes the window. **It changes the JUSTIFICATION (liveness, not integrity) and the
+ACCEPTANCE CRITERIA (a concurrent run must not produce that error).**
