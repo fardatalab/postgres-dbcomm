@@ -3663,3 +3663,46 @@ re-entrancy bug and must change shape (e.g. queue the CQE for the next real drai
 - ⚠ **The gate will NOT exercise this** — the SQL command path uses the `CRITICAL_CONTROL` lane, whose CQEs
   already retire internally (§23.6). **This stage is validated for NO REGRESSION, not for the fix.** Say so.
   The workload that would exercise it is backend-to-backend COPY, which is 🔴 **already broken at HEAD**.
+
+### 25.6 §25 / F7 — LANDED + VALIDATED (citus `16e4bdf3e`, 2026-07-12)
+
+**PASS.** 3× gate, `2000/2000` tx, **0 failed**, **ALARM = 0** on all four logs across three runs and a clean
+SIGTERM. All four intended-path proofs held; the farnet0 host service log is banner + the new registration line
+and **nothing else**.
+
+**The wiring proof (new acceptance criterion, and the one that mattered):**
+`tuple-sink service: registered persistent send-completion owner dispatch callbacks=0x… context=0x…` printed
+**exactly once at startup on all three services**, with real pointers. **Its ABSENCE would have meant every
+internal blocking drain was still running without owner dispatch — i.e. the bug still live, silently.**
+
+**PERFORMANCE — the first VALID comparison this session.** 288.7 / 284.9 / 283.3 tps against the previous
+stage's like-for-like 286.9 / 285.5 / 283.4 (**same `-t 2000`, same `--debug`, same command shape**) — within
+~1%. **No regression.** This is what §22.10.2 asked for: a reference stamped with its workload shape.
+
+#### 25.6.1 ⚠ THE GATE DOES NOT EXERCISE THIS FIX — say so, do not let PASS imply otherwise
+
+The SQL command path runs on the **`CRITICAL_CONTROL`** lane, whose CQEs **already** retired internally. The bug
+is reachable only on the tuple/COPY path (which shares a QP with payload batches), and **backend-to-backend COPY
+is 🔴 broken at HEAD** for unrelated reasons. **This run validated NO REGRESSION + THE MACHINERY IS WIRED UP.
+It did not validate the fix.** The fix is validated by construction and by review, not by execution.
+
+#### 25.6.2 Review corrections applied to the worker's implementation
+
+- ⚠ **The worker shipped code that DOES NOT COMPILE** — it invented a `HOMER_PEER_RDMA_LOG` macro that does not
+  exist in this file. **Its build was blocked by the sandbox, so it never compiled its own work.** Caught by the
+  editor's diagnostics before it reached a build. **This is precisely why the main agent builds.**
+- ⚠ **The fix reintroduced its own bug.** A foreign untagged CQE was handled with a **silent `continue`** — i.e.
+  the CQE was **destroyed**, in the stage whose one-sentence contract is *"no CQE may be destroyed."* The
+  worker's reasoning was sound (untagged sends are serialized by their own blocking wait, so a second untagged WR
+  cannot be in flight) — **but that is exactly the argument that made the original bug invisible.** Changed to a
+  LOUD ALARM naming the undeliverable event. **"Unreachable" is a reason to ALARM, not a reason to stay quiet.**
+
+#### 25.6.3 Re-entrancy — VERIFIED, not assumed
+
+`HomerServiceHandlePayloadSendCqeFromDrain` (`tuple_sink_service_process.c:15032`) and its callees are
+**`HomerServiceApply*Frontier` only** — no publish, no post, no drain, no wait. So dispatching a payload CQE from
+inside a blocking wait **cannot recurse into the publisher**. (P0-a's `HomerServiceSendCqDrainDepth` guard wraps
+only the typed service drains and would neither protect nor block this dispatch — so this had to be answered on
+its own merits, and it was.)
+
+**NEXT: §24 (the WR-ID contract), then §23 (P0-c).**
