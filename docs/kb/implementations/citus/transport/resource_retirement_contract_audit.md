@@ -3987,3 +3987,52 @@ execution.** `ALARM=0` proves it did not *false-positive*; it does not prove it 
 - **A review that only confirms is a wasted review.** Round 3 refuted the load-bearing claim (C3), found two
   un-asserted table couplings (C4), and killed the first self-test outright (R4). Every one of those was a real
   defect heading for the tree.
+
+### 24.9 ⚠ CORRECTION to §24.8 — the gate DOES exercise the payload owner-handle path. My caveat was WRONG.
+
+§24.8 claimed *"the gate does NOT exercise the payload/ACK OWNER_SLOT + OWNER_INCARNATION path, because those
+retire on the tuple/COPY path, and COPY is broken at HEAD."* **That is false, and it conflated two different
+things: the broken COPY WORKLOAD, and the payload MACHINERY that workload happens to use.**
+
+**The DPU result relay is a SECOND consumer of exactly that machinery, and it works.**
+`HomerServicePumpOutgoingDpuMirrorByteRingPayload` (`tuple_sink_service_process.c:31394`) —- the farnet1-DPU →
+farnet0-DPU result leg —- calls:
+
+- `HomerServiceReservePayloadSendOwner` (`:31817`) → takes a slot, **bumps its incarnation**
+- `HomerServiceAttachPayloadSendOwnerDpuMirror` (`:31820`) → `HOMER_PAYLOAD_SEND_OWNER_SOURCE_DPU_MIRROR`
+- the payload byte-ring publish, whose **signalled tail WR carries the payload WR id** with `OWNER_SLOT` +
+  `OWNER_INCARNATION` (`:31828`)
+
+and the CQE comes back through `HomerServiceHandlePayloadSendCqeFromDrain` →
+`HomerServiceResolvePayloadSendOwnerToken` → the slot-range / `POSTED` / incarnation checks →
+`HomerServiceApplyTrackedPayloadCompletionFrontier`.
+
+**And it MUST have run:** a DPU-spawned backend has **no host-shm result sink at all**, so its only egress is
+the arena role-5 byte ring, drained by the DPU and relayed over peer RDMA. The five distinct `abalance` values
+and the 2000/2000 could not have arrived any other way.
+
+**The ACK table too.** The receiving DPU credits consumed-head via `HomerServicePostReceiverHeadAck` (`:33204`)
+→ `HomerServiceTrackReceiverHeadAckOwner` (`:33260`), which is the **second** owner table —- the one selected by
+the WR id's `KIND` field. So `RECEIVER_HEAD_ACK` WR-ids with an ACK-owner slot + incarnation were produced and
+retired on the farnet0 DPU.
+
+**So both owner tables, both handles, and both incarnation checks ran on real traffic across ~2000
+transactions, and every payload CQE resolved to a POSTED owner with a matching incarnation.** Had ANY
+resolution failed, the drain returns false → bound-payload protocol reset → the run would have ALARMed or lost
+rows. It returned 2000/2000, 0 failed, ALARM=0.
+
+**What is ACTUALLY still unexercised** is only the **rejection branches** (`named a RECYCLED owner slot`,
+`named a non-POSTED owner`). Those are FAULT DETECTORS: by construction they do not fire in a healthy run, and
+exercising them needs fault injection, not a workload. That is a normal and much weaker caveat than the one
+§24.8 stated.
+
+⚠ **Do NOT confuse this with P0-b's `retiring=0` gap (§22.10), which is a REAL coverage hole:** that is a
+*normal-operation* branch that still never executes. This one is not.
+
+**And the pgbench DPU result path is NOT broken.** What is broken at HEAD is the **Citus backend-to-backend COPY
+workload** (`byte_ring_slot_capacity_regression.md`, "Problem 2") -— a different consumer of the same payload
+machinery. Two distinct facts; §24.8 fused them into one wrong sentence.
+
+**Rule earned (again, and this is the ninth time in this document):** *a forward chain from a mechanism I had
+just read, with no check of what the OTHER callers of that mechanism actually do.* "COPY is broken" was true;
+"therefore the payload path is untested" did not follow, and one grep for the other caller would have shown it.
