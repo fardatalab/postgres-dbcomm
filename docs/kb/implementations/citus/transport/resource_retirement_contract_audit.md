@@ -3706,3 +3706,284 @@ only the typed service drains and would neither protect nor block this dispatch 
 its own merits, and it was.)
 
 **NEXT: §24 (the WR-ID contract), then §23 (P0-c).**
+
+---
+
+### 24.5 ⚠ DEVIATION FROM THE PLAN — the union becomes DISJOINT, and the priority chain is DELETED
+
+**Decision taken 2026-07-12 while implementing §24, before writing any code.** §24.1's RULE OF RECORD said:
+*"the WR-ID is a priority-decoded tagged union … This must be stated in the code, not just here."* **That rule is
+now WITHDRAWN.** The code will not state it, because the code will no longer *have* it.
+
+#### The fact that unlocks this (VERIFIED, not inferred)
+
+Every WR-ID bit-layout macro — `..._WR_ID_TAG`, `..._KIND_*`, `..._STREAM_INDEX_*`, `..._GENERATION_*`,
+`..._TOKEN_MASK`, `..._INDEX_MASK`, `..._RESPONSE_FLAG` — and every `...WrIdIsTagged` predicate lives **only** in
+`remote_execution_peer_transport_rdma.c`. Nothing else in either tree references one:
+
+```
+grep -rn 'WR_ID_TAG|WR_ID_KIND|WR_ID_STREAM|WR_ID_GENERATION|WR_ID_TOKEN|WR_ID_INDEX|WR_ID_RESPONSE|WrIdIsTagged' \
+     --include=*.c --include=*.h | grep -v remote_execution_peer_transport_rdma.c   ->  EMPTY
+```
+
+Outside the transport `.c` a WR-ID is an **opaque `uintptr_t`**: the service calls an exported encoder
+(`TupleSinkServiceEncodePeerCommandWrId` at `tuple_sink_service_process.c:21519`,
+`TupleSinkServiceEncodePeerClientCompletionPublishWrId` at `:19168`) and hands the result straight back to an
+exported post API. **It never inspects a bit.** Combined with §24's standing fact that a WR-ID is never
+transmitted, the layout is **entirely private and free to change**.
+
+#### Why the priority decode was never load-bearing — only inherited
+
+§24.1 kept the overlapping tags because it was preserving the *existing* bit assignment. But §24.3 was already
+going to **rewrite the payload layout wholesale** (byte-aligned, `OWNER_SLOT` replacing the 40-bit token). Once
+the layout is being rewritten anyway, **preserving the exclusion chain buys nothing and costs the one thing §24
+exists to remove.**
+
+#### THE NEW LAYOUT — one disjoint 3-bit CLASS field at bits 61-63
+
+```
+bits 61-63   CLASS (3 bits, 8 values, 5 used)      <- HomerPeerSendWrClass, the discriminant, ON THE WIRE OF THE ID
+               0 = UNTAGGED            (the whole 64-bit value IS a raw source-buffer address)
+               1 = PAYLOAD   2 = COMMAND   3 = CONTROL   4 = CLIENT_COMPLETION
+
+PAYLOAD (class 1), bits 0-60:
+  bits 56-58   KIND                 3    DATA | RECEIVER_HEAD_ACK (2 of 8 used; was 1 bit)
+  bits 59-60   reserved             2
+  bits 48-55   STREAM_INDEX         8    caps <= 256 streams   (was 6 bits / 64)
+  bits 32-47   STREAM_GENERATION   16    unchanged
+  bits 24-31   OWNER_SLOT           8    caps <= 256 owners    (REPLACES the 40-bit token, 24.3.1)
+  bits 16-23   reserved             8
+  bits  8-15   RESERVED_TAIL_SLOTS  8    0 or 1 (P0-c / 26.3)
+  bits  0- 7   reserved             8
+
+CONTROL (class 3), bits 0-60:  bit 60 RESPONSE_PUBLISH; bits 16-47 SLOT_GENERATION (32); bits 0-15 SLOT_INDEX (16)
+COMMAND (class 2) / CLIENT_COMPLETION (class 4), bits 0-15: INDEX (16)
+UNTAGGED (class 0): the raw source address. REQUIRES bits 61-63 clear -- see below.
+```
+
+**What this buys over the priority-decoded version:**
+1. **The exclusion chain is GONE.** There is no decode *order* left to get wrong, so there is nothing to
+   document, nothing to preserve, and no fifth class can silently steal a fourth class's CQE. §24.1's entire
+   hazard evaporates rather than being commented.
+2. **The decode is one shift + one mask** — strictly cheaper on the send-CQ drain hot path than four
+   short-circuit predicates (which is what G9 was worried about; this makes the worry moot).
+3. **`UNTAGGED == 0` is now the NATURAL encoding**, not "fell off the end of the ladder". A pointer has bits
+   61-63 clear, so a source address decodes to class 0 by construction.
+4. **Class distinctness is trivially assertable** — they are enum values, not bit positions that must not
+   collide. The §24.4 tag-distinctness asserts become `_Static_assert(HOMER_PEER_SEND_WR_CLASS_COUNT <= 8)`.
+5. **Hex-readable top nibble** (bits 60-63): `0x0`=untagged, `0x2`=payload, `0x4`=command, `0x6`/`0x7`=control
+   (low bit = response), `0x8`=client-completion. §24.3's second motivation, delivered.
+
+#### The untagged-pointer assumption is UNCHANGED in kind, and slightly WEAKER in degree
+
+It was *"every registered source address has bits 60-63 clear"*; it is now *"bits 61-63 clear"* — a strictly
+easier requirement, still trivially true (canonical user VAs are below 2^57 even with 5-level paging). It is
+**enforced at every pointer -> WR-ID conversion**, of which there are exactly **five**, all in the transport `.c`:
+
+| site | the pointer |
+|---|---|
+| `TupleSinkServicePostWriteBufferInternal` (`:5302`) | `(uintptr_t) buffer` — the generic untagged write |
+| payload batch, body WRs (`:9971`) | `(uintptr_t) payloadWrite->buffer` |
+| payload byte-ring, body WRs (`:10199`) | `(uintptr_t) payloadWrite->buffer` |
+| unsignalled ACK tail (`:10420`) | `(uintptr_t) tailSource` |
+| `TupleSinkServicePostSendBuffer` (`:5171`) | `rdma_post_send`'s `context` arg **becomes the `wr_id`** — the bootstrap send is untagged too |
+
+⚠ The 4th and 5th were **not in §24's site inventory.** The bootstrap one is invisible unless you know that
+`rdma_post_send(cmId, context, ...)` stores `context` as the `wr_id`.
+
+#### What does NOT change
+
+- **Receive WR-IDs remain a separate, disjoint namespace** (§26.7): bootstrap recv expects `0`, notification
+  recv encodes `slotIndex + 1`. The decoder is still named `HomerPeerDecodeSendWrId` and still documents that.
+- **The decoded object is still a union of DECODED FIELDS, not bitfields** (§24.1.2) — the reason stands
+  verbatim: `_Static_assert` cannot check a bitfield's bit *position*, which would destroy §24.4.
+- **`sizeof == 16`** still asserted; the decoder stays `static inline` and private (§26.8 G10).
+- **The three non-mechanical switch sites** (§26.6) are unaffected by this change — `:4146` is still failure
+  instrumentation and still must probe before the success check and retire only after it.
+
+#### Residual risk, stated honestly
+
+Changing the class encoding changes **every** WR-ID value the process produces. A stale WR-ID *in flight across
+the change* is impossible (WR-IDs never leave the process and never outlive it), so there is no mixed-version
+hazard — but a **stale binary** on one DPU would produce IDs the other side never decodes... **no: WR-IDs are
+purely local to one process's own send CQ.** A DPU running an old binary decodes only its OWN IDs. So even a
+partial deploy is safe. **No ABI bump, no DPU resync required** — though both DPUs are rebuilt anyway.
+
+---
+
+### 24.6 ⚠ REVIEW ROUND 3 BROKE §24.5's KEY CLAIM — the bare handle was a REGRESSION. OWNER_INCARNATION added.
+
+**This is the objection I asked for, and it landed.** I gave the reviewer six falsifiable claims and named C3 as the
+one I was least sure of. C3 is where it hit.
+
+#### What I claimed (C3), and what survived
+
+> *"OWNER_SLOT as a HANDLE is safe: a send-owner slot cannot be recycled while its WR is still in flight, so
+> `payloadSendOwnerTokens[slot]` at CQE time always yields the token that WR was posted with."*
+
+**The LIFETIME half is VERIFIED** — the reviewer checked it end to end and so did I:
+- reserve refuses a slot whose owner is `RESERVED`/`POSTED` (`tuple_sink_service_process.c:16513-16542`);
+- commit requires the same slot + `RESERVED` + token (`:16617-16651`);
+- retirement walks FIFO `POSTED` owners and only then decrements (`:16735-16818`);
+- zero-WR rollback frees and rewinds; **PARTIAL post deliberately RETAINS** for reset (`:31111`, `:31652`, `:32427`);
+- reset destroys QP+CQ **first** (`remote_execution_peer_transport_rdma.c:5651`), and only then aborts owners
+  (`:29442`); stream rebinding cannot proceed until both owner counts are zero (`:25939`);
+- the ACK table has the same discipline (`:32759-32903`).
+
+**No legal path frees and re-hands-out a slot while its old QP/CQ can still produce a CQE.** The handle is CORRECT.
+
+#### What was REFUTED — and it is subtle enough that I had waved past it myself
+
+> **"Looking the token up FROM the slot the CQE names makes the token comparison TAUTOLOGICAL."**
+
+Today the WR id carries the **absolute** token, so a stale / duplicated / mis-routed CQE is caught by comparing it
+against the owner table (`:16871-16880` for DATA; `:32845-32882` for ACK, which additionally demands FIFO equality).
+Resolve `token = table[slot]` and then "compare" it against `table[slot]` and you have compared a value with itself.
+**The handle preserves the LIFETIME guarantee and silently DELETES the FAULT DETECTION.**
+
+That is the exact shape of a refactor that looks safe, passes every test, and removes a check nobody realises is
+load-bearing until something is already corrupt.
+
+#### THE FIX — `OWNER_INCARNATION`, 8 bits, bits 16-23 (was reserved)
+
+Each owner table now carries a **per-slot incarnation counter**, bumped on every hand-out
+(`payloadSendOwnerIncarnations[]`, `receiverHeadAckIncarnations[]`). It rides in the WR id beside the slot, and
+`HomerServiceResolvePayloadSendOwnerToken` (`tuple_sink_service_process.c`) refuses a CQE that does not name the
+incarnation currently live in that slot. Three checks, all of which the absolute token used to give us for free:
+
+| check | catches |
+|---|---|
+| slot in range | a corrupt WR id |
+| owner state is `POSTED` | a CQE for a FREE or already-RETIRED owner — **stronger than the old token check** |
+| **incarnation matches** | a late CQE for a **RECYCLED** slot — *the one a bare handle cannot do* |
+
+**And the downstream checks stay REAL, not tautological**, because they compare against the **FIFO head**, not
+against the slot the CQE named: `HomerServiceCompleteTrackedPayload` still requires an exact token match walking
+from the head, and `HomerServiceRetireReceiverHeadAckOwners` still demands the head's token equal the resolved one
+(which is now, in effect, an assertion that `ownerSlot == headIndex`).
+
+**Why an incarnation beats simply keeping a (shorter) token:** the incarnation only has to DISTINGUISH consecutive
+uses of one slot, never to ORDER them. So its 8-bit wrap is not a limit the way the token's 40-bit wrap was: a
+wrap costs at worst one missed detection of a fault that cannot occur anyway (verbs does not duplicate CQEs, and
+§25/F7 guarantees exactly-once software delivery), whereas the absolute token's wrap was a **correctness ceiling on
+how much a stream could ever send.** We keep the wrap-limit removal AND the fault detection.
+
+#### Other review findings, and what was done with each
+
+| finding | verdict | action |
+|---|---|---|
+| **C1 qualified** — the standalone DOCA validation programs (`postgres-citus/homer/doca_validation/*.c`) have their OWN unrelated WR-ID packing | ACCEPTED, harmless | They never touch the Homer encoders or transport. The *production* layout is still 100% private. No change. |
+| **C2** — no sixth pointer→WR-id site exists; and note the payload body WRs are **UNSIGNALLED**, so they normally produce no CQE at all | ACCEPTED | The five sites are all checked. The unsignalled point is *why* it still matters: a **failed/flushed** body WR does produce a CQE, carrying that pointer. Comment says so at the site. |
+| **C4** — §24.4 was incomplete: **COMMAND's** 16-bit index caps a **256**-entry table, and **CLIENT_COMPLETION's** caps another | ACCEPTED — real gap | Both constants moved into the transport header and asserted. That is **four** tables now capped by a WR-ID field, not two. |
+| **C5** — no ABI bump needed; nothing derived from a WR id is ever transmitted | VERIFIED both ways | No change. |
+| **C6** — the `:4146` naive-switch trap is real; **and there is a FOURTH ordering-sensitive CQ consumer**, `TupleSinkServiceWaitForSendCompletion` | ACCEPTED | The drain keeps its 3-block order, now with a comment stating *why* the order is load-bearing. The blocking wait's asymmetry (it does not run the payload failure probe) is recorded below as a KNOWN GAP. |
+
+#### ⚠ KNOWN GAP, deliberately not closed in §24
+
+`TupleSinkServiceWaitForSendCompletion` calls `TupleSinkServiceLogSendCompletionFailure` on a failed CQE but does
+**not** invoke `payloadCompletionProbe`, while the async drain does. So a payload CQE that fails *while a blocking
+wait is polling* gets the generic failure log but not the P3 owner trace. It is **diagnostic-only** (the probe is
+`#ifdef HOMER_DPU_P2_DIAG`) and the CQE is still correctly not retired. Recorded rather than fixed, so it is a
+known asymmetry instead of a surprise.
+
+### 24.7 ⚠ THE ASSERTS PROVE WIDTHS. THEY CANNOT PROVE SHIFTS. Hence a startup self-test.
+
+Realised while wiring the asserts, and it is the most useful thing in this section:
+
+> **Transpose two shifts and every single `_Static_assert` still passes** — no width changed. The entire assert
+> block is blind to the one error it most looks like it is preventing.
+
+Only an encode→decode round trip catches a wrong offset, and §24.4 put that round trip under
+`HOMER_PEER_RDMA_DIAG` — **which is `0`** (`remote_execution_peer_transport_rdma.c:387`). So as specified, the check
+that proves the layout **would never have run.**
+
+**`TupleSinkServiceVerifyPeerSendWrIdLayoutRdma`** now round-trips **one WR id per class at its field boundaries,
+once at startup, in EVERY build**, and the service **refuses to start** if it fails. It costs microseconds on the
+control path and it converts "the shifts are right" from an assumption into something the process proves about
+itself before it posts a single WR. Its `PASSED` line is also the landed-proof string for a deploy.
+
+**Rule earned:** *a static assert proves a field FITS; only a round trip proves it is in the right PLACE. If the
+round trip is behind a debug flag, the layout is unverified in every build that matters.*
+
+---
+
+### 24.8 ✅ §24 LANDED + VALIDATED (2026-07-12)
+
+**The DPU gate passed** (`pgbench --homer --homer-dpu-command`, 4-role cross-node topology, hard clean baseline).
+
+| acceptance gate | result |
+|---|---|
+| `send WR-ID layout self-test PASSED (5 classes vs GOLDEN ids, plus field boundaries)` | **exactly 1** in EACH of the 3 service logs (farnet0 host, farnet1 DPU, farnet0 DPU) |
+| `ALARM` count, all services | **0** — none of `named a RECYCLED owner slot`, `named a non-POSTED owner`, `WR-ID address-space assumption is broken`, `RETIREMENT EVENT LOST`, `may be corrupt` |
+| `self-test FAILED` / service `FATAL` | **0** |
+| correctness (`-t 5 --debug`) | `transport: homer-dpu-command (implies dpu result relay)`; **5 distinct abalances**; 5/5, 0 failed |
+| DPU spawn | `DPU backend spawn begin` + `COMPLETED … launched_pid=3558654` on the farnet1 DPU |
+| anti-fallback | farnet0 host service log = **startup banner only**, zero session/command/payload activity |
+| clean SIGTERM | all 3 services, no crash, no hang |
+| **tps** (`-t 2000 --debug`, warmed, warmup discarded) | **287.8 / 282.7 / 281.7** vs F7's **288.7 / 284.9 / 283.3** → −0.3% / −0.8% / −0.6%, **inside noise, NO REGRESSION** |
+
+The no-regression result is what §24.1.2's G9 asked for and refused to assume: the decoder is now **one shift +
+one mask** per CQE where it used to be up to four short-circuit predicates, and it measures as free.
+
+#### ⚠ THE SELF-TEST WAS PROVEN BY A NEGATIVE TEST, NOT BY PASSING
+
+A self-test that has only ever passed is not evidence. So it was **deliberately broken and re-run**: transposing
+`STREAM_INDEX_SHIFT` (48) with `OWNER_SLOT_SHIFT` (24) — two fields of **equal width**, the exact case a
+round-trip cannot see.
+
+```
+build:      CLEAN. Every _Static_assert passed (no width changed; still disjoint).
+startup:    tuple-sink service: FATAL send WR-ID layout self-test FAILED class=payload:
+            encoded 0x2104000302000501, expected 0x2102000304000501
+            -- a shift or mask does not match the documented layout
+exit code:  1  (the service REFUSED TO START)
+```
+
+That is the whole §24.7 thesis, demonstrated: **the compiler saw nothing, and only the golden literal saw it.**
+Restored and re-validated afterwards.
+
+#### ⚠ WHAT THE GATE DOES **NOT** EXERCISE (same shape as F7's caveat — do not overclaim)
+
+The gate drives the **SQL** path, whose sends are `CRITICAL_CONTROL` and `COMMAND`. It therefore exercises:
+- ✅ the CONTROL and COMMAND classes, the decode switch, all four posting guards, the untagged bootstrap send,
+  the startup self-test, and the whole no-regression claim;
+- ❌ **NOT the payload/ACK OWNER_SLOT + OWNER_INCARNATION path** — those retire on the tuple/COPY payload path,
+  and backend-to-backend COPY is **broken at HEAD** (see `byte_ring_slot_capacity_regression.md`).
+
+So the **incarnation check is validated by construction, by review, and by the negative test — NOT by
+execution.** `ALARM=0` proves it did not *false-positive*; it does not prove it *fires*. Exactly like P0-b's
+`RETIRING` branch (§22.10), this needs the COPY path back, or a fault-injection run.
+
+#### Residual gaps, recorded rather than hidden
+
+1. **Incarnation wrap (review R1).** Widened 8 → **16 bits** (bits 8-23; bits 0-7 were spare, so it was free)
+   after the reviewer showed an 8-bit counter aliases after 256 reuses of one slot. **This narrows the window
+   256×; it does not eliminate it.** A finite counter always wraps. The honest claim is: *the incarnation
+   restores stale/duplicate detection for any fault that can occur under verbs semantics (which do not
+   duplicate CQEs), and it does so WITHOUT reintroducing the absolute token's wrap ceiling on how much a stream
+   may ever send.* It is **not** "at least" the old token's coverage in the pathological limit, and §24.6's
+   first draft wrongly claimed it was.
+2. **ACK's one-WR post helper discards `bad_wr`** and records every failure as zero-posted
+   (`remote_execution_peer_transport_rdma.c`), so callers roll back. Under a **nonconforming provider** that
+   accepts the WR and *then* returns failure with `bad_wr == NULL`, the ACK owner is freed while a CQE is still
+   possible. Pre-existing, and the control path already recognises exactly that provider behaviour (P0-b,
+   §22.9). **The new incarnation check now CATCHES the resulting stale CQE loudly** instead of mis-retiring —
+   so §24 makes this failure mode visible rather than silent. Fixing the helper is P1 work.
+3. **CONTROL response retirement ignores the slot generation** (validates only slot + in-use), while the
+   request path validates it. Pre-existing; the WR-ID contract must not be read as implying generation protects
+   BOTH control tables.
+4. **The blocking wait does not run the payload failure probe** while the async drain does (§24.6). Diagnostic-
+   only, `HOMER_DPU_P2_DIAG`-gated.
+
+#### Rules earned
+
+- **A static assert proves a field FITS; only a golden-literal round trip proves it is in the right PLACE.**
+  And a round trip whose oracle is the implementation's own macros proves *nothing at all* — it shows the
+  encoder and decoder agree, which is true for **any** shift assignment.
+- **A test vector of all-ones cannot see a transposition.** Give every field a **different** value.
+- **A startup gate must run BEFORE anything that can fail.** This self-test was first placed after transport
+  init, where a routine `rdma_bind_addr` failure swallowed it — the gate silently never ran and the log looked
+  normal. *A gate that only runs when everything else already worked is not a gate.*
+- **A review that only confirms is a wasted review.** Round 3 refuted the load-bearing claim (C3), found two
+  un-asserted table couplings (C4), and killed the first self-test outright (R4). Every one of those was a real
+  defect heading for the tree.
