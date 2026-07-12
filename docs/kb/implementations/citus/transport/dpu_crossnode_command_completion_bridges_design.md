@@ -2520,31 +2520,64 @@ committed service-owned DPU result failure ... clean_close=1
 runs, `bits == clean` every time. Before this, a clean close and a genuine peer reset emitted
 byte-identical lines, so a real failure was indistinguishable from the tail of every successful run.
 
-### 15.2 THIS IS NOT THE FULL FIX, and the acceptance criterion is knowingly not met
+### 15.2 THE FULL FIX LANDED — acceptance #5 met (ZERO failure publications on a clean close)
 
-§12.2 acceptance #5 says **ZERO** `ABORTING` / `peer-reset-abort` / `committed ... failure` lines on a
-clean close. They still fire — they are now merely *honest*. The clean path still runs through the failure
-machinery, which means:
+The reporting-only version above was a stopgap; the real fix followed immediately. A session that
+completes T1..T4 sets `teardownCompletedCleanly`; the peer-reset sweep stamps its streams with
+`peerResetAfterCleanClose`; and at **reset-COMPLETE** such a stream takes a dedicated reclaim branch:
 
-- a clean close still publishes a failure completion nobody is listening for (bookkeeping, not an
-  incident, but it is still a lie inside the state machine rather than in the log);
-- the failure counters still move on every successful run.
+```c
+if (streamEntry->stream.peerResetAfterCleanClose) {
+    HomerServiceClearPayloadStreamPeerBinding(streamEntry);
+    PayloadBindingsCleanReclaimed++;
+    HomerServiceResetPayloadStreamEntry(streamEntry, true);   /* unbinds the byte-ring POOL slots */
+    return;
+}
+```
 
-**The first attempt DID try to do it properly, and it broke the next session's RDMA connect**
-(`CM event ... REJECTED status=8`): I reclaimed the stream in peer-reset-**BEGIN**, but the abort path's
-own comment says why that is wrong -- *"the QP/CQ reset is the transport proof"* that no send can still
-reference the stream, and that proof only exists at reset-**COMPLETE**. The two-phase structure is
-load-bearing. Reverted to reporting-only, which changes no timing.
+Deliberately NOT called: `MarkPayloadStreamSendFailed` / `...ReceivePeerFailed` (there was no failure),
+`ArmPayloadFailureReady` (that is what published the phantom failure completion), and
+`ReleaseAbortedProducerSourceCreditAfterTerminal` (it stores into `sendQueue.byteRingControl`, dead
+storage on the mirror path, to unblock a producer -- the backend -- that has already exited).
 
-**Remaining work (P4-class, NOT a hotfix):** give the reset state machine a genuine clean-reclaim path —
-capture the stream at reset-begin as today, but at reset-COMPLETE reclaim it without
-`MarkPayloadStreamSendFailed` / `ArmPayloadFailureReady` / the failure completion. That is surgery on a
-working state machine and belongs with the other P4 band-aid paydown, with a failure-injection test beside
-it. Do it before any deliberate failure-injection work, because until then the failure counters are noisy.
+**What was actually wrong.** Nothing observable, which is why it mattered. On every SUCCESSFUL run the
+abort path marked the stream FAILED, published a `failureState`, set `dpuResultPeerOpenFailed` on the
+retained session, and committed a "service-owned DPU result failure through terminal completion" into a
+slot whose client had already exited. The failure counters moved on every success, and — the real hazard —
+**the happy path depended on the FAILURE machinery to reclaim its own stream.** The day anyone made that
+machinery do more (mark the peer unhealthy, refuse session reuse, notify a client), every clean close
+would have tripped it.
 
-### 15.3 Rule earned (again)
+**Bonus, and it confirms the mechanism:** the payload stream entry is now REUSED — `index=0` on all three
+sessions, where it used to climb 0, 1, 2. The failure path's deferred reclaim had been leaving stream
+slots allocated.
 
-**Do not restructure a working state machine to fix a logging problem.** The danger P5.c addresses is
-diagnostic (a real failure hiding in the noise of successful runs). The minimum change that removes the
-danger is to make the log tell the truth. Anything more is a refactor, and it gets a refactor's care and a
-refactor's test.
+**Reclamation stays at reset-COMPLETE, never reset-BEGIN.** The first attempt moved it to begin and broke
+the next session's RDMA connect (`CM event ... REJECTED status=8`): the abort path's own comment says why
+-- *"the QP/CQ reset is the transport proof"* that no send can still reference the stream, and that proof
+does not exist yet at begin. The two-phase structure is load-bearing.
+
+**Validated:** three consecutive pgbench runs, same postmaster and services, no baseline reset — all 5/5,
+five decoded rows each, empty error streams; **ZERO** failure publications on a clean close (was 9); 3x
+clean reclaim; 3x `BACKEND_SLOT_RELEASE`; zero surviving backends; zero engine fatals; zero postgres
+FATALs.
+
+### 15.3 P5 IS CLOSED — all six §12.2 criteria
+
+| # | criterion | result |
+|---|---|---|
+| 1 | `teardown T1..T4`, in order | PASS (3x) |
+| 2 | `BACKEND_SLOT_RELEASE` in postgres.log | PASS (3) |
+| 3 | NO surviving `remote exec backend` | PASS (0) |
+| 4 | consecutive runs, NO baseline reset | PASS (3 back-to-back) |
+| 5 | ZERO failure-machinery lines on a clean close | **PASS (0)** |
+| 6 | rc=0 **and** empty error stream | PASS (3x) |
+
+### 15.4 Rules earned
+
+- **Do not restructure a working state machine to fix a logging problem** — but do NOT stop at the log
+  either when the state machine is itself lying. The log fix bought a correct, low-risk landing; the state
+  fix was then done separately, in the phase where it is safe.
+- **A happy path must not depend on the failure path to clean up after it.** That coupling is invisible
+  while both work, and it converts any future strengthening of failure handling into a regression on every
+  successful run.
