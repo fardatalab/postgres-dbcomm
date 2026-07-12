@@ -2128,3 +2128,95 @@ the knowledge is.
   with good manners.
 - **A fix for corruption is not a fix for availability.** I set out to stop a slot being poisoned and produced a
   design under which the slot is never reused at all.
+
+---
+
+## 18. P0-e′ — RESCOPED. The crash work is DEAD; the stage is not.
+
+**Owner decision (July 12, 2026):** *"our backend really shouldn't normally just die… if it does that's a bug
+from us. So P0-g is separate but also unnecessary… Perhaps P0-e is also unnecessary?"*
+
+**Agreed on the premise, and it kills two items outright:**
+
+| item | verdict |
+|---|---|
+| **P0-g** (crash liveness leak — no DPU-visible signal that a backend died, so the 30 s deadline never starts) | **DROPPED.** Crash-only. |
+| **P0-e as framed** (the reaper memsets while DPU DMA is in flight) | **DROPPED.** The reaper only fires on `kill(pid,0)==ESRCH` — a backend that died *without* releasing. Hard-crash only. |
+| **The DPU-side quarantine** (refuse to re-nominate a force-unbound slot, §17.4) | **DROPPED.** Only reachable once the DOCA engine is *already* fatally broken; P0-d already **ALARM**s there. Recorded, not built. |
+
+### 18.1 ⚠ BUT: verifying the owner's premise surfaced a NON-CRASH race, and it is the real bug
+
+**VERIFIED:** role-3 completion polling gates on `boundServiceSessionId != 0`, `!pollQuiesced`, and its own
+in-flight flags (`homer_service_dpu_dma.c:1661-1683`). **It does NOT check `tenancyBaselinePending`.**
+
+And `ResetRingTenancyState` — the unbind that *sets* that flag — says (`:4610-4617`):
+
+> *"The outgoing tenant's bytes are still sitting in the host publish line right now — **the backend clears them
+> ASYNCHRONOUSLY**, and the next tenant's DPU-side clear has not run yet. So this ring has **NO trustworthy
+> baseline** until that clear lands: suppress its **grouped-control** reads until then."*
+
+**It names the hazard exactly — and then guards only grouped-control.** Role-3's dedicated poll path is open:
+
+```
+T4:  DPU unbinds slot N's rings   (fires when the RELEASE *write* RETIRES — i.e. BEFORE the
+                                   backend has even READ it)
+     ... the backend is still alive and will re-init the slot ASYNCHRONOUSLY, whenever it
+         gets round to processing BACKEND_SLOT_RELEASE ...
+     a new session arrives -> HomerDpuDmaBindRingSession picks slot N
+                              (its rings are unbound; it NEVER consults the HOST slot state)
+     -> role-3 polling ARMS at once
+     -> reads the DEAD tenant's completion header: publishedEpoch = 39
+     -> ringRuntime->acceptedPublishedEpoch is 0  =>  "39 completions to pull"
+     -> the PREVIOUS session's completions are delivered to the NEW one
+```
+
+**No crash anywhere in that story.** It is invisible today only because validation is **sequential** — one
+pgbench at a time, so the host wins the race by milliseconds. **Concurrent multi-client sessions are exactly
+where it bites, and that is on the roadmap.**
+
+### 18.2 THE DESIGN (P0-e′) — Option A's core, minus everything crash-related
+
+1. **`ARENA_PUBLISH_LINE_CLEAR` → `ARENA_SLOT_REINIT`.** The DPU writes the slot's **ABI-stamped control headers**
+   as well as the publish lines, in the window it already occupies (post-unbind ⇒ drained; pre-re-arm;
+   pre-doorbell, so no backend exists yet):
+   - role-2 `commandMailbox` epoch header (proto, slotCount, publishedEpoch=0, consumedEpoch=0)
+   - role-3 `completionMailbox` epoch header (proto, publishedEpoch=0, consumedEpoch=0)
+   - role-5 `resultRingControl` (proto, ringBytes) — 64 B
+   - `hostPublishLines[3]` — 192 B, **already written today**
+
+   **~400 B, 4 NON-CONTIGUOUS writes** (the headers are megabytes apart inside the slot), so it needs an
+   **AGGREGATE completion condition**: `arenaLinesCleared` goes true only when **ALL FOUR** physically retire, or
+   a half-initialized slot becomes observable (§17.2).
+
+   **The BODIES are NOT written** — 13.7 MB, and provably unreachable: the command mailbox is **epoch-indexed**
+   and the result ring **frontier-based**; C1 confirmed this on four independent readers (§17.1).
+
+2. **`tenancyBaselinePending` becomes the UNIVERSAL gate** — checked by **role-2 publication** and **role-3
+   polling** as well as grouped-control discovery. One bool read on an already-hot cache line, on each path.
+   *"X gates Y" must be checked at the layer that PERFORMS Y* (§17.6).
+
+3. **Delete `HomerFrontendAgentInitArenaSlot` from `HomerFrontendAgentReleaseArenaSlot`** — a *consequence*, not
+   extra work. `ReleaseArenaSlot` then only publishes `FREE`. **NOTE: it has THREE callers, not two** (§17.5):
+   the reaper (`homer_frontend_agent.c:739`), `on_proc_exit` (`remote_execution_backend_bridge.c:2584`), and —
+   the one I missed — the backend applying `BACKEND_SLOT_RELEASE` **inside its command loop** (`:2660`, from
+   `:3074`/`:3201`/`:3252`).
+
+   **`HomerFrontendAgentCreateArena`'s whole-arena zero + per-slot init STAYS** (postmaster start, fresh process).
+
+4. **`HomerFrontendAgentBindArenaSlot`'s verification stays EXACTLY as is** — it becomes what it should always
+   have been: **the check that the DPU did its job.** The invariant upgrades from *"FREE implies initialized"* to
+   *"NOMINATED implies initialized"*, asserted by the only party that can prove it.
+
+### 18.3 It pays for itself twice
+
+- **Correctness:** kills the §18.1 concurrency race **by construction** — there is no host/DPU re-init ordering
+  left to lose. (And it happens to fix the dropped crash case for free.)
+- **Latency:** `InitArenaSlot` memsets **13.7 MB on the backend's session-close path** — order **1–3 ms of pure
+  `memset`**, every session close, delaying the slot's return to `FREE`. Deleting it is a real win on a stack
+  whose steady state is 3.14 ms/tx.
+
+### 18.4 Rule earned
+
+> **Interrogating a "this is out of scope" premise is not wasted work.** The owner was right that the crash paths
+> do not matter — and checking *why* they did not matter is what exposed the race that does. **The scoping
+> question and the bug hunt are the same question asked twice.**
