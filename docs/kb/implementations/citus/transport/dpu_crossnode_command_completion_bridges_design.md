@@ -2963,3 +2963,58 @@ Three coupled decisions, none of which the plan settles:
 - *Verifying that an outcome happened is not verifying that it happened through the path you built.* P5's
   teardown was real; the mechanism I credited for it was not the one running.
 - *Every skip must log.* A guard with no `else` turns "did not run" into "ran fine".
+
+### 18.5 The owner is RIGHT: it SHOULD be one session with two sinks. The second session is an ARTIFACT.
+
+**What `opKind` actually is — there are TWO of them, and only one is identity.**
+
+| | enum | values | is it session identity? |
+|---|---|---|---|
+| `sessionKey.opKind` (logged as `sessionKeyOpKind=5`) | the SEMANTIC op kind | `CLIENT_SQL_SESSION`, ... | **YES** — it is a field of `CitusRemoteExecSessionKey` (homer_control_abi.h), the struct that IDENTIFIES a session |
+| `request.opKind` (logged as `opKind=1/2`) | `CitusRemoteExecControlOpKind` | `TUPLE_SINK=1`, `COMMAND_SESSION=2` | **NO** — it says what THIS REQUEST OPENS: a payload sink, or the command spine |
+
+Both of node A's `OPEN_SESSION`s carry the **same `sessionKey`** (`sessionKeyOpKind=5`, same db/user/node/
+policies) and the **same `sessionUID`** (`5657593410303321`). By identity they ARE the same session. And the
+session struct already supports one-session-many-sinks: `TupleSinkServiceSessionState` carries
+`activeSinkCount`, incremented at four `activeSinkCount++` sites.
+
+**So why did the second OPEN allocate a NEW session?** Because the service does not ask *"which session does
+this sink belong to?"*. It asks `TupleSinkServiceFindReusableSession()` -> `TupleSinkServiceSessionAllowsReuse()`,
+which is a **connection-POOLING** predicate:
+
+```c
+base-compatible?  &&  freshnessPolicy != FORCE_FRESH
+                  &&  !PostCommandStateForbidsReuse(session)     /* DO_NOT_REUSE */
+                  &&  !TupleSinkServiceCommandMailboxBusy(session)
+                  &&  !TupleSinkServiceCommandStillInFlight(session)
+                  &&  (freshness != REQUIRE_CLEAN || activeSinkCount == 0 ...)
+```
+
+That predicate answers *"is this idle pooled session safe to hand to a NEW client?"* — a completely different
+question from *"is this the session this sink belongs to?"*. **A sink's owner is not a matter of policy; it is
+a matter of identity, and the identity is right there in the request (`sessionUID`).**
+
+The TUPLE_SINK open is issued as the client starts its FIRST command, i.e. while session 1 has a command in
+flight. Any of `CommandMailboxBusy` / `CommandStillInFlight` then rejects reuse, and the service silently
+allocates session 2 — a second service session, for the same client, same uid, same key — which then owns the
+result stream and has **no close path on any route** (§18.3 Fact 6).
+
+**This is the same species as everything else in this arc: the right answer was available (the `sessionUID` in
+the request) and the code consulted a heuristic instead.**
+
+**HYPOTHESIS, NOT YET PROVEN:** that the rejecting predicate is specifically `CommandMailboxBusy` /
+`CommandStillInFlight`. `TupleSinkServiceSessionAllowsReuse` is a 6-way ANDed guard that reports NOTHING about
+which arm rejected — CLAUDE.md: *"a guard that ANDs N conditions must report WHICH one failed."* **The next step
+is a probe on that predicate, not a patch.** Do not fix this until a log line names the arm.
+
+### 18.6 Revised P5.d shape (for discussion — NOT implemented)
+
+1. **PROBE FIRST.** Make `TupleSinkServiceSessionAllowsReuse` name its rejecting arm, and make the
+   OPEN_SESSION handler log "reused session N" vs "allocated NEW session N (reuse rejected: <arm>)". One run
+   turns the hypothesis above into a fact.
+2. **Sink attach should be by IDENTITY, not by reusability.** An OPEN carrying a `sessionUID` that names a live
+   session should ATTACH its sink to that session, full stop. Reusability is for picking a *pooled* session for
+   a *new* client, and must not be consulted when the client has already named one.
+3. **Then the close collapses to one session** and P5.d's other two questions (§18.4) mostly dissolve: one
+   session, closed once, cleanly, with `CLOSE_SESSION` actually reaching node A.
+4. `sqlSessionTerminal` gating BOTH closes off, and step 1's silent skip, still need fixing regardless.
