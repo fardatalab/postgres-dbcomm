@@ -2350,3 +2350,73 @@ not doing it now.**
 - **Six refuted inferences in one subsystem is not bad luck — it is a signal about the method.** Every single
   one was a forward chain from a mechanism I had just read, with no check of who was reading downstream. The
   adversarial pass is not a formality here; it is the only thing that has been reliably right.
+
+---
+
+## 20. P0-a — IMPLEMENTATION SPEC (peer-client completion publish: the source MR is released under a live WR)
+
+**Status: IN PROGRESS.** Line numbers below are current (post-P0-d).
+
+### 20.1 The smoking gun, restated from the code
+
+Two sibling functions, **fifty lines apart**, both called from `TupleSinkServiceResetSession` (`:23660`, `:23665`):
+
+| | `ClearClientSqlCommandWriteCompletionsForSession` (`:6550`) | `ClearPeerClientCompletionPublishCompletionsForSession` (`:6604`) |
+|---|---|---|
+| finds an active owner | **REFUSES** — prints, then `exit(1)`, with a comment naming the exact use-after-free | **BLINDLY CLEARS IT** (`:6619`) |
+| why it can | its signal policy has a **TERMINAL CASE** | its signal policy **HAS NONE** |
+
+`TupleSinkServiceClientSqlCommandWriteShouldSignal` (`:6625`) force-signals when
+`commandKind == CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_SESSION_CLOSE` (`:6638`), **then** falls back to ring
+pressure and a signal interval.
+
+`TupleSinkServicePeerClientCompletionPublishShouldSignal` (`:5560`) has **only** ring pressure and the interval.
+**It does not even RECEIVE the command kind** — its parameters are `(sessionState, reservedSourceCount)`, so it
+*cannot* know the publish is terminal.
+
+> **So the LAST completion publish of a session is typically UNSIGNALLED. No CQE is coming. The lane FIFO
+> (`:5935`) retires cumulatively only when a LATER signalled publish arrives — and after close there is none.
+> The owner can therefore NEVER retire, which is precisely why `:6604` had to clear it blindly — and that clear
+> is what lets session reset deregister the source MR under a live WR.**
+
+**The blind clear is not the bug. It is the SYMPTOM of a signal policy with no terminal case.**
+
+### 20.2 The fix — phase by phase
+
+| phase | what |
+|---|---|
+| **1 DECIDE** | session close (exists) |
+| **2 QUIESCE** | the publish path already stops at close; **assert** it rather than adding a flag (see §20.4) |
+| **3 DRAIN** | **(a)** give `PeerClientCompletionPublishShouldSignal` the **TERMINAL CASE** — take the `commandKind`, force-signal on `CLIENT_SQL_SESSION_CLOSE`. **NOT** `TupleSinkServiceCommandStateIsTerminal` (`:17927`), which means `COMPLETED\|\|FAILED` = **EVERY command**, and would put a signalled WR on the **hot path**. **(b)** then **BOUNDED SYNCHRONOUS DRAIN** in the funnel: pump `HomerServiceDrainTypedPeerSendCq` (`:3889`) until this session's active owners reach zero, or a deadline. |
+| **4 RELEASE** | only then clear owners / reset the session |
+
+**On non-convergence: ALARM + route to Scenario E** (the connection reset already abandons owners and records
+what it discarded, §9.4). **Do NOT silently clear.** This also covers the abort path that never publishes a
+close: it will hit the deadline, say so, and cancel honestly rather than pretend.
+
+**`exit(1)` at `:6600` also goes.** A *signalled* post can legitimately still be un-polled at reset (CQ
+retirement is async), so the exemplar's refusal is right but its remedy is too violent. **Both families get the
+same bounded drain**, and FATAL only on bounded non-convergence.
+
+### 20.3 ⚠ RE-ENTRANCY — the same question P0-d had to answer, and it must be answered the same way
+
+`HomerServiceDrainTypedPeerSendCq` is called today from the progress pump (`:6741`, `:14573`). The funnel
+(`TupleSinkServiceResetSession`) would now call it too. **If `ResetSession` were ever reachable from INSIDE a
+send-CQ drain callback, the pump would recurse.**
+
+The four drain callbacks are retirement handlers (`HomerServiceHandleCommandSendCqeFromDrain`,
+`HomerServiceHandlePayloadSendCqeFromDrain`, a diag probe, and the peer-client-completion retire), and no
+`ResetSession` call site sits inside them. **But that is an INFERENCE, and inference has a 0-for-6 record in
+this subsystem.** So: **guard it by construction.** A `SendCqDrainDepth` counter; the funnel's drain refuses to
+pump if depth > 0 and says so **LOUDLY** — re-entry is a bug we want to SEE, not paper over.
+*(Contrast P0-d, where re-entrancy was ruled out by PROOF: the DOCA callback never calls service code. Here we
+cannot prove it as cheaply, so we assert instead of assuming.)*
+
+### 20.4 Also in scope
+
+- A **partial post** leaves a slot `FAILED_OR_INFLIGHT` (`:19043`) that no CQE can identify. Phase 3 cannot
+  retire it. **Route it to Scenario E EXPLICITLY** (§9.4) rather than letting it look drained.
+- **ACCEPTANCE (from P0-d's shutdown run, §15.6):** a clean SIGTERM shutdown must **no longer print**
+  `refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers quiesce … reset_complete=0`
+  (`:23669`). That line is a guard refusing to release, followed by a leave that ignores the refusal — the exact
+  shape this item exists to fix, and P0-d's shutdown exercise is the first time we saw it fire.
