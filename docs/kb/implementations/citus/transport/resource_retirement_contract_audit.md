@@ -357,25 +357,260 @@ what P7b.1 must avoid.
 
 ---
 
-## 4. REMEDIATION PLAN
+## 4. REMEDIATION PLAN — precise, per issue
 
-Ordered by (reachability x blast radius), and **all P0 items land BEFORE P7b.1's reuse**, because reuse is what
-removes the QP-destruction fence that currently hides them.
+**Performance rule for every fix below: NO new round-trips, and NO new work on the hot data path.** Every
+mechanism here is either (a) a counter/flag already touched on that path, or (b) a change to *when an existing
+message is sent*, never a new message.
 
-| # | item | why here |
-|---|---|---|
-| **P0-a** | **Sibling B (`:6604`) must do what Sibling A (`:6550`) does** — refuse to clear an active owner. **Copy the exemplar.** | Highest reachable blast radius (poisoned QP / cross-session wrong bytes), and the correct implementation already exists fifty lines away. Cheapest high-value fix in the whole list. |
-| **P0-b** | **P7b.0 — control op: release on PHYSICAL retirement.** `sendCompletionRetired`; release on whichever of {response consumed, send CQE retired} comes **LAST**. The dead guard becomes the real retirement site **plus a LOUD assertion**. Delete the decoy comment. Closes the RESPONSE-slot hazard by construction. | The exact resource P7b starts reusing. Ubiquitous (every control op). |
-| **P0-c** | **Shared staging pools need owners.** `payloadPublishTailBuffers` / `payloadFragmentHeaderBuffers`: add a per-slot owner (or a connection-global outstanding bound) so a modulo lap cannot overwrite an in-flight source. | **No ownership at all today**, and pooling is precisely what makes a lap-while-outstanding reachable. Corrupts *credit*, which is the worst thing to corrupt silently. |
-| **P0-d** | **V2 — forced arena unbind must not reset with tasks in flight** (`:43569` / `homer_service_dpu_dma.c:6353`). Drain, or refuse-and-retry, or fence the ring so a late completion cannot write back. Today it **warns and proceeds**. | Reachable on the teardown deadline; corrupts tenancy state. |
-| **P0-e** | **V1 — dead-PID arena reaper needs a DPU handshake** (`homer_frontend_agent.c:689`). A host-side reaper may not zero + free a slot the DPU may still be DMA-ing into. The DPU's `inFlightTaskCount` already exists; it is simply never asked. | **Worst absolute blast radius** (cross-session HOST memory corruption) but needs a protocol addition, so it is not a one-liner. |
-| **P1** | Remote-writable MRs (§3.4): make `peerWritersQuiesced` an actual proof, or keep the QP-lifetime fence explicitly for these MRs (defer deregistration to connection reset, as the sender-head mirror MR already does). | On a pooled QP the failure escalates from "kills a dying connection" to "poisons a live shared one". |
-| **P1** | Payload stream/doorbell late-event punishment (§3.4): a late WIMM must not reset a **pooled** connection shared by other sessions. | Correctness holds; the blast radius is what changes under pooling. |
-| **P1** | Harden the three latent APIs (§3.5) — assert, or document the caller contract at the signature. | They are safe only by current usage; pooling adds callers. |
-| **P7b.1** | clean host-export detach RELEASES the connection instead of resetting it | now safe to land |
-| **P7b.2 / .3** | pooled connections at startup; create-on-demand fallback | the owner's directive |
-| **P2** | `HomerDpuDmaDestroy` drain on clean exit (`homer_service_dpu_dma.c:1179` — says so itself) | clean-shutdown only |
-| **P2** | Grouped-control reads outliving tenancy (§2.3 A1): leave as-is, **write the invariant down** ("safe only while the staging buffer is private and never pooled") + a tripwire if it is ever pooled | correct today; the danger is a future change |
+Ordering: **all P0 lands before P7b.1**, because P7b.1 removes the QP-destruction fence that hides them.
+
+---
+
+### P0-a — Peer-client completion publish: the owner is cleared while its WR may still be reading
+
+**Scenario A.** `TupleSinkServiceClearPeerClientCompletionPublishCompletionsForSession`
+(`tuple_sink_service_process.c:6604`) finds an `active` owner and clears it; session reset then deregisters the
+source MR (`:23617`). Sibling `TupleSinkServiceClearClientSqlCommandWriteCompletionsForSession` (`:6550`) does
+this correctly: it scans, and refuses while any owner is active.
+
+**⚠ THE NON-OBVIOUS PART — "copy the exemplar" ALONE IS WRONG AND WOULD HANG THE SERVICE.**
+`TupleSinkServicePeerClientCompletionPublishShouldSignal` (`:5560`) signals only on **ring pressure**
+(`reservedSourceCount >= RING_SLOTS - 1`) and a **signal interval**. **It has NO terminal/close case.** So the
+LAST completion publish of a session can be **unsignaled — no CQE is ever coming for it.** Sibling A can afford
+`exit(1)` only because its close write is FORCE-SIGNALED (`:6638-6645`, comment: *"Force a CQE checkpoint so
+cleanup-heavy paths do not leave only unsignaled command writes outstanding when the frontend command mailbox
+is reset"*). **The missing forced signal IS the root cause of B's blind clear**, and it is why B "had" to
+cheat. (Unsignaled != complete: the NIC still reads the source, so deregistering the MR is a real
+use-after-free.)
+
+**FIX — two parts, in this order:**
+
+1. **`TupleSinkServicePeerClientCompletionPublishShouldSignal` (`:5560`): force a signal on the TERMINAL
+   completion.** Mirror `TupleSinkServiceClientSqlCommandWriteShouldSignal`'s close case (`:6638`): if the
+   completion being published is terminal for the session (`TupleSinkServiceCommandStateIsTerminal`, or kind ==
+   `CLIENT_SQL_SESSION_CLOSE`), return `true`. **This creates the CQE that part 2 waits for.**
+2. **`...ClearPeerClientCompletionPublishCompletionsForSession` (`:6604`): scan-and-refuse, like `:6570`.**
+   Before the check, drain the send CQ (`TupleSinkServiceDrainTaggedSendCompletions` on the owner's
+   `connectionHandle` — the entry already carries it). If any owner for this session is still `active`, do NOT
+   clear it: **log each one and refuse the reset.**
+
+**Refuse HOW?** Sibling A `exit(1)`s. Do the same here **only after part 1 makes retirement guaranteed** — with
+part 1 in place, a still-active owner at reset means a real bug, which is exactly what we want to catch loudly.
+**Do NOT ship part 2 without part 1**, or the service exits on every clean run.
+
+**Fields:** none new. `TupleSinkServicePeerClientCompletionPublishCompletion` already has
+`active`, `serviceSessionId`, `sourceSlotIndex`, `connectionHandle` (`:1592`).
+**Perf:** one extra signaled WR **per session close** (cold path). Zero hot-path cost.
+**Validation:** a clean pgbench run must show no `refusing to reset` line and no `exit(1)`; the terminal
+completion must produce a CQE.
+
+---
+
+### P0-b — Control op: release on PHYSICAL retirement (this is P7b.0)
+
+**Scenario A + B.** `TupleSinkServiceReleasePeerControlOp` (`remote_execution_peer_transport_rdma.c:7825`)
+memsets the op slot — **including `requestMessage`, the registered RDMA SOURCE BUFFER** — at
+**response-match** (`:10990`), while the request's own send CQE may be unpolled.
+
+**FIX:**
+- **New field** on `TupleSinkServicePeerControlOpState` (`:263`): `bool sendCompletionRetired;`
+- **New phase**: `CITUS_REMOTE_EXEC_PEER_CONTROL_OP_RETIRING`.
+- **Release requires BOTH, in whichever order they arrive** — the CQE usually arrives FIRST, so this cannot
+  simply move to the CQE handler:
+  - **response consumed** (`:10990`): if `sendCompletionRetired` -> memset (release). Else -> `phase = RETIRING`.
+  - **send CQE** (`TupleSinkServiceRetireControlSendCompletion`, `:3699`): set `sendCompletionRetired = true`;
+    if `phase == RETIRING` -> memset (release).
+- **The allocator (`:7790`) already takes only `UNUSED` slots**, so a slot can never be reused with a
+  completion outstanding. **No other change needed.**
+- **The dead guard becomes real.** Today both branches `return true`. With the above, a generation mismatch
+  means a CQE arrived for a slot already freed by someone else — **a genuine bug.** Make it a LOUD error, not
+  `return true`. **DELETE the decoy comment** (it blames a blocking-adapter timeout path that has **no
+  caller**).
+- **Post-failure release (`:10644`) is unchanged**: `WOULD_BLOCK` posted no WR; `PARTIAL` resets the
+  connection.
+
+**This closes the control-RESPONSE-slot hazard (§3.4) BY CONSTRUCTION** — same rule, no separate generation
+plumbing.
+**Perf:** two branches on a control path. Zero hot-path cost.
+**Validation:** the new LOUD assertion must never fire across the full workload set.
+
+---
+
+### P0-c — The staging pools have no ownership at all
+
+**Scenario A.** `TupleSinkServiceReservePayloadPublishTailSlot` (`:743`) and
+`...ReservePayloadFragmentHeaderSlot` (`:760`) hand out slots by **blind modulo cursor**
+(`payloadPublishTailNextSlot`), with no `inUse`, no generation, no completion frontier. The comment admits it:
+*"relies on the existing bounded outstanding-WR discipline before the ring wraps"* — **but those bounds are
+PER STREAM, not per connection**, and the pool is per connection. Enough concurrent streams -> a lap -> the
+cursor hands out a slot whose WR is still being read by the RNIC. **Corrupts a payload tail or a consumed-head
+CREDIT.**
+
+**FIX — and it needs NO new CQE plumbing, because these WRs ALREADY HAVE OWNERS THAT RETIRE:**
+
+- the DATA-tail WIMM slot belongs to a **payload send owner** (`HomerServiceReservePayloadSendOwner`,
+  `tuple_sink_service_process.c:16297`), which is retired at its CQE (`:16579`);
+- the receiver-head ACK slot belongs to a **receiver-head ACK owner** (`:32463`), retired at `:32550`;
+- the fragment headers are **unsignaled** but are chained to the batch's **signaled tail WIMM**, so they retire
+  with the *same* owner.
+
+So:
+1. Add `bool inUse;` per staging slot (both pools).
+2. **Record the slot index (and, for fragment headers, the first-index + count of the batch) IN THE EXISTING
+   OWNER.** The owner structs already carry token/state/WR-count.
+3. **Clear `inUse` when that owner retires** — at the CQE sites that already run (`:16579`, `:32550`).
+4. **Reservation:** scan for a free slot; if none, **drain the send CQ and retry; if still none, LOUD ERROR.**
+   This is exactly the pattern `controlResponsePublishSlots` already uses (`:7955`) — reuse it, do not invent.
+
+**Perf:** one flag write on reserve, one on retire — both already-touched cache lines. **No allocation, no
+round-trip, no extra WR.** The scan is over 128 / 1024 entries only when the pool is full, i.e. never in steady
+state.
+**Validation:** the "pool full" error must never fire; add a high-water-mark counter under the stats macro.
+
+---
+
+### P0-d — Forced arena unbind resets tenancy with DMA in flight
+
+**Scenario D.** The 30-second forced-teardown deadline (`tuple_sink_service_process.c:43569`) calls
+`TupleSinkServiceReleaseDpuArenaBinding` **without the T2 drain**. The DPU unbind
+(`homer_service_dpu_dma.c:6353`) then READS `inFlightTaskCount != 0`, **PRINTS** *"a late completion can
+re-poison the tenancy reset"*, and **resets anyway** (`:6394`).
+
+The clean path already does it right: **T2 DRAIN** gates on
+`HomerDpuDmaArenaSlotTasksInFlight(engine, bridgeGeneration, slotIndex, &inFlight)` **and**
+`completionEventCount == 0` (`:43638`). **The predicate exists. The forced path just skips it.**
+
+**FIX — two parts:**
+1. **PRIMARY (owner: "fail fatally to catch our own bugs"):** the forced-teardown deadline must **not** bypass
+   T2. If the drain has not converged by the deadline, that is **a bug in our drain, not a condition to paper
+   over** -> **FATAL**, naming the slot, the ring, and the in-flight count. A hang we can see beats corruption
+   we cannot.
+2. **STRUCTURAL BACKSTOP (needed anyway for the crash path):** stamp the ring's **`tenancyGeneration`** into
+   each arena DMA task. On completion, if the stamped generation is stale: **still retire the task's resources
+   (free the `doca_buf`, decrement `inFlightTaskCount`) but DO NOT apply its frontier.** That is
+   *attribution*, not *discard* — the completion is still fully handled by its rightful owner; only the
+   write-back into a new tenancy is suppressed. **The mechanism already exists** for grouped-control reads
+   (`homer_service_dpu_dma.c:4580` bumps it; `:12644` compares it) — extend it to arena ring tasks.
+
+**Perf:** one `uint32` compare in the completion callback. Zero hot-path cost.
+
+---
+
+### P0-e — Dead-PID arena reaper: a HOST free with zero knowledge of DPU DMA  ⚠ worst blast radius
+
+**Scenario D, crash variant — and the one place a handshake is IMPOSSIBLE: the backend is dead, there is
+nobody to ask.** `HomerFrontendAgentReapDeadArenaSlots` (`homer_frontend_agent.c:689`) sees `kill(pid,0) ==
+ESRCH`, **zeroes the slot bodies and publishes FREE** (`:666`) — while the DPU may still be DMA-ing into those
+pages. Its safety argument (*"a backend crash drives a postmaster crash-restart, which kills every other
+backend"*) is airtight **on the host** and **never mentions the DPU** — a separate machine, not restarted,
+whose import of the `/dev/shm` arena stays valid.
+
+**FIX — QUARANTINE, not free. Fail-SAFE (leak a slot) rather than fail-SILENT (corrupt memory):**
+
+1. **New slot state `HOMER_FRONTEND_ARENA_SLOT_QUARANTINED`** (alongside FREE / BOUND).
+2. The reaper **must not zero the bodies and must not publish FREE.** It publishes **QUARANTINED** and logs
+   loudly (pid, slot, session). **A QUARANTINED slot is never handed out.**
+3. **Only the DPU may certify it back to FREE**, because the DPU is the only party that can see
+   `inFlightTaskCount`. It already computes exactly this via `HomerDpuDmaArenaSlotTasksInFlight`. The
+   certification rides the **existing** DPU->host channel — **no new round-trip on any hot path** (this is a
+   crash-recovery path that runs at most once per dead backend).
+4. **FATAL if QUARANTINED slots exhaust the arena** (16 slots). That is the point at which it *is* our bug, and
+   it fails loudly instead of quietly.
+
+**Why not FATAL in the reaper itself?** Because our own runbook `kill -9`s surviving `remote exec backend`
+processes after every `--homer-dpu-command` run — the reaper is on the ROUTINE cleanup path. Making it fatal
+would crash the postmaster on every run. **Quarantine gives us a visible, bounded, non-corrupting failure;
+FATAL is reserved for the point where quarantine actually runs out.**
+
+**Open design point (needs the owner):** the exact DPU->host certification carrier. Candidates: the existing
+spawn doorbell socket; a field in the arena the DPU already DMAs; or a setup-socket message. **Pick one before
+implementing.**
+
+---
+
+### P1-f — Remote-writable MRs: an ack that means "I stopped issuing", not "my writes retired"
+
+**Scenario C.** `TupleSinkServiceClientSqlPeerCommandMailboxMayDeregister` (`:23958`) accepts
+`peerWritersQuiesced || connectionResetComplete`, and `peerWritersQuiesced` is set when the **close command is
+OBSERVED terminal** (`:23951`) — i.e. **logical**, not physical.
+
+**The command mailbox is actually SAFE today, and it is worth saying WHY so nobody "fixes" it wrongly:** node
+A's command writes to that MR all travel one RC QP, RDMA writes are delivered **in order** on a QP, and the
+close is the **last** command — so observing the close proves every earlier write landed, and no further write
+will be posted. **That is a real architectural guarantee, not luck. It is merely UNWRITTEN.** -> **Write it
+down as an invariant + assert that nothing writes to that MR outside the ordered command stream.**
+
+**The completion mailbox (`:23613`) and peer command-completion ring (`:23618`) are NOT covered by that
+argument** — they are written by the **opposite** party, on the **opposite** direction, so "I sent my close"
+proves nothing about the peer's in-flight completion writes. **Today only `connectionResetComplete` (the QP
+fence) saves them. P7b.1 removes it.**
+
+**FIX — change WHAT AN EXISTING MESSAGE MEANS. No new message, no new round-trip:**
+
+> The peer's close **response** must not be sent until the peer's **own send CQEs for writes into my MRs are
+> retired.** The peer CAN see its own CQEs (Scenario A). So `peerWritersQuiesced` becomes a *received* fact
+> ("the peer certified physical retirement"), not a *locally inferred* one.
+
+This is **Scenario C collapsing into Scenario A**: every actor retires its own work, and the ack then means
+*physically retired*. **The CLOSE_SINK / close response already exists** — we are changing when it is sent, not
+adding a message. **Zero extra round-trips.**
+
+**Note the failure direction is SAFE:** a session that dies without a close leaves `peerWritersQuiesced` false,
+so the gate **refuses to deregister** -> the MR **leaks** until connection reset. Leak, not corruption. Under
+pooling that leak becomes unbounded, so it needs a bounded-quarantine escape hatch — **but it fails closed,
+which is the right direction.**
+
+---
+
+### P1-g — A late payload WIMM must not reset a SHARED connection
+
+**Scenario B.** The doorbell-token generation correctly prevents wrong-tenant mutation (`:29647`), but a
+mismatch requests a **connection-wide reset** (`:29671`). On a per-session connection that only kills a dying
+connection. **On a POOLED connection it aborts other sessions' live work.**
+**FIX:** a stale-but-well-formed token (correct connection, known-stale generation) must be **counted and
+dropped at the stream level**, not escalated to a connection reset. A *malformed* token stays a reset.
+**Perf:** one branch. Zero cost.
+
+---
+
+### P1-h — Three latent API landmines
+
+None have production callers today; **pooling adds callers.**
+- `TupleSinkServiceDeregisterPeerMemoryRegionRdma` (`:9010`) — `ibv_dereg_mr()` with **no** owner check.
+  **FIX:** assert no send owners reference the MR, or take an explicit "caller certifies quiescence" argument
+  so the contract is at the signature.
+- `TupleSinkServiceEnsureInlineWriteBuffer` (`:4420`) — growth deregisters/frees the shared source with **no
+  fence** (`:4458`). **FIX:** drain the send CQ before the swap, or refuse to grow while any unsignaled write
+  sources from it.
+- `HomerDpuByteRingUnbind` (`homer_dpu_byte_ring_pool.c:250`) — clears ownership with no in-flight check.
+  **FIX:** assert the stream's reclaim facts (which its current callers already prove) at the API, not in the
+  callers.
+
+---
+
+### P2-i — `HomerDpuDmaDestroy`: drain on CLEAN exit  (Scenario E)
+
+`homer_service_dpu_dma.c:1179` says drain-before-destroy is **unimplemented**, and it is called on **clean**
+service exit (`tuple_sink_service_process.c:47985`).
+**FIX:** on clean exit, progress the PE until the **global** outstanding-task count is zero (bounded, with a
+FATAL on non-convergence), then destroy. **Violent teardown on a FAILURE exit stays exactly as it is — that is
+Scenario E used correctly.**
+
+### P2-j — Grouped-control reads outliving tenancy  (Scenario B, accepted)
+
+Correct today: the read lands in **private DPU staging** and its stale result is rejected by generation
+(`:12644`). **FIX: none.** **Write the invariant down** — *"safe only while the staging buffer is private and
+never pooled"* — and add a **tripwire** that fires if that buffer is ever shared or pooled.
+
+---
+
+### 4.1 What P7b.1 may then do
+
+Only after P0: a clean host-export detach **RELEASES** the connection (owner -> 0, QP intact) instead of
+resetting it. **It must NOT use `TupleSinkServiceResetPeerConnection` as the release mechanism** — that is
+Scenario E (violent, correct for failure only), and using it for clean release is precisely the substitution
+this whole audit exists to end.
 
 ## 5. RULES EARNED (all owner-driven)
 
