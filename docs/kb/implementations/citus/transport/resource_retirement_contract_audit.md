@@ -3197,6 +3197,68 @@ retirement site.
 **Fix: one `HOMER_PEER_RDMA_DIAG` check at post time** — assert an untagged WR-ID has no tag bits. Cheap, and it
 makes the assumption speak for itself instead of being inferred from the platform.
 
+### 24.1.2 MAKE IT A REAL DISCRIMINATED UNION — but of DECODED FIELDS, not of bits
+
+**Owner's call (2026-07-12), and it is right for a better reason than tidiness.**
+
+**The priority decode currently has NO single home.** It is re-implemented as a hand-ordered `if`-ladder at
+THREE dispatch sites (`:3485-3507`, `:3779-3852`, `:4078`) plus two one-off checks (`:9363`, `:9449`).
+**Not one of them is a `switch`.** So a fifth WR-ID class needs every ladder edited by hand, in the correct
+order, and **nothing tells you if you miss one** — this is CLAUDE.md hazards §5 (*"a new collector needs FOUR
+edits; -Wswitch protects nothing"*) sitting in the CQE dispatch path, where a mis-decode means a CQE is
+delivered to the wrong owner's retirement site.
+
+⚠ **NOT a union of BITFIELDS.** C bitfield layout is **implementation-defined** — the standard fixes neither
+allocation order within a storage unit nor bit numbering. It would *work* on GCC/Linux, but **`_Static_assert`
+can check `sizeof` and never a field's bit POSITION.** Expressing the layout as bitfields would therefore
+**destroy §24.4**, the compile-time enforcement that is the entire point of this section. Masks and shifts are
+integer constant expressions; disjointness, capacity and tag-distinctness stay statically assertable. **The bit
+layout MUST remain mask/shift-defined.**
+
+The union belongs one level up — over the **decoded** fields:
+
+```c
+typedef enum HomerPeerWrClass          /* the discriminant, explicit at last */
+{
+    HOMER_PEER_WR_CLASS_UNTAGGED = 0,  /* a raw source-buffer address */
+    HOMER_PEER_WR_CLASS_PAYLOAD,
+    HOMER_PEER_WR_CLASS_COMMAND,
+    HOMER_PEER_WR_CLASS_CONTROL,
+    HOMER_PEER_WR_CLASS_CLIENT_COMPLETION,
+} HomerPeerWrClass;
+
+typedef struct HomerPeerWrId
+{
+    HomerPeerWrClass  class;
+    union {
+        HomerPeerPayloadWrIdFields          payload;
+        HomerPeerCommandWrIdFields          command;
+        HomerPeerControlWrIdFields          control;
+        HomerPeerClientCompletionWrIdFields clientCompletion;
+        uintptr_t                           untaggedSourceAddress;
+    } u;
+} HomerPeerWrId;
+
+bool     HomerPeerDecodeWrId(uint64_t raw, HomerPeerWrId *out);  /* THE ONLY place bits 60-63 are examined */
+uint64_t HomerPeerEncodePayloadWrId(const HomerPeerPayloadWrIdFields *fields);
+```
+
+Every dispatch site then becomes `switch (id.class)` **with NO `default:` arm**, so `-Wswitch` finally guards a
+new class at every site at once.
+
+**What this buys:**
+1. The **decode order lives in ONE function**, not in the order of `if`s at three sites.
+2. **`-Wswitch` gets teeth.** (Only if there are NO `default:` arms — hazards §5.)
+3. **`UNTAGGED` becomes a NAMED state** rather than "fell off the end of the ladder". It is a raw pointer, so
+   §24.1.1's address-space assumption now has exactly ONE place to be checked.
+4. The bit layout stays statically assertable (§24.4 survives).
+5. A `HOMER_PEER_RDMA_DIAG` encode->decode round-trip proves the **shifts**; the static asserts prove the
+   **widths**. Between them the layout is pinned.
+
+⚠ **MEASURE, do not assume:** `HomerPeerDecodeWrId` returns a ~16-byte struct on the **send-CQ drain hot path**
+(per CQE). It is stack-local and inlinable, so it should stay in registers — but "obviously free" has been wrong
+in this subsystem before. **Confirm on the gate, do not assert it.**
+
 ### 24.2 The couplings that silently cap tables
 
 A WR-ID field width is a **hard cap on the table it indexes.** One such assert already exists (`:118`) — and it
