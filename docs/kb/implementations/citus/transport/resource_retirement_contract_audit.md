@@ -1068,6 +1068,56 @@ already DMAs / the setup socket). **Until picked, the "no new round-trip" claim 
 
 ---
 
+#### P0-f — THE CERTIFIER CANNOT SAY "I DON'T KNOW".  ⚠ MANDATORY, independent of every other item
+
+**This is not part of P0-e — it is a live defect in a safety primitive, and P0-e (Option A) does not even use
+it. Every OTHER caller does.**
+
+`HomerDpuDmaArenaSlotTasksInFlight()` (`homer_service_dpu_dma.c:6268`) is the primitive that answers *"is this
+arena slot's DMA drained?"* — i.e. it is the **phase-3 certifier** for Scenario D. It returns
+`bool` + `*inFlightOut`, and:
+
+- `HomerDpuDmaFindArenaSlotImport()` (`:5894`) requires an **ACTIVE import whose `bridgeGeneration` matches
+  EXACTLY** (`:5917`);
+- when that lookup **FAILS**, `ArenaSlotTasksInFlight` **returns `true` with `*inFlightOut = 0`** (`:6280`).
+
+> **"NOT FOUND" is therefore INDISTINGUISHABLE from "FOUND AND DRAINED".**
+
+After an agent restart mints a new `bridgeGeneration` (`homer_frontend_agent.c:1529`) while old BOUND slot state
+survives in the shared arena, the query **misses the old import and silently reports DRAINED** — certifying as
+safe a slot whose DMA state is **unknown**.
+
+`HomerDpuDmaUnbindRingSession()` (`:6303`) has the **same shape**: a missing import is treated as idempotent
+success (`:6327`).
+
+**This is THE BUG FAMILY — a missing thing read as a definite negative — sitting INSIDE the primitive whose
+entire job is to certify safety.** It is the same defect as `ownerSession == NULL` meaning "not clean" (§20.1)
+and `clean_close=1` being computed and ignored (§25.2), except here the false negative **grants permission to
+reuse host memory**.
+
+**THE FIX — make the unknown state REPRESENTABLE, then force every caller to answer for it:**
+
+```c
+typedef enum
+{
+    HOMER_DPU_ARENA_SLOT_DRAINED = 0,   /* found, inFlight == 0  -- SAFE */
+    HOMER_DPU_ARENA_SLOT_IN_FLIGHT,     /* found, inFlight  > 0  -- NOT SAFE */
+    HOMER_DPU_ARENA_SLOT_NOT_FOUND      /* lookup failed         -- WE DO NOT KNOW. NEVER "safe". */
+} HomerDpuArenaSlotDrainState;
+```
+
+- **Every caller must handle `NOT_FOUND` EXPLICITLY at the call site.**
+- A caller doing **idempotent cleanup** may still choose to proceed on `NOT_FOUND` — but it must say so, in a
+  comment, deliberately.
+- A caller using it as a **SAFETY GATE** must treat `NOT_FOUND` as **UNSAFE**. There is no third option.
+- **`bool` is the wrong return type for a question with three answers.** That is how the bug got in.
+
+**Caller enumeration is in flight** (adversarial review) — the open question is whether this is **already
+biting us** somewhere unrelated to P0-e. Fold the result in before implementing.
+
+**Rule:** *a predicate that cannot express "I don't know" will lie, and it will lie in the direction of
+"yes" — because `0` is the value a failed lookup leaves behind.*
+
 #### P1-f — remote-writable MRs (and it SUBSUMES P1-g and the mirror-MR leak)
 
 **Command mailbox: ALREADY CORRECT** (§9.2) — RC in-order on one QP + close-is-last proves *"no further write
@@ -1125,11 +1175,21 @@ owners, explicitly recording what it discarded** (`:4278`, `:4290`).
 - **Any resource whose phase 3 cannot converge must route HERE explicitly**, not silently (e.g. the partial-post
   slot in P0-a).
 
-### 9.5 SEQUENCING
+### 9.5 SEQUENCING (current, after three review rounds)
 
-**P0-a, P0-b, P0-c** are self-contained (phases 2-3 are local). **P0-d** is self-contained on the DPU.
-**P0-e** and **P1-f** each have ONE open question (the certification carrier; and whether RC ordering already
-gives P1-f's proof for free). **P7b.1/2/3 land only after P0.**
+| item | state | note |
+|---|---|---|
+| **P0-a** | ready | self-contained; phases 2-3 are local |
+| **P0-b** | ready | self-contained |
+| **P0-c** | ready | needs the transport-helper API change (return the slot indices) + WOULD_BLOCK backpressure |
+| **P0-d** | ready, **much smaller than first thought** | the quiesce+count ALREADY exist (§10.1). All that remains is that the forced-teardown deadline bypasses the drain. |
+| **P0-e** | **DECIDED — Option A** (§12) | quarantine until postmaster restart. No protocol. |
+| **P0-f** | **ready, MANDATORY** | the certifier's `bool` cannot express NOT_FOUND. Independent of everything else. |
+| **P1-f** | ready, **FREE** | **TWO invariants, not one** (§11.1) — one per resource, each with its own proof |
+| **P7b.1/.2/.3** | **BLOCKED on P0** | and P7b.1 must NOT use `ResetPeerConnection` as its release mechanism — that is CANCELLATION (§9.4) |
+
+**DISSOLVED by the protocol** (do not implement these — they were guards, and the guards deleted themselves):
+P1-g; the sender-head mirror-MR leak; §27's response-slot generation check; §7.5's three-way partition.
 
 ### 9.6 The rule
 
