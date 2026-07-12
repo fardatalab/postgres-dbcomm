@@ -1,6 +1,6 @@
 # The resource-retirement contract: audit and remediation plan
 
-**Status:** OPEN. Audit complete for DOCA DMA; RDMA sweep in progress.
+**Status:** OPEN. **Audit COMPLETE** (RDMA + DOCA DMA). Remediation plan in section 4; P0 items block P7b.1.
 **Opened:** July 12, 2026. **Owner-driven** (the contract below is an owner statement, not a derived rule).
 **Code baseline:** citus `d33f6ded3`, postgres `0021633a44a`.
 
@@ -145,42 +145,129 @@ buffer is ever pooled or retargeted, this becomes wrong control state.** Flagged
 
 ---
 
-## 3. AUDIT — RDMA
+## 3. AUDIT — RDMA (sweep complete)
 
-*(sweep in progress; this section will be completed from it)*
+### 3.0 THE ORGANIZING INSIGHT — read this first
 
-Known before the sweep:
+> **Today, QP DESTRUCTION is the universal physical fence.** Many paths release/deregister/reuse without any
+> completion proof of their own, and are safe only because the connection is eventually torn down violently,
+> which destroys the QP and CQs and thereby annihilates every outstanding completion.
+>
+> **Pooling REMOVES that fence.** Once a QP is long-lived, only resources with their OWN explicit owner/CQE or
+> task-count gate remain contract-compliant. **Semantic close alone is not a proof.**
 
-| resource | verdict | evidence |
+That single sentence explains why this audit had to precede P7b.1 rather than follow it — and why the fix list
+is longer than "one bug".
+
+### 3.1 What HOLDS (verified — do not re-audit)
+
+| resource | proof |
+|---|---|
+| payload DATA send owners/MRs | `CLOSE_SINK` gated on `payloadSendOwnerCount == 0 && payloadSendOwnerOutstandingWrs == 0` (`tuple_sink_service_process.c:27062`) |
+| receiver-head ACK slots/MR | reclaim refuses while `receiverHeadAckOutstandingCount != 0 \|\| completedHead < postedTail` (`:35605`) |
+| **client SQL command scratch MR** | **THE EXEMPLAR — see §3.2.** Scans owners; refuses to reset while any remain (`:6550`, `:6570`) |
+| sender-head mirror MR | deliberately deferred deregistration; a late consumed-head ACK would otherwise `REM_ACCESS_ERR` and poison the QP (`:25071`, `:26325`) |
+| DPU mirror byte-range claim | release only the completed prefix (`homer_service_dpu_dma.c:5266`) |
+| detached-import reclaim | import task count zero + both semantic closes + frontier checks (`:9526`, `:9574`, `:9592`) |
+| arena slot, normal T1–T4 release | quiesce, then **all three** arena-ring task counts zero, then RELEASE, then re-check `inFlight==0` before unbind (`:43638`, `:43689`) |
+| `outgoingPublishedTailBuffer` | current helpers post and synchronously await completion (`remote_execution_peer_transport_rdma.c:10185`) |
+| notification RECV slots | reposted per consumption; connection-lifetime, not per-tenant (`:6990`) |
+
+### 3.2 ⚠ THE SMOKING GUN — two siblings, fifty lines apart, one correct
+
+**`TupleSinkServiceClearClientSqlCommandWriteCompletionsForSession` (`:6550`) — CORRECT.** Scans the owner
+table; if any owner for this session is still `active`, it **refuses to reset and `exit(1)`**, with a comment
+that states the contract exactly:
+
+> *"A posted command owner means the RNIC may still read the command mailbox. Resetting the session would
+> deregister/unmap that source memory and reuse the session slot under an in-flight WR. Treat this as
+> reset-required rather than silently manufacturing a use-after-free."*
+
+**`TupleSinkServiceClearPeerClientCompletionPublishCompletionsForSession` (`:6604`) — VIOLATED.** Same job,
+sibling resource, fifty lines below:
+
+```c
+if (entry->active && entry->serviceSessionId == sessionState->serviceSessionId)
+{
+    TupleSinkServiceClearPeerClientCompletionPublishCompletionIndex(completionIndex);   /* BLINDLY CLEARS */
+}
+```
+
+It finds an **active** owner — the RNIC may still be reading that source — and simply erases it. No check, no
+refusal, no warning. Then session reset **deregisters that source MR** (`:23617`).
+
+**Failure:** RNIC reads deregistered/reused source memory -> local-protection CQE, **poisoned QP**, or wrong
+completion bytes delivered to a *later* session. **Reachable** whenever a clean session reset races completion-CQ
+polling; pooling removes the accidental connection-destruction fence that hides it.
+
+**This is the whole thesis in one file:** we do not need to invent what "correct" looks like — it is fifty lines
+above, with the comment explaining the exact use-after-free its sibling manufactures.
+
+### 3.3 VIOLATED — no completion ownership AT ALL
+
+| resource | site | why it is bad |
 |---|---|---|
-| payload DATA send | **HOLDS** | `CLOSE_SINK` gated on `payloadSendOwnerCount == 0 && payloadSendOwnerOutstandingWrs == 0` (`tuple_sink_service_process.c:27070`) |
-| receiver-head ACK | **HOLDS** | reclaim refuses while `receiverHeadAckOutstandingCount > 0` (`:35605`) |
-| sender-head mirror MR | **HOLDS** | deliberately left registered; deregistering would `REM_ACCESS_ERR` and poison the retained QP (`:25063`) |
-| **control REQUEST op** | **VIOLATED** | released at response-match while its send CQE may be unpolled; the memset also wipes `requestMessage`, the **registered RDMA source buffer** (`remote_execution_peer_transport_rdma.c:10990`). Safe today only by an **unwritten RC-ordering argument**. |
-| **its "guard"** | **DEAD CODE** | `:3699` — **both branches `return true`**. It guards a mutation that does not exist, and its comment blames a blocking-adapter timeout path that **has no caller**. It read as a considered design for months. |
-| control RESPONSE slot | **BY-ACCIDENT** | freed only by its own CQE (`:3695`) — but only because the allocator happens to skip `inUse` slots. Nothing enforces it; the generation is decoded and **discarded**. |
+| **`payloadPublishTailBuffers[128]`** | unconditional **modulo** reservation, `remote_execution_peer_transport_rdma.c:743` | Sourced by DATA-tail **and** receiver-head-ACK WRs (`:10054`, `:10249`). **No per-slot `inUse`, no generation, no completion frontier.** The comment relies on "bounded outstanding discipline" — but the bounds are **per stream, not per connection**. A cursor lap overwrites a source word the RNIC is still reading -> **corrupt payload tail or consumed-head CREDIT**. |
+| **`payloadFragmentHeaderBuffers[1024]`** | unconditional modulo reservation, `:760` | Registered header overwritten immediately before an unsignaled RDMA write (`:10008`). Pool size is the *only* protection. -> corrupt transport header, malformed payload, protocol reset. |
+| **control REQUEST op / source buffer** | `:7825` (reached from `:10975`) | memsets the registered `requestMessage` **source** before its own send CQE is necessarily polled. Masked today only by an **unwritten RC-ordering argument**. Its "guard" (`:3707`) is **dead code — both branches return true**. |
 
-Open question for the sweep: **every `ibv_dereg_mr` call site.** Deregistering an MR while a local WR still
-reads it, or while a remote peer can still write into it, is corruption or a poisoned QP — the sharpest shape
-this contract prevents.
+Concurrency-dependent, so **inferred** today — but a pooled lane shared across time and sessions is exactly the
+condition that makes a modulo cursor lap while a WR is outstanding.
+
+### 3.4 BY-ACCIDENT — safe only via RC ordering or allocator shape
+
+- **Remote-writable session MRs** (command mailbox `:23615`, completion mailbox `:23613`, peer completion ring
+  `:23618`): the reset gate accepts `peerWritersQuiesced || connectionResetComplete` (`:23960`), and
+  `peerWritersQuiesced` is set when the *close command is observed* (`:23945`) — which does **not** prove the
+  **remote** writer's local CQE retired. Memory safety rests on RC write-before-doorbell ordering. **A late
+  remote write into a deregistered MR poisons a POOLED QP** — where today it merely kills a dying connection.
+- **Local receive payload/byte-ring MRs** (`:25065`): node A cannot observe retirement of node B's physical DATA
+  CQE. The protocol makes it *likely* safe; nothing makes it *provably* safe.
+- **Control RESPONSE slots** (`:3684`): freed only by their own CQE — but only because the allocator skips
+  `inUse` (`:7950`). Emergent, with the generation decoded and discarded.
+- **Payload stream slot + doorbell token** (`:26321`): the token generation DOES live outside resettable stream
+  storage (`:3783`) and dispatch validates token + binding + connection generation + class (`:29647`), so a late
+  event **cannot corrupt the new tenant**. But release does not prove old WIMM CQEs drained, and the punishment
+  for a late event is a **connection-wide reset** (`:29671`) — which on a POOLED connection aborts unrelated
+  sessions' work.
+
+### 3.5 Latent API landmines (no production caller today)
+
+- `TupleSinkServiceDeregisterPeerMemoryRegionRdma` (`:9010`) — `ibv_dereg_mr()` with **no** owner/quiescence
+  check. Safety wholly delegated to callers.
+- `TupleSinkServiceEnsureInlineWriteBuffer` (`:4420`) — growth deregisters and frees the old shared source with
+  **no completion fence** (`:4458`).
+- `HomerDpuByteRingUnbind` (`homer_dpu_byte_ring_pool.c:250`) — clears ownership with no in-flight/frontier
+  check. Current callers happen to be safe; the API is not.
+
+### 3.6 Violent-by-design (correct — do not "fix")
+
+`TupleSinkServiceResetPeerConnectionInternal` destroys QP+CQs **before** deregistering MRs (`:5530`), and QP
+destruction is explicitly the cutoff for outstanding one-sided WRs (`:4687`). This is **correct containment for
+a real failure**. It is a **landmine only if used as the mechanism for clean pooled release** — which is exactly
+what P7b.1 must avoid.
 
 ---
 
 ## 4. REMEDIATION PLAN
 
-Ordered. **P0 lands before P7b.1's reuse**, because reuse is what makes these reachable.
+Ordered by (reachability x blast radius), and **all P0 items land BEFORE P7b.1's reuse**, because reuse is what
+removes the QP-destruction fence that currently hides them.
 
-| # | item | why it is where it is |
+| # | item | why here |
 |---|---|---|
-| **P7b.0** | **Control op: release on PHYSICAL retirement.** Add `sendCompletionRetired`; release on whichever of {response consumed, send CQE retired} comes **LAST** (the CQE usually arrives FIRST, so it cannot simply move to the CQE handler). The dead guard at `:3699` becomes the real retirement site **plus a LOUD generation assertion**. Delete its decoy comment. Closes the RESPONSE-slot hazard **by construction**, by the same rule. | Smallest, fully understood, and it is the exact resource P7b will start reusing. |
-| **P7b.0b** | **V2 — forced arena unbind must not reset with tasks in flight.** Either drain, or refuse and retry, or (if a hard deadline must win) *fence the ring* so a late completion cannot write back. Today it warns and proceeds. | Reachable, and it corrupts *tenancy* state — the thing P7b multiplies. |
-| **P7b.0c** | **V1 — dead-owner arena reaper needs a DPU handshake.** A host-side reaper may not free a slot the DPU may still be DMA-ing into. Needs the DPU to confirm `inFlightTaskCount == 0` for that slot's rings (the count already exists — it is simply never asked). | **Worst blast radius: cross-session host-memory corruption.** But needs a protocol addition, so it is not a one-liner. |
-| **P7b.1** | clean host-export detach RELEASES the connection instead of resetting it | the original P7b goal; now safe to land on top of the above |
-| **P7b.2 / .3** | pooled connections at startup; create-on-demand fallback | the owner's directive; sized against **concurrency**, not latency (P7 made a connect ~10 ms) |
-| **P2** | **V3 — `HomerDpuDmaDestroy` drain on clean exit.** | Clean-shutdown-only; does not affect steady state. Lowest urgency, but it is a known hole that says so in its own comment. |
-| **P2** | **A1 — grouped-control reads outliving tenancy.** Leave as-is, but **write the invariant down** ("safe only while the staging buffer is private and never pooled") and add a tripwire if it is ever pooled. | Correct today; the danger is a future change, so a stated invariant + tripwire is the proportionate response. |
-
----
+| **P0-a** | **Sibling B (`:6604`) must do what Sibling A (`:6550`) does** — refuse to clear an active owner. **Copy the exemplar.** | Highest reachable blast radius (poisoned QP / cross-session wrong bytes), and the correct implementation already exists fifty lines away. Cheapest high-value fix in the whole list. |
+| **P0-b** | **P7b.0 — control op: release on PHYSICAL retirement.** `sendCompletionRetired`; release on whichever of {response consumed, send CQE retired} comes **LAST**. The dead guard becomes the real retirement site **plus a LOUD assertion**. Delete the decoy comment. Closes the RESPONSE-slot hazard by construction. | The exact resource P7b starts reusing. Ubiquitous (every control op). |
+| **P0-c** | **Shared staging pools need owners.** `payloadPublishTailBuffers` / `payloadFragmentHeaderBuffers`: add a per-slot owner (or a connection-global outstanding bound) so a modulo lap cannot overwrite an in-flight source. | **No ownership at all today**, and pooling is precisely what makes a lap-while-outstanding reachable. Corrupts *credit*, which is the worst thing to corrupt silently. |
+| **P0-d** | **V2 — forced arena unbind must not reset with tasks in flight** (`:43569` / `homer_service_dpu_dma.c:6353`). Drain, or refuse-and-retry, or fence the ring so a late completion cannot write back. Today it **warns and proceeds**. | Reachable on the teardown deadline; corrupts tenancy state. |
+| **P0-e** | **V1 — dead-PID arena reaper needs a DPU handshake** (`homer_frontend_agent.c:689`). A host-side reaper may not zero + free a slot the DPU may still be DMA-ing into. The DPU's `inFlightTaskCount` already exists; it is simply never asked. | **Worst absolute blast radius** (cross-session HOST memory corruption) but needs a protocol addition, so it is not a one-liner. |
+| **P1** | Remote-writable MRs (§3.4): make `peerWritersQuiesced` an actual proof, or keep the QP-lifetime fence explicitly for these MRs (defer deregistration to connection reset, as the sender-head mirror MR already does). | On a pooled QP the failure escalates from "kills a dying connection" to "poisons a live shared one". |
+| **P1** | Payload stream/doorbell late-event punishment (§3.4): a late WIMM must not reset a **pooled** connection shared by other sessions. | Correctness holds; the blast radius is what changes under pooling. |
+| **P1** | Harden the three latent APIs (§3.5) — assert, or document the caller contract at the signature. | They are safe only by current usage; pooling adds callers. |
+| **P7b.1** | clean host-export detach RELEASES the connection instead of resetting it | now safe to land |
+| **P7b.2 / .3** | pooled connections at startup; create-on-demand fallback | the owner's directive |
+| **P2** | `HomerDpuDmaDestroy` drain on clean exit (`homer_service_dpu_dma.c:1179` — says so itself) | clean-shutdown only |
+| **P2** | Grouped-control reads outliving tenancy (§2.3 A1): leave as-is, **write the invariant down** ("safe only while the staging buffer is private and never pooled") + a tripwire if it is ever pooled | correct today; the danger is a future change |
 
 ## 5. RULES EARNED (all owner-driven)
 
