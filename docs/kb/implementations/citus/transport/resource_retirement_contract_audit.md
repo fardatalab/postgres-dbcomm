@@ -4036,3 +4036,96 @@ machinery. Two distinct facts; §24.8 fused them into one wrong sentence.
 **Rule earned (again, and this is the ninth time in this document):** *a forward chain from a mechanism I had
 just read, with no check of what the OTHER callers of that mechanism actually do.* "COPY is broken" was true;
 "therefore the payload path is untested" did not follow, and one grep for the other caller would have shown it.
+
+---
+
+## §27 — P0-c IMPLEMENTED (staging pools). Two latent bugs found; the review found a THIRD that was MINE.
+
+**Status: implemented 2026-07-12, reviewed twice, awaiting validation.** Transport-only —- the service already
+had correct `WOULD_BLOCK` / `FAILED_PARTIAL` handling, so nothing there needed to change for the mechanism.
+
+### 27.1 What shipped
+
+| pool | treatment |
+|---|---|
+| **TAIL** (`payloadPublishTailBuffers[128]`) | reserve/retire **frontier** (`payloadPublishTailReserved` / `...Retired`); reserve returns **`WOULD_BLOCK`** at capacity and **does NOT drain internally** (the owner drains; the reserver reports); retired by the CQE's **`RESERVED_TAIL_SLOTS`** — §24 already encodes it, so **the completion says what it frees** and a two-counter frontier suffices. |
+| **HEADER** (`payloadFragmentHeaderBuffers[1024]`) | **ROLLBACK ONLY**, no frontier (§26.3). |
+| both | roll back **iff ZERO WRs posted**; a **PARTIAL** post **retains** (those WRs are live on those slots) and forces a reset, which zeroes the pools after QP/CQ teardown (**verified**, `:6425`). |
+
+A first-time **one-shot announcement** fires when a lane first hits tail-pool backpressure: before P0-c that
+boundary was not a state, it was where the corruption began. *Silence must not be a valid state; spam must not
+be the price of saying so.*
+
+### 27.2 ⚠ TWO LATENT BUGS FOUND WHILE IMPLEMENTING — both primed to detonate in THIS stage
+
+1. **The fixed-slot builder reserves NO tail slot** (it re-tags the last payload write as the signalled
+   `WRITE_WITH_IMM`) — but **§24 had me thread `TAIL_SLOTS_PER_BATCH = 1` into BOTH encoders.** Its completion
+   therefore claimed to free a slot it never took. Harmless *only* while nothing read the field —- and **P0-c is
+   what starts reading it**: the frontier would **OVER-ADVANCE** and hand out slots that are still live, which
+   is precisely the corruption P0-c exists to prevent. Now encodes **0**.
+   **Rule: a WR id must describe the WR that carries it, not the shape of its sibling.**
+2. **The unsignalled receiver-head ACK** reserved a tail slot but posted an **UNTAGGED** WR id → **no CQE** →
+   the slot could never be retired. Unretirable by construction; also a straight violation of P0-i (an
+   unsignalled WR with no guaranteed signalled successor). **Now refused outright.**
+
+### 27.3 ⚠ THE REVIEW FOUND A THIRD, AND IT WAS THE WORST ONE
+
+> **The byte-ring publisher's ZERO-WR `ibv_post_send` failure path had NO ROLLBACK.**
+
+That path is **`ENOMEM` on a full send queue** —- *the exact `WOULD_BLOCK` retry storm P0-c exists to fix.*
+Without the rollback the cursors advance with no WR behind them; after 128 such failures the tail pool is
+permanently "full" and **the lane wedges forever.**
+
+**P0-c would have shipped a fresh instance of the very bug it was written to remove.**
+
+**Root cause of the miss, and it is the lesson:** my patch script's `.replace()` matched
+`"ibv_post_send(payload byte-ring) failed"` while the real literal is `"...byte-ring **publish**) failed"`. Every
+*other* replacement in that script asserted its match count. **That one did not.** So it silently no-op'd and
+**the build stayed green.** A second script then asserted *after* the writes it had already reported "OK",
+aborting before the file was written at all.
+
+> **A CLEAN BUILD IS NOT EVIDENCE THAT YOUR EDIT LANDED.** Every fix in this stage was subsequently **proven by
+> reading the code back**, not by a successful compile. (This is the same failure family as the July-12
+> `make | tail` script that printed `DPU BUILD OK` over `make: *** Error 1`.)
+
+### 27.4 The review's OTHER findings, all accepted
+
+- ⚠ **The header pool's capacity check was OFF BY ONE BATCH.** I checked `granted_max_send_wr < 1024`. But **a
+  batch RESERVES AND WRITES up to `PAYLOAD_BATCH_MAX_WRITES` (32) headers BEFORE it posts**, so the
+  in-construction batch is on the cursor too. With **993** accepted-but-unretired WRs against a 1024-slot pool,
+  the next batch's 32 headers **wrap onto a live slot and overwrite it** —- *before* the inevitable full-SQ
+  failure can roll them back. **A rollback that has not happened yet cannot save a slot that has already been
+  scribbled on.** Correct bound, now enforced both statically and at QP creation:
+  `granted_send_wr + PAYLOAD_BATCH_MAX_WRITES <= FRAGMENT_HEADER_SLOTS`.
+- ⚠ **And the check had to exist at all** because the proof rested on the send-queue depth we **REQUESTED**.
+  `rdma_create_qp()` writes the **GRANTED** caps back into `qpInitAttr.cap`, and the code read back only
+  `max_inline_data` (`:5410`). A provider may grant **more**. The connection is now **refused** (loud ALARM) if
+  the granted depth could outrun the pool. The requested depth (256 + 32 vs 1024) has ample headroom; the check
+  exists for the provider that grants more than we asked.
+- **The inline-disabled retry reused `qpInitAttr` after a FAILED create.** The struct's contents are only
+  guaranteed on success —- and we now make a *correctness* decision out of those fields. All requested caps are
+  re-stated before the retry.
+- **Rollback no longer depends on `postResult` being non-NULL** (it is an optional out-param; correctness must
+  never ride on whether the caller wanted a report). The posted count is recomputed from the same helper
+  `MarkPeerPostFailure` uses, and neither the WR chain nor `bad_wr` is mutated in between.
+- **`WOULD_BLOCK` is now an EXPECTED state, so it is no longer logged as a publish failure** —- at **six** hot
+  publish/credit-ACK sites, not the one I first found. Per-occurrence logging there would spam under legitimate
+  saturation and depress the very throughput being measured.
+
+### 27.5 ⚠ A LANDED-PROOF FALSE-NEGATIVE (new operational hazard)
+
+The DPU deploy check **failed on a good binary**. The DPU's system `pg_config` carries **`-flto=auto`**; LTO let
+GCC see across translation units, **prove `signaled` is always true, and DELETE the unsignalled-ACK refusal
+branch** —- including its strings. Our host build (no LTO) keeps them.
+
+- The compiler thereby **independently confirmed the invariant** I claimed. Nice.
+- But **a string-grep landed-proof FALSE-NEGATIVES on code the compiler can prove dead**, and would have blocked
+  a correct deploy. **Key landed-proofs on strings the compiler cannot eliminate.**
+
+### 27.6 Rules earned
+
+- **A capacity bound must count what is IN CONSTRUCTION, not only what is ACCEPTED.** The slot is written before
+  the post; the rollback comes after it.
+- **Never make a correctness decision out of a struct the API only fills in on SUCCESS.**
+- **A WR id must describe the WR that carries it, not the shape of its sibling.**
+- **A clean build is not evidence your edit landed. Read it back.**
