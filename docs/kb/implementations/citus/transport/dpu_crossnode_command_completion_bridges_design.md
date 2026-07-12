@@ -3183,3 +3183,66 @@ ONE-TIME rendezvous stall in the result peer-open. **Do not chase the engine's c
 - **A probe's verdict can be an artifact of a second bug.** `live_session_with_that_uid=0` read as
   "the compat session is load-bearing". It was really "the uid was never stored". Always ask what ELSE
   could make the measurement read that way.
+
+---
+
+## 20. P5.d LANDED — the close now actually closes, ONE session, zero failure machinery (citus b19e0d663)
+
+### 20.1 The four coupled defects, and the one shape behind them
+
+| # | defect | fix |
+|---|---|---|
+| 1 | **`sessionUID` was never STORED on node A's command session.** The SYNC control-slot open stamps it (:36071 — whose comment even claims *"farnet0 records it here from the client's OpenSession"*), but a REMOTE open is REJECTED by that path (*"must use async local-control path"*, :36040) and lands in the ASYNC one, which omitted the stamp. The uid was on the wire, in the log, and threaded to node B — while the session that owned it locally held **0**. | stamp it in the async path |
+| 2 | **The result peer-open decided OWNERSHIP with a connection-POOLING predicate.** Unable to find the owner, it called `FindReusableSession` -> `AllowsReuse` (base-compat AND !FORCE_FRESH AND !DO_NOT_REUSE AND !mailbox-busy AND !cmd-in-flight ...) — which answers *"is this idle pooled session safe to hand to a NEW client?"*, a different question. It minted a throwaway **"peer compatibility session"**: a SECOND service session, same client, same uid, same key, owning the result stream, named by no close path. | look the owner up **by uid**; fall back to pooling only when there is no uid |
+| 3 | **The lifecycle `CLOSE_SESSION` was SKIPPED whenever the session was terminal** — i.e. on every successful run, because step 1 makes the backend exit and the backend correctly answers `DO_NOT_REUSE`. Both stated reasons were wrong: *"a dead responder"* conflates the **BACKEND** with the **SERVICE** (a control-slot request is answered by the DPU service, which is alive and is the process that must reclaim the session); *"the busy-control-slot refusal"* is the bug **P5.b(2) already fixed**. And a SESSION close must close **the sinks bound to it** — only the sink-level branch ever initiated the peer close, so the session-level close then rejected with *"exact sinks are still active"*. | send it; release bound sinks |
+| 4 | **ORDER: the role-7 unbind ran BEFORE the lifecycle close.** The unbind detaches the result ring's export, and node A reports a host-consumer detach as a payload-protocol FAILURE (correct for a client that vanishes mid-stream). It beat `CLOSE_SESSION` to the service by **~5 ms**, every run. The old comment justified unbind-before-close as *"the DPU must still hold this client's import while it tears the ring down"* — real, but it does NOT order these two: the import dies in **STEP 4**. | close the session first; the detach then finds nothing bound |
+
+**And the family's signature move, one level up.** Once the close ran, the abort STILL said
+`REAL PEER FAILURE ... clean_close=0`. `peer-reset-begin` DERIVES cleanliness by looking the owner session
+up — but by then **the close has destroyed it**, so `ownerSession == NULL` was read as *"NOT a clean close"*
+when it means *"the owner already left"*. Cleanliness is now a **LATCH stamped on the STREAM** at the moment
+the owner asks to close; the reset-begin derivation may only ever set it, never clear it.
+
+> *A missing thing must never read as a definite negative.* That is the same sentence as
+> "a zeroed struct lies", "silence is a valid state", and "an un-armable collector looks idle".
+
+### 20.2 P5 IS CLOSED — all six §12.2 criteria, WITH THE NODE NAMED ON EVERY ROW
+
+Three consecutive `pgbench --homer --homer-dpu-command` runs, one stack, **no baseline reset**:
+
+| # | criterion | node A (farnet0 DPU) | node B (farnet1 DPU) |
+|---|---|---|---|
+| 1 | `teardown T1..T4`, in order | n/a | **PASS** (3x T4) |
+| 2 | `BACKEND_SLOT_RELEASE` | n/a | **PASS** |
+| 3 | NO surviving `remote exec backend` | **PASS** (0, by `/proc/<pid>/exe`) | |
+| 4 | consecutive runs, NO baseline reset | **PASS** (3 back-to-back) | |
+| 5 | ZERO failure machinery on a clean close | **PASS (0/0/0/0)** | **PASS (0)** |
+| 6 | rc=0 **and** empty error stream | **PASS** (3x, 5/5 tx, 5 decoded rows each) | |
+
+Plus, new and specific to P5.d: **3x "bound to the OWNING session by sessionUID"**, **0 compatibility
+sessions**, **3x control-slot `CLOSE_SESSION` received**, **3x `CLEAN-CLOSE RECLAIM`**. All 7 smoke targets
+build; `homer_tuple_deform_smoke` ALL PASS.
+
+**§15.3's table is superseded by this one.** Its row 5 said PASS on evidence from one node.
+
+### 20.3 Rules earned
+
+- **A criterion checked on one end of a two-ended path is not checked.** Every acceptance row now names the
+  node. This cost a whole phase of false confidence.
+- **Absence of a log line is not absence of the event.** I concluded "the close is never sent" from a literal
+  node B never prints — one section after writing the rule against it. Only the probe caught it.
+- **Ask an analyst before you instrument.** The Codex sweep corrected my premise (pgbench sends
+  `CLIENT_SQL_TX_BEGIN -> 5x SQL_EXECUTE -> TX_COMMIT` + a warm-up `TX_ABORT`, not just `SQL_EXECUTE`) and
+  eliminated the entire role-6 chain by reading, turning a 3-instrument probe into a 2-instrument one that
+  answered everything in a single run.
+- **A probe's verdict can be an artifact of a second bug.** `live_session_with_that_uid=0` read as
+  "the compatibility session is load-bearing". It really meant "the uid was never stored."
+- **Ownership is IDENTITY, not policy.** A reuse/pooling predicate must never be asked *"who owns this?"*.
+
+### 20.4 Still open (unchanged by P5.d)
+
+- **§10k, REFRAMED (see §19.4): the stall is ONE ~2.1 s wait for the result peer-open to arm**, not a
+  per-command engine grant stall. All five results flush in 4 ms once it arms. **Do not chase the DMA
+  engine's collector arming.** This is now the top perf item; `p3trace`/`p2diag` must be stripped first.
+- **P4.1** — mirror-path truth-source. Fully designed (§17.3), not started.
+- **One export instead of two** (§18.8) — deferred, not ignored.
