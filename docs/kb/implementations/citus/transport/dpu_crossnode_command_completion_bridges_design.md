@@ -3883,3 +3883,80 @@ stream through the CLEAN path, and **RELEASE** the connection (owner -> 0, QP in
   conflated: (1) the byte ring is empty (`publishedTail == consumedHead` — what `TupleSinkServiceQueueIsDrained`
   actually proves); (2) the stream is semantically closed (`CLOSE_SINK` acked); (3) the transport has no
   outstanding tenant WRs. Name which one you mean, every time.
+
+---
+
+## 27. P7b HARDENING — the control-RESPONSE publish slot is freed without a generation check
+
+Raised by the owner, on reading §26.4's phrase "tolerates arrival after slot reuse": *"tolerate seems very
+suspicious, I don't think we should have anything arrive from remote via RDMA after being reused."*
+
+### 27.1 First, the vocabulary — it is NOT a remote arrival
+
+The thing that "arrives late" is our **own LOCAL send CQE**, not a remote RDMA write. Nothing lands in reused
+memory from the wire. It can arrive late purely as a **polling-order** artifact:
+
+```
+1. post control REQUEST WR            -> controlOps[slot], generation G
+2. peer receives it, posts a RESPONSE
+3. we poll the RECV CQ first, match the response, RELEASE controlOps[slot]
+4. a new op claims controlOps[slot]   -> generation G+1
+5. we finally poll the SEND CQ        -> the CQE for step 1 (generation G) turns up here
+```
+
+Nothing forces the send CQ to be drained before the recv CQ.
+
+### 27.2 The REQUEST branch is safe and considered
+
+`TupleSinkServiceRetireControlSendCompletion` (`remote_execution_peer_transport_rdma.c:3664`) checks
+`controlOps[slotIndex].generation != slotGeneration` and returns without mutating a later op that reused the
+slot (`:3699`), with a comment saying exactly why. It also mutates nothing even on a match. Safe.
+
+### 27.3 The RESPONSE branch decodes a generation and THROWS IT AWAY
+
+```c
+if (responsePublish) {
+    if (slotIndex >= CITUS_REMOTE_EXEC_PEER_CONTROL_RESPONSE_PUBLISH_SLOTS) { ...error... }
+    connectionState->controlResponsePublishSlots[slotIndex].inUse = false;   /* NO generation check */
+    return true;
+}
+```
+
+This one frees a **real registered source buffer**. A stale CQE for a previous occupant would clear `inUse` on
+the CURRENT occupant while its WR is still in flight and the NIC is still reading that buffer — the slot then
+looks free, is reallocated, and is overwritten mid-DMA. **Silent wire corruption**, no error, no log.
+
+### 27.4 Currently UNREACHABLE — but only by an unwritten invariant
+
+There are exactly two writers of the flag:
+
+| | site | effect |
+|---|---|---|
+| set | the allocator, `:7962` — which **skips any slot with `inUse`** | `inUse = true` |
+| clear | the send-CQE handler, `:3695` | `inUse = false` |
+
+So a slot's lifetime is exactly *allocated -> its own CQE*, and it cannot be reused while its CQE is
+outstanding. Therefore a stale response CQE cannot exist today.
+
+**But the safety is EMERGENT, not enforced.** The invariant — *"a response-publish slot is freed ONLY by its
+own send CQE"* — is nowhere stated, nowhere asserted, and the generation needed to enforce it is already
+decoded and then discarded.
+
+### 27.5 Why this must be hardened AS PART OF P7b, not after
+
+**P7b is precisely the change that endangers it.** Making connections long-lived and reused across tenants is
+exactly the context in which someone writes a plausible *"clear the response slots on release/adopt"* line.
+The moment anything other than the CQE can clear `inUse`, the hazard goes live — and it corrupts the wire
+**silently**. Same signature as the RNR bug (§23): a fault whose only expression is silence.
+
+**Hardening:** add a generation to `TupleSinkServicePeerControlResponsePublishSlot`, stamp it at allocation,
+check it before clearing `inUse`, and make the mismatch a LOUD error rather than a silent skip (unlike the
+request branch, a mismatch here means a real invariant was violated, not a benign late CQE). Cost: a few
+lines; the generation is already in the `wr_id`.
+
+### 27.6 Rule earned
+
+**An invariant that holds only because of how the code currently happens to be arranged is not an invariant —
+it is a coincidence with good luck.** If the data needed to enforce it is already in hand (here: the
+generation is decoded and dropped), enforce it. Ask this specifically when a change is about to extend an
+object's lifetime, because lifetime extension is what turns "cannot happen" into "happens rarely, silently".
