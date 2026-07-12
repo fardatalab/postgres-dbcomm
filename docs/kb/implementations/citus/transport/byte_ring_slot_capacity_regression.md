@@ -441,7 +441,33 @@ It is tempting — and wrong — to blame Problem 1. The evidence rules it out a
 
 The hang is therefore **upstream of the data plane**, in the command/session path.
 
-### Leading suspect (unverified): `a3cdd5f3c`
+### ⚠ THE `a3cdd5f3c` SUSPECT IS REFUTED (2026-07-12) — DO NOT CHASE IT
+
+**The attribution below was written before anyone read what the deleted registry was FOR. It is wrong, and a
+confidently-recorded wrong suspect is worse than none: it will cost whoever picks COPY up a day reverting a
+commit that cannot be the cause.** Evidence, all VERIFIED:
+
+- **The tombstone in the code says what the registry was for** (`tuple_sink_service_process.c:619-626`):
+  *"It existed **only because the basebackup relay stream** was owned by a throwaway base-compat session with no
+  sessionUID; **the relay resolved the target role-7 ring** by looking the uid up in this side table."* It was
+  the basebackup DPU relay's role-7 ring resolution —- **not COPY session pairing.**
+- **`a3cdd5f3c` touched exactly ONE file**, `tuple_sink_service_process.c`. It touched **neither**
+  `multi_copy.c` **nor** `worker_tuple_sink_insert.c`. **The deleted registry had no COPY call site.**
+- **COPY pairs by a completely different mechanism**: `TupleSinkServiceFindExactReceiveAttachableSink`
+  (`:25285`), selected for non-basebackup RECEIVE at `:36930`. Basebackup's `(node, tag)` pairing
+  (`HomerServiceBaseBackupSessionKeysPairable`, `:22791`) is selected **only** for `baseBackupOpen` (`:27868`).
+
+**The hang IS bounded** to COPY's control plane: peer `START_COMMAND` reaches `TupleSinkServiceSubmitBackendSpawnRequest`
+(`:41050`) only after the exact-sink check (`:41000`) and command publish (`:41022`). No backend is ever spawned,
+so it never reaches `:41050`. **The payload pumps, send-owner retirement, staging pools and ACKs are NOT
+implicated.**
+
+**➜ THE BISECT ACROSS `7a2eaed53..HEAD` STILL HAS TO BE RUN. It never was.**
+
+See [`copy_path_revival_contract.md`](copy_path_revival_contract.md) for the full coverage map and the
+invariants a revival must uphold.
+
+### (SUPERSEDED, kept to show the reasoning that misled us) Leading suspect (unverified): `a3cdd5f3c`
 `a3cdd5f3c` (2026-07-08) — *"homer: delete the pending-binding registry (Part 3.5.2 stage 4)"* — is a
 session-pairing change, and the observed failure is precisely "the session never pairs, so no command
 is dispatched and no stream is created." That work was validated against **basebackup**, whose pairing
