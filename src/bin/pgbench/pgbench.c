@@ -753,7 +753,7 @@ typedef struct
 	 * DPU result relay state. When homer_dpu_result_relay is on (--homer-dpu, or
 	 * --homer-dpu-command which implies it -- P3 hop 6), the measured command's RESULT
 	 * tuples arrive through the session's role-7 DPU->host ring
-	 * (session.sqlResultDpuStream) rather than a host-shm result sink. The
+	 * (role 7 in session.commandDpuStream) rather than a host-shm result sink. The
 	 * per-command tuple-view contract is captured from the command completion
 	 * (see HomerApplyCommandCompletion) so the DPU drain can finalize each
 	 * decoded tuple; homer_last_abalance holds the most recently decoded first
@@ -3785,7 +3785,7 @@ typedef enum HomerCompletionApplyResult
 /*
  * HomerDrainPendingDpuResultRelay is the --homer-dpu counterpart of
  * HomerDrainPendingResultSink. Instead of a host-shm result sink it advances the
- * session's role-7 DPU->host result ring (session.sqlResultDpuStream): result
+ * session's role-7 DPU->host result ring (in session.commandDpuStream): result
  * tuples land as WHOLE decoded records that HomerClientPollSqlResultDpuReceive
  * delivers once per call, finalizing each tuple against the per-command
  * tuple-view contract (captured in HomerApplyCommandCompletion) and reporting
@@ -9761,18 +9761,17 @@ openHomerSession(TState *thread, CState *st)
 	if (homer_dpu_result_relay)
 	{
 		/*
-		 * Binding: mint this session's UNIQUE sessionUID ONCE here, BEFORE the command
-		 * session is opened, into the shared sessionOptions so BOTH the command-session
-		 * open (threaded to the service and back onto stream B) AND the role-7 result
-		 * opener bind on the SAME value.  The DPU->host relay resolves the target host
+		 * Binding: mint this session's UNIQUE sessionUID ONCE here, BEFORE the selected-DPU
+		 * SQL session's one export/open binds its complete ring set.  The role-7 descriptor
+		 * carries this same value, and the DPU->host relay resolves the target host
 		 * role-7 ring by this sessionUID.  Uniqueness among concurrently live sessions
 		 * comes from the distinct per-client CState pointer (st); pid/time add
 		 * cross-process/cross-run entropy.  This is NOT the connection sessionKey, which
 		 * is deliberately non-unique (four clients on one db/user/node share one).
 		 *
 		 * S1a: --homer-dpu-command also needs it. Its opener rejects a zero sessionUID
-		 * outright, because a zero would silently defeat the role-7 rendezvous later, far
-		 * from the open. The two flags are independent, so mint under either.
+		 * outright, because a zero would silently defeat role-7 lookup later, far from
+		 * the open. The two flags are independent, so mint under either.
 		 */
 		sessionOptions.sessionUID =
 			(((uint64_t) getpid()) << 32) ^ (uint64_t) pg_time_now() ^ (uint64_t) (uintptr_t) st;
@@ -9817,35 +9816,10 @@ openHomerSession(TState *thread, CState *st)
 	st->homer_session_open = true;
 
 	/*
-	 * With the command session established, open the session-scoped role-7 result
-	 * receive stream (DPU->host ring) exactly once. It reuses the basebackup
-	 * RECEIVE opener and the HOMER_FRONTEND_DPU_SETUP_* env vars for the DPU TCP
-	 * setup handshake, and writes its state into st->homer_session.sqlResultDpuStream
-	 * (also setting session.sqlResultDpuStreamOpen). On failure the whole session
-	 * is torn down so pgbench does not run half-wired.
-	 *
-	 * P3 hop 6: keyed on homer_dpu_result_relay, so --homer-dpu-command binds it too.
-	 * This ring is the DESTINATION the relay flag above promised the service; binding it
-	 * is what makes the sessionUID rendezvous on the local DPU resolvable. The ring's own
-	 * OpenSession(RECEIVE) is a self-contained selected-DPU export (its own DPU setup
-	 * connection and control slot) bound to the command session ONLY by sessionUID --
-	 * which is why sessionUID is minted once, before the command open, under either flag.
+	 * ONE EXPORT PER SESSION: HomerClientOpenSqlSessionSelectedDpu returned only
+	 * after binding the SQL session kind's complete ring set (roles 1, 6, and 7).
+	 * There is deliberately no later result-ring bind or setup handshake here.
 	 */
-	if (homer_dpu_result_relay)
-	{
-		/* Bind the role-7 result ring to this session (reframe of the selected-DPU RECEIVE open). */
-		if (!HomerClientBindResultRing(&st->homer_session,
-									   &sessionOptions,
-									   &st->homer_session.sqlResultDpuStream,
-									   errorMessage,
-									   sizeof(errorMessage)))
-		{
-			pg_log_error("client %d could not bind Homer DPU SQL result receive ring: %s",
-						 st->id, errorMessage);
-			finishHomerSession(st);
-			return false;
-		}
-	}
 	memset(&st->homer_result_sink, 0, sizeof(st->homer_result_sink));
 	st->homer_result_sink.fileDescriptor = -1;
 	st->homer_result_sink_open = false;
