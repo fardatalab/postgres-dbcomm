@@ -3140,3 +3140,198 @@ enumerating a set of call sites exhaustively (the exact thing that has burned th
 trades memory for concurrency and that is a **decision for the owner, not an improvisation.**
 
 **STOPPED HERE FOR DISCUSSION.**
+
+---
+
+## §24 — THE WR-ID CONTRACT (canonical). Prerequisite for P0-c.
+
+**Status: SPEC (2026-07-12).** The verbs `wr_id` is the ONLY channel by which a completion tells software what
+it completed. Everything in §0's retirement contract ultimately routes through it. It has never been written
+down, and it currently encodes couplings that **silently cap tables elsewhere in the tree.**
+
+**A `wr_id` is 64 bits, purely LOCAL — it is never transmitted.** Changing the layout needs **no protocol or ABI
+bump**, and no DPU resync. That is what makes §24 cheap.
+
+### 24.1 ⚠ The tag space is NOT disjoint — it is a PRIORITY-DECODED union
+
+This is the most dangerous undocumented fact in the file:
+
+| tag | bit | …but that bit is ALSO |
+|---|---|---|
+| `PAYLOAD_WR_ID_TAG` | **63** | — |
+| `COMMAND_WR_ID_TAG` | **62** | **the payload's `KIND` bit** (`KIND_SHIFT = 62`) |
+| `CONTROL_WR_ID_TAG` | **61** | **inside the payload's `STREAM_INDEX` field** (bits 56–61) |
+| `CLIENT_COMPLETION_WR_ID_TAG` | **60** | **inside the payload's `STREAM_INDEX` field**, *and* **`CONTROL_WR_ID_RESPONSE_FLAG`** |
+
+It is correct today **only** because the `IsTagged` predicates form an **exclusion chain**:
+payload = `bit63`; command = `bit62 && !payload`; control = `bit61 && !payload && !command`;
+client-completion = `bit60 && !payload && !command && !control` (`:3244-3256`).
+
+**The decode order is load-bearing and exists nowhere but in the order of four `&&` clauses.** Reorder them,
+or add a fifth class, and CQEs silently route to the wrong owner — which, per §0, means a resource is retired by
+the wrong actor, or not at all.
+
+**RULE OF RECORD:** the WR-ID is a **priority-decoded tagged union**. A class is chosen FIRST, by the first tag
+bit set from 63 downward; only THEN are that class's fields decoded. A class's fields MAY reuse lower tag bits,
+**because the class has already been decided.** This must be stated in the code, not just here.
+
+### 24.2 The couplings that silently cap tables
+
+A WR-ID field width is a **hard cap on the table it indexes.** One such assert already exists (`:118`) — and it
+is the only one:
+
+```c
+_Static_assert(CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS <= ..._STREAM_INDEX_MASK + 1U,
+               "payload stream table must fit in payload WR id stream-index bits");
+```
+
+Somebody had exactly the right instinct once and never extended it. **Every coupling must have one**, or a
+future table growth becomes a silent mis-decode instead of a build failure.
+
+### 24.3 The new payload WR-ID layout — BYTE-ALIGNED
+
+Two reasons, and the second is the real one:
+1. Byte-aligned extraction is a shift by a multiple of 8 and an `0xff` mask.
+2. **A hex-printed WR-ID becomes directly readable in a log.** On a subsystem where the CQE is the only evidence
+   of what happened, that is worth more than the cycles.
+
+| byte | bits | field | width | caps |
+|---|---|---|---|---|
+| 7 | 63 | `PAYLOAD_TAG` | 1 | — (must stay at 63; the exclusion chain depends on it) |
+| 7 | 60–62 | `KIND` | 3 | 8 completion kinds (2 used: `DATA`, `RECEIVER_HEAD_ACK`) |
+| 7 | 56–59 | *reserved* | 4 | — |
+| 6 | 48–55 | `STREAM_INDEX` | **8** | ≤ **256** streams (today `MAX_LOCAL_SINKS`) |
+| 4–5 | 32–47 | `STREAM_GENERATION` | 16 | unchanged |
+| 3 | 24–31 | **`SEND_OWNER_SLOT`** | **8** | ≤ **256** send owners (today `MAX_INFLIGHT_OBJECTS + 1 = 64`) |
+| 2 | 16–23 | **`RESERVED_HEADER_SLOTS`** | **8** | ≤ 255 (today `PAYLOAD_BATCH_MAX_WRITES = 32`) |
+| 1 | 8–15 | **`RESERVED_TAIL_SLOTS`** | **8** | 0 or 1 |
+| 0 | 0–7 | *spare* | 8 | — |
+
+#### 24.3.1 `SEND_OWNER_SLOT` REPLACES the 40-bit `TOKEN`. This is the important change.
+
+Today the WR-ID carries the **absolute 40-bit `completionToken`**. That is a *value*, and it imposes a **wrap
+limit (~1.1e12)** that nothing checks — an implicit ceiling on how much a stream may ever send.
+
+But the service **already** owns the authoritative table:
+`payloadSendOwnerTokens[HOMER_SERVICE_PAYLOAD_MAX_INFLIGHT_OBJECTS + 1]` (`tuple_sink_service_process.c:1946`),
+and `HomerServiceReservePayloadSendOwner` already hands back the `slotIndex` into it.
+
+**So carry the HANDLE, not the VALUE.** The completion callback recovers the exact 64-bit token via
+`stream->payloadSendOwnerTokens[slot]`. This:
+- **removes the wrap limit entirely** — no absolute counter rides in the WR-ID, so any COPY size works *by
+  design*, not by a bound;
+- frees **34 bits**, which is what pays for P0-c's reservation fields;
+- costs nothing on the wire (WR-IDs are local).
+
+**RULE:** *carry a HANDLE when an authoritative table already exists; carry a VALUE only when it does not.*
+Carrying both — as today — is redundant **and** imports the value's range limit into a design that had none.
+(This is the mirror of §16's P0-e lesson: there the record was self-describing so the side table was
+unnecessary; here the table is authoritative so the value is unnecessary.)
+
+⚠ **`RECEIVER_HEAD_ACK` completions do NOT own a send-owner slot** (`tuple_sink_service_process.c:15072` applies
+them as a frontier). The `KIND` field is decoded first, so ACK may keep a value-carrying encoding in the spare
+bytes. **Verify before finalising the layout.**
+
+### 24.4 The asserts (this is the deliverable, not decoration)
+
+```c
+/* -- capacity <-> width. If a table grows, the BUILD must break, not the decode. -- */
+_Static_assert(CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS      <= ..._STREAM_INDEX_MASK      + 1U, "...");
+_Static_assert(HOMER_SERVICE_PAYLOAD_MAX_INFLIGHT_OBJECTS + 1U<= ..._SEND_OWNER_SLOT_MASK   + 1U, "...");
+_Static_assert(CITUS_REMOTE_EXEC_PEER_PAYLOAD_BATCH_MAX_WRITES<= ..._RESERVED_HEADER_MASK,        "...");
+_Static_assert(CITUS_REMOTE_EXEC_PEER_PAYLOAD_TAIL_SLOTS_PER_BATCH <= ..._RESERVED_TAIL_MASK,     "...");
+/* -- fields must not overlap each other -- */
+_Static_assert(((MASK_A << SHIFT_A) & (MASK_B << SHIFT_B)) == 0, "payload WR id fields overlap");   /* each pair */
+/* -- the four class tags are distinct single bits -- */
+_Static_assert(PAYLOAD_TAG != COMMAND_TAG && COMMAND_TAG != CONTROL_TAG && ..., "...");
+```
+
+⚠ **`HOMER_SERVICE_PAYLOAD_MAX_INFLIGHT_OBJECTS` currently lives in `tuple_sink_service_process.c:326`**, where
+the transport header cannot see it. **Move it into the transport header.** Once the WR-ID encodes the slot, that
+cap **belongs to the WR-ID contract** — it is no longer a service-private tuning knob. Co-locating the constant
+with the field width is the whole point.
+
+**Plus a debug-mode encode→decode→compare round-trip check** in each encoder (`HOMER_PEER_RDMA_DIAG`). A static
+assert proves the widths fit; only a round-trip proves the *shifts* are right.
+
+---
+
+## §25 — F7: "NO CQE MAY BE DESTROYED." Prerequisite for P0-c.
+
+**Status: SPEC (2026-07-12). Found by adversarial review; verified by me. See §23.6.**
+
+### 25.1 The contract already exists — in the header — and the code violates it
+
+`remote_execution_peer_transport_rdma.h:1094-1100` states it outright:
+
+> *"control/bootstrap helpers may still perform internal control-only drains, but service-owned command, payload,
+> and peer-client-completion CQEs **must retire through the typed callback set here**."*
+
+`TupleSinkServiceWaitForSendCompletion` (`:3922`) is one of those "control/bootstrap helpers" — **and it runs on
+QPs that are NOT control-only.** It passes **NULL callbacks** into `TupleSinkServiceHandleTaggedSendCompletion`
+(`:3962`). Control CQEs are retired internally (safe — this is what makes P0-a/P0-b sound). But a **payload,
+command, or peer-client CQE requires a callback**: with NULL, the handler errors out (`:3796`, `:3810`, `:3832`,
+`:3846`, `:3890`, `:3905`) — **after `ibv_poll_cq` has already dequeued the CQE** (`:3938`).
+
+**The completion is destroyed. Its owner never retires.** The rule is written down; nothing enforces it.
+
+**Reachable:** tuple/COPY command completion stores the **payload** connection in
+`peerCommandCompletionConnectionHandle` (`tuple_sink_service_process.c:27898`, `:38667`), so the blocking epoch
+write (`:19461`) runs on a QP that also carries payload batches. (SQL commands use `CRITICAL_CONTROL`
+(`:37991`), whose CQEs retire internally — which is exactly why the DPU gate has never seen this.)
+**Backend-to-backend COPY is 🔴 broken at HEAD; this is a candidate contributor.**
+
+### 25.2 Why this BLOCKS P0-c
+
+Any retirement scheme that advances a frontier **by a delta the completion reports** is sound only if **every
+completion is delivered exactly once.** A single destroyed CQE desyncs such a frontier **permanently and
+silently** — the exact failure class this audit exists to eliminate. **So F7 lands first.**
+
+### 25.3 The fix
+
+| # | change | why |
+|---|---|---|
+| 1 | **Register the send-completion callbacks PERSISTENTLY on `TupleSinkServicePeerTransportState`** — the same pattern as `lifecycleObserver` in `TupleSinkServiceCreatePeerTransportState` (`..._rdma.h:440`). The service already builds the struct (`tuple_sink_service_process.c:15232`). | Then **every** internal drain — including the blocking wait — can retire typed CQEs through their real owners. **No signature churn across the five public wait-backed APIs.** |
+| 2 | `WaitForSendCompletion` uses the **registered** callbacks instead of NULL, and **keeps polling** for its own completion after dispatching someone else's. | It becomes a *participant* in the drain instead of a thief. |
+| 3 | **Match on `wr_id`, not on opcode.** Pass the expected WR-ID in. (Untagged WR-IDs are already the source-buffer address, `:5231` — a usable identity.) Keep the opcode check as a secondary sanity check. | Today ANY untagged `IBV_WC_RDMA_WRITE` CQE satisfies the wait. That is a latent premature-retirement bug: the caller would believe its source buffer is free while its WR is still in flight. |
+| 4 | If a typed CQE arrives and **no callbacks are registered**, that is an **ALARM that NAMES THE LOST EVENT** (`"ALARM ... RETIREMENT EVENT LOST kind=%u stream=%u token=%llu"`) + reset. **Never a quiet `return false`.** | §0: *silence must not be a valid state.* A destroyed retirement event currently reads as a generic error. |
+| 5 | **Enforce the header's own rule:** a blocking wait on a connection whose traffic class is not `CRITICAL_CONTROL` is legal **only** if callbacks are registered. | Turns the prose contract into a checked one. |
+
+### 25.4 Follow-up, NOT this stage (PERF)
+
+The blocking wait is also a **serialization point on a hot path** — the comment at
+`tuple_sink_service_process.c:19445` admits it *"serializes terminal command completion across all tuple COPY
+shard sessions."* Moving that epoch write to the async publish path, or onto the `CRITICAL_CONTROL` lane, is a
+**PERF item** (it is a candidate contributor to the ~450 µs/command). **Do not conflate it with the correctness
+fix.**
+
+---
+
+## §23 (REVISED) — P0-c, now built on §24 + §25
+
+**Order of work: §24 (WR-ID contract) → §25 (delivery guarantee) → §23 (the staging pools).**
+
+The bug (unchanged, §23.1–23.2): both staging pools are handed out by a **blind modulo cursor**, and
+**the cursor counts ATTEMPTS while safety depends on COMPLETIONS.** A slot is reserved and **overwritten before
+`ibv_post_send` is even attempted** (`:10141`), and the cursor advances **even when the post fails** — so a
+`WOULD_BLOCK` retry storm laps the pool and scribbles over the live RDMA source of an in-flight WR. This is why
+**both** pools are broken (§23.5 F1: my "4× headroom" argument for the header pool was worthless — it bounded
+*live* slots and never asked *what moves the cursor*).
+
+**The fix, in three parts:**
+
+1. **ROLL BACK any reservation that does not post.** Cheap, local, single-threaded — and **most of the bug on its
+   own.** Covers the mid-construction `return false` (`:9879`), the `WOULD_BLOCK`, and the hard post failure.
+2. **The completion says what it frees** (§24): `RESERVED_TAIL_SLOTS` + `RESERVED_HEADER_SLOTS` in the WR-ID.
+   Retirement advances both frontiers by exactly those counts. Sound **because** §25 guarantees every CQE is
+   delivered exactly once.
+3. **Reservation returns `WOULD_BLOCK` BACKPRESSURE at capacity, and does NOT drain internally** (the owner
+   drains; the reserver reports — the same rule P0-b's op table follows).
+
+**Also:** the **ACK path** (`:10338`) is a **second producer** into the tail pool (§23.5 F2) and gets the same
+treatment. Reset already memsets the whole connection state after QP/CQ teardown (`:5566`), so the new frontiers
+are reset for free — **verify, do not assume.**
+
+**Severity, corrected (§23.5 F5):** the receiver **validates** framing/generation/sizes, so a bogus tail causes a
+**stall, a reset, or wrong credit** — not silent object corruption. Still a real bug; **not** the catastrophe I
+first claimed.
