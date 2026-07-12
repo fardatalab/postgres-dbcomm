@@ -2670,3 +2670,44 @@ every row, which is exactly what run 39 did.
 **Remaining P4 sequence:** P4.1 (mirror-path truth-source) -> P4.2a (delete the already-dead producer
 byte-ring code) -> section 10k (strip diag, measure, fix the grant stall) -> P4.2b (complete removal, gated
 on the host-service local-byte-ring retirement).
+
+### 16.6 "Reserved means zero" is now UNIFORM — one definition, every path (citus a27faae20)
+
+Owner's point, and it corrected a real hole: if the rule is family-agnostic, it must be **uniform**, and it
+was not. This is the distinction P4.0 turns on, so it is worth stating precisely:
+
+- the OLD field (`generationSequence`) was **family-DEPENDENT** — it *meant different things* per family
+  (0 for basebackup, a 1-based command sequence for tuples). Every consumer had to know which family it was
+  reading. That was the bug.
+- the NEW field (`reservedSequence1`) is **family-AGNOSTIC** — reserved means **zero, for everybody**. Zero
+  per-family knowledge required. Semantic sequences moved DOWN into each family's own payload header
+  (`sinkSequence` packed, `commandSequence` decoded), which is where per-family meaning belongs.
+
+**What was actually broken.** The writers were uniform; the checkers were not:
+
+- the service's reserved-zero check sat **inside `else if (objectFamily == BASE_BACKUP_STREAM)`** — a rule
+  stated as universal, enforced for exactly one family, with the tuple-view arm checking nothing. Same
+  shape as the bug P4.0 exists to kill.
+- the two PACKED receive paths (`HomerClientDrainResultSinkUntil`, `PollCitusTupleSinkRecord`) validated no
+  reserved field at all.
+
+**And because nothing looked, nothing noticed:** `HomerClientSubmitBaseBackupRecord` and the service's EOS
+append assign the envelope field-by-field and **forgot `reserved1`**, while the record buffer is a slice of
+a byte ring that is never cleared — so that field went out **carrying whatever the previous record left in
+it**. A "MUST be zero" that nobody checks is aspirational.
+
+**Fix:** `CitusTupleSinkTransportHeaderReservedIsZero()` in `homer_tuple_abi.h` is THE SINGLE DEFINITION,
+called from every envelope validator (service check hoisted OUT of the basebackup arm to before the
+per-family switch). Both leaky producers now memset the envelope before filling it — zero by DEFAULT, so a
+field added tomorrow is correct without anyone remembering to come back.
+
+**Rule earned:** *a rule that is uniform in the comment but hand-copied at N call sites is not uniform.*
+Give it one definition and call it; otherwise the drift is only a matter of time, and it will drift in the
+direction of whichever family the last author had in mind.
+
+**Validated:** three consecutive pgbench runs — 5/5, five decoded rows each, zero reject probes, **zero
+"nonzero reserved fields" errors** (with the check finally enforced everywhere, no producer is shipping
+garbage), zero failure publications, zero engine fatals. `homer_tuple_deform_smoke` ALL PASS.
+
+**CAVEAT:** the basebackup producer's `reserved1` fix is NOT exercised by pgbench — it needs the 4-role
+DPU-relay basebackup workload. Correct by inspection (memset before fill), but unvalidated at runtime.
