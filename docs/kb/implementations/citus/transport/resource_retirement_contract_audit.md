@@ -3175,6 +3175,28 @@ the wrong actor, or not at all.
 bit set from 63 downward; only THEN are that class's fields decoded. A class's fields MAY reuse lower tag bits,
 **because the class has already been decided.** This must be stated in the code, not just here.
 
+### 24.1.1 The exclusion chain IS correct today (verified) — and it hides a SECOND assumption
+
+**Verified by construction:** no class can be stolen by another, because each class's own FIELDS never set a
+HIGHER class's tag bit. Payload (tag 63) occupies bits 0-62 — its `KIND` (62) and `STREAM_INDEX` (56-61) do set
+bits 60-62, but payload has already won at bit 63. Command (tag 62) carries only a 16-bit index. Control
+(tag 61) carries index bits 0-15 and generation bits 16-47 — it never reaches bit 62. Client-completion (tag 60)
+carries only a 16-bit index. **So there is NO live mis-routing bug.** The chain is fragile and undocumented, not
+broken.
+
+⚠ **But the UNTAGGED class is defined by ABSENCE — "no tag bit set" — and untagged WR-IDs are raw POINTER
+VALUES** (the source-buffer address; see the diag decoder at `:3529`). So CQE routing silently depends on:
+
+> **every registered buffer address has bits 60-63 clear.**
+
+True on Linux x86-64 (canonical user VAs are below 2^47; even 5-level paging stays under bit 57) — but it is an
+**assumption about the address space**, it is load-bearing for correct CQE dispatch, and it is written nowhere.
+If a pointer ever set bit 60, its completion would be decoded as a *tagged* CQE and delivered to a stranger's
+retirement site.
+
+**Fix: one `HOMER_PEER_RDMA_DIAG` check at post time** — assert an untagged WR-ID has no tag bits. Cheap, and it
+makes the assumption speak for itself instead of being inferred from the platform.
+
 ### 24.2 The couplings that silently cap tables
 
 A WR-ID field width is a **hard cap on the table it indexes.** One such assert already exists (`:118`) — and it
