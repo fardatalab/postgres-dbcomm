@@ -194,6 +194,60 @@ Everything expensive in this subsystem has been the same defect:
 
 ---
 
+## 6b. THE RESOURCE CONTRACT — retire before you release
+
+*(Owner-stated, July 12, 2026. Applies to EVERY transport in this system — RDMA and DOCA DMA alike.)*
+
+> **A resource may be released, freed, reused, reset, deregistered or detached ONLY when its own outstanding
+> physical operations have been retired. You do not leave until you have handled your own work. Nothing is
+> left behind for a later occupant to trip over.**
+
+**Corollary — you may not declare something "stale" until you can NAME WHO WAS WAITING FOR IT.** A work request
+exists *because* something waits on its completion: a send CQE retires a WR slot and frees its staging buffer;
+an ACK advances credit; a DOCA task completion releases a buf. Dropping such a completion does not make it
+harmless — it leaks the slot, or wedges the credit. **"Stale => discard" is never available.** If a completion
+truly has no consumer, that is a question about why it is posted, not a licence to drop it.
+
+### Why this is a standing rule and not a bug report
+
+Audit as of July 12, 2026 found the contract is upheld **exactly where someone had previously been burned**,
+and nowhere else. That is scar tissue, not design:
+
+| path | resource | upholds it? | why |
+|---|---|---|---|
+| payload DATA send | `payloadSendOwnerOutstandingWrs` | **YES** | `CLOSE_SINK` is gated on it being 0 (`tuple_sink_service_process.c:27070`) — comment explains the bug that forced it |
+| receiver-head ACK | `receiverHeadAckOutstandingCount` | **YES** | reclaim refuses while > 0 (`:35605`) — same |
+| sender-head mirror MR | the MR itself | **YES** | deliberately left registered, because a late ACK would otherwise `REM_ACCESS_ERR` and poison the QP (`:25063`) |
+| control REQUEST op | the op slot (= the RDMA **source buffer**) | **NO** | released at response-match while its send CQE may be unpolled (`remote_execution_peer_transport_rdma.c:10990`) |
+| control RESPONSE slot | `controlResponsePublishSlots[].inUse` | **BY ACCIDENT** | freed only by its own CQE — but only because the allocator happens to skip `inUse` slots. Nothing enforces it. |
+| DOCA DMA (imports, bufs, tasks, arena slots) | — | **UNDER AUDIT** | see the sweep |
+
+### The three failure shapes this rule prevents
+
+1. **Storage reused under a live engine.** The classic: free/overwrite a buffer the NIC or the DMA engine is
+   still reading. Silent wire/host corruption, no error.
+2. **A completion applied to the WRONG TENANT.** A slot reused by a new owner, then the old owner's completion
+   lands and advances *its* frontier or frees *its* buffer.
+3. **A completion whose consumer has left.** Leaked slot, wedged credit, or a failure status nobody reads.
+
+### The two rules that fall out of it
+
+- **Release on PHYSICAL retirement, not logical completion.** "My response came back" is not "my work is done" —
+  the completion for the request *you* posted is still yours. Own it to the end.
+- **Remove the category, don't guard the case.** A generation check makes the wrong thing *safe*; the invariant
+  makes it *unrepresentable*. A guard is somewhere a future change can walk past; an impossibility is not.
+  (And check that a guard's branches actually DIFFER before trusting it as evidence of a considered design —
+  `remote_execution_peer_transport_rdma.c:3699` is a guard whose branches are identical, and it read as
+  protection for months.)
+
+### Why it matters MORE now
+
+Connection/resource **pooling** (P7b) makes objects long-lived and reused. **Every "this cannot happen because
+the object is destroyed anyway" argument stops holding the moment we pool.** Those arguments are exactly the
+landmines, and several of them are currently load-bearing and unwritten.
+
+See the plan doc sections 25-30 for the derivation, the consumer inventory, and the sweep results.
+
 ## 7. KNOWN GAPS (as of July 12, 2026)
 
 | # | gap | state |
