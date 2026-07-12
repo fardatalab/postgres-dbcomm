@@ -2499,3 +2499,52 @@ A clean close and a real peer reset remain indistinguishable in the logs. T4 mus
 binding so a disconnect on an unbound stream is a no-op, while a disconnect WITH a live binding stays
 loud. This does not block P4.0/P4.1 — it is cosmetic-but-dangerous (it hides real peer failures), so fix
 it before any failure-injection work.
+
+---
+
+## 15. P5.c — clean close vs. real peer failure (July 12, 2026)
+
+### 15.1 What shipped: the logs no longer lie. The machinery is unchanged.
+
+Every peer-reset line now reports `clean_close=`, stamped from the owning session's
+`teardownCompletedCleanly` (set at T4), and the sweep reports `bits=` vs `clean=`:
+
+```
+payload stream marked ABORTING (EXPECTED: after a clean close) ... clean_close=1
+peer reset-begin captured payload streams bits=0x1 clean=0x1 ...
+cleared aborted payload binding ... clean_close=1
+committed service-owned DPU result failure ... clean_close=1
+```
+
+**Read it as: any bit set in `bits` but NOT in `clean` is a REAL peer failure.** On three consecutive clean
+runs, `bits == clean` every time. Before this, a clean close and a genuine peer reset emitted
+byte-identical lines, so a real failure was indistinguishable from the tail of every successful run.
+
+### 15.2 THIS IS NOT THE FULL FIX, and the acceptance criterion is knowingly not met
+
+§12.2 acceptance #5 says **ZERO** `ABORTING` / `peer-reset-abort` / `committed ... failure` lines on a
+clean close. They still fire — they are now merely *honest*. The clean path still runs through the failure
+machinery, which means:
+
+- a clean close still publishes a failure completion nobody is listening for (bookkeeping, not an
+  incident, but it is still a lie inside the state machine rather than in the log);
+- the failure counters still move on every successful run.
+
+**The first attempt DID try to do it properly, and it broke the next session's RDMA connect**
+(`CM event ... REJECTED status=8`): I reclaimed the stream in peer-reset-**BEGIN**, but the abort path's
+own comment says why that is wrong -- *"the QP/CQ reset is the transport proof"* that no send can still
+reference the stream, and that proof only exists at reset-**COMPLETE**. The two-phase structure is
+load-bearing. Reverted to reporting-only, which changes no timing.
+
+**Remaining work (P4-class, NOT a hotfix):** give the reset state machine a genuine clean-reclaim path —
+capture the stream at reset-begin as today, but at reset-COMPLETE reclaim it without
+`MarkPayloadStreamSendFailed` / `ArmPayloadFailureReady` / the failure completion. That is surgery on a
+working state machine and belongs with the other P4 band-aid paydown, with a failure-injection test beside
+it. Do it before any deliberate failure-injection work, because until then the failure counters are noisy.
+
+### 15.3 Rule earned (again)
+
+**Do not restructure a working state machine to fix a logging problem.** The danger P5.c addresses is
+diagnostic (a real failure hiding in the noise of successful runs). The minimum change that removes the
+danger is to make the log tell the truth. Anything more is a refactor, and it gets a refactor's care and a
+refactor's test.
