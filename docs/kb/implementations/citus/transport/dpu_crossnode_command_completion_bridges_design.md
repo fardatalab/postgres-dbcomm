@@ -4037,3 +4037,97 @@ Consequences, all of them improvements:
 - **A "tolerate" in a resource-lifetime path is a smell, and the comment explaining it is the first thing to
   distrust.** Here the comment cited a timeout path that does not exist, and it had been read (by me) as
   evidence the design was considered.
+
+---
+
+## 29. CORRECTION to §28, and what the guard ACTUALLY does (nothing)
+
+### 29.1 THE GUARD IS DEAD CODE. Both branches return true.
+
+Owner: *"what does the guard actually do though, anything meaningful or even correct?"* The answer is **no**:
+
+```c
+if (slotIndex >= CITUS_REMOTE_EXEC_PEER_CONTROL_OP_SLOTS) { ...error...; return false; }   /* <- the ONLY real check */
+
+if (controlOps[slotIndex].generation != slotGeneration ||
+    controlOps[slotIndex].phase == CITUS_REMOTE_EXEC_PEER_CONTROL_OP_UNUSED)
+{
+    /* "...instead of mutating a later op that reused the slot." */
+    return true;        /* branch A */
+}
+
+return true;            /* branch B -- IDENTICAL */
+```
+
+The condition is computed and **discarded**. It claims to prevent "mutating a later op" — but **the request branch
+of this function mutates nothing in either path**. It guards code that does not exist.
+
+So this is not merely a decoy *comment* on a real guard. It is a **decoy GUARD**: dead code shaped like
+protection, which is why it read (to me) as evidence of a considered design. CLAUDE.md's rule — *"a diagnostic
+that lies is worse than none"* — has a twin: **a GUARD that lies is worse than none.** Contrast it with the
+response-MATCHING check (`:7863`), which validates four echoed fields (`phase`, `generation`, `messageSequence`,
+`requestKind`) and errors loudly on mismatch. That is what a real identity check looks like.
+
+Under P7b.0 this stub becomes the **actual retirement site** — the place where an op moves from RETIRING to
+UNUSED — which is presumably what it was always meant to be.
+
+### 29.2 CORRECTION: I overclaimed the harm. This is a live TRAP, not a live BUG.
+
+§28.2 said the leftover CQE means "a send failure could be silently dropped by an occupant that already left."
+**That is WRONG, and the code refutes it.** `TupleSinkServiceDrainTaggedSendCompletions` checks
+`workCompletion->status != IBV_WC_SUCCESS` **before** dispatching to any per-op handler (`:4046`), logs it, and
+fails the connection. **Send failures are caught at the drain level whether or not the op slot still exists.**
+
+The honest verdict on today's code:
+
+| concern | status |
+|---|---|
+| source buffer wiped under a live NIC read? | **No.** RC ordering: the peer's REPLY proves the request was delivered and ACKed, so the HCA is done reading `opState->requestMessage` before `:10990` memsets it. |
+| send failure dropped? | **No.** Caught at the drain, before the per-op handler. |
+| per-op state corrupted by a stale CQE? | **No.** The handler mutates nothing. |
+
+**So this is NOT a live bug.** It is correct — but correct by (a) an **unwritten RC-ordering argument** and
+(b) a **guard that only appears to protect it**. Those are precisely the two things a future change walks past.
+
+### 29.3 Why P7b.0 still lands — the honest reason
+
+Not "fix a bug". **Convert incidental safety into structural safety BEFORE building reuse on top of it.**
+
+- The RC-ordering argument is nowhere written and holds only for the request path.
+- The **response-publish slot next door has the SAME release-on-logical-completion shape WITHOUT that argument
+  to save it** (§27) — it is unreachable only because the allocator happens to skip `inUse` slots.
+- **Pooling is exactly the change that breaks this class.** Extending object lifetimes is what turns "cannot
+  happen" into "happens rarely, silently".
+
+The vocabulary, for the record:
+
+- **op** — an RPC between the two Homer *services* over the peer-control mailbox.
+- **its response** — the reply composed **in software by the remote service** (`TupleSinkServiceDispatchPeerRequest`),
+  RDMA-written back into our mailbox. NOT a transport ACK and NOT a CQE.
+- **matching** — the reply echoes `{opIndex, opGeneration, messageSequence, requestKind}`; all four must agree
+  and `phase` must be `WAIT_RESPONSE` (`:7863`), else a loud error.
+- **the memset** — `TupleSinkServiceReleasePeerControlOp()` zeroes the whole op slot, which does **two** things
+  at once: frees the slot (`phase -> UNUSED`) **and wipes `requestMessage`, the registered RDMA SOURCE BUFFER
+  of the request WR**. That conflation is the heart of the issue.
+
+### 29.4 P7b.0, restated correctly (release on whichever comes LAST)
+
+The send CQE usually arrives BEFORE the response, so release cannot simply be moved to the CQE handler. Release
+when **both** hold, in **either** order:
+
+- add `bool sendCompletionRetired` to the op state;
+- the CQE handler sets it, and if the response has already been consumed, IT performs the memset;
+- the response poller consumes the response, and if the CQE is already retired, IT performs the memset;
+  otherwise the op stays in a `RETIRING` phase;
+- the allocator keeps taking only `UNUSED` slots.
+
+Then a slot is **never** reusable while its completion is outstanding, and the dead guard becomes a **real
+generation assertion that errors loudly** — because a mismatch would then mean a genuine bug, not a routine race.
+
+### 29.5 Rules earned
+
+- **A guard that lies is worse than none** — the twin of CLAUDE.md's rule about diagnostics. Before trusting a
+  guard as evidence of a considered design, check that its branches actually DIFFER.
+- **Distinguish a live BUG from a live TRAP, and say which you have.** Overclaiming harm to justify a change is
+  its own failure — the change here is justified without it, and the honest justification is stronger because it
+  survives scrutiny.
