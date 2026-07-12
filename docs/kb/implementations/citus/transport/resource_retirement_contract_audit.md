@@ -1972,3 +1972,60 @@ redundant AND racy.**
   the job already.
 - **Read the site you are about to change BEFORE you design the change.** The bind site's comment forbids
   Option A′ by name. It cost nothing to read and would have saved the whole design.
+
+### 16.7 ⚠ CORRECTION TO §16.3 — I NAMED THE WRONG BYTES (owner caught the framing error)
+
+**Owner:** *"It seems that this is about the crash scenario, where the Homer user (PG backend) is gone; then why
+would it be memset by the backend?"* — **Correct, and it exposed that I had conflated two actors.**
+
+`InitArenaSlot` has **TWO** callers, with **different** hazards:
+
+| caller | when | hazard |
+|---|---|---|
+| the **exiting backend**, via `on_proc_exit` → `ReleaseArenaSlot:666` | **CLEAN** exit | this is what §16.3 was about |
+| the **reaper** `ReapDeadArenaSlots:708` → the same `ReleaseArenaSlot` | **CRASH** (hard kill; `on_proc_exit` skipped) | **this is P0-e** |
+
+**§16.3 IS NOT ESTABLISHED. I named the wrong bytes.** `homer_frontend_agent.c:180-190`:
+
+> *"Since S4.0b the 16 **ROLE-5** lines are live: each **role-5** descriptor points its `hostControlOffset` at
+> `hostPublishLines[ringIndex]`… which enrols it in grouped-control discovery. **The roles-2/3 lines remain
+> unused reservations**."*
+
+So the **role-2 publish line I built §16.3 on is DEAD MEMORY.** What the DPU actually reads from a slot is
+role-3's `completionMailbox` header (via `BACKEND_COMPLETION_CONTROL_READ` — *those* are run 8's "proto=15"
+reads) and role-5's control (via grouped control). **T1 quiesces EXACTLY those two** (`localBase+1`,
+`localBase+2`, `homer_service_dpu_dma.c:6246-6272`). **The clean path is therefore plausibly safe, for a reason
+I had missed** — role-2 is left unquiesced precisely because the DPU only *writes* there.
+
+**This is the FOURTH inferred claim about this file to be refuted by the code** (see §10.1, §14.8, §15.1).
+**In this codebase, "I reasoned it must be so" has a losing record. Read the descriptor, not the struct comment
+— and note the struct comment in `homer_frontend_agent.h:160-175` still describes the PRE-S4 state and says so
+itself: *"Read the note there before assuming this comment still describes the end state."***
+
+**P0-e is UNAFFECTED and still real.** In the crash case there is **no terminal completion, therefore NO T1
+quiesce at all** — the DPU is still actively reading role-3/role-5 and writing role-2 — and the **reaper**
+memsets all of it, with no way to know. That is the hazard, and it stands.
+
+### 16.8 ✅ DECISION: OPTION A (owner-approved). And it does NOT touch the hot path.
+
+**The DPU re-init must rewrite only the ABI-STAMPED CONTROL HEADERS, never the bodies:**
+
+| region | size | DPU rewrites? |
+|---|---|---|
+| `commandMailbox` | **3.2 MB** | **NO** — only its ~64 B epoch header (proto, slotCount, publishedEpoch=0, consumedEpoch=0) |
+| `completionMailbox` | **270 KB** | **NO** — only its ~64 B epoch header |
+| `resultRingControl` | 64 B | yes (whole struct: proto, ringBytes) |
+| `hostPublishLines[3]` | 192 B | yes — **already done today** by `ARENA_PUBLISH_LINE_CLEAR` |
+| `resultRingStorage` | **10 MiB** | **NO** |
+
+**The bodies never need zeroing.** The command mailbox is **epoch-indexed** and the result ring is
+**frontier-based**, so nothing beyond the published frontier is ever read; a stale body under a fresh
+`publishedEpoch = 0` is unreachable. The host's `InitArenaSlot` zeroes all 13.7 MB purely as **hygiene** —
+cheap for a local CPU `memset`, **absurd as a PCIe DMA**.
+
+> **Total DPU re-init write: ~400 bytes, ONCE per backend spawn, on the spawn phase machine's control path —
+> before the backend even exists. It is not on the hot data path, and it does not add a round-trip.**
+
+*Rule earned: when a fix moves work from a CPU memset to a DMA, price it by what must ACTUALLY be written, not
+by what the old code happened to touch. The old code zeroed 13.7 MB because zeroing was free; naively porting
+that to the DPU would have made a ~400-byte correctness fix into a 13.7 MB per-session transfer.*
