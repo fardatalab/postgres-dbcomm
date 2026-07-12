@@ -201,7 +201,7 @@ Everything expensive in this subsystem has been the same defect:
 | 1 | **The result peer-open takes ~2.1 s to arm.** This is the whole of the observed `latency average = 431 ms` (one stall averaged over five transactions, not five slow ones); all results then flush in **4 ms**. It is a **one-time rendezvous stall**, *not* a per-command grant stall in the DMA engine. | top perf item; `p3trace`/`p2diag` must be stripped before measuring |
 | 2 | **Mirror-path truth-source** (P4.1): the DPU-mirror path still maps a DPU-local producer shm whose data region is dead and whose `publishedTail` is producer-stale by construction. Six sites gate on the mapping *existing*. | fully designed (design doc §17.3), not started |
 | 3 | **The producer byte-ring mapping still exists** (P4.2b) — its full removal *is* the host-service local-byte-ring retirement. | gated on that owner decision, not on anything technical |
-| 4 | **Basebackup does not yet obey the one-export contract** (it exports roles 1 + 4 separately per stream). | follow-up to P6 |
+| 4 | **Basebackup does not yet obey the one-export contract** (it exports roles 1 + 4 separately per stream). | follow-up to P6 (which landed for the SQL path: citus `1fda20594`) |
 
 ---
 

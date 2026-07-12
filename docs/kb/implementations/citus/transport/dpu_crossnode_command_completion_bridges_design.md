@@ -3330,3 +3330,38 @@ Basebackup should follow the same contract later; that is a separate step.
 3. **ZERO `dpu control slot: OPEN_SESSION opKind=1`** (the rendezvous is gone).
 4. Failure machinery stays at zero on BOTH nodes; `CLEAN-CLOSE RECLAIM` still fires (P5.d must not regress).
 5. All 7 smoke targets build; `homer_tuple_deform_smoke` ALL PASS.
+
+### 21.5 P6 LANDED and VALIDATED (citus `1fda20594`, postgres `98e72e8f9b0`)
+
+Net **-700 lines**. `HOMER_CLIENT_DPU_COMMAND_SETUP_RING_COUNT` 2 -> 3; `HOMER_DPU_BRIDGE_PROTOCOL_VERSION`
+unchanged at 5, as predicted (`ringCount` is a runtime field).
+
+**Deleted, not fixed:** export B entirely (region, TCP setup connection, bridge generation, mmap
+export/import, its redundant role-1 control slot, and its **detach edge**); the role-7 rendezvous
+`OPEN_SESSION` on BOTH sides; `HomerClientOpenSqlResultReceiveStreamSelectedDpu`,
+`HomerClientBindResultRing`, `HomerClientUnbindRing`; the role-7 unbind step in the close; the
+`sqlResultDpuStream` carrier.
+
+**The one non-mechanical find, and it would have been a silent data-path break:**
+`HomerDpuDmaBindFrontendSessionRings` **filtered for roles 1 and 6**. Adding `descriptor[2]` alone would
+have shipped the role-7 ring in the export and then dropped it on the DPU side. Extended to role 7.
+*(A filter that enumerates the roles it accepts is the same hazard as a switch with a `default:` arm: adding
+a member compiles clean and silently falls through.)*
+
+**Acceptance, three consecutive runs on one stack, no baseline reset:**
+
+| # | criterion | result |
+|---|---|---|
+| 1 | 5/5 tx, five decoded rows, empty error stream | **PASS** (3x) |
+| 2 | exactly ONE export + ONE detach per client | **PASS** — 3 distinct bridge generations and 3 detaches for 3 runs (**was 6 and 6**) |
+| 3 | ZERO rendezvous opens (`OPEN_SESSION opKind=1`) | **PASS** (0; `opKind=2` = 3, one real session per run) |
+| 4 | P5.d must not regress | **PASS** — node A: 3x bound-to-OWNING-session-by-uid, 3x `CLEAN-CLOSE RECLAIM`, 0 `REAL PEER FAILURE`, 0 compatibility sessions. node B: 3x T4, 0 failure machinery. |
+| 5 | 7 smoke targets build; deform smoke ALL PASS | **PASS** |
+
+**Basebackup still exports roles 1 + 4 per stream and does NOT yet obey the contract.** That is the next
+application of it, not a regression.
+
+**Measurement trap avoided (worth recording):** my first acceptance grep counted `host-detached` as 6 and I
+nearly filed a bug. It was matching BOTH `setup import host-detached` AND `reclaiming host-detached import` --
+**two lines for the SAME event.** The code was right; the instrument was wrong. *Count events, not lines that
+mention the event.*
