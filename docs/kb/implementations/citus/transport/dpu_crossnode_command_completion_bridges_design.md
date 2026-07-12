@@ -3396,3 +3396,131 @@ is `boundCount != import->ringCount`, which can see a **partially**-bound export
 Validated: three consecutive runs, 5/5 tx, five decoded rows each, empty error streams, **zero** ring-bind
 rejections; P6 holds (3 client exports, 0 rendezvous opens) and P5.d holds (3x `CLEAN-CLOSE RECLAIM`,
 0 `REAL PEER FAILURE`).
+
+---
+
+## 22. §10k RE-MEASURED on post-P6 code — the stall is PEER RDMA CONNECTION SETUP (July 12, 2026)
+
+§19.4 localized the stall to "the result peer-open failing to arm". That was right as far as it went, and
+it is now **superseded**: re-measuring on today's code (post-P5.d `b19e0d663`, post-P6 `1fda20594`/`d2f8e9284`)
+shows *why* the peer-open is late, and it is nothing to do with the result path.
+
+### 22.1 The measurement (3 consecutive pgbench runs, one stack, `-t 5`)
+
+`latency average` = **435 / 290 / 371 ms**, i.e. essentially UNCHANGED from the 431 ms of §19.4. P5.d and P6
+were correctness fixes; neither touched this. Node A, run 1:
+
+```
+19.562  OPEN_SESSION (client)                                    <-- session opens
+20.855  posted peer command sequence=1                           <-- measured window STARTS
+20.857  sequence=2      20.858  sequence=4
+20.857  sequence=3      20.862  sequence=5                       <-- ALL FIVE POSTED IN 7 ms
+        ............... 2.14 s OF NOTHING ...............
+23.002  peer-open arrives from node B
+23.004  armed peer-provisioned P3 result receive relay
+23.004  sequence=6 ... 23.022 CLOSE_SESSION                      <-- everything else in 20 ms
+```
+
+`435.283 ms x 5 = 2.176 s` == exactly `20.855 -> 23.03`. **The measured window is 7 ms of work and 2.14 s of
+one stall.** The client is not waiting on the engine, on commands, or on grants; it is blocked on the first
+row-returning `SELECT`'s result.
+
+### 22.2 The mechanism — a NEW RDMA CM connection, built lazily, on the critical path
+
+Node B, same run:
+
+```
+21.104  accepted persistent incoming RDMA peer transport host=10.10.1.200 traffic_class=1   <-- COMMAND conn
+21.108  landed peer command sequence=1
+21.116  landed peer command sequence=5
+21.118  started service-owned P3 result peer-open session=1 sink=1                          <-- prompt! +12 ms
+21.118  payload connection allocate: session=1 NEW outgoing slot index=0 class=2            <-- a NEW conn
+21.121  RDMA write data-in-order caps=...                                                   <-- a NEW QP
+        ............... 1.88 s ...............
+23.001  (node A) accepted persistent incoming RDMA peer transport host=10.10.1.201 traffic_class=2
+```
+
+Node B *initiates* the result peer-open **12 ms** after the first command lands. It cannot *send* it, because
+the peer-open request rides on a **payload-class (class-2) RDMA connection that does not exist yet**. There
+are two peer connections, not one:
+
+| | direction | traffic class | when built | carries |
+|---|---|---|---|---|
+| command | node A -> node B | 1 | at session open | commands, completions |
+| **result** | node B -> node A | **2** | **lazily, at first result** | result payload + the peer-open itself |
+
+### 22.3 TWO SEPARATE DEFECTS
+
+**Defect 1 — peer RDMA CM setup costs ~1.5 s. It should cost ~1 ms.**
+
+This is NOT specific to the result path. Node A's *command* connection took **1.54 s** too
+(`OPEN_SESSION 19.563` -> node B `accepted 21.104`). Every new peer connection costs it. The command
+connection's cost merely hides inside pgbench's excluded "initial connection time"; the result connection's
+cost lands inside the measured window because it is built lazily.
+
+**EXTERNAL CONTROL (the decisive evidence).** `rping` — a raw `rdma_cm` connect + ping + teardown between the
+*same two DPU ports over the same fabric* — takes **31 ms**:
+
+```
+raw rdma_cm connect+ping #1: rc=0 elapsed=0.031 s        (farnet1 DPU -> farnet0 DPU, 10.10.1.200)
+```
+
+**31 ms raw vs ~1500 ms through our service: a ~50x gap that is entirely OUR code.** This eliminates the
+fabric, ARP, RoCE/GID config, and the DPU kernel in one command, with no rebuild. The setup pump is being
+starved.
+
+Where it can starve: the setup state machine
+`TupleSinkServiceProgressPeerConnectionSetup()` (`remote_execution_peer_transport_rdma.c:6224`) runs only
+from the peer pump, and only when the scheduler's grant carries the SETUP phase bit —
+`if (!bootstrapComplete && (phaseMask & TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SETUP) != 0)` at
+`remote_execution_peer_transport_rdma.c:10868` (outgoing) and `:10919` (incoming). The CM event poll itself
+is non-blocking (`poll(fd, 1, 0)`, `:2938`), so **if the pump runs, it sees the event immediately**. The only
+peer RDMA wall-clock timeout is 5000 ms (`:58`) and it neither sleeps nor retries. So the ~1.5 s is not a
+timer — it is passes in which the pump was not granted the SETUP phase.
+
+**Defect 2 — the payload connection is REBUILT PER SESSION, against its own stated design.**
+
+`ownerServiceSessionId` (`remote_execution_peer_transport_rdma.c:577-588`) documents the intent:
+
+> "release only flips OWNED-READY -> FREE (owner -> 0) **while keeping the RDMA connection established for
+> immediate reuse**"
+
+and `TupleSinkServiceReleaseOutgoingPeerConnectionsForSessionRdma()` (`:8545`, owner -> 0 at `:8568`) plus
+Find's prefer-own-then-adopt-free pass (`:6330`, `adopted FREE outgoing slot` at `:6405`) implement it. But
+across three sequential sessions node B logs:
+
+```
+payload connection allocate: session=1 NEW outgoing slot index=0 class=2
+payload connection allocate: session=2 NEW outgoing slot index=0 class=2
+payload connection allocate: session=3 NEW outgoing slot index=0 class=2
+```
+
+**three NEW allocations, zero `adopted FREE`** — and always slot 0, so slot 0 is going *inactive* between
+sessions. Node A's class-1 command connection, by contrast, is allocated ONCE and correctly reused. Node B's
+own teardown line names the cause: *"retained fenced service session=N (clean close — **a later peer
+disconnect on this session is expected and benign**)"*. The session close **disconnects the RDMA
+connection**, so the slot is reset, so the next session must pay a full CM connect.
+
+The `NEW outgoing` log line was added *specifically* to catch this ("Lets us confirm during validation that
+sequential runs REUSE (adopt) rather than allocate", `:10301-10304`). It is now catching what it was built
+to catch.
+
+### 22.4 Ranking, and what to fix
+
+Defect 1 is the root performance bug and hits the FIRST session, basebackup, and every new peer — fix it
+first. Defect 2 is a correctness-of-lifetime bug that keeps the cost on the *steady-state* path; with
+Defect 1 fixed it costs ~1 ms/session instead of ~1.5 s, but a per-session RDMA connect is still wrong and
+the code already says so. Fix both; Defect 1 first, separately validated.
+
+### 22.5 Rules earned
+
+- **An external control beats a probe when one exists.** `rping` exercised the same hardware path through
+  *different software* and eliminated the fabric, ARP, RoCE config and the kernel — for one command, no
+  rebuild, no code change. Reach for that before instrumenting our own code.
+- **Judge latency against the target, not the bug** (CLAUDE.md). "Peer connect takes 1.5 s" reads as
+  plausible setup cost until you have the 31 ms number next to it.
+- **A diagnostic added to catch a regression only works if someone reads it.** `NEW outgoing` vs
+  `adopted FREE` was designed as the reuse check; three `NEW`s in a row had been sitting in the logs.
+- Codex's analysis asserted the peer-open "posts it on the already-established payload-class RDMA
+  connection". The log says `NEW outgoing` + a fresh QP. **Do not inherit a subagent's mechanism** — one
+  grep of the run log refuted it.
