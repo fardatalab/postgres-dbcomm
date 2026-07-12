@@ -2429,3 +2429,73 @@ with (A)/(B)/(C) above, so sequence it after that decision.
 - **A reset that silently does nothing looks exactly like a reset that ran.** The `tenancy reset
   (forgetting ...)` line is what PROVED my own fix executed — and therefore that it was not the answer.
 - **`rc=0` is still not the verdict.** Run 41a exited 0 while silently skipping the semantic close.
+
+---
+
+## 14. P5 CLOSED — arena slot REUSE works; three consecutive runs green (July 12, 2026)
+
+### 14.1 Acceptance (§12.2), all six criteria
+
+| # | criterion | evidence |
+|---|---|---|
+| 1 | `teardown T1..T4`, in order | 3× `teardown T4` (one per session) |
+| 2 | `BACKEND_SLOT_RELEASE` in postgres.log | **3** |
+| 3 | NO surviving `remote exec backend` | /proc scan clean |
+| 4 | **consecutive runs, NO baseline reset** | **THREE ran back to back; all 5/5, all 5 decoded rows** |
+| 5 | ZERO failure-machinery lines on a clean close | **9 — STILL OPEN (P5.c, §14.4)** |
+| 6 | rc=0 **and empty error stream** | all three runs |
+
+Slot reuse is genuinely exercised, not vacuously passed: the DPU log shows arena slot 0 released and
+re-let three times (`publish lines cleared` → `tenancy reset` → `publish lines cleared` → ...), with
+**zero** `epoch regressed` and **zero** `fatal error state`.
+
+### 14.2 The fix that finally worked — and the two that did not
+
+Owner chose option (B): the DPU zeroes the arena slot's host publish lines by DMA at BIND, awaited
+before the doorbell (which is what forks the backend, so the zeros necessarily precede the new tenant's
+first publication). That is `HOMER_DPU_DMA_TASK_KIND_ARENA_PUBLISH_LINE_CLEAR` +
+`HOMER_SERVICE_DPU_SPAWN_PHASE_CLEAR_ARENA_LINES` / `..._AWAIT_CLEAR`, plus a host-side companion that
+closes the arena's own stated invariant (`HomerFrontendAgentInitArenaSlot` now clears the slot's publish
+lines, which live OUTSIDE `HomerFrontendArenaSlot` and so had been silently exempt from
+"a slot is always already empty and ABI-initialized while it is FREE").
+
+**But (B) alone did NOT fix it, and neither did a stale-completion guard.** The full sequence took three
+attempts, and the two failures are the lesson:
+
+1. **Tenancy reset** (`HomerDpuDmaResetRingTenancyState`): make the DPU FORGET the dead tenant's frontier.
+   The old unbind hand-cleared 3 of ~25 fields; this memsets and restores only the in-flight accounting,
+   so a field added later is forgotten by DEFAULT. **Necessary, not sufficient** — run 41i showed the ring
+   back at the exact values it had just forgotten.
+2. **Tenancy-generation guard**: stamp the tenancy into each grouped-control read, drop completions whose
+   stamp is stale. **Fired ZERO times and fixed nothing** (run 41m). The poisoning read was submitted
+   AFTER the reset, so it carried the CURRENT tenancy and sailed straight through.
+3. **THE ACTUAL FIX — `tenancyBaselinePending`, a SUBMIT-side gate.** Between a slot's release and its
+   next tenant's clear landing in host memory, the engine issues **no grouped-control reads at all** for
+   that ring. Set by the tenancy reset; cleared in the COMPLETION of the clear DMA — because
+   *"the write was issued" is not "the bytes are zero"*.
+
+**OWNER'S POINT, and it is the general rule:** *don't submit a task whose completion will be meaningless —
+if the task was submitted, somebody needs its completion, and throwing it away breaks that consumer.*
+Discarding a completion is defensible ONLY for **discovery** work that nobody awaits (a grouped-control
+read is a poll; its only consumer is the ring runtime it updates, and the next poll re-reads the same
+line). For any awaited task — a command pull, a payload write, the spawn chain — a dropped completion
+would strand the waiter, and the correct move is to not have it in flight across the boundary. The
+generation guard is kept as a cheap net for reads issued *before* a reset, but it is explicitly the
+secondary defence; the submit-side gate is the primary one.
+
+### 14.3 The root defect, stated once
+
+**An arena ring's host state is TENANT-scoped, but its DPU-side runtime and its discovery polling were
+RING-scoped.** Nothing marked the boundary between tenants, so the DPU could not tell "the previous
+tenant's last frontier" from "the current tenant's first". Every symptom (epoch regressed, engine fatal,
+second-run session-open timeout) is downstream of that one missing concept.
+
+### 14.4 P5.c — still open (the ONLY remaining P5 item)
+
+A clean close still routes through the FAILURE machinery: `T4 released backend; retained fenced service
+session=N`, then the client's ordinary `CM event=DISCONNECTED` finds a live payload binding and produces
+`marked ABORTING` / `peer-reset-abort` / `committed ... failure` (3 lines per session, 9 in this run).
+A clean close and a real peer reset remain indistinguishable in the logs. T4 must drop the payload
+binding so a disconnect on an unbound stream is a no-op, while a disconnect WITH a live binding stays
+loud. This does not block P4.0/P4.1 — it is cosmetic-but-dangerous (it hides real peer failures), so fix
+it before any failure-injection work.
