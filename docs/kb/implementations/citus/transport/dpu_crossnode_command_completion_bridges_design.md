@@ -2839,3 +2839,102 @@ One extra validation cycle, and it means a hang in step 2 has exactly one possib
 2. Zero reads of `sendQueue.byteRingControl->publishedTail` outside a LOCAL_BYTE_RING branch.
 3. **No `/dev/shm/citus_res_*` object is created by a DPU-path run.** This is P4.2b's end-state proof, and
    step (e) makes it checkable ALREADY — the mirror path stops creating the shm object at all.
+
+---
+
+## 18. P4.2a LANDED (citus a39f233bf) — and it exposed that P5's acceptance #5 was measured on ONE NODE
+
+### 18.1 P4.2a: validated and committed
+
+All 7 smoke targets build; `homer_tuple_deform_smoke` ALL PASS; three consecutive
+`pgbench --homer --homer-dpu-command` runs on ONE stack with **no baseline reset** — 5/5 each, five
+decoded rows each, empty error streams, **0** surviving backends, `T1..T4` x3, **0** engine fatals,
+anti-fallback proven (the farnet0 HOST service log contains only its startup banner).
+
+Landed-proof for a pure DELETION needs a negative AND a positive control, or "absent" is
+indistinguishable from "the binary never built". Both DPUs report
+`DELETED_EOS_APPEND_LIT=0` **and** `POSITIVE_CONTROL_LIT=1`.
+
+Two bugs in my own deploy script surfaced and are fixed (`r42_dpu_deploy.sh`):
+- the peer path is a TWO-STAGE rsync and **stage 2 had no `--exclude build/`**, so `--delete` wiped the
+  farnet0 DPU's build directory on every peer deploy;
+- the build step was an inlined double-hop `ssh farnet0 ssh dpu "cd ~/..."`, and `~` expands on
+  **farnet0** (to `/home/jasonhu`), not on the DPU (user `ubuntu`). CLAUDE.md names this trap. The build
+  now lives in a script that is shipped and invoked BY PATH. Together these had left farnet0's DPU with
+  **no service binary at all**.
+
+### 18.2 CORRECTION TO §15.3: acceptance #5 (ZERO failure machinery on a clean close) is NOT met
+
+§15.2 recorded "**ZERO** failure publications on a clean close (was 9)". Today, with the P5.c fix in
+place and P4.2a green, the run shows:
+
+| | `marked ABORTING` | `peer-reset-abort` | `committed ... failure` |
+|---|---|---|---|
+| node B (farnet1 DPU) | 0 | 0 | 0 |
+| **node A (farnet0 DPU)** | **3** | **3** | **3** |
+
+**9 = 3 lines x 3 runs — exactly the "was 9" that §15.2 claims to have zeroed.** The P5.c fix works, on
+node B. Node A has the SAME defect from a DIFFERENT trigger and was never checked: **acceptance #5 was
+measured on one node.** P5 is therefore **NOT closed**; the six-criteria table in §15.3 is wrong on row 5.
+
+This is not a P4.2a regression: its diff touches none of the P5.c machinery (`teardownCompletedCleanly`,
+`peerResetAfterCleanClose`, the clean-reclaim branch) — filter returns 0 hits.
+
+### 18.3 The node-A defect (P5.d), diagnosed
+
+Node A carries **two** sessions per run, and the log join key is `sessionUID`:
+- `session=1` — the client's SQL command session (control slot; `OPEN_SESSION opKind=1/2`);
+- `session=2` — the **peer-created result-stream session** (opened by node B's peer OPEN). It owns the
+  result payload stream and the role-7 relay.
+
+`teardownCompletedCleanly` is set at exactly ONE place: **inside T4**
+(tuple_sink_service_process.c:43655). T4 runs only on the node that owns the DPU arena binding and the
+spawned backend — node B. **Node A's session 2 has no T4 and receives no client `CLOSE_SESSION`** (it was
+created by a peer), so it can never be stamped clean.
+
+The actual trigger on node A is the client's own ORDERLY DOCA detach — step 4 of the library-owned close
+order (`semantic CLIENT_SQL_SESSION_CLOSE` -> role-7 unbind -> control-slot `CLOSE_SESSION` -> setup close
++ DOCA teardown):
+
+```
+setup import host-detached bridge_generation=... client_instance_id=...
+terminating DPU relay after host consumer detached session=2 sink=1 sessionUID=5657593410303321
+marked byte-ring receive queue failed for sink=1 reason=relay-host-consumer-detached failure=4
+payload stream marked ABORTING for peer reset (REAL PEER FAILURE) ... reason=4 clean_close=0
+committed service-owned DPU result failure through terminal completion ... clean_close=0
+```
+
+`reason=4` is `HOMER_PEER_RESET_PAYLOAD_PROTOCOL` (remote_execution_peer_transport_rdma.h:367) — node A is
+not merely observing an orderly CM disconnect, it is REQUESTING a reset for a payload-protocol violation.
+
+**It is the same root defect as P5.c, one hop earlier and on the other node: the final step of the CLEAN
+path trips the FAILURE machinery, because nothing told node A the detach was expected.** Node A does hold
+the information — the client sent both the semantic close and the control-slot `CLOSE_SESSION` (steps 1
+and 3) BEFORE detaching (step 4), and session 1 and session 2 share a `sessionUID`. It is simply not
+propagated to session 2 or to the relay-terminate path.
+
+Functionally the run still succeeds and the stream slot IS reused (`index=0` on all three runs, so no
+leak). The damage is the same as P5.c's: a failure completion published into a slot whose client has
+exited, failure counters that move on every success, and a happy path that depends on the failure
+machinery to clean up after it.
+
+### 18.4 STOPPED — two design questions I will not improvise
+
+1. **Where does node A stamp "closing cleanly", and is that racy?** Stamping when the control-slot
+   `CLOSE_SESSION` completes (step 3) is the natural analogue of node B's T4 and precedes the detach
+   (step 4). But if node A can ever observe the detach BEFORE the close lands (a client CRASH, or an
+   asynchronous control response), the stamp must move earlier — to the semantic `CLIENT_SQL_SESSION_CLOSE`
+   (step 1). The choice decides what a real mid-stream client crash looks like, and a crash **must stay
+   loud**.
+
+2. **Should "host consumer detached" ever be a FAILURE?** If a client can only detach after it is done,
+   the classification is always wrong and the whole `relay-host-consumer-detached` path should be a clean
+   terminate with no flag at all. If a client CRASH also produces a detach, the two are genuinely
+   different and the flag is required. This is the crux, and the plan does not settle it.
+
+Note this is exactly the hazard §15.4 predicted: *"the day anyone made that machinery do more, every clean
+close would trip it."* It is already tripping on node A, and we could not see it because we were reading
+the other node's log.
+
+**Rule earned (the third time this arc):** *a criterion checked on one end of a two-ended path is not
+checked.* The P5 acceptance list must name the NODE for every row.
