@@ -3680,3 +3680,100 @@ it is noise. **Judge the pool against the workload, not against the bug we just 
   service start slower and holds QPs open against peers that may never be used.
 - **Staleness**: a pooled connection whose peer restarted is dead but looks FREE. Needs a liveness check or a
   generation stamp on adopt.
+
+---
+
+## 25. P7b — the disconnect edge is FOUND and VERIFIED: a normal detach classified as a payload FAILURE
+
+### 25.1 The chain (verified in code AND in the run logs)
+
+It is **not** `CLOSE_SINK`. The clean close protocol is well-behaved: it quiesces, clears the logical binding
+and reclaims the stream **without resetting the connection** (`tuple_sink_service_process.c:27232`); its only
+reset calls are error-only (`:27125`, `:27144`, `:27210`).
+
+The destructive edge is the **role-7 host-export detach** — i.e. the client exiting normally and destroying
+its DOCA mmap (`homer_client.c:5561`):
+
+```
+client destroys its role-7 DOCA export        (NORMAL end-of-session)
+  -> node A: "setup import host-detached"
+  -> HomerServiceTerminateDetachedRelayConsumer()          tuple_sink_service_process.c:33166
+         sessionState->dpuResultPeerOpenFailed = true;     <-- a NORMAL detach, recorded as a FAILURE
+         return HomerServiceFailReceivePayloadAndResetPeer(streamEntry, "relay-host-consumer-detached");
+  -> HomerServiceFailReceivePayloadAndResetPeer()          :26640
+         HomerServicePublishLocalPayloadFailure(...)       :26645  <-- P5.d taught THIS about clean closes
+         HomerServiceRequestBoundPayloadProtocolReset(...) :26657  <-- UNCONDITIONAL. Nobody taught this one.
+  -> HOMER_PEER_RESET_PAYLOAD_PROTOCOL
+  -> TupleSinkServiceResetReasonRequestsDisconnect() == true       peer_transport_rdma.c:5425
+  -> rdma_disconnect()                                             :5414  (the repo's ONLY rdma_disconnect)
+  -> QP + CQs destroyed, slot zeroed (active = false)              :5526, :5538
+  -> node B sees RDMA_CM_EVENT_DISCONNECTED                        :7301
+  -> node B resets its OUTGOING class-2 slot                       :7339
+  => next session finds no FREE connection and allocates a NEW one -> pays a full CM connect
+```
+
+### 25.2 The code ALREADY KNOWS it is a clean close — and resets anyway
+
+Node A's own log, verbatim, three sessions in a row:
+
+```
+setup import host-detached ...
+terminating DPU relay after host consumer detached session=7 sink=7 ...
+marked byte-ring receive queue failed for sink=7 reason=relay-host-consumer-detached failure=4
+payload stream marked for CLEAN-CLOSE RECLAIM (no failure will be published) ... clean_close=1
+```
+
+`clean_close=1` is computed, printed, and **used only to suppress the failure publication**. The reset request
+on the very next line of `HomerServiceFailReceivePayloadAndResetPeer` never consults it.
+
+**This is the bug family's FIFTH costume** (§20.1, and now the architecture note): *a missing/normal thing read
+as a definite negative*. Here: **the absence of the client's export — which is what a successful, completed
+client looks like — is read as a payload-protocol failure.** P5.c/P5.d fixed the *reporting* of this
+misclassification; they never fixed the *consequence*.
+
+### 25.3 The fix (part 1 of the owner's three)
+
+`HomerServiceFailReceivePayloadAndResetPeer` must be split. On a **clean** detach: publish nothing (already
+true), clear the binding, reclaim the stream, and **RELEASE** the connection (owner -> 0, QP intact). On a
+**real** failure: today's behaviour, unchanged. `TupleSinkServiceResetSession()` already calls
+`TupleSinkServiceReleaseOutgoingPeerConnectionsForSessionRdma()` (`:23640`), so the release half exists and
+runs — it is simply undone moments later by this reset.
+
+### 25.4 THE ONE REAL DESIGN FORK (needs a decision, not an improvisation)
+
+Ownership release does **not** change the connection's `generation` (`peer_transport_rdma.c:8736`; generation
+is assigned once at connect, `:5744`). Today that is harmless because every close *destroys* the connection.
+Once we start **reusing** it, it stops being harmless:
+
+> **An in-flight payload WR or ACK from the OLD session can complete on the SAME connection AFTER a NEW
+> session has adopted it, and there is no generation on the CQE by which to reject it.**
+
+The peer transport's session-scoped state must therefore be either drained or made stale-rejectable before
+adoption. From the state inventory: mailbox sequences / credit mirrors (`nextOutgoingMessageSequence`,
+`outgoingControlPublishedTail`, `peerControlConsumedHeadMirror`, `controlDoorbellArrivedTail`) are
+**connection-scoped and MUST carry over coherently** (zeroing them without a fresh bootstrap corrupts credit);
+but pending `controlOps[]`, payload send WRs, receiver-head ACK WRs and their completion counters are
+**stream-scoped and MUST be retired**. Also relevant: the sender-head mirror MR is *deliberately* allowed to
+outlive stream teardown because a late consumed-head ACK can arrive after it (`:25071`) — which is precisely
+an example of the hazard.
+
+Two candidate answers, both defensible:
+
+- **(A) Adoption epoch.** Add a `connectionAdoptionEpoch` that increments on every release, stamp outgoing WR
+  ids with it, and drop CQEs whose epoch is stale. Matches an idiom the codebase already uses for exactly this
+  purpose (payload doorbell-token generations reject stale stream-slot notifications,
+  `tuple_sink_service_process.c:24431`). Cheap, and robust to a slow straggler.
+- **(B) Drain-before-release.** Refuse to release a connection until its stream WRs/CQEs are fully retired;
+  keep it OWNED until quiescent. Simpler state, but it puts a drain on the close path and needs a fallback for
+  a peer that never ACKs.
+
+They compose (A is the safety net; B is the fast path), and my recommendation is **A first**, because it is
+the one that makes a stale completion *impossible to misattribute* rather than merely *unlikely*.
+**Not yet implemented — raised for discussion per the standing rule.**
+
+### 25.5 Also still open
+
+- **No peer-restart detection.** The bootstrap message (`peer_transport_rdma.c:236`) carries no peer
+  incarnation/epoch, and the connection `generation` is local slot identity only. So a pooled connection whose
+  peer has restarted looks **FREE and healthy**; detection is reactive (CM disconnect / CQ failure / failed
+  post). Pooling makes this reachable in a way that per-session connections never were.
