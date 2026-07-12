@@ -687,14 +687,17 @@ The shared-memory files have different owners in the runtime lifecycle:
   and completion rings.
 - `/dev/shm/citus_remote_exec_backend_spawn_v*` is created by the PostgreSQL
   backend bridge when PostgreSQL starts.
-- `/dev/shm/citus_homer_frontend_arena_v2` (**59,774,080 B ≈ 57 MiB**; `_v1` was 59,767,936 B and is
-  orphaned — delete it) is created by the postmaster only when
-  `citus.enable_homer_dpu_frontend_agent=on`. It is neither `shm_unlink`ed at
-  shutdown nor re-zeroed on a postmaster crash-restart, so a stale one can leave
-  arena slots marked BOUND. That fails loudly at the next claim (`arena slot N is
-  already bound`), never silently — but remove it as part of a hard clean
-  baseline. The version is in the name, so an old object is simply not found;
-  the arena ABI bump is **host-only** and needs no DPU redeploy.
+- `/dev/shm/citus_homer_frontend_arena_v3` — **⚠ the version is in the NAME, so a stale entry HERE makes the
+  clean-baseline step silently clean NOTHING.** This note said `_v2` until July 12, 2026 while the code had
+  already moved to `_v3` (`homer_frontend_agent.h:97`), so the documented procedure was deleting an object that
+  no longer exists and **leaving the real arena in place**. Delete `citus_homer_frontend_arena_*` by GLOB, and
+  confirm the current version from the header rather than trusting this line:
+  `grep HOMER_FRONTEND_ARENA_SHM_NAME src/backend/distributed/utils/homer/homer_frontend_agent.h`.
+  Created by the postmaster only when `citus.enable_homer_dpu_frontend_agent=on`. It is neither `shm_unlink`ed
+  at shutdown nor re-zeroed on a postmaster crash-restart, so a stale one can leave arena slots marked BOUND.
+  That fails loudly at the next claim (`arena slot N is already bound`), never silently — but remove it as part
+  of a hard clean baseline. The arena ABI bump is **host-only** and needs no DPU redeploy.
+  (`_v1` was 59,767,936 B; `_v2` was 59,774,080 B ≈ 57 MiB. Both orphaned.)
 - `/dev/shm/citus_res_*` files are payload/result queues created by active or
   recently active Homer sessions.
 
