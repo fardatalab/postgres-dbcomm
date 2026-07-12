@@ -1180,7 +1180,7 @@ owners, explicitly recording what it discarded** (`:4278`, `:4290`).
 | item | state | note |
 |---|---|---|
 | **P0-a** | ✅ **LANDED + VALIDATED** (citus `71b523757`) | §20. The blind clear was a SYMPTOM of a signal policy with no terminal case. **But the fix is PER-SITE — see §21 (P0-i), which generalizes it into a substrate invariant and may have found a LIVE HANG in the payload lane.** |
-| **P0-i** | **RESCOPED — small, NOT urgent** (§21.8-21.11) | the payload HANG was **REFUTED** (I inferred a policy from a stats counter). The payload + credit lanes **already fence themselves** — every batch ends with a forced-signalled WR; **they are the EXEMPLAR.** Only the 2 runtime-selective lanes lack it, and only on the **ABORT** path (no close message ⇒ nothing to force-signal ⇒ P0-a's Scenario E clear = a LOUD use-after-free). Fence must carry its **own lane's WR-ID class** — CQ dispatch is per-class, so a cross-lane CQE does **not** retire it. |
+| **P0-i** | ✅ **LANDED + VALIDATED** (citus `67ebc0167`), §21.12-21.15 | the payload HANG was **REFUTED** (I inferred a policy from a stats counter). The payload + credit lanes **already fence themselves** — every batch ends with a forced-signalled WR; **they are the EXEMPLAR.** Only the 2 runtime-selective lanes lack it, and only on the **ABORT** path (no close message ⇒ nothing to force-signal ⇒ P0-a's Scenario E clear = a LOUD use-after-free). Fence must carry its **own lane's WR-ID class** — CQ dispatch is per-class, so a cross-lane CQE does **not** retire it. |
 | **P0-b** | ready | self-contained |
 | **P0-c** | ready | needs the transport-helper API change (return the slot indices) + WOULD_BLOCK backpressure |
 | **P0-d** | ✅ **LANDED + VALIDATED** (citus `9a6f68257`) | §15. NOT what §8 thought: two premises were refuted, and the real hole was the `ResetSession` FUNNEL releasing with no drain (reachable from shutdown). Fixed by enforcing the drain IN the funnel — every path correct by construction. |
@@ -2599,3 +2599,78 @@ clear anyway. **I made it LOUD. I did not make it SAFE.**
 **Rule earned (again, and this one is getting expensive):** **a counter named `...PerSignaledCqe` is a STATISTIC
 until you find the `if` that reads it.** I inferred a *policy* from a *metric*. **Find the predicate, or you do
 not know the policy.**
+
+### 21.12 ✅ P0-i LANDED AND VALIDATED (citus `67ebc0167`) — and the OWNER's rule replaces mine
+
+**Owner, July 12, 2026:** *"I would be more relaxed than this… amortize across units only if you KNOW there are
+more units for sure, not just opportunistically and eventually say 'oh there's no more coming, I guess I'll do a
+signalled flush'. Though with that said, this flush may also be viable, should we need that for performance."*
+
+**THE RULE OF RECORD (supersedes my "never amortize across units", which was too absolute):**
+
+> **You may defer a WR's retirement to a later signalled WR ONLY IF THAT LATER WR IS GUARANTEED. Never defer on
+> the mere EXPECTATION that more work will arrive.**
+>
+> A successor is guaranteed in exactly two cases:
+> **(a)** it is inside the **same logical unit** — a unit always ends, so you may leave every WR of a batch
+> unsignalled and force-signal the last one (**this is what the PAYLOAD lane does, and it is the exemplar**); or
+> **(b)** you have **already committed** to posting it (N queued, posting all N).
+>
+> **Amortizing across units you have already queued is FINE. Amortizing on a HOPE is not.**
+> **And the FLUSH stays in the toolbox** — if a lane ever needs amortization without a guaranteed successor, a
+> signalled fence at quiesce is a legitimate way to buy it.
+
+**My error:** I generalized from *"the payload lane amortizes within a batch"* to *"never amortize across units"*
+— banning a safe practice because the one broken instance happened to sit on the other side of that line. **The
+defect was never cross-unit amortization; it was amortization against traffic that may simply STOP.**
+
+### 21.13 ⚠ AND THE LAYERING — a substrate/scheduler conflation that helped hide the bug
+
+**Owner:** *"the intervals are more for the scheduler (the heuristics)… not sure we should couple those into the
+RDMA substrate contract/principle. We should be more careful here."*
+
+**Right, and the old code HAD coupled them:**
+
+| concern | owner | decides | cost of being wrong |
+|---|---|---|---|
+| **signalling** | **RDMA substrate** | *"must I ask the HCA for a CQE, or may a successor retire this owner?"* | **CORRECTNESS** — an unsignalled WR with no successor can never retire |
+| **CQ poll threshold** | **scheduler** | *"is it worth draining the CQ this pass?"* | **latency only** |
+
+**THREE scheduler poll-readiness predicates were using `SIGNAL_INTERVAL` as their threshold** (`:6822`, `:8609`,
+`:14883`). **That is how a substrate constant came to look load-bearing in code that has nothing to do with
+signalling — and it is part of why this bug was hard to see.**
+
+**Now separated:** polling has its own `HOMER_SERVICE_PEER_CLIENT_COMPLETION_PUBLISH_POLL_THRESHOLD` at the same
+value (scheduler behaviour unchanged), and the signalling predicates read **no scheduler constant at all**.
+**Keep them separate.**
+
+### 21.14 What shipped
+
+- **Both control lanes signal EVERY write.** The predicates collapse to `return true` and explain why.
+  *(The command-write lane's `ShouldSignal` was ALREADY constant-true — its interval was 1, so its
+  `SESSION_CLOSE` branch was **dead code** and the whole predicate a **decoy that looked like a policy**.)*
+- **Both signal-interval macros DELETED, replaced by `#error` TRIPWIRES**, so a `-D` flag cannot silently re-arm
+  opportunistic amortization — *which is exactly how the original shipped.* The tripwire **GATES rather than
+  forbids**: it names the terminal flush you would have to add first. **VERIFIED IT FIRES**
+  (`-DHOMER_SERVICE_PEER_CLIENT_COMPLETION_PUBLISH_SIGNAL_INTERVAL=8` now fails the build with that message).
+- **P0-a's terminal special case is now redundant** and gone. So is the fence I was about to build.
+
+**PERFORMANCE — measured, not assumed.** The plan feared *"a signalled WR on the hot path"*. **tps
+109.9 / 124.4 / 122.4 — squarely inside the 95–128 band** of the three preceding validations of this exact smoke
+(P0-f 95.2/125.3/104.1, P0-d 114.6/125.3/121.4, P0-a 107.2/128.3/122.3). **No regression.** The refutation had
+been sitting two hundred lines away the whole time: the sibling lane already signalled every write, at the same
+rate, on the same QP.
+
+**ALARM = 0** across three runs and a clean shutdown, on both nodes; P0-d's teardown still 3/3/3/3.
+
+### 21.15 Rules earned
+
+- **A tunable default is not an invariant.** The bug shipped as a `#define` someone could set; the fix is a
+  `#error` someone must argue with. **If a constant can silently reintroduce a use-after-free, it should not be
+  a constant.**
+- **Do not generalize a rule from the one instance that broke.** My "never across units" banned safe practice
+  because the broken lane happened to fall on that side of the line. **Ask what the broken case actually lacked**
+  — here, a *guaranteed* successor, not a *same-unit* one.
+- **When a constant is used by two layers, it belongs to neither.** A substrate signalling interval doubling as a
+  scheduler poll threshold made both harder to reason about, and made the substrate constant look load-bearing
+  where it was not.
