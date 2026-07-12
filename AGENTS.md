@@ -201,6 +201,12 @@ ssh dpu "cd ~/dbcomm/citus-dbcomm && PG_CONFIG=/usr/bin/pg_config ./configure --
 And **prove the deploy landed** by grepping the binary for a string literal only the new code emits; grepping
 for a macro *name* proves nothing in either direction (hazards §3.2, §3.3).
 
+⚠ **A DPU build script that pipes `make` into `tail`/`grep` reports SUCCESS after a FAILED build** — the
+pipeline's status is the *last* command's. Use `set -e -o pipefail`, or redirect `make` to a log and test its
+status explicitly. On July 12 a script printed `DPU BUILD OK` over `make: *** Error 1`, and the only thing that
+caught it was the landed-proof grep returning 0. **Make the landed-proof grep `exit 1` on a miss** — otherwise
+it, too, is decoration.
+
 ### Installed artifacts
 
 `/data/dbcomm/pg-citus/bin/{postgres,pgbench,pg_basebackup,citus_tuple_sink_service}` and
@@ -239,9 +245,19 @@ builds) is **not** indexed and `findReferences` will silently miss it. Cross-che
 Dry-run first (`-n`), then remove it. Exclude local logs — they are not needed for validation and can make
 rsync return `23` even after the important artifacts copied.
 
+⚠ **The source-tree rsync MUST run as `dbcomm` on the receiving side** (`--rsync-path='sudo -n -u dbcomm rsync'`),
+exactly like the `pg-citus` one below. farnet0's trees are owned by `dbcomm`; if your shell user is anyone else,
+rsync fails `chgrp` on **every file**, returns **code 23**, and — this is the trap — **leaves files untransferred
+without saying which**. On July 12 this left farnet0's `homer_queue_abi.h` **three days stale**, which was invisible
+until a *DPU* build failed on undeclared macros from a stage that had long since landed. **Code 23 is not benign
+here.** Always verify afterwards:
+`diff <(md5sum-of-tree-on-farnet1) <(md5sum-of-tree-on-farnet0)` → must be **0 differing files**.
+
 ```sh
-rsync -azn --delete --itemize-changes /data/dbcomm/postgres-citus/ farnet0:/data/dbcomm/postgres-citus/
-rsync -azn --delete --itemize-changes /data/dbcomm/citus-dbcomm/   farnet0:/data/dbcomm/citus-dbcomm/
+rsync -azn --delete --itemize-changes --rsync-path='sudo -n -u dbcomm rsync' \
+  /data/dbcomm/postgres-citus/ farnet0:/data/dbcomm/postgres-citus/
+rsync -azn --delete --itemize-changes --rsync-path='sudo -n -u dbcomm rsync' \
+  /data/dbcomm/citus-dbcomm/   farnet0:/data/dbcomm/citus-dbcomm/
 
 rsync -az --delete \
   --exclude data/ --exclude '*.log' --exclude logfile --exclude stage_tmp/ \
@@ -643,6 +659,12 @@ The DPU-spawned `postgres: remote exec backend` **survives** and does **not** re
 fast` (socketless backends have no clean-shutdown path until S4). **Reap it by `/proc/<pid>/exe` + `kill -9`
 at end-of-run**, or the next preflight trips on a stale backend. Never `kill -9` it *mid-run* — that
 crash-restarts the postmaster (Non-negotiable #3).
+
+⚠ **A tps figure here is meaningless without its `-t` AND its logging state.** The gate example above uses
+`-t 5`, where the ~40 ms per-connection setup dominates and tps lands around **95–128**; at `-t 2000` setup
+amortizes away and the same system reports **~285–320**. They are not comparable, and **~3.5 ms/tx is the
+quantity that actually is.** Separately, `--debug` (needed for proof #2) prints ~12k lines onto the measured
+path and depresses tps by ~10%. **Never compare a `--debug` run to a stripped one** (KB audit §22.10.2).
 
 Warmed steady state after P7: **3.14 ms/tx, 318 tps** (`-t 2000`), on a fully stripped stack. That is
 ≈450 µs/command and **still far from the microsecond target** — an open performance question, not a pass/fail

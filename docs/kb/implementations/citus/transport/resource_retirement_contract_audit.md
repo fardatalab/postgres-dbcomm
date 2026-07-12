@@ -2674,3 +2674,295 @@ rate, on the same QP.
 - **When a constant is used by two layers, it belongs to neither.** A substrate signalling interval doubling as a
   scheduler poll threshold made both harder to reason about, and made the substrate constant look load-bearing
   where it was not.
+
+---
+
+## §22 — P0-b: the control op releases its slot on RESPONSE MATCH, not on physical retirement
+
+**Status: SPEC (2026-07-12). Supersedes the P0-b entry in §9.3 — the hazard §9.3 stated is REFUTED.**
+
+### 22.1 What §9.3 claimed, and why it is WRONG
+
+§9.3 said: *"`TupleSinkServiceReleasePeerControlOp` memsets the op slot INCLUDING `requestMessage`, the
+registered RDMA SOURCE BUFFER, before its send CQE is polled."*
+
+The **first half is true**; the conclusion — that this is a live use-after-free — is **not reachable today**.
+Both release sites are safe, each by a proof that is **written nowhere in the code**. That is the actual defect.
+
+This is the **eighth** refutation of one of my own inferences in this audit, and it has the same shape as the
+previous seven: a forward chain from a mechanism I had just read (*a memset of registered memory*), with **no
+check of what downstream actually guarantees**.
+
+### 22.2 VERIFIED facts (all `remote_execution_peer_transport_rdma.c` unless stated)
+
+| # | fact | evidence |
+|---|---|---|
+| F1 | The control publish is **exactly ONE WR**: `IBV_WR_RDMA_WRITE_WITH_IMM`, **always `IBV_SEND_SIGNALED`** (`signaled=true` is a literal at the call). A CQE is therefore **guaranteed** for every posted request. | `:7614-7617` → `:9640` |
+| F2 | Its source is `opState->requestMessage`, which lives **inside** `connectionState->controlOps[]`, which **is** the registered MR `controlOpsMr`. | `:10634-10636`, `:4624-4627` |
+| F3 | `sizeof(TupleSinkServicePeerControlMessage)` = **34,160 B** (DWARF, from the built service binary), vs an mlx5 `max_inline_data` of tens–hundreds of bytes. **`IBV_SEND_INLINE` (`:9641`) can NEVER be taken for a control message.** The source is genuinely live after `ibv_post_send` returns. | `gdb -batch -ex 'print sizeof(...)'` |
+| F4 | The publish primitive **states the contract in its own comment**: *"The message source is op-owned or response-slot-owned and remains valid until the tagged send CQE retires it."* | `:7608-7613` |
+| F5 | `TupleSinkServiceRetireControlSendCompletion`'s **response** arm honors F4 (`controlResponsePublishSlots[i].inUse = false`). Its **request** arm is a **STUB**: it decodes, range-checks, generation-checks — and then **`return true` in BOTH branches**. | `:3695` vs `:3707-3719` |
+| F6 | Exactly **TWO** release call sites: `:10644` (post failed) and `:10990` (response matched). The stub's comment blames *"a blocking adapter may time out and release an op"* — **NO SUCH CALLER EXISTS.** A decoy. | `grep TupleSinkServiceReleasePeerControlOp` |
+| F7 | The WR-ID packs `slotIndex` in bits 0–15 and the **full 32-bit** `slotGeneration` in bits 16–47. **No truncation, no aliasing** — a generation check on a control CQE is trustworthy. | `:123-125`, `:3259-3269` |
+| F8 | `CITUS_REMOTE_EXEC_PEER_CONTROL_OP_SLOTS` = 64; `sizeof(TupleSinkServicePeerControlOpState)` = **68,304 B** → the op table alone is **4.4 MB** of registered memory per connection. | `..._rdma.h:55`; DWARF |
+
+### 22.3 The two UNWRITTEN proofs that make today's code safe
+
+**Proof A — `:10644`, the post-failure release, always has ZERO WRs in flight.**
+`HOMER_PEER_POST_FAILED_PARTIAL` requires `postedWrCount > 0` (`:9587`), but `postedWrCount` comes from
+`TupleSinkServiceCountPostedWorkRequests(first, bad, /*maxWorkRequests=*/1)` (`:9545`, called at `:9657`), and on
+a **one-WR chain** verbs sets `bad_wr == first_wr`, so the loop breaks at once and returns **0**. Therefore
+`FAILED_PARTIAL` is **unreachable on the control lane**, and every failure release happens with nothing posted.
+**Safe — because the chain happens to be length 1.** Nothing says so; nothing checks it.
+
+**Proof B — `:10990`, the response-match release, is retiring an already-dead buffer.**
+The peer cannot have produced a response carrying `(opIndex, generation, messageSequence, requestKind)` unless
+our WIMM **landed in its mailbox** — which means our HCA finished reading `requestMessage`. So the source is
+physically retired at the moment the response matches. This is a **real** proof, and it is *stronger* than a
+CQE (§0.3: it proves the peer **acted**, not merely that the bytes landed). **It appears nowhere in the code.**
+
+### 22.4 Why P0-b must be done ANYWAY — the proofs are exactly what P7b will break
+
+Both proofs are load-bearing, invisible, and one edit away from false:
+
+- **Proof A dies** the moment the control publish becomes 2 WRs (a tail write, an SGE chain, a batched publish).
+  `FAILED_PARTIAL` becomes reachable, `:10644` memsets a **live** source, and **nothing warns**.
+- **Proof B dies** the moment any control op is released for a reason *other than a matched response*: a timeout
+  (which the decoy comment already claims exists!), a caller abandoning an async op, a fire-and-forget control
+  message, or a **pooled connection** recycling its op table on detach.
+- Meanwhile the **enforcing function is a stub**, and its comment actively **misdirects** the next reader toward
+  a nonexistent timeout path — so a maintainer who wonders "what retires the request source?" reads `:3711-3715`,
+  concludes it is handled, and moves on.
+
+**P0-b is therefore rescoped: not "fix a live use-after-free" but "convert two unwritten proofs into one enforced
+mechanism, while the cost is zero."** The precondition that makes this free is **F1**: the WIMM is *always*
+signalled, so gating release on the CQE can never hang. (That is exactly the substrate rule P0-i just made
+explicit — §21.)
+
+### 22.5 The design
+
+Release the op slot on **whichever of {response consumed, send CQE retired} happens LAST.**
+
+1. **New op phase** `CITUS_REMOTE_EXEC_PEER_CONTROL_OP_RETIRING`: *the caller has its response and is gone; the
+   slot is now owned solely by the outstanding send CQE.*
+2. **New field** `bool sendCompletionRetired` in `TupleSinkServicePeerControlOpState`.
+3. **`TupleSinkServiceRetireControlSendCompletion`'s request arm becomes the REAL retirement site** (F5's stub):
+   on generation match, set `sendCompletionRetired = true`; if the phase is already `RETIRING`, **release the
+   slot now**. Delete the decoy comment.
+4. **`TupleSinkServicePollPeerRequestRdma` at `COMPLETED` (`:10987`)**: copy the response out and finish the
+   caller **exactly as today — zero added latency**. Then release the slot **only if** `sendCompletionRetired`;
+   otherwise move the op to `RETIRING` and leave it. **The caller is never blocked on a CQE; only slot REUSE is.**
+5. **`:10644` (post failure)**: keep the immediate release, but **assert `postedWrCount == 0` first**. If a future
+   change makes PARTIAL reachable, do **not** release — mark the op `FAILED` and let the reset retire it. This
+   turns Proof A into an **enforced check** instead of an accident of chain length.
+6. **The generation-mismatch arm becomes a LOUD ALARM, not a benign no-op.** Under this design a slot is *not*
+   recycled until its CQE lands, so a control CQE **cannot** find a stale generation. F7 says the check is
+   trustworthy. If it ever fires, something posted a WR whose op was released early — the exact class of bug
+   this stage exists to prevent.
+7. **The reset abort classifier (`:4292`)** gains a `RETIRING` case. An op in `RETIRING` is **not a lost
+   operation** — its caller already got its answer — so it must be counted separately (`retiringControlOpsDiscarded`)
+   and **must not** inflate `waitingControlOpsAborted`.
+8. **`TupleSinkServicePeerControlAsyncOpReady` (`:10904`)** gains the `RETIRING` case. A live async handle can
+   never observe it (the handle is memset at COMPLETED), so it is a `-Wswitch` completeness case, not a path.
+9. **The response-publish slot already follows the protocol.** Do not change it — just **assert** that only its
+   own CQE clears `inUse`.
+
+### 22.6 The one real tradeoff, and why it is acceptable
+
+Deferring slot release to the CQE means an op can sit in `RETIRING` after its caller is done. With 64 slots, a
+burst of control ops could in principle exhaust the table before the send CQ is drained.
+
+**Why it converges:** reservation failure returns `HOMER_PEER_POST_WOULD_BLOCK` (`:10624`), the async op is *not*
+failed, and `TupleSinkServicePollPeerRequestRdma` retries publication on the next poll (`:10942-10952`) — after
+the pump has drained the send CQ. So backpressure resolves itself. **Reservation must NOT drain internally**
+(same rule as P0-c): the owner drains, the reserver reports.
+
+**Why `RETIRING` should be RARE:** the send CQE is *generated* when the remote HCA ACKs our WIMM — which happens
+**before** the remote CPU has even seen the message, let alone composed a response. So by the time a response is
+matched, our CQE is essentially always already sitting in the CQ. Whether it has been *polled* depends only on
+the pump's drain order. `RETIRING` is thus a real but short-lived state — **exercised, not dead**, which is what
+we want.
+
+### 22.7 Acceptance
+
+- 3 consecutive `pgbench --homer --homer-dpu-command` runs, no restarts, tps in the **95–128** band.
+- **ALARM = 0** on both nodes (a control-CQE generation mismatch would print one).
+- Clean SIGTERM shutdown on both nodes.
+- ⚠ **NOT this stage's criterion:** the `refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers
+  quiesce` line at `tuple_sink_service_process.c:24152` belongs to **P1-f** (a different resource, Scenario C).
+  It will still print once. Do not read it as a P0-b failure. (Same trap that nearly produced a false FAIL in P0-a.)
+
+### 22.8 ADVERSARIAL REVIEW OUTCOME (2026-07-12) — the spec was NOT clean
+
+Round 1 of the review (codex, read-only, given falsifiable targets F1–F5 / B1–B4). **Both sides recorded**, per
+the audit's own rule: the reasoning that produced the error is as instructive as the fix.
+
+**Held up:** F1 (one WR, always signalled — a CQE is guaranteed; the load-bearing premise of the design),
+F5 (Proof B — the reviewer traced the peer's *actual* consumption path and confirmed the response identity is
+**echoed from the received 34 KB record**, `:8094` → `:7915`, after an acquire fence and a full-record copy
+`:7430-7448`; there is no immediate-only, NAK, partial-record, or locally-synthesized response path — so a
+matched response really does prove the WIMM landed), B2 (reset destroys the QP **and both CQs** at `:5515-5530`
+*before* the abort classifier memsets any slot — the classifier's comment is honest), B3 (a generation-mismatch
+ALARM cannot be triggered by an ordinary QP-error flush: failed CQEs take the failure route before tagged
+retirement, and reset destroys the CQ before recycling slots), and B4-aliasing (`controlOpsMr` is registered
+`IBV_ACCESS_LOCAL_WRITE` **only**, `:4624` — no part of `controlOps[]` is remote-writable; `requestPublishedTail`
+is local bookkeeping, never an SGE).
+
+#### 22.8.1 ⚠ THE REAL FIND: an abandoned async op ORPHANS its transport slot (VERIFIED myself)
+
+**F4 is REFUTED.** §22.2's F6 claimed *"no timeout/abandon path releases an op."* True — and that is exactly the
+bug, read the other way round. **A path abandons an op without releasing it.**
+
+- `TupleSinkServiceLocalControlAsyncOp` **embeds** the transport handle:
+  `TupleSinkServicePeerControlAsyncOp peerAsyncOp;` — `tuple_sink_service_process.c:37166`.
+- `TupleSinkServicePumpLocalControlAsyncOpAt` checks, **at the top of every pump**, whether its SHM control slot
+  was recycled under it (`slot->requestSequence != asyncOp->requestSequence`, or the slot is no longer
+  `SERVICE_OWNED`) — `tuple_sink_service_process.c:39079`. On a hit it logs *"dropping stale async local-control
+  op"* and calls `TupleSinkServiceResetLocalControlAsyncOp` (`:39087`), which **memsets the whole local op —
+  including `peerAsyncOp`** (`:37564`).
+- The check runs on **every** pump, including pumps where the peer request is **already published and in
+  flight**. So the local handle is destroyed while `controlOps[opIndex]` sits in `WAIT_RESPONSE`.
+- **Nothing ever releases that slot.** The only two releases (`:10644`, `:10990`) both require a live handle to
+  poll. When the peer's response eventually arrives, `TupleSinkServiceCompletePeerControlOp` still matches it
+  from the **op state** (which is intact) and flips the phase to `COMPLETED` — where it stays **forever**.
+
+**Consequence: a permanent, silent wedge.** 64 stale drops on one connection exhaust the op table; every
+subsequent control op then gets `HOMER_PEER_POST_WOULD_BLOCK` — **no error, no log, no recovery.**
+
+**It is NOT a use-after-free** (the slot is never memset while a WR reads it), so Proof B survives for *memory
+safety*. It is a **resource leak of the exact class this audit exists to kill: an owner vanishes without
+retiring its resource.** Reachable whenever a client abandons and re-issues on a control slot (client timeout,
+Ctrl-C, crash) — rare in a clean run, which is why it has never been seen.
+
+**This is pre-existing and independent of P0-b, but it is P0-b's own resource and P0-b's own contract. In scope.**
+
+#### 22.8.2 B1 — §22.6's liveness claim was TOO STRONG (corrected, not fatal)
+
+§22.6 said *"the pump has drained the send CQ."* **It is not drained unconditionally.** The `PEER_SEND_CQ`
+collector is scheduled by the machine-baseline policy via
+`HomerServiceMachineBaselinePeerCollectorsDue` → `TupleSinkServiceHasActivePeerWork` → 
+`HomerMachineBaselinePolicyPeerControlDue(activePeerWork)` (`tuple_sink_service_process.c:45160-45174`), and
+`TupleSinkServiceHasActivePeerWork` (`:29456`) knows only **two** facts: an active session with
+`peerCommandEndpointValid`, and an active payload stream with a peer binding. **Outstanding control ops are not
+a fact it knows.**
+
+**Verified consequence:** with `activePeerWork == false` the send-CQ collector falls back to the *idle* cooldown
+— it is a **blind liveness poll that still runs**, just rarely (the code says so itself: *"policy-owned peer
+active/idle cooldown only for blind recv/mailbox/send-CQ liveness"*, `:45181-45184`). **So this is a LATENCY
+concern, not a deadlock — the new design cannot hang the service.**
+
+But it is the wrong shape to depend on. The worst case is real: a `CLOSE_SESSION` op whose response is consumed
+*after* the session went inactive would sit in `RETIRING` on the idle cadence, holding its slot. **Fix: make
+outstanding control ops an authoritative fact** — exactly the direction the file already states for itself
+(*"until their authoritative facts are maintained directly"*).
+
+#### 22.8.3 Smaller corrections accepted
+
+- **F2 is not code-enforced.** The QP requests only `CITUS_REMOTE_EXEC_PEER_INLINE_WRITE_BYTES = 64` inline bytes
+  (`:106`, `:4534`), but the provider-returned `max_inline_data` is stored with no upper bound (`:4555`), and
+  inline is chosen purely by `length <= maxInlineData` (`:9641`). 34,160 B will never inline in practice, but
+  **nothing in the source says so.** → Add a `_Static_assert` tripwire. **Note: the new design is correct either
+  way** — if the message ever *did* go inline, CQE-gating would merely be redundant, never wrong.
+- **F3 has a defensive hole.** `postedWrCount` is 0 on a 1-WR chain only because verbs sets `bad_wr == first_wr`
+  (`/usr/include/infiniband/verbs.h:3389`). A **nonconforming provider returning `bad_wr == NULL`** would make
+  `TupleSinkServiceCountPostedWorkRequests` count the sole WR as *posted* (`:9552`) and classify it PARTIAL
+  (`:9587`). → The design already handles this correctly: **on PARTIAL, do not release.**
+
+### 22.9 THE CORRECTED DESIGN (supersedes §22.5/§22.6)
+
+The release predicate becomes purely local to the transport, and **both conditions must hold**:
+
+1. **`sendCompletionRetired`** — the send CQE landed. *The RDMA substrate is done with the source buffer.*
+2. **the owner is done** — either it **consumed** the response (`TupleSinkServicePollPeerRequestRdma` at
+   `COMPLETED`) or it **abandoned** the op (new; see below).
+
+An abandoned op **still occupies a mailbox slot at the peer and will still receive a response**, so it must stay
+reserved until that response arrives and is discarded. Releasing it early would let a late response hit a
+recycled slot, where `TupleSinkServiceCompletePeerControlOp` rejects it (`:7864`) → **connection reset**. So an
+abandoned op is a **zombie that self-reaps on {response arrives} ∧ {CQE landed}** — it needs no poller.
+
+| part | change |
+|---|---|
+| **1. CQE-gated release** | `bool sendCompletionRetired` + phase `..._OP_RETIRING` (*"owner done, awaiting CQE"*). `TupleSinkServiceRetireControlSendCompletion`'s request-arm stub (`:3707`) becomes the **real retirement site**: set the flag; if phase is `RETIRING` **or** (`ownerAbandoned` ∧ response already in), release now. Delete the decoy comment. `PollPeerRequestRdma` at `COMPLETED` (`:10987`): hand the response to the caller **exactly as today — zero added latency** — then release only if `sendCompletionRetired`, else → `RETIRING`. |
+| **2. ALARM** | Generation mismatch in the request arm becomes a **LOUD ALARM**. Under this design a slot is not recycled until its CQE lands, so a control CQE **cannot** find a stale generation (F7: the WR-ID carries the full 32-bit generation, no truncation; B3: reset flushes cannot reach here). If it fires, something posted a WR whose op was released early — the exact bug this stage exists to prevent. |
+| **3. Abandon API** (§22.8.1) | New `TupleSinkServiceAbandonPeerControlOpRdma(asyncOp)` in the transport. Sets `ownerAbandoned = true`. If the response already arrived (`COMPLETED`) it is equivalent to "owner done" → release now or → `RETIRING`. Called from the stale drop (`tuple_sink_service_process.c:39087`) **before** the local memset, and only when `peerAsyncOp.requestPublished`. |
+| **4. Active-work fact** (§22.8.2) | Per-connection `outstandingControlOps` counter (++ at reserve, -- at release). Expose `TupleSinkServicePeerTransportHasOutstandingControlOpsRdma()`; make `TupleSinkServiceHasActivePeerWork` (`:29456`) consult it. **A counter, not a 64-slot scan** — this predicate runs on the service loop. This also reaps a *pre-existing* hazard: today's unpolled control CQEs accumulate in the send CQ whenever the service goes idle. |
+| **5. Failure release** | At `:10644`, **assert `postResult->postedWrCount == 0`** before releasing. If PARTIAL is ever reachable (a 2-WR control publish, or a nonconforming `bad_wr == NULL`), **do NOT release** — mark the op `FAILED` and let the CQE or the reset retire it. Turns Proof A from an accident of chain length into an **enforced check**. |
+| **6. Classifier** | The reset classifier (`:4292`) gains a `RETIRING` case and counts `retiringControlOpsDiscarded` **separately** — an op in `RETIRING` is **not a lost operation** (its caller already got its answer) and must not inflate `waitingControlOpsAborted`. An abandoned op *is* discarded work and is counted as such. |
+| **7. Tripwires** | `_Static_assert` that `sizeof(TupleSinkServicePeerControlMessage) > CITUS_REMOTE_EXEC_PEER_INLINE_WRITE_BYTES` (§22.8.3). Response-publish slots keep their existing (correct) protocol — just **assert** that only their own CQE clears `inUse`. |
+
+**Decision recorded (per the standing rule):** parts 3 and 4 were **not** in the original P0-b scope. They are
+included because they are *the same resource* (the 64-slot control op table) and *the same contract* (retire
+before release), and because part 1 **depends** on part 4 being right. Splitting them would land a design whose
+liveness argument rests on a blind cooldown.
+
+### 22.10 P0-b — LANDED + VALIDATED (2026-07-12)
+
+**Correctness: PASS.** 3 consecutive gate runs (`pgbench --homer --homer-dpu-command`, `-t 2000 -c 1`), no
+restarts. `transport: homer-dpu-command (implies dpu result relay)` on all three; `2000/2000` processed, **0
+failed**; farnet1 DPU shows `DPU backend spawn begin` → `COMPLETED … launched_pid=N` once per run; the farnet0
+host service log holds its **banner and nothing else** (no silent host-relay fallback); farnet1 host service
+DOWN. **ALARM = 0** on all four logs across three runs **and** a clean SIGTERM shutdown (T1→T2→T3→T4 teardown
+intact, P0-d's counters still 3/3/3/3).
+
+**The new observability fired:** `peer reset-complete discarded control state node=0 reason=4 waiting_lost=0
+completed=0 retiring=0 failed=0 response_slots=1`, once per teardown. Those counters had been computed by the
+abort classifier since it was written and **printed by nobody**.
+
+#### 22.10.1 ⚠ `retiring=0` — THE NEW BRANCH WAS NEVER EXERCISED
+
+`retiring=0` in every run. §22.6 *predicted* `RETIRING` would be rare (the send CQE is generated when the remote
+HCA ACKs, which precedes the peer's CPU even seeing the message, let alone composing a response — so by the time
+a response matches, our CQE is essentially always already in the CQ). **Prediction confirmed. But "rare" is not
+"tested."** This smoke is single-client with one command in flight; it does not drive the `RETIRING` path at all.
+
+**OPEN:** the RETIRING branch is validated only by construction, not by execution. Driving it needs either a
+multi-client run or an artificially delayed send-CQ drain. **Do not claim it is exercised.**
+
+#### 22.10.2 ⚠ THE tps BAND IN THIS DOC IS NOT A BAND — two methodology errors, both mine
+
+The acceptance criterion said *"tps in the 95–128 band"* (P0-f 95.2/125.3/104.1, P0-d 114.6/125.3/121.4,
+P0-a 107.2/128.3/122.3, P0-i 109.9/124.4/122.4). This run returned **283–287 tps** — and that is **not a
+speedup**, it is a **different measurement**:
+
+1. **The 95–128 band is from `-t 5` runs** (the gate example in CLAUDE.md uses `-t 5`), where the ~40 ms
+   per-connection setup dominates five transactions. This run used `-t 2000`, where setup amortizes to nothing.
+   **Per-transaction latency, the quantity that is actually comparable, is ~3.5 ms in BOTH.** The tps figures
+   were never measuring the same thing.
+2. **This run carried `--debug`** — required for gate proof #2 (decoded `abalance` per transaction) — which
+   prints ~12,000 lines onto the measured path. CLAUDE.md's like-for-like `-t 2000` steady state (**3.14 ms/tx,
+   318 tps**) was taken *"on a fully stripped stack"*, and CLAUDE.md explicitly warns that logging on the
+   measured path has produced false regressions in this prototype before.
+
+**Consequence: this stage has NO usable performance number, in either direction.** Do not read 283 tps as a
+gain, and do not read 3.50-vs-3.14 ms as a regression. P0-b touches **only the control path** (session
+open/close ops — a handful per run); it has **no mechanism** by which it could move per-transaction cost.
+
+**Rejected explanation (recorded so it is not re-proposed):** the validating agent attributed the jump to the P2
+stall fix. **Refuted** — P2 (`bf6cf0ea42d`) was already committed *before* P0-f/P0-d/P0-a/P0-i were validated,
+so it cannot explain a change that appears only now.
+
+**ACTION for the PERF item:** the reference numbers in this doc must be re-stamped with their `-t` **and** their
+logging state, or deleted. A tps figure without both is not a measurement. (This is the same failure the project
+already knows about — hazards §8.2, *"stamp every baseline with a commit SHA"* — one level deeper: **stamp it
+with its workload shape too.**)
+
+#### 22.10.3 Review corrections applied to the worker's implementation
+
+Reviewed every edit personally. Three defects found and fixed by hand before validation:
+
+- **A new `abort()` path dressed as a safety check.** The worker introduced `#include <assert.h>` — **new to the
+  entire homer tree** — and four `assert()` calls. `NDEBUG` is defined nowhere, so those asserts were **live**,
+  and a live `assert` calls `abort()`: an invariant violation would have **killed the service**, with a message
+  naming neither the peer nor the slot. Two of the four were also vacuous (one restated its own enclosing branch
+  predicate). **Replaced with the project's ALARM-and-continue style.**
+- **A spurious ALARM on a legitimate path.** `AbandonPeerControlOpRdma` ALARMed when the connection was inactive
+  or the slot generation had moved on — but *that is exactly what a prior connection reset leaves behind*: the
+  abort classifier has already reaped the slot, so there is nothing wrong. With **ALARM = 0** as the acceptance
+  criterion, an ALARM on a benign path both fails validation and devalues every other ALARM. **Downgraded to an
+  informational log with full context;** only a NULL handle or an out-of-range index remains an ALARM.
+- **Write-only counters.** `retiringControlOpsDiscarded` would have joined three *existing* abort-report counters
+  that **nothing ever printed**. Added the reset-complete report (§22.10) — otherwise the classifier change would
+  have been unobservable during its own validation.
+
+**Commits:** citus `81593cdf9`, kb `02d220a26d0`.
