@@ -1873,3 +1873,102 @@ acceptance criteria: after P0-a, a clean shutdown must not print it.**
 *Rule earned: exercising the SHUTDOWN path found a live contract violation in a subsystem the change did not
 touch. Shutdown is where every "we'll clean it up later" comes due at once — put it in the acceptance criteria,
 not the follow-ups.*
+
+---
+
+## 16. ⛔ P0-e IS BLOCKED — Option A′ CONTRADICTS A DOCUMENTED, RUN-8-VALIDATED INVARIANT
+
+**STOP. This needs a decision, not an improvisation.**
+
+### 16.1 Option A′ step 3 is exactly the thing the code forbids
+
+Option A′ (§13.3) says: *"the backend's bind may CAS `QUARANTINED → BOUND` — **zeroing the bodies FIRST** (the
+FREE-state ABI init the reaper deferred)."*
+
+`HomerFrontendAgentBindArenaSlot` (`homer_frontend_agent.c:568-595`) says, in a comment written after a
+four-run hunt:
+
+> *"**⚠⚠ THE P1 BLOCKER LIVED EXACTLY HERE** (root-caused by run 8, July 10, 2026). This site used to call
+> `HomerFrontendAgentInitArenaSlot(slot)`… by this point **the DPU is already polling that mailbox with
+> back-to-back CONTROL_READ DMAs** (run 8 counted ~100 successful proto=15 reads during backend startup, then
+> ONE all-zero read). A DMA sampling inside the memset→restamp window reads an all-zero header, fails the DPU's
+> snapshot protocol validation, and **permanently fatals the engine**… **do not "fix" a verification failure by
+> resurrecting the bind-time reset.**"*
+
+**Option A′ removes the reaper's re-init and then resurrects the bind-time reset to compensate — the precise
+move that comment forbids.** I proposed it without reading the bind site.
+
+### 16.2 There is NO safe HOST-side window to re-initialize a slot. None.
+
+| candidate re-init site | why it is unsafe |
+|---|---|
+| **the reaper** (`ReapDeadArenaSlots:708` → `ReleaseArenaSlot:666` → `InitArenaSlot:269`) | the DPU may still have **counted, in-flight DMA writing into the slot** (`BACKEND_COMMAND_BODY`, `..._READY_SEQ`, `..._PUBLISHED_EPOCH`, `BACKEND_COMPLETION_CONSUMED_EPOCH`, byte-ring credit). The host **cannot see** the DPU's drain state. A late write lands after the re-init → the slot is FREE but **not** ABI-initialized → every future bind FATALs on the verification → **the slot is permanently poisoned.** |
+| **the backend at bind** | **run 8**: the DPU is already grouped-control-polling this slot; the memset's transient-zero window fatals the engine. **AND run 9**: the DPU is the role-2 **producer** and *"may publish commands into a BOUND slot before this backend finishes starting up"* — so the memset would also **destroy a command the DPU already published**, leaving the DPU's bookkeeping claiming an in-flight command the backend will never see. |
+
+**Both host-side windows are closed, for two independent reasons each, both already discovered the hard way.**
+
+### 16.3 ⚠ AND THE SAME RE-INIT RUNS ON THE **CLEAN** PATH — this looks like a LIVE latent bug
+
+`HomerFrontendAgentReleaseArenaSlot` runs from **`on_proc_exit`** and calls the same `InitArenaSlot`, which
+memsets **`arena->exports[...].hostPublishLines[ringIndex .. +2]`** — *the very lines the DPU reads with
+grouped-control `CONTROL_READ`* (`homer_service_dpu_dma.c:11604`: the read source is
+`descriptor->hostRingAddress + descriptor->hostControlOffset`, a `HomerDpuBridgeHostPublishLine`).
+
+And T1's quiesce covers **only** `localBase+1` (role-3 completion) and `localBase+2` (role-5 result)
+(`homer_service_dpu_dma.c:6246-6272`). **`localBase+0` — the role-2 command mailbox — is DELIBERATELY left
+polled**, because teardown publishes the `BACKEND_SLOT_RELEASE` command through it (§10.1 item 4).
+
+> **So from T1 to T4 the DPU keeps grouped-control-polling role-2's publish line, while an exiting backend may
+> memset exactly that line.** That is the run-8 shape, on the clean path.
+
+Whether it fires depends on a race we have **not** proven either way: T4 unbinds and calls
+`ResetRingTenancyState` (which sets `tenancyBaselinePending` and thereby **suppresses** discovery), and the
+backend exits only after it *reads* the RELEASE command. If T4's unbind always wins, the memset lands on a
+suppressed ring and is harmless. But T4 fires when the RELEASE **write retires** (a service-side CQE), while
+the backend exits when it **polls and sees the bytes** — those are concurrent, and the backend's exit is one
+scheduler pass away from beating T4. **NOT PROVEN SAFE. Treat as a live latent bug.**
+
+### 16.4 The only party with a safe window is the DPU — and it is already standing in it
+
+The DPU's own allocation sequence is:
+
+```
+DPU unbinds rings (⇒ post-P0-d, DRAINED)   ->  nominates slot N  ->  binds rings
+   ->  submits ARENA_PUBLISH_LINE_CLEAR    ->  its COMPLETION clears tenancyBaselinePending
+   ->  discovery RE-ARMS  ->  doorbell  ->  postmaster forks backend  ->  backend binds slot
+```
+
+Everything between *unbind* and *discovery re-arms* is **inside the DPU's control, with its own DMA provably
+drained and no poller running**. **`ARENA_PUBLISH_LINE_CLEAR` already lives exactly there** — its completion
+comment even says: *"the zeros are now IN HOST MEMORY, so this slot's rings finally have a baseline **the DPU
+established itself**… Clearing the flag here, in the COMPLETION and not at submit, is the whole point."*
+
+**The DPU already owns the re-initialization of the DPU-visible part of a slot. The host's copy of that work is
+redundant AND racy.**
+
+### 16.5 THE OPTIONS (needs an owner decision)
+
+- **A — the DPU owns the whole FREE-state re-init (RECOMMENDED).** Extend `ARENA_PUBLISH_LINE_CLEAR` into a full
+  slot re-init (publish lines **+ mailbox headers + result-ring control**, with the ABI stamps), and **DELETE**
+  the host-side `InitArenaSlot` call from **both** `ReleaseArenaSlot` and the reaper. Then there is **exactly
+  one writer** of the FREE-state, in a **provably drained, pre-production window**, and the host's bind-time
+  verification becomes exactly what it should be: *the check that the DPU did its job.* The invariant upgrades
+  from *"FREE implies initialized"* to *"NOMINATED implies initialized"* — asserted by the only party that can
+  prove it. **Also fixes §16.3 for free.** Cost: the DPU must carry the slot ABI stamps
+  (`protocolVersion`/`slotCount`/`ringBytes`), i.e. the ABI init logic exists on the DPU side; one larger DMA
+  write instead of one small one. **No new protocol, no new round-trip, no new carrier.**
+- **B — keep the host re-init, gate it on a DPU certificate.** Requires a NEW host-visible *"the DPU has
+  unbound slot N"* fact. That is a new carrier — the thing §13.2 was so pleased to have avoided. **Rejected
+  unless A is impossible.**
+- **C — narrow scope: quarantine only, DPU re-init only for quarantined slots.** Leaves **two** re-init owners
+  and does not fix §16.3. **Worst of both.**
+
+### 16.6 Rules earned
+
+- **A plan item that says "just zero it first" must name WHO zeroes, WHEN, and WHO IS READING IT AT THAT
+  MOMENT.** Option A′ passed four adversarial review rounds with none of us asking the third question.
+- **The invariant you need may already be enforced by the other side.** I spent this whole item looking for a
+  host-side window. There is none — and the DPU has been standing in the only safe one all along, doing half
+  the job already.
+- **Read the site you are about to change BEFORE you design the change.** The bind site's comment forbids
+  Option A′ by name. It cost nothing to read and would have saved the whole design.
