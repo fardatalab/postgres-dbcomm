@@ -3246,3 +3246,87 @@ build; `homer_tuple_deform_smoke` ALL PASS.
   engine's collector arming.** This is now the top perf item; `p3trace`/`p2diag` must be stripped first.
 - **P4.1** — mirror-path truth-source. Fully designed (§17.3), not started.
 - **One export instead of two** (§18.8) — deferred, not ignored.
+
+---
+
+## 21. P6 — ONE EXPORT PER SESSION (design of record + THE CONTRACT, July 12, 2026)
+
+### 21.1 THE CONTRACT (owner-stated; this is the rule, not an optimization)
+
+> **Homer's user has DB semantics. It knows, AT OPEN, what rings a session of a given kind needs.
+> So a session BINDS EVERY RING IT NEEDS, IN ONE GO, IN ONE EXPORT.**
+>
+> The SESSION KIND determines the RING SET. There is never a reason to discover a session's rings
+> later, and therefore never a reason for a second export, a second setup handshake, or a rendezvous
+> protocol to glue them back together.
+
+Vocabulary, because conflating these is what produced the bug:
+
+- an **EXPORT** is a DOCA mmap export of one host memory REGION plus its ring descriptors, shipped over
+  the TCP setup socket; the DPU **IMPORTS** it. The postmaster's **frontend arena** is the same mechanism
+  for socketless backends: **ONE region, 48 arena rings + 1 spawn ring, ONE import.**
+- a **BIND** is the session<->ring relationship. **A session binds all the rings it needs.**
+
+The arena already obeys the contract. The client does not.
+
+### 21.2 What the client does today (and what it costs)
+
+A selected-DPU SQL client makes **TWO** exports:
+
+| | export A (command) | export B (result) |
+|---|---|---|
+| descriptor[0] | role 1 `FRONTEND_CONTROL_SLOT` | role 1 `FRONTEND_CONTROL_SLOT` **(a SECOND, redundant control slot)** |
+| descriptor[1] | role 6 `FRONTEND_COMPLETION_EVENT` | role 7 `PAYLOAD_BYTE_RING_DPU_TO_HOST` (10 MiB) |
+| own TCP setup connection to :9727 | yes | yes |
+| own bridge generation / mmap import | yes | yes |
+| own **detach** at teardown | yes | yes |
+
+homer_client.c:69-78 justifies the split: *"the two are bound by sessionUID, not by sharing an export.
+hostMmapImportCapacity is 1024, so two imports per client is free."* **Free in capacity, not in lifecycle.**
+It costs:
+
+1. **A redundant `FRONTEND_CONTROL_SLOT`.** Export B ships a whole second control slot the session never uses.
+2. **A second teardown edge.** Export B's detach is what P5.d had to defuse — we made the service treat it as
+   expected; we did not remove it.
+3. **A rendezvous protocol that exists ONLY to glue the two back together.** The role-7
+   `OP_TUPLE_SINK` OPEN_SESSION (tuple_sink_service_process.c:36127-36205) **creates no session** -- it
+   returns `serviceSessionId=0, serviceSinkId=0` and a zeroed queue descriptor. Its entire job is to tell
+   the DPU *"this ring belongs to sessionUID X"*.
+4. **`sessionUID` doing a job it should not have.** It is a cross-node SESSION identity, but because the
+   ring lives in an export the session does not own, it is ALSO the ring-lookup key
+   (`HomerDpuDmaFindDpuToHostByteRingRef` scans for it). That overload is precisely how it became
+   load-bearing in the P5.d bug -- where it turned out never to have been STORED.
+
+### 21.3 The change
+
+**ONE export, THREE descriptors: role 1 (control slot) + role 6 (completion events) + role 7 (result byte
+ring).** Everything in export B except the role-7 ring is redundant, and the role-7 ring belongs in the
+session's own region.
+
+**No bridge ABI bump is needed.** `ringCount` / `descriptorCount` are already RUNTIME fields of
+`HomerDpuBridgeControlBlockHeader` -- the arena export ships **49** rings through the same path. Only
+`HOMER_CLIENT_DPU_COMMAND_SETUP_RING_COUNT` goes 2 -> 3. (`HOMER_DPU_BRIDGE_PROTOCOL_VERSION` stays 5, and
+the DPUs do NOT need a protocol-driven redeploy -- though they do need the rebuild, as always.)
+
+What is DELETED, not fixed:
+
+- export B in its entirety: its setup connection, its bridge generation, its mmap export/import, its
+  redundant role-1 control slot, and **its detach edge**;
+- the role-7 rendezvous `OPEN_SESSION` -- client side (the submit) and service side (the whole
+  `clientSqlResultOpen && clientSqlResultDpuRelay && direction == RECEIVE` branch);
+- the role-7 unbind step in the close (there is no separate export left to tear down);
+- `HomerClientBindResultRing` as a separate lifecycle step: the ring is bound when
+  `HomerClientOpenSqlSessionSelectedDpu` returns, because the SESSION KIND said it would be.
+
+**Basebackup exports are UNTOUCHED** (`HOMER_CLIENT_DPU_SETUP_RING_COUNT` stays 2). This change is scoped to
+the selected-DPU SQL session, which is the one whose ring set the session kind fully determines today.
+Basebackup should follow the same contract later; that is a separate step.
+
+### 21.4 Acceptance
+
+1. `pgbench --homer --homer-dpu-command`: three consecutive runs, one stack, no baseline reset -- 5/5 tx,
+   five decoded rows each, empty error streams, zero surviving backends.
+2. **Node A logs exactly ONE `setup import` and ONE `host-detached` per client** (it logs two today).
+3. **ZERO `dpu control slot: OPEN_SESSION opKind=1`** (the rendezvous is gone).
+4. Failure machinery stays at zero on BOTH nodes; `CLEAN-CLOSE RECLAIM` still fires (P5.d must not regress).
+5. All 7 smoke targets build; `homer_tuple_deform_smoke` ALL PASS.
