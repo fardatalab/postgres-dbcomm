@@ -3796,3 +3796,90 @@ applied to completions instead of logs.
   incarnation/epoch, and the connection `generation` is local slot identity only. So a pooled connection whose
   peer has restarted looks **FREE and healthy**; detection is reactive (CM disconnect / CQ failure / failed
   post). Pooling makes this reachable in a way that per-session connections never were.
+
+---
+
+## 26. P7b CONSUMER INVENTORY — the drain ALREADY EXISTS, and "outstanding == 0" is the WRONG predicate
+
+The owner's due-diligence demand ("don't claim something is stale — name who was waiting for it") did not just
+avoid a bug. **It found that the drain-before-release we were about to build is already there.**
+
+### 26.1 My predicate was unreachable
+
+I proposed *"release the connection only when outstanding WRs == 0"*. **That can never be true on a healthy
+connection.** The notification RECV WQEs are **permanently posted** — depth 64
+(`remote_execution_peer_transport_rdma.c:73`), primed at setup (`:5000`), and **reposted on every consumption**
+(`:6990`). An idle pooled connection always has 64 outstanding WRs *by design*. A literal drain-to-zero would
+have wedged forever.
+
+The right predicate is about **tenant-owned SEND-side owners**, never "all WRs".
+
+### 26.2 The tenant-owned send WRs are ALREADY drained before reclaim — both directions
+
+| side | gate that already exists | what it proves | code |
+|---|---|---|---|
+| sender (node B, outgoing class-2) | `finalPayloadSendRetired` requires `payloadSendOwnerCount == 0 && payloadSendOwnerOutstandingWrs == 0` — **checked BEFORE `CLOSE_SINK` is published** | every payload RDMA write is locally complete | `tuple_sink_service_process.c:27070` |
+| receiver (node A, incoming class-2) | reclaim refuses while `receiverHeadAckOutstandingCount > 0 \|\| receiverHeadAckCompletedHead < receiverHeadAckPostedTail` | every consumed-head ACK's tagged send CQE is drained | `tuple_sink_service_process.c:35605` |
+
+Both gates carry comments stating exactly this intent — the sender's says *"The receiver must not observe
+CLOSE_SINK until the sender has locally completed every RDMA write that targeted the receiver-owned payload
+ring"*; the receiver's says *"a posted consumed-head ACK still owns a connection-level source word and will
+later produce a tagged send CQE. Keep the stream bound until that CQE is drained."*
+
+**So at reclaim, the tenant owns nothing on the connection.** No epoch is needed for DATA or ACK WRs.
+
+### 26.3 What is NOT drained is CONNECTION-scoped — and that is exactly what a pool should carry
+
+Control ops (`controlOps[]`), response-publish slots (`controlResponsePublishSlots[]`), the notification RECV
+WQEs, and the mailbox sequences / credit mirrors (`nextOutgoingMessageSequence`, `outgoingControlPublishedTail`,
+`peerControlConsumedHeadMirror`, `controlDoorbellArrivedTail`) are **connection-scoped, not session-scoped**.
+They MUST carry over coherently — zeroing them without a fresh bootstrap corrupts credit accounting.
+
+**And this INVERTS the hazard I was worried about.** `quiescedResponsePosted` is set when the response is
+*posted*, not *completed* (`tuple_sink_service_process.c:28021`), so node A's response send CQE can still be in
+flight at reclaim. That CQE's only job is to clear `controlResponsePublishSlots[slot].inUse` — a **connection**
+resource. **If the connection survives, the CQE lands later and correctly frees its slot. Keeping the
+connection alive makes that MORE correct, not less.** It is only tolerable today because we destroy everything.
+
+### 26.4 The one ownership-neutral completion (and it is still not disposable)
+
+The **control-REQUEST send CQE** (e.g. `CLOSE_SINK`'s) is the only completion whose handler provably mutates
+nothing — `TupleSinkServiceRetireControlSendCompletion` bounds-checks and returns, even for a live matching op,
+and explicitly tolerates arrival after slot reuse (`remote_execution_peer_transport_rdma.c:3699`). Request
+lifetime is governed by the *response*, not this CQE.
+
+**It still must be polled** — it occupies finite send-CQ capacity and is where a send *failure* would be
+detected. Which is the owner's point in miniature: even the one WR nobody semantically waits on is not garbage.
+
+### 26.5 The ONLY convergence hazard is confined to the failure case
+
+Sender close waits for `senderVisibleRemoteConsumedHead >= payloadCloseFinalTail`
+(`tuple_sink_service_process.c:27086`) — **remote** credit. A peer that dies or stops servicing its receive ring
+never returns it, so a drain-based close cannot converge there.
+
+**But that is exactly when reset-and-disconnect is the CORRECT answer.** So the clean-vs-failure discrimination
+we already have (`peerResetAfterCleanClose`, P5.d) is precisely the fork needed, and **no bounded-timeout
+fallback is required**: clean close -> release; real failure -> reset. The hazard does not cross into the
+clean path.
+
+### 26.6 Therefore P7b.1 is SMALL
+
+`HomerServiceTerminateDetachedRelayConsumer` (`:33166`) must stop treating a **host-export detach** — i.e. a
+client that finished and exited normally — as a payload-protocol failure. The detach is not a reason to RESET;
+it is only a reason to **stop relaying**. The stream's own close/reclaim machinery already knows when it is
+safe to reclaim and already holds the gates in §26.2. So: mark the relay terminal (already done), reclaim the
+stream through the CLEAN path, and **RELEASE** the connection (owner -> 0, QP intact) instead of requesting
+`HOMER_PEER_RESET_PAYLOAD_PROTOCOL`. Keep today's reset behaviour for a genuine failure.
+
+### 26.7 Rules earned
+
+- **Before you may call something stale, you must NAME WHO WAS WAITING FOR IT.** A WR exists because something
+  waits on its completion; discarding it leaks its slot or wedges its credit. "Stale ⇒ drop" is never
+  available. (Owner, July 12, 2026 — and it found the existing drain rather than duplicating it.)
+- **A quiescence predicate must be reachable.** "Outstanding WRs == 0" is *unreachable* on a connection with
+  permanently-posted receives. Check the predicate can actually become true on a HEALTHY system before
+  designing around it — an unreachable gate is a hang, and it looks exactly like a slow one.
+- **"Is it drained?" is ambiguous in a layered transport.** Three different claims live here and are trivially
+  conflated: (1) the byte ring is empty (`publishedTail == consumedHead` — what `TupleSinkServiceQueueIsDrained`
+  actually proves); (2) the stream is semantically closed (`CLOSE_SINK` acked); (3) the transport has no
+  outstanding tenant WRs. Name which one you mean, every time.
