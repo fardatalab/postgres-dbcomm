@@ -1,5 +1,20 @@
 # Homer current implementation checkpoint
 
+> ## ⚠ STALE — MILESTONE HISTORY ONLY (banner added July 12, 2026)
+>
+> This doc was last true on **July 3, 2026**. It predates the **command-plane migration (S1-S4)**, which
+> moved SQL's command spine ONTO the DPU, and predates **P1-P6**. Its model of a session and many of its
+> code pointers are no longer correct.
+>
+> **For current truth, read
+> [`selected_dpu_session_rings_and_lifecycle.md`](selected_dpu_session_rings_and_lifecycle.md)** — the
+> architecture of record for the selected-DPU path (identities, ring roles, exports, lifecycle).
+>
+> One claim in here is actively DANGEROUS to inherit: that SQL's command spine "lives entirely in the HOST
+> service on both ends". It does not, and a code comment carrying that premise justified a duplicate-session
+> bug for months (design doc §18.7, §20).
+
+
 ## Scope
 
 - **What this doc explains**: the current landed Homer implementation across the Citus-facing frontend, the standalone Homer service, shared ABI headers, RDMA peer transport, tuple COPY, client SQL pgbench, and basebackup payload streams.
