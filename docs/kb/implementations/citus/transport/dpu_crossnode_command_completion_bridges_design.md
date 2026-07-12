@@ -3960,3 +3960,80 @@ lines; the generation is already in the `wr_id`.
 it is a coincidence with good luck.** If the data needed to enforce it is already in hand (here: the
 generation is decoded and dropped), enforce it. Ask this specifically when a change is about to extend an
 object's lifetime, because lifetime extension is what turns "cannot happen" into "happens rarely, silently".
+
+---
+
+## 28. SUPERSEDES §27's FIX — the rule is RELEASE ON PHYSICAL RETIREMENT, not on logical completion
+
+Owner, on §27: *"why would a stale CQE for a previous occupant ever land? I thought the invariant is that you
+don't leave or tear down or close unless you have handled all your work, not leaving something to a later
+occupant — everything should be meaningful and you should care about each and all of them."*
+
+That is the correct invariant, and it makes §27's proposed generation-check a **band-aid on the wrong layer**.
+§27's *finding* stands; its *fix* is superseded by this section.
+
+### 28.1 First: the comment that justified the tolerance is describing a path that DOES NOT EXIST
+
+`remote_execution_peer_transport_rdma.c:3699` says:
+
+> "A blocking adapter may **time out and release an op** before the local send CQE for its already-posted
+> request arrives."
+
+There is **no such path.** `TupleSinkServiceReleasePeerControlOp()` has exactly two callers:
+
+| site | when | WR in flight? |
+|---|---|---|
+| `:10644` | the request POST FAILED | no (`WOULD_BLOCK` posted nothing), or the connection is RESET (`PARTIAL_POST`/`SEND_CQ_FAILURE`) |
+| `:10990` | the RESPONSE was matched | **yes — the request's send CQE may still be unpolled** |
+
+`TupleSinkServiceWaitForSendCompletion()` is a **cold** setup/bootstrap helper (`:3868`); a timeout there yields
+an error -> a connection reset, never a slot release. **A decoy comment: it blames a nonexistent hazard and
+thereby misexplains the guard it is attached to.** (CLAUDE.md: "a diagnostic that lies is worse than none" —
+this is the comment-shaped version of the same failure.)
+
+### 28.2 Is real work left behind? Split the question
+
+- **Data plane: NO, and provably.** For the peer to have RESPONDED it must have RECEIVED the request; on an RC
+  QP that means our HCA finished reading the source buffer and the remote HCA ACKed. So when `:10990` memsets
+  the op slot, it is provably no longer under NIC DMA. **No corruption today.** But this is **correct by an
+  argument nobody wrote down** — exactly the "coincidence, not an invariant" shape of §27.6.
+- **Bookkeeping: YES, exactly one thing, and it is not nothing.** The **unpolled send CQE**. It carries the
+  send's **success/failure status** (a send failure would be detected THERE) and occupies a finite send-CQ
+  slot. The previous occupant walks away and leaves it for whoever drains next. **That is the violation.**
+
+### 28.3 THE RULE
+
+> **A slot/op/connection returns to the free pool only when BOTH (a) its logical work is complete AND (b) its
+> own physical completions have been retired. You do not leave until you have handled your own work.**
+
+The current protocol releases on **logical completion** (response matched) when it must release on **physical
+retirement** (response matched AND send CQE drained). Those two coincide only when nothing is in flight —
+which is precisely the assumption that stops holding the moment connections are POOLED. This is why the code
+kept sprouting "tolerate"-shaped guards here.
+
+### 28.4 The change (P7b.0 — lands BEFORE P7b.1)
+
+At response-match, do **not** `memset` the op. Move it to a new `..._OP_RETIRING` phase. The send-CQ drain, on
+seeing the CQE for `(slot, generation)`, performs the release. The allocator (`:7790`) already takes only
+`UNUSED` slots, so **a slot can never be reused while its completion is outstanding.** Nothing blocks — the op
+merely lingers a moment; the CQE always arrives (success or error) or the connection resets.
+
+Consequences, all of them improvements:
+
+- The stale CQE becomes **IMPOSSIBLE**, not tolerated. The generation check in
+  `TupleSinkServiceRetireControlSendCompletion` becomes an **ASSERTION** — if it fires, that is a real bug and
+  it must say so LOUDLY, not `return true`.
+- **§27's response-slot hazard is closed BY CONSTRUCTION**, by the same rule, with no separate generation
+  plumbing: a response-publish slot is likewise only freed by its own CQE, and now nothing else may free it.
+- A **send failure can no longer be silently dropped** by an occupant that already left.
+
+### 28.5 Rules earned
+
+- **Release on PHYSICAL retirement, not logical completion.** "My response came back" is not "my work is
+  done"; the completion for the request you posted is still yours. Own it to the end.
+- **Remove the category, don't guard the case.** A generation check would have made the wrong thing *safe*;
+  this invariant makes the wrong thing *unrepresentable*. Prefer the latter — a guard is a place a future
+  change can walk past, an impossibility is not.
+- **A "tolerate" in a resource-lifetime path is a smell, and the comment explaining it is the first thing to
+  distrust.** Here the comment cited a timeout path that does not exist, and it had been read (by me) as
+  evidence the design was considered.
