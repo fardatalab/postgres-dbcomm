@@ -1180,7 +1180,7 @@ owners, explicitly recording what it discarded** (`:4278`, `:4290`).
 | item | state | note |
 |---|---|---|
 | **P0-a** | ✅ **LANDED + VALIDATED** (citus `71b523757`) | §20. The blind clear was a SYMPTOM of a signal policy with no terminal case. **But the fix is PER-SITE — see §21 (P0-i), which generalizes it into a substrate invariant and may have found a LIVE HANG in the payload lane.** |
-| **P0-i** | **NEW — HIGHEST PRIORITY after the audit** | §21. *A lane that defers retirement to a later signalled WR must guarantee one exists.* Substrate fence at quiesce. §21.4 may be a live hang. |
+| **P0-i** | **RESCOPED — small, NOT urgent** (§21.8-21.11) | the payload HANG was **REFUTED** (I inferred a policy from a stats counter). The payload + credit lanes **already fence themselves** — every batch ends with a forced-signalled WR; **they are the EXEMPLAR.** Only the 2 runtime-selective lanes lack it, and only on the **ABORT** path (no close message ⇒ nothing to force-signal ⇒ P0-a's Scenario E clear = a LOUD use-after-free). Fence must carry its **own lane's WR-ID class** — CQ dispatch is per-class, so a cross-lane CQE does **not** retire it. |
 | **P0-b** | ready | self-contained |
 | **P0-c** | ready | needs the transport-helper API change (return the slot indices) + WOULD_BLOCK backpressure |
 | **P0-d** | ✅ **LANDED + VALIDATED** (citus `9a6f68257`) | §15. NOT what §8 thought: two premises were refuted, and the real hole was the `ResetSession` FUNNEL releasing with no drain (reachable from shutdown). Fixed by enforcing the drain IN the funnel — every path correct by construction. |
@@ -2535,3 +2535,67 @@ building anything.*
 > **Any deferred or cumulative acknowledgement scheme needs a terminal flush.** Batching is safe *while traffic
 > continues* and breaks *exactly at the end* — which is precisely when you release the resource. **Whenever you
 > see "we'll retire this later, when the next one completes," ask what happens when there is no next one.**
+
+### 21.8 ✅ THE AUDIT LANDED — my payload HANG is REFUTED, and the real gap is ABORT-PATH ONLY
+
+**§21.4 REFUTED (VERIFIED).** `payloadBytesPerSignaledCqe` / `payloadSignaledCqes`
+(`tuple_sink_service_process.c:31101`, `:31760`, `:32407`) are **STATISTICS updated after a batch — NOT inputs
+to a signalling predicate.** I read a stats counter and inferred a policy. **Seventh refuted inference in this
+subsystem — but this time I predicted it and verified BEFORE building. The process worked.**
+
+**The payload lane is safe BY CONSTRUCTION, and it is THE EXEMPLAR.** Its signalling rule is **positional and
+unconditional — every batch's LAST WR is forced signalled**:
+
+- fixed-slot: the last payload WR is converted to `WRITE_WITH_IMM | IBV_SEND_SIGNALED`
+  (`remote_execution_peer_transport_rdma.c:9811-9838`);
+- byte-ring: a **separate signalled tail WIMM is APPENDED** to the batch (`:10039-10077`).
+
+> **That is EXACTLY the fence, already implemented — as a per-batch idiom.** A one-row pgbench stream does not
+> hang because its single batch still ends with a forced-signalled WIMM. **The invariant is not undocumented
+> luck; it is built into the batch shape.** The fence is not a new idea in this codebase — **it is an existing
+> idiom that the two runtime-selective lanes never adopted.**
+
+**Credit ACKs also batch and are also SAFE:** closing forces a below-threshold credit publication and the
+dedicated final-head WR is **always** signalled (`tuple_sink_service_process.c:33627-33636`, `:35557-35570`).
+
+**Only TWO lanes choose signalling at runtime** — command-write (`:6744`) and peer-client-completion publish
+(`:5566`) — and **both now carry the `CLIENT_SQL_SESSION_CLOSE` terminal case.** The **NORMAL path is covered.**
+
+### 21.9 ⚠ THE REAL GAP — and P0-a's own fallback is the tell
+
+> *"If abnormal teardown bypasses the terminal command, an owner can remain until the reset drain times out; the
+> fallback then clears owners despite explicitly warning that source memory may still be read by the RNIC."*
+
+**That is P0-a's Scenario E fallback (`:6709-6736`) — a LOUD use-after-free.** On an **ABORT path there is no
+close message**, so nothing force-signals, the tail stays unsignalled, the 2 s drain cannot converge, and we
+clear anyway. **I made it LOUD. I did not make it SAFE.**
+
+**The fence closes exactly this**, and then the drain **always converges** — making Scenario E on these two lanes
+**unreachable**, which is where it belongs (reserved for a genuinely broken transport, not for a missing flush).
+
+### 21.10 ⚠ A CORRECTION THAT CHANGES THE FENCE'S DESIGN
+
+**My assumption that a signalled WR on a SHARED QP retires every lane's tail is WRONG (VERIFIED).**
+
+- QPs are **not** shared across all four lanes: command + peer-client-completion share the **control** QP;
+  payload + ACK/credit share the **stream** QP (`:19138`, `:21485`, `:31033`, `:32996`).
+- **And even on a shared QP it would not work:** CQ dispatch is **per-WR-ID CLASS**
+  (`remote_execution_peer_transport_rdma.c:3770-3800`, `:3828-3854`). **A command CQE does NOT retire
+  peer-completion owners, nor vice versa.** RC ordering makes the *hardware* retire in order; the *software*
+  owners are retired by class-dispatched callbacks.
+
+> **So the fence must carry ITS OWN LANE'S WR-ID encoding**, so its CQE dispatches to that lane's cumulative
+> retire-through. Cheap — but I would have got it wrong.
+
+### 21.11 P0-i RESCOPED — small, and no longer urgent
+
+| | |
+|---|---|
+| **scope** | a signalled zero-length **fence** at quiesce, on the **two runtime-selective lanes only**, carrying that lane's WR-ID class |
+| **fixes** | the **ABORT-path** unsignalled tail → makes P0-a's Scenario E clear unreachable |
+| **does NOT need to touch** | the payload lane or the credit lane — **both already fence themselves** |
+| **priority** | **NOT above P0-b/P0-c.** The hang I feared does not exist; the normal path is covered; the gap is abort-only and already **loud** |
+
+**Rule earned (again, and this one is getting expensive):** **a counter named `...PerSignaledCqe` is a STATISTIC
+until you find the `if` that reads it.** I inferred a *policy* from a *metric*. **Find the predicate, or you do
+not know the policy.**
