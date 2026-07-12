@@ -1184,7 +1184,7 @@ owners, explicitly recording what it discarded** (`:4278`, `:4290`).
 | **P0-c** | ready | needs the transport-helper API change (return the slot indices) + WOULD_BLOCK backpressure |
 | **P0-d** | ready, **much smaller than first thought** | the quiesce+count ALREADY exist (§10.1). All that remains is that the forced-teardown deadline bypasses the drain. |
 | **P0-e** | **DECIDED — Option A** (§12) | quarantine until postmaster restart. No protocol. |
-| **P0-f** | **ready, MANDATORY** | the certifier's `bool` cannot express NOT_FOUND. Independent of everything else. |
+| **P0-f** | ✅ **LANDED + VALIDATED** (citus `64050e0dd`) | the certifier's `bool` could not express NOT_FOUND. §14. Was load-bearing for P0-d/P0-e; both are now unblocked. |
 | **P1-f** | ready, **FREE** | **TWO invariants, not one** (§11.1) — one per resource, each with its own proof |
 | **P7b.1/.2/.3** | **BLOCKED on P0** | and P7b.1 must NOT use `ResetPeerConnection` as its release mechanism — that is CANCELLATION (§9.4) |
 
@@ -1584,3 +1584,162 @@ so on an identity mismatch **the service forgets its ownership while the DPU rin
   message. The existing message already carried the fact — I just had not asked what its precondition PROVED.
 - **`FATAL` in a restartable background worker is not a fatal.** It restarts the worker and loops, leaving the
   condition intact. Know which process your `FATAL` actually kills.
+
+---
+
+## 14. P0-f — IMPLEMENTATION SPEC (the certifier cannot say "I DON'T KNOW")
+
+**Status: IN PROGRESS.** This is the concrete, call-site-by-call-site spec. It supersedes the sketch in
+§9.3/P0-f, which it refines in three ways (all recorded below): a **FOURTH defective primitive** the audit
+never enumerated; a **mandatory RENAME** (a type change alone is not enough — see §14.2); and a **four-state**
+enum rather than three, with the SAFE state deliberately **not** zero (§14.3).
+
+### 14.1 The complete site table (caller set is CLOSED — verified by grep over both trees)
+
+All four primitives are built on `HomerDpuDmaFindArenaSlotImport()` (`homer_service_dpu_dma.c:5894`), which
+requires an import that `HomerDpuDmaImportCanSubmit()` AND whose `bridgeGeneration` matches **exactly**
+(`:5918`). The lookup therefore fails when the arena export is torn down (frontend-agent restart), when the
+import is detached-awaiting-reclaim, or on any generation mismatch.
+
+| primitive | phase | call site | not-found TODAY | verdict |
+|---|---|---|---|---|
+| `HomerDpuDmaBindRingSession` (`:5980`) | allocate | `tuple_sink_service_process.c:20115` | **loud error, `false`** | ✅ **already correct** — and it is the *only* one, which is more evidence for §3.0 (the contract is upheld exactly where someone was previously burned) |
+| `HomerDpuDmaQuiesceArenaCompletionPolling` (`:6228`) | **2 QUIESCE** | T1 `:42812` | `return true` — *"the import and its DPU-private polling state are already gone"* | ⚠ **NEW FINDING, not in the audit.** We stopped **no** poller and we cannot prove one is not running. A phase-2 gate that cannot see its producer must not claim it stopped it. |
+| `HomerDpuDmaArenaSlotTasksInFlight` (`:6280`) | **3 DRAIN** | T2 `:43640` | `true` + `inFlight=0` → **ADVANCES to RELEASE_PUBLISH** | 🔴 **LIVE BUG** (§13.5) |
+| `HomerDpuDmaArenaSlotTasksInFlight` | **3 DRAIN** | T4 `:43706` | `true` + `inFlight=0` → **FINALIZES teardown** | 🔴 **LIVE BUG** (§13.5) |
+| `HomerDpuDmaUnbindRingSession` (`:6327`) | **4 RELEASE** | `:19971` | `true` ("idempotent"), caller then clears its cached binding (`:19979`) | 🔴 the DPU-side `boundServiceSessionId` **and** the role-5 result-sink stamp (header: *"cleared by HomerDpuDmaUnbindRingSession"*) **LEAK FOREVER**; the slot is refused at the next bind |
+
+### 14.2 ⚠ THE RENAME IS LOAD-BEARING, NOT COSMETIC
+
+Changing `HomerDpuDmaArenaSlotTasksInFlight`'s return type from `bool` to the enum **while keeping the name**
+would still **compile**, and the bug would survive **verbatim**:
+
+```c
+if (!HomerDpuDmaArenaSlotTasksInFlight(engine, gen, slot, &inFlight))   /* !enum is legal C */
+    return false;                       /* not taken for NOT_FOUND (== 1), just as before */
+if (completionEventCount == 0 && inFlight == 0)                          /* inFlight is STILL 0 */
+    phase = RELEASE_PUBLISH;                                             /* STILL falsely advances */
+```
+
+So: **rename to `HomerDpuDmaQueryArenaSlotDrainState()`.** The rename is what makes the compiler enumerate
+every call site. *Rule: when you fix a predicate by widening its answer set, rename it — otherwise the callers
+that ignored the old answer will ignore the new one, silently.*
+
+### 14.3 The type encodes the rule
+
+```c
+typedef enum
+{
+    HOMER_DPU_ARENA_SLOT_QUERY_INVALID = 0, /* bad args / malformed import -- WE DO NOT KNOW */
+    HOMER_DPU_ARENA_SLOT_NOT_FOUND,         /* no import for (generation, slot) -- WE DO NOT KNOW */
+    HOMER_DPU_ARENA_SLOT_IN_FLIGHT,         /* found, inFlight > 0  -- NOT safe, retry */
+    HOMER_DPU_ARENA_SLOT_DRAINED            /* found, inFlight == 0 -- the ONLY safe state */
+} HomerDpuArenaSlotDrainState;
+```
+
+**The numbering is the fix.** `0` is *"we do not know"*, never *"safe"* — so a zero-initialized variable, a
+`memset`, or a forgotten assignment can never accidentally read as DRAINED. That directly encodes the rule the
+bug taught us: *a predicate that cannot express "I don't know" will lie, and it will lie in the direction of
+"yes", because `0` is the value a failed lookup leaves behind.* Four states, not three: the existing function
+already has **two distinct** `false` returns (bad args; malformed import) and collapsing them would destroy
+information — the exact sin being fixed. Every call site `switch`es with **no `default:` arm**, so `-Wswitch`
+makes a future fifth state a compile error (AGENTS.md: a `default:` arm turns `-Wswitch` off).
+
+### 14.4 What each call site does — and WHY that answer and not another
+
+**Common ground: all four NOT_FOUND cases mean the same physical thing** — *the frontend agent's arena export
+vanished under us*. It is not transient: the session's `dpuArenaBridgeGeneration` is frozen at bind time, and
+an import never comes back under an old generation. **So waiting for the 30 s deadline can never resolve it**
+— burning the deadline is pure latency with zero chance of convergence.
+
+- **T1 QUIESCE (`:42812`)** — pass a mandatory `bool *importFoundOut`. On not-found: **log LOUDLY and continue
+  to DRAIN anyway.** Do NOT `return false` (that is the service's completion-acceptance path; a hard failure
+  there kills the whole service including healthy sessions on other generations). Do NOT abandon inline: we
+  have just enqueued a completion event into `selectedSession` at `:42796` that the client still has to see,
+  and the abandon helper `memset`s that struct. **T2 will hit the same NOT_FOUND one pass later, at a safe
+  point, and abandon there.** One abandon site, not two.
+- **T2 DRAIN (`:43640`)** and **T4 RETIRE (`:43706`)** — full `switch`, no `default:`.
+  `DRAINED` → the existing advance/finalize. `IN_FLIGHT` → stay (existing behavior). `NOT_FOUND` /
+  `QUERY_INVALID` → **`HomerServiceDpuAbandonArenaTeardown(reason)`**.
+  This is **§9.4 applied literally**: *"any resource whose phase 3 cannot converge must route to Scenario E
+  EXPLICITLY, not silently."* Abandon-and-record — not service-fatal, because the engine is fine and only this
+  session's import is gone; other sessions must survive.
+- **`:19971` UNBIND** — pass a mandatory `bool *importFoundOut`. On not-found: **log LOUDLY**, naming the slot,
+  the generation, and the consequence (*the DPU-side ring binding and result-sink stamp are LEAKED; the slot
+  will be refused at the next `BindRingSession`*), then still clear the cached binding — it has nowhere else to
+  point. This is the sanctioned case from §9.3/P0-f: *"a caller doing idempotent cleanup may proceed on
+  NOT_FOUND — but it must SAY SO, deliberately."* Fail-**SAFE** (leak a slot), never fail-**SILENT**.
+
+### 14.5 Refactor: ONE abandon path
+
+Extract the body of the 30 s deadline block (`:43582`-`:43635`: scrub queued publish slots → release the arena
+binding → `memset` the selected session → decrement the count) into
+
+```c
+static void HomerServiceDpuAbandonArenaTeardown(HomerServiceDpuDmaSchedulerState *dpuDmaState,
+                                                HomerServiceDpuSelectedSessionState *selectedSession,
+                                                TupleSinkServiceSessionState *serviceSession,
+                                                const char *reason);
+```
+
+called from **three** sites: the deadline (behavior identical — a pure extraction), T2 NOT_FOUND, T4 NOT_FOUND.
+`reason` goes in the log line, so the three are distinguishable in a trace. **This extraction is also exactly
+what P0-d needs next** (P0-d must change what the forced path may and may not skip — it may abandon the backend
+handshake, never the DMA drain), so it is paid for twice.
+
+### 14.6 Non-goals for P0-f (do NOT do these here)
+
+- **Do not** try to make `FindArenaSlotImport` resolve across generations. That is arena-aliasing, and it is
+  P0-e's problem.
+- **Do not** change the 30 s deadline's *policy*. That is P0-d. P0-f only extracts its body.
+- **Do not** touch `HomerDpuDmaBindRingSession` — it is already correct, and it is P0-e's certificate.
+
+### 14.7 ✅ P0-f LANDED AND VALIDATED (citus `64050e0dd`, July 12, 2026)
+
+**Three consecutive pgbench runs on the full four-role DPU stack, one postmaster, one pair of services, no
+restarts.** 5/5 tx and five decoded result rows per run, empty error streams, both nodes. Both DPU service
+logs: `ALARM` = **0**, `ABANDONING teardown` = **0**, and the clean `T1 → T2 → T3 → T4` teardown fires once
+per session with `importFound=1` every time. All seven smoke targets build; deform + DMA smokes pass.
+
+**An unplanned, stronger proof fell out of the run: all three sessions bound `slot=0`.** The slot RECYCLES
+across sessions — which can only happen if the unbind genuinely cleared the DPU-side `boundServiceSessionId`,
+because `HomerDpuDmaBindRingSession` **refuses a slot whose rings are still bound**. The clean release path
+demonstrated itself. *(This is the same refusal that P0-e turns into its certificate — §13.3.)*
+
+### 14.8 Corrections to the §14 spec, made during implementation
+
+1. **`inFlightOut` became OPTIONAL, not mandatory.** The spec made it mandatory by analogy with
+   `importFoundOut`. Wrong analogy: for the drain query the **return value IS the answer**, so forcing an
+   out-param the caller never reads just breeds a dead variable — and T2/T4 promptly grew one. It is now
+   NULL-able, and the count is read exactly where it *means* something: the **cancellation path**, which must
+   record what it discarded. `importFoundOut` on Quiesce/Unbind stays **mandatory**, because those still
+   return `bool` and the out-param is the ONLY place the caller can learn the unknown state. *The rule is not
+   "make out-params mandatory"; it is "the caller must be unable to miss the unknown state" — and where the
+   return value already carries it, a second channel is noise.*
+2. **The abandon path now RECORDS WHAT IT DISCARDED** (`drain=%s in_flight_dma_tasks=%u`), taken **before**
+   `TupleSinkServiceReleaseDpuArenaBinding()` clears the (generation, slot) the query needs. §9.4 always
+   demanded this ("abandons owners, **explicitly recording what it discarded**"); the deadline path never did
+   it. It is also **precisely the diagnostic P0-d needs** to substantiate its claim that the DMA drain always
+   converges.
+3. **`ALARM` is the log token**, not the literal word "LOUD". It is greppable and it is the audit's own word
+   for *"we are handling staleness — that is a bug, not a feature."* Acceptance now greps for `ALARM = 0`.
+4. **T1's log line was lying.** It printed `teardown T1 quiesced arena slot` unconditionally — including when
+   it had quiesced **nothing**. Now: `teardown T1 advanced to DRAIN … importFound=%u`.
+
+### 14.9 Rules earned
+
+- **When you fix a predicate by widening its answer set, RENAME it.** A `bool` → `enum` return-type change
+  **compiles** at every `if (!Fn(...))` call site and preserves the bug **verbatim** — `NOT_FOUND == 1` is
+  truthy, so the error branch is still skipped and the out-param is still `0`. The rename is what makes the
+  compiler enumerate the callers. Silent survival of a bug through its own fix is the worst outcome available.
+- **Put the SAFE state at a NONZERO enum value.** Zero is what a `memset`, a zero-init, a forgotten
+  assignment, and a failed lookup all leave behind. If "safe" is `0`, every one of those failures reads as
+  permission. *Encode the invariant in the type, not in the comment above it.*
+- **Verify that the new UNSAFE branch is UNREACHABLE on the healthy path — in the code, before running.** The
+  whole risk of this change was turning clean closes into abandons. The proof was cheap: every transition out
+  of submit-capable state is keyed on `(bridgeGeneration, clientInstanceId)` — a whole **agent-export** close
+  or detach — or on a DOCA *lost-host-export* error. **None is per-session.** One grep for the writers of
+  `lifecycleState` / `staleTeardownPending` settled it.
+- **A sibling with the same shape is a sibling with the same bug.** The audit enumerated three sites; the
+  fourth (`QuiesceArenaCompletionPolling`, a **phase-2** gate) was found only by asking *"who else is built on
+  this lookup?"* rather than *"who else did the audit name?"* **Enumerate by MECHANISM, not by memory.**
