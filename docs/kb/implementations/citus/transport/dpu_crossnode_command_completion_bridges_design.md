@@ -3074,3 +3074,112 @@ justifies it as *"hostMmapImportCapacity is 1024, so two imports per client is f
 free in lifecycle: **each export detaches separately, and it is one of those detaches that node A reports as a
 payload-protocol FAILURE.** Folding them into one export (one region, all four rings) removes a whole
 teardown edge. Not required for correctness; explicitly RECORDED, not ignored. Revisit after P5.d.
+
+---
+
+## 19. P5.d PROBE RESULTS (July 12, 2026) — three facts, and one of them REFUTES §18.3
+
+The owner said: *before instrumenting, ask a subagent for an analysis.* That was right, and it paid twice —
+it CORRECTED my premise (pgbench does not submit only SQL_EXECUTE; it submits
+`CLIENT_SQL_TX_BEGIN -> 5x SQL_EXECUTE -> TX_COMMIT`, plus a warm-up `CLIENT_SQL_TX_BEGIN` + `TX_ABORT`),
+and it narrowed the probe from three instruments to two. The Codex sweep also verified, with file:line, that
+the entire role-6 completion chain copies `postCommandState` faithfully and that a successful `SQL_EXECUTE`
+never sets it — so the probe had exactly one question left to answer.
+
+### 19.1 REFUTED: "the close protocol is never sent" (§18.3) — IT IS SENT
+
+```
+homer client: [p5d] sqlSessionTerminal LATCHED by session=1 command_kind=8 command_sequence=38
+              command_state=3 post_command_state=2 post_flags=0
+```
+
+`command_kind=8` is `CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_SESSION_CLOSE`. **The semantic close IS submitted
+and DOES complete** (the `[p5d] SKIPPED the semantic ...` probe fired ZERO times), and `post=2`
+(`DO_NOT_REUSE`) is the CORRECT response to a close. `sqlSessionTerminal` latches as a *consequence* of the
+close, exactly as designed.
+
+Node A's ingress census confirms the whole command mix, with post-states:
+
+| kind | count | post | meaning |
+|---|---|---|---|
+| 7 `CLIENT_SQL_TX_BEGIN` | 6 | 0 | 1 warm-up + 5 transactions |
+| 4 `TX_ABORT` | 1 | 1 (`REUSABLE_IDLE`) | the warm-up abort — correctly NOT terminal |
+| 6 `SQL_EXECUTE` | 25 | 0 | 5 per transaction |
+| 3 `TX_COMMIT` | 5 | 1 (`REUSABLE_IDLE`) | correctly NOT terminal |
+| **8 `CLIENT_SQL_SESSION_CLOSE`** | **1** | **2 (`DO_NOT_REUSE`)** | **the latch — and it is CORRECT** |
+
+**§18.3 was WRONG, and it was wrong for a reason worth naming.** I concluded "node B never receives
+CLIENT_SQL_SESSION_CLOSE" from grepping node B's log for that literal — which node B simply never prints.
+**That is the absence-of-log fallacy, one paragraph after I wrote the rule against it.** The probe caught it.
+
+### 19.2 THE REAL P5.d BUG: only STEP 3 is skipped, on a false premise
+
+`HomerClientCloseSqlSessionSelectedDpu` step 3 (homer_client.c:3399-3411) skips the lifecycle `CLOSE_SESSION`
+whenever the session is terminal, justifying it:
+
+> *"the backend already exited ... Submitting CLOSE_SESSION would either hang on a DEAD RESPONDER or trip the
+> busy-control-slot refusal"*
+
+**The responder for a control-slot `CLOSE_SESSION` is not the backend — it is the DPU SERVICE, which is very
+much alive.** The comment conflates the dead BACKEND (farnet1) with the live SERVICE (node A) that actually
+answers control-slot requests. (And the "busy-control-slot refusal" it also feared is the bug already fixed in
+P5.b(2).)
+
+Consequence: node A's sessions are NEVER closed, are torn down only by the client's DOCA detach, and that
+detach can only be reported as a payload-protocol FAILURE. **That is the whole of the node-A failure
+machinery, and it is one skipped request.**
+
+### 19.3 NEW BUG: node A's command session never records its own sessionUID
+
+The probe asked whether the "peer compatibility session" is avoidable, and answered
+`live_session_with_that_uid=0 -> load-bearing`. **That verdict is an ARTIFACT of a second bug.**
+
+There are exactly THREE sites that stamp `sessionUID` onto a session:
+
+| site | path |
+|---|---|
+| :36071 | the **SYNC** control-slot open — **but that path REJECTS remote opens** (*"remote command session open must use async local-control path"*, :36040) |
+| :36853 | basebackup RECEIVE |
+| :40254 | the peer command-session open (node B side) |
+
+Our client's open is REMOTE (`destNode=1`), so it takes the **ASYNC** path — `TupleSinkServiceCreateSession(
+sessionState, &asyncOp->request.sessionKey, 0)` at **:37601 — which never stamps the uid.** So node A's
+command session carries `sessionUID = 0` while the uid is on the wire, in the log, and threaded to node B.
+
+The comment at :36071 even says *"farnet0 records it here from the client's OpenSession"* — its author
+believed the sync path handled it. Remote opens do not go through it.
+
+**So the peer-open's owner lookup cannot find the session, and mints a compatibility session instead.**
+The compat session is NOT load-bearing: it is the downstream symptom of a missing one-line stamp.
+
+### 19.4 BONUS — the §10k stall is now LOCALIZED, and it is not what we assumed
+
+Node A's completion timestamps:
+
+```
+1st SQL_EXECUTE   03:41:01.737
+2nd SQL_EXECUTE   03:41:03.859   <-- 2.12 SECONDS later
+3rd,4th,5th       03.859 - 03.863  (4 ms)
+close (kind=8)    03.876
+```
+
+`latency average = 431 ms` is **ONE 2.12-second stall averaged over five transactions**, not five slow ones.
+And the peer-provisioned result relay ARMS at **03:41:03.859 — exactly when the stall ends**
+(`armed peer-provisioned P3 result receive relay session=2 sink=1`).
+
+**The stall IS the result peer-open failing to arrive/arm for 2.1 s.** The instant it arms, all five results
+flush in 4 ms and the run completes. There is exactly ONE armed relay per run, and it lives ~31 ms.
+
+This reframes §10k entirely: it is not a per-command grant/scheduling stall in the DMA engine. It is a
+ONE-TIME rendezvous stall in the result peer-open. **Do not chase the engine's collector arming.**
+
+### 19.5 Rules re-earned (the hard way, again)
+
+- **Absence of a log line is not absence of the event.** I inferred "the close is never sent" from a literal
+  that node B never prints. Written one section after I wrote the rule. The probe cost one cycle; believing
+  the inference would have cost a wrong fix in the close path — the exact area that has already bitten 3x.
+- **Ask before instrumenting.** The Codex sweep eliminated the whole role-6 chain and corrected the pgbench
+  command mix, turning a 3-instrument probe into a 2-instrument one that answered everything in one run.
+- **A probe's verdict can be an artifact of a second bug.** `live_session_with_that_uid=0` read as
+  "the compat session is load-bearing". It was really "the uid was never stored". Always ask what ELSE
+  could make the measurement read that way.
