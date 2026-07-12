@@ -2396,7 +2396,8 @@ close: it will hit the deadline, say so, and cancel honestly rather than pretend
 
 **`exit(1)` at `:6600` also goes.** A *signalled* post can legitimately still be un-polled at reset (CQ
 retirement is async), so the exemplar's refusal is right but its remedy is too violent. **Both families get the
-same bounded drain**, and FATAL only on bounded non-convergence.
+same bounded drain.** On non-convergence: **ALARM + Scenario E, NOT `FATAL`** — the 2 s bounded drain is exactly
+what distinguishes *"not yet"* from *"never"*, and once it has expired the honest act is to cancel and say so.
 
 ### 20.3 ⚠ RE-ENTRANCY — the same question P0-d had to answer, and it must be answered the same way
 
@@ -2420,3 +2421,31 @@ cannot prove it as cheaply, so we assert instead of assuming.)*
   `refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers quiesce … reset_complete=0`
   (`:23669`). That line is a guard refusing to release, followed by a leave that ignores the refusal — the exact
   shape this item exists to fix, and P0-d's shutdown exercise is the first time we saw it fire.
+
+### 20.5 ⚠ CORRECTION — §15.6's acceptance criterion belongs to P1-f, NOT P0-a
+
+I attributed the shutdown line to P0-a. **Wrong, and it would have produced a false FAIL.**
+
+```
+tuple-sink service: refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers
+quiesce session=1 ... reset_complete=0
+```
+
+comes from `TupleSinkServiceClientSqlPeerCommandMailboxMayDeregister` (`:24152`), which gates on
+`peerLifetime.peerWritersQuiesced || peerLifetime.connectionResetComplete`.
+
+**That is a DIFFERENT RESOURCE.** It is the **peer COMMAND MAILBOX** — a **remote-writable MR that the PEER
+writes into**, i.e. **Scenario C** (*"the remote peer writes into my memory; I cannot see their completions"*).
+**P0-a retires OUR OWN send-completion owners** (Scenario A). It cannot possibly clear that guard.
+
+**That line is P1-f's acceptance criterion** (§9.3/P1-f: *"`peerWritersQuiesced` must become a RECEIVED FACT,
+not a locally-inferred one — today it is set merely on OBSERVING the close"*). Moved.
+
+**P0-a's own acceptance:**
+- the blind clear at `:6604` is gone, and `exit(1)` at `:6600` is gone;
+- **`ALARM` count == 0** across runs and a clean shutdown (no non-convergence, no re-entrancy);
+- the DPU-command pgbench path still passes 5/5 with five decoded rows (the force-signal must not perturb it);
+- **no per-command CQE regression**: the ONLY new signalled WR is one per *session close*.
+
+*Rule earned: two resources whose guards print similar-sounding refusals are still two resources. **Before you
+adopt a log line as an acceptance criterion, find the function that emits it and check WHAT it is protecting.***
