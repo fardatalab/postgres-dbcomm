@@ -3757,19 +3757,38 @@ but pending `controlOps[]`, payload send WRs, receiver-head ACK WRs and their co
 outlive stream teardown because a late consumed-head ACK can arrive after it (`:25071`) — which is precisely
 an example of the hazard.
 
-Two candidate answers, both defensible:
+**CORRECTION (owner, July 12, 2026) — my first recommendation here was WRONG, and it is worth recording why.**
 
-- **(A) Adoption epoch.** Add a `connectionAdoptionEpoch` that increments on every release, stamp outgoing WR
-  ids with it, and drop CQEs whose epoch is stale. Matches an idiom the codebase already uses for exactly this
-  purpose (payload doorbell-token generations reject stale stream-slot notifications,
-  `tuple_sink_service_process.c:24431`). Cheap, and robust to a slow straggler.
-- **(B) Drain-before-release.** Refuse to release a connection until its stream WRs/CQEs are fully retired;
-  keep it OWNED until quiescent. Simpler state, but it puts a drain on the close path and needs a fallback for
-  a peer that never ACKs.
+I originally proposed an **adoption epoch that DROPS stale CQEs**, and ranked it above drain-before-release.
+The owner rejected it on a principle I had skipped past:
 
-They compose (A is the safety net; B is the fast path), and my recommendation is **A first**, because it is
-the one that makes a stale completion *impossible to misattribute* rather than merely *unlikely*.
-**Not yet implemented — raised for discussion per the standing rule.**
+> "we can't just throw away the WRs and CQEs like they are garbage, they have their own purpose (by design,
+> otherwise they wouldn't exist) — so something is going to be interested in them; unless you can show
+> otherwise, and in that case we should review why it's there in the first place if nobody cares about them.
+> Use due diligence... don't just claim something is stale, we need to convince ourselves that it really is
+> fine to be stale."
+
+He is right, and the error is concrete, not philosophical. **A work request exists precisely because
+something is waiting on its completion.** A send CQE retires a WR slot and releases its staging buffer; a
+receiver-head ACK advances credit. **Dropping such a completion does not make it harmless — it leaks the WR
+slot or the staging buffer, or wedges the credit.** So "stale ⇒ discard" is never available. At most an epoch
+buys correct *attribution* (retire the completion against its ORIGINAL tenant's accounting), and it never
+buys permission to discard.
+
+**Therefore: DRAIN BEFORE RELEASE is the primary mechanism.** A connection may only be released once its
+outstanding WRs are retired. An epoch, if it is used at all, is a *safety net for attribution* under a bounded
+fallback — not a licence to drop.
+
+**And the prerequisite is a CONSUMER INVENTORY, not a state inventory.** Before any of this is designed, every
+WR that can be outstanding on a class-2 connection at close must be listed with: what posts it, WHO CONSUMES
+its completion and what that consumer does with it, and what concretely breaks if it never arrives or is
+attributed to the wrong tenant. If some WR turns out to have no consumer at all, that is not a licence to drop
+it either — **it is a question about why it is posted.** (Investigation in flight.)
+
+**The generalizable rule:** *before you may call something stale, you must name who was waiting for it.*
+"Nobody cares about this anymore" is a claim with a consumer on the other end of it, and it must be proven,
+not assumed. This is the same discipline as §20.3's "absence of a log line is not absence of the event",
+applied to completions instead of logs.
 
 ### 25.5 Also still open
 
