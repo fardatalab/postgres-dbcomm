@@ -2880,61 +2880,86 @@ measured on one node.** P5 is therefore **NOT closed**; the six-criteria table i
 This is not a P4.2a regression: its diff touches none of the P5.c machinery (`teardownCompletedCleanly`,
 `peerResetAfterCleanClose`, the clean-reclaim branch) — filter returns 0 hits.
 
-### 18.3 The node-A defect (P5.d), diagnosed
+### 18.3 CORRECTED DIAGNOSIS — the close is not mis-CLASSIFIED, it is NEVER SENT (P5.d)
 
-Node A carries **two** sessions per run, and the log join key is `sessionUID`:
-- `session=1` — the client's SQL command session (control slot; `OPEN_SESSION opKind=1/2`);
-- `session=2` — the **peer-created result-stream session** (opened by node B's peer OPEN). It owns the
-  result payload stream and the role-7 relay.
+My first read of this (that node A's `session=2` was "peer-created" and merely needed a clean stamp) was
+WRONG. The owner challenged the two-session claim, and the thread unravelled into something larger.
 
-`teardownCompletedCleanly` is set at exactly ONE place: **inside T4**
-(tuple_sink_service_process.c:43655). T4 runs only on the node that owns the DPU arena binding and the
-spawned backend — node B. **Node A's session 2 has no T4 and receives no client `CLOSE_SESSION`** (it was
-created by a peer), so it can never be stamped clean.
+**Fact 1 — node A really does carry TWO service sessions per run, and BOTH are opened by the CLIENT** on
+its DPU control slot, with the same `sessionUID`:
 
-The actual trigger on node A is the client's own ORDERLY DOCA detach — step 4 of the library-owned close
-order (`semantic CLIENT_SQL_SESSION_CLOSE` -> role-7 unbind -> control-slot `CLOSE_SESSION` -> setup close
-+ DOCA teardown):
+- `OPEN_SESSION opKind=2` = `CITUS_REMOTE_EXEC_CONTROL_OP_COMMAND_SESSION` -> service session 1
+- `OPEN_SESSION opKind=1` = `CITUS_REMOTE_EXEC_CONTROL_OP_TUPLE_SINK`     -> service session 2
+
+Sessions are keyed by op kind (`sessionKey.opKind`), so this is the existing architecture, not a bug in
+itself. Session 2 owns the result payload stream and the role-7 relay. It is the one that gets aborted.
+
+**Fact 2 — node A receives ZERO `CLOSE_SESSION`, for EITHER session.** The DPU control-slot instrument
+logs one (`[homer-service] dpu control slot: CLOSE_SESSION opKind=%u session=%llu sink=%llu`,
+tuple_sink_service_process.c:43171) and there is not a single such line in three runs.
+
+**Fact 3 — node B receives ZERO `CLIENT_SQL_SESSION_CLOSE`.** So the SEMANTIC close is not sent either.
+
+**Fact 4 — WHY: `sqlSessionTerminal` is latched during NORMAL command traffic.** It is set at
+homer_client.c:6876-6879 whenever any completion carries `postCommandState` of `DO_NOT_REUSE` **or**
+`FAILED`; and `HomerClientCloseSqlSessionSelectedDpu` gates BOTH closes on it:
+
+- step 1 (semantic `CLIENT_SQL_SESSION_CLOSE`): `if (!session->sqlSessionTerminal && serviceSessionId != 0)`
+- step 3 (lifecycle `CLOSE_SESSION`):           `if (session->sqlSessionTerminal) { ...skip... }`
+
+The client log confirms the skip: `homer client: skipping CLOSE_SESSION submit for terminal session 1
+(backend exited)` on every run.
+
+**So on every SUCCESSFUL run, the entire designed close protocol is skipped and the session is torn down
+by the client's DOCA detach instead** -- which node A can only interpret as a payload-protocol failure:
 
 ```
-setup import host-detached bridge_generation=... client_instance_id=...
-terminating DPU relay after host consumer detached session=2 sink=1 sessionUID=5657593410303321
+setup import host-detached ...
+terminating DPU relay after host consumer detached session=2 sink=1 sessionUID=...
 marked byte-ring receive queue failed for sink=1 reason=relay-host-consumer-detached failure=4
 payload stream marked ABORTING for peer reset (REAL PEER FAILURE) ... reason=4 clean_close=0
 committed service-owned DPU result failure through terminal completion ... clean_close=0
+reclaiming sink session=2 sink=1 reason=payload-failure-reclaim
 ```
 
-`reason=4` is `HOMER_PEER_RESET_PAYLOAD_PROTOCOL` (remote_execution_peer_transport_rdma.h:367) — node A is
-not merely observing an orderly CM disconnect, it is REQUESTING a reset for a payload-protocol violation.
+(`reason=4` = `HOMER_PEER_RESET_PAYLOAD_PROTOCOL`, remote_execution_peer_transport_rdma.h:367.)
 
-**It is the same root defect as P5.c, one hop earlier and on the other node: the final step of the CLEAN
-path trips the FAILURE machinery, because nothing told node A the detach was expected.** Node A does hold
-the information — the client sent both the semantic close and the control-slot `CLOSE_SESSION` (steps 1
-and 3) BEFORE detaching (step 4), and session 1 and session 2 share a `sessionUID`. It is simply not
-propagated to session 2 or to the relay-terminate path.
+Node B's `T1..T4` still fire -- but they are triggered by the DPU setup close / doorbell EOF, **NOT** by
+the semantic close. That is why P5's validation looked green: **I verified the teardown HAPPENED, never
+that it happened THROUGH the path I had just built.**
 
-Functionally the run still succeeds and the stream slot IS reused (`index=0` on all three runs, so no
-leak). The damage is the same as P5.c's: a failure completion published into a slot whose client has
-exited, failure counters that move on every success, and a happy path that depends on the failure
-machinery to clean up after it.
+**Fact 5 -- and this is why it hid: step 1's skip is SILENT.** The guard at homer_client.c:3348 has no
+`else`. Step 3 at least prints "skipping CLOSE_SESSION submit for terminal session". Step 1 prints
+nothing at all. *Silence is a valid state* -- the exact anti-pattern CLAUDE.md names, and the reason a
+close that never ran looked identical to a close that ran fine.
 
-### 18.4 STOPPED — two design questions I will not improvise
+**Fact 6 -- the TUPLE_SINK session is never closed even when step 3 DOES run.** homer_client.c:3420 hard-
+codes `request->opKind = CITUS_REMOTE_EXEC_CONTROL_OP_COMMAND_SESSION` with the comment *"serviceSinkId
+stays 0: a command session owns no payload sink."* So node A's session 2 has NO close path at all, on any
+route. Even fixing the `sqlSessionTerminal` gate would leave it orphaned.
 
-1. **Where does node A stamp "closing cleanly", and is that racy?** Stamping when the control-slot
-   `CLOSE_SESSION` completes (step 3) is the natural analogue of node B's T4 and precedes the detach
-   (step 4). But if node A can ever observe the detach BEFORE the close lands (a client CRASH, or an
-   asynchronous control response), the stamp must move earlier — to the semantic `CLIENT_SQL_SESSION_CLOSE`
-   (step 1). The choice decides what a real mid-stream client crash looks like, and a crash **must stay
-   loud**.
+### 18.4 STOPPED — this needs an owner decision, not improvisation
 
-2. **Should "host consumer detached" ever be a FAILURE?** If a client can only detach after it is done,
-   the classification is always wrong and the whole `relay-host-consumer-detached` path should be a clean
-   terminate with no flag at all. If a client CRASH also produces a detach, the two are genuinely
-   different and the flag is required. This is the crux, and the plan does not settle it.
+The immediate question is what `DO_NOT_REUSE` is supposed to MEAN. The backend
+(remote_execution_backend_bridge.c:3130-3148) sets it on `TX_COMMIT`/`TX_ABORT` **only when the session is
+not a client SQL session**, and unconditionally on `CLIENT_SQL_SESSION_CLOSE`. So on the pgbench path it
+should mean *"the backend is exiting because you asked it to"* -- yet the client is latching it BEFORE it
+ever asks. Which completion carries it, and why, is the next probe.
 
-Note this is exactly the hazard §15.4 predicted: *"the day anyone made that machinery do more, every clean
-close would trip it."* It is already tripping on node A, and we could not see it because we were reading
-the other node's log.
+Three coupled decisions, none of which the plan settles:
 
-**Rule earned (the third time this arc):** *a criterion checked on one end of a two-ended path is not
-checked.* The P5 acceptance list must name the NODE for every row.
+1. **Should `sqlSessionTerminal` gate the close AT ALL?** Its comment says a terminal postCommandState means
+   "no further command can ever execute on this session" -- but 5/5 transactions execute after it is
+   latched, so the flag's stated meaning and its actual behavior already disagree. Distinguishing "the
+   backend exited because we told it to" from "the backend died" is the crux, and a real crash MUST stay loud.
+2. **Who closes the TUPLE_SINK session?** It has no close path on any route today (Fact 6).
+3. **Should "host consumer detached" ever be a FAILURE?** If a client can only detach after it is done, the
+   classification is always wrong and `relay-host-consumer-detached` should be a clean terminate. If a
+   client CRASH also detaches, the two are genuinely different and a flag is required.
+
+**Rules earned:**
+- *A criterion checked on one end of a two-ended path is not checked.* The P5 acceptance table must name
+  the NODE for every row.
+- *Verifying that an outcome happened is not verifying that it happened through the path you built.* P5's
+  teardown was real; the mechanism I credited for it was not the one running.
+- *Every skip must log.* A guard with no `else` turns "did not run" into "ran fine".
