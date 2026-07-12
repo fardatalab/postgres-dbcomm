@@ -3018,3 +3018,59 @@ is a probe on that predicate, not a patch.** Do not fix this until a log line na
 3. **Then the close collapses to one session** and P5.d's other two questions (§18.4) mostly dissolve: one
    session, closed once, cleanly, with `CLOSE_SESSION` actually reaching node A.
 4. `sqlSessionTerminal` gating BOTH closes off, and step 1's silent skip, still need fixing regardless.
+
+### 18.7 CORRECTION TO §18.5, and the REAL session-identity defect
+
+§18.5 said "both sessions are opened by the CLIENT". **That is wrong** — I inferred it from the two
+`dpu control slot: OPEN_SESSION` log lines without reading what the second one does. Correcting:
+
+- **The client's role-7 `OP_TUPLE_SINK` open creates NO session.** It is a pure RENDEZVOUS: the handler
+  returns early at tuple_sink_service_process.c:36198-36204 with `serviceSessionId=0, serviceSinkId=0` and a
+  zeroed queue descriptor. Its only job is to record the ring's `sessionUID` binding.
+- **Node A's `session=2` is a "peer compatibility session"**, created by node B's RESULT PEER-OPEN arriving at
+  node A: `tuple-sink service: created peer compatibility session=2 op=5 dest_node=1 ...`
+  (allocation at :27501, `TupleSinkServiceCreateSession(sessionState, &request->sessionKey, 0)`).
+
+**Terminology, corrected (owner's point).** The right verb is **BIND**, not "open" or "export":
+- an **export** is a DOCA mmap export of a host memory REGION + its ring descriptors, shipped over the TCP
+  setup socket; the DPU **imports** it. The postmaster's **frontend arena** is the same mechanism for
+  socketless BACKENDS (one region, 48 arena rings + 1 spawn). A client makes its own export(s).
+- a **BIND** is the session<->ring relationship. **A session can bind all the rings it needs — by design.**
+- The bug is the conflation: "I need another region imported" got implemented as "I need another OPEN", and
+  the service then answered "who owns this sink?" with a POOLING predicate instead of the identity in the
+  request.
+
+**The chain, fully verified by reading:**
+
+| # | fact | file:line |
+|---|---|---|
+| 1 | node B's result peer-open PUTS the client's uid on the wire: `request->sessionUID = sessionState->sessionUID` | `TupleSinkServiceStartServiceResultPeerOpen` :39229 |
+| 2 | node A's session 1 (the client's command session) HAS that uid stamped | :36016 |
+| 3 | node A's peer-open handler **NEVER consults `request->sessionUID` to FIND a session** — it calls `FindReusableSession(sessionKey)`, fails, and allocates a "peer compatibility session" | :27489-27501 |
+| 4 | it *does* pass the uid DOWN into the stream (`dpuRelayResultSessionUID`) — so the uid is received, stored on the STREAM, and never used to find the OWNER | :27554 |
+
+**So the owner is right and the fix is small in principle: the peer-open should FIND the local session whose
+`sessionUID` matches and bind the result stream to it. One session, two bound ring-sets.**
+
+**Why the code didn't do that — a comment describing a topology that no longer exists.** :36161-36164 says:
+
+> *"SQL's command spine lives entirely in the HOST service on both ends while the DPU relay is a separate peer
+> leg; the two are bound by the UNIQUE sessionUID, not by a shared session table. (Unifying ownership would
+> need a net-new DPU<->DPU command-session spine -- a later milestone.)"*
+
+**That premise is now FALSE for this path.** The command-plane migration (S1-S4) moved the command spine ONTO
+the DPU: node A's DPU service now HOLDS the client's command session (session 1, opened over the DPU control
+slot, uid stamped). The "net-new DPU<->DPU command-session spine" the comment says we'd need... is the thing
+we just built. **The compatibility session is a vestige of the pre-migration topology.**
+
+This is the same species as the rest of the arc: *the truthful identity was on the wire and in the struct; the
+code consulted a heuristic instead.*
+
+### 18.8 Also do not lose: ONE export vs TWO (owner: "we should not just ignore it")
+
+The client currently makes TWO DPU exports (two setup connections, two bridge generations, two mmap imports):
+COMMAND (role 1 control slot + role 6 completion line) and RESULT (role 7 + credit). homer_client.c:69-78
+justifies it as *"hostMmapImportCapacity is 1024, so two imports per client is free."* Free in capacity, NOT
+free in lifecycle: **each export detaches separately, and it is one of those detaches that node A reports as a
+payload-protocol FAILURE.** Folding them into one export (one region, all four rings) removes a whole
+teardown edge. Not required for correctness; explicitly RECORDED, not ignored. Revisit after P5.d.
