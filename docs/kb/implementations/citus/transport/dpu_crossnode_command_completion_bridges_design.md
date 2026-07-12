@@ -3365,3 +3365,34 @@ application of it, not a regression.
 nearly filed a bug. It was matching BOTH `setup import host-detached` AND `reclaiming host-detached import` --
 **two lines for the SAME event.** The code was right; the instrument was wrong. *Count events, not lines that
 mention the event.*
+
+### 21.6 P6b — the DPU ring-bind must NOT filter by role (citus `d2f8e9284`)
+
+The owner asked the right question about §21.5's "non-mechanical find": **why was it filtering at all?**
+
+`HomerDpuDmaBindFrontendSessionRings` (homer_service_dpu_dma.c:6055) walks a client's imported export and
+stamps the real `serviceSessionId` onto its rings. Its loop carried a **role ALLOW-LIST** that `continue`d
+past anything it did not name (roles 1 and 6 — and P6 had to *add* role 7 to it). That is wrong twice:
+
+- **REDUNDANT.** The import is already selected by `bridgeGeneration`, so the loop is looking at exactly ONE
+  client's export. Under the contract, **every descriptor in it belongs to that session by construction.**
+  There is nothing to filter out. The allow-list was a **SECOND, hand-maintained declaration of the session's
+  ring set**, in a different file from the one that BUILDS it — with nothing enforcing that the two agree.
+- **SILENT.** An unlisted role was **skipped, not rejected**: the ring was exported, imported, and then never
+  bound. And the only backstop, `boundCount == 0`, catches *"NOTHING was bound"* — never *"2 of the 3 were
+  bound"*. Adding a role compiles clean, ships the ring, and drops it on the floor.
+
+Now: **bind every ring in the import**; an unrecognized role is a **loud error**, not a skip; and the backstop
+is `boundCount != import->ringCount`, which can see a **partially**-bound export. The role check became a
+*validation of what a frontend-session export may contain*, not a *filter deciding what to act on*.
+
+**Rule earned — the general form of CLAUDE.md's `default:`-arm warning:**
+
+> **A consumer that enumerates what it will accept is a second declaration of the producer's contract.**
+> Two declarations drift, and when the consumer's failure mode is `continue`, they drift **silently**.
+> Prefer: the producer declares; the consumer binds **everything** and **errors** on what it does not
+> recognize. One declaration, one edit, loud on disagreement.
+
+Validated: three consecutive runs, 5/5 tx, five decoded rows each, empty error streams, **zero** ring-bind
+rejections; P6 holds (3 client exports, 0 rendezvous opens) and P5.d holds (3x `CLEAN-CLOSE RECLAIM`,
+0 `REAL PEER FAILURE`).
