@@ -3259,6 +3259,74 @@ new class at every site at once.
 (per CQE). It is stack-local and inlinable, so it should stay in registers — but "obviously free" has been wrong
 in this subsystem before. **Confirm on the gate, do not assert it.**
 
+### 24.1.3 The decoded object, CONCRETELY — 16 bytes, and asserted
+
+The reviewer's G9 objection was that the decoded object *might* be 24 bytes, and an x86-64 aggregate over 16
+bytes stops fitting the two return registers. **Do not argue about it -- PIN it.** (`RESERVED_HEADER_SLOTS` is
+gone per §26.3, which is what makes 16 reachable.)
+
+```c
+typedef enum HomerPeerSendWrClass          /* the discriminant, explicit at last */
+{
+    HOMER_PEER_SEND_WR_CLASS_UNTAGGED = 0, /* a raw source-buffer ADDRESS (see 24.1.1) */
+    HOMER_PEER_SEND_WR_CLASS_PAYLOAD,
+    HOMER_PEER_SEND_WR_CLASS_COMMAND,
+    HOMER_PEER_SEND_WR_CLASS_CONTROL,
+    HOMER_PEER_SEND_WR_CLASS_CLIENT_COMPLETION,
+} HomerPeerSendWrClass;
+
+typedef struct HomerPeerPayloadSendWrIdFields
+{
+    uint8_t   kind;               /* DATA | RECEIVER_HEAD_ACK                                       */
+    uint8_t   streamIndex;        /* -> streamEntries[]                                             */
+    uint16_t  streamGeneration;
+    uint8_t   ownerSlot;          /* DATA -> payloadSendOwnerTokens[];  ACK -> the ACK owner table.
+                                     WHICH table is selected by `kind`.  A HANDLE, never a value.
+                                     (see 24.3.1 / 26.5 -- this is what removes the token wrap limit) */
+    uint8_t   reservedTailSlots;  /* 0 or 1: what this batch must FREE on retirement (P0-c, 23/26.3) */
+} HomerPeerPayloadSendWrIdFields;                          /* 6 used, 8 with padding */
+
+typedef struct HomerPeerControlSendWrIdFields
+{
+    bool      responsePublish;
+    uint16_t  slotIndex;
+    uint32_t  slotGeneration;
+} HomerPeerControlSendWrIdFields;                          /* 8 bytes */
+
+typedef struct HomerPeerIndexedSendWrIdFields              /* COMMAND and CLIENT_COMPLETION */
+{
+    uint16_t  index;
+} HomerPeerIndexedSendWrIdFields;                          /* 2 bytes */
+
+typedef struct HomerPeerSendWrId
+{
+    HomerPeerSendWrClass class;                            /* 4 bytes + 4 padding */
+    union {                                                /* 8 bytes (widest member: uintptr_t) */
+        HomerPeerPayloadSendWrIdFields  payload;
+        HomerPeerControlSendWrIdFields  control;
+        HomerPeerIndexedSendWrIdFields  command;
+        HomerPeerIndexedSendWrIdFields  clientCompletion;
+        uintptr_t                       untaggedSourceAddress;
+    } u;
+} HomerPeerSendWrId;
+
+/* The send-CQ drain decodes one of these PER CQE. If a future field pushes this to 24 bytes it stops
+ * fitting the x86-64 return registers -- break the BUILD so that becomes a deliberate decision. */
+_Static_assert(sizeof(HomerPeerSendWrId) == 16,
+               "decoded send WR-ID must stay 16 bytes (send-CQ drain hot path)");
+
+/* THE priority decode. The ONLY place bits 60-63 are examined. SEND CQEs ONLY -- see 26.7:
+ * receive WR-IDs are a SEPARATE namespace (bootstrap = 0, notification = slotIndex + 1) and a
+ * "universal" decoder would misclassify those small numeric ids as UNTAGGED SENDS. */
+static inline bool HomerPeerDecodeSendWrId(uint64_t raw, HomerPeerSendWrId *out);
+```
+
+**`ownerSlot` is ONE field selected by `kind`, not two.** A separate `sendOwnerSlot` and `ackOwnerSlot` would be
+honest and wasteful -- they can never both be live, and the second one is what would push the struct to 24.
+
+It is still passed by **out-param**, so in practice the 16 bytes mostly never materialise. The assert means we do
+not have to *hope* so. ⚠ Still **MEASURE on the gate** (G9): source inspection cannot prove "free".
+
 ### 24.2 The couplings that silently cap tables
 
 A WR-ID field width is a **hard cap on the table it indexes.** One such assert already exists (`:118`) — and it
