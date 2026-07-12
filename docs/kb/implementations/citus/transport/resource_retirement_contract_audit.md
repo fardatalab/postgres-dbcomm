@@ -3611,3 +3611,55 @@ namespace must be stated as separate and disjoint.
 3. **§23 — P0-c.** Header pool: **rollback only**. Tail pool: rollback (zero-WR failures only) + frontier +
    `WOULD_BLOCK` backpressure, retired by the completion's `RESERVED_TAIL_SLOTS`. ACK path (`:10338`) gets the
    same treatment.
+
+### 25.5 IMPLEMENTATION SPEC (concrete) — §25 / F7
+
+**⚠ The single most important discovery while specifying this.** `TupleSinkServiceWaitForPeerSendCompletionRdma`
+(`:10397`) says in its OWN doc comment:
+
+> *"waits for the signaled payload publish checkpoint. Once it returns successfully, all earlier unsignaled WRs
+> posted on the same QP are locally complete as well, so **the caller may advance its source-slot reuse
+> frontier**."*
+
+**That is P0-c's frontier, and this is the function whose success authorises advancing it — and it matches on
+OPCODE ONLY, with no `wr_id`.** A stranger's `RDMA_WRITE` CQE satisfies it, after which the caller frees staging
+slots whose WRs are **still in flight**.
+
+**F7 and P0-c are not adjacent bugs. F7 is the mechanism by which a caller is TOLD it is safe to do the thing
+P0-c is trying to make safe.** Fixing the pools while this function can lie would be building on sand. This is
+the concrete vindication of §26.1's re-ordering.
+
+**It has NO CALLER** (verified). **DELETE IT** — an unused API that authorises a frontier advance on an opcode
+match is a landmine the next implementer will reach for **by name**. Deleting is a stronger fix than repairing.
+
+#### The edits
+
+| # | file | change |
+|---|---|---|
+| 1 | `..._rdma.c` (`:799` struct) + `.h` | Add `const TupleSinkServicePeerSendCompletionCallbacks *sendCompletionCallbacks; void *sendCompletionContext;` to `TupleSinkServicePeerTransportState`. New API `TupleSinkServiceRegisterPeerSendCompletionCallbacksRdma(...)`. **Document that both pointers MUST outlive the transport.** |
+| 2 | `tuple_sink_service_process.c` | Make the callback set a **file-scope `static const`** (its 4 members are static function pointers — stable forever; mind the `#ifdef HOMER_DPU_P2_DIAG` probe at `:15234`). Add a **service-owned** `HomerServiceCqDrainContext` whose `sessionStates`/`streamEntries` are the long-lived tables and whose `progressResult` points at a **service-owned accumulator** — ⚠ **NEVER a caller's stack frame** (§26.2). Register both once, after the tables exist. |
+| 3 | `tuple_sink_service_process.c` | ⚠ **DO NOT change the normal drain.** `HomerServiceExecuteCqDrainProgressPlan` (`:15212`) keeps its per-call stack structs — it needs the *caller's* `progressResult`. The registered pair is used **only** by internal/blocking drains. |
+| 4 | `..._rdma.c:3922` | `TupleSinkServiceWaitForSendCompletion` gains `uint64_t expectedWorkRequestId`. It passes the **registered** callbacks/context to `HandleTaggedSendCompletion` instead of NULL, and **keeps polling** after dispatching someone else's CQE. |
+| 5 | `..._rdma.c:3973` | Match on **`wr_id == expectedWorkRequestId`**, not on opcode. Keep the opcode check as a **secondary sanity check that ALARMs on mismatch** (a right-id/wrong-opcode CQE means the WR-ID space is corrupt). |
+| 6 | `..._rdma.c:3796`+ | If a typed CQE arrives and **no callbacks are registered**: **ALARM that NAMES THE LOST EVENT** (`"ALARM ... RETIREMENT EVENT LOST class=%u wr_id=0x%llx"`), then fail. **Never a quiet `return false`** — today a destroyed retirement event is indistinguishable from a generic error. |
+| 7 | callers `:7756`, `:9573`, `:10279`, `:10465` | Thread the WR-ID they posted (for untagged writes it is the source-buffer address, `:5231`). |
+| 8 | `..._rdma.c:10397` + `.h` | **DELETE `TupleSinkServiceWaitForPeerSendCompletionRdma`** (see above). |
+
+#### ⚠ The one thing the implementer MUST verify, not assume
+
+**Re-entrancy.** Dispatching a **payload** callback from inside a blocking wait means the payload completion
+handler runs while the caller is somewhere deep in a publish path. P0-a added `HomerServiceSendCqDrainDepth`
+(`tuple_sink_service_process.c:3889`), and the review verified it wraps only the **typed service drains** — it
+does **NOT** cover the blocking wait's direct polling, so it will neither protect nor block this dispatch.
+
+**So: does `HomerServiceHandlePayloadSendCqeFromDrain` only advance stream frontiers, or can it re-enter the
+publisher / mutate state the interrupted caller is mid-way through updating?** If it can, this fix introduces a
+re-entrancy bug and must change shape (e.g. queue the CQE for the next real drain instead of dispatching inline).
+**VERIFY IN THE CODE. Report the answer either way.**
+
+#### Acceptance
+
+- Builds all targets. 3× gate, `ALARM = 0`, clean SIGTERM (the standard pipeline).
+- ⚠ **The gate will NOT exercise this** — the SQL command path uses the `CRITICAL_CONTROL` lane, whose CQEs
+  already retire internally (§23.6). **This stage is validated for NO REGRESSION, not for the fix.** Say so.
+  The workload that would exercise it is backend-to-backend COPY, which is 🔴 **already broken at HEAD**.
