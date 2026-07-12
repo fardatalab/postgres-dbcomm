@@ -1182,7 +1182,7 @@ owners, explicitly recording what it discarded** (`:4278`, `:4290`).
 | **P0-a** | ready | self-contained; phases 2-3 are local |
 | **P0-b** | ready | self-contained |
 | **P0-c** | ready | needs the transport-helper API change (return the slot indices) + WOULD_BLOCK backpressure |
-| **P0-d** | ready, **much smaller than first thought** | the quiesce+count ALREADY exist (§10.1). All that remains is that the forced-teardown deadline bypasses the drain. |
+| **P0-d** | ✅ **LANDED + VALIDATED** (citus `9a6f68257`) | §15. NOT what §8 thought: two premises were refuted, and the real hole was the `ResetSession` FUNNEL releasing with no drain (reachable from shutdown). Fixed by enforcing the drain IN the funnel — every path correct by construction. |
 | **P0-e** | **DECIDED — Option A** (§12) | quarantine until postmaster restart. No protocol. |
 | **P0-f** | ✅ **LANDED + VALIDATED** (citus `64050e0dd`) | the certifier's `bool` could not express NOT_FOUND. §14. Was load-bearing for P0-d/P0-e; both are now unblocked. |
 | **P1-f** | ready, **FREE** | **TWO invariants, not one** (§11.1) — one per resource, each with its own proof |
@@ -1832,3 +1832,44 @@ contract being a property of the RESOURCE, not of each caller's discipline.
 - **Verify inferred claims BEFORE designing on them, not after.** Two of the three premises I was about to
   build on were false, and one of them was mine. This is the *third* time an inferred claim about this file was
   refuted by the code (see §10.1, §14.8). **In this codebase, "I reasoned it must be so" has a losing record.**
+
+### 15.5 ✅ P0-d LANDED AND VALIDATED (citus `9a6f68257`, July 12, 2026)
+
+Three consecutive pgbench runs on the four-role DPU stack (one postmaster, one pair of services, no restarts):
+5/5 tx and five decoded rows each, empty error streams. **Plus a NEW validation step that exercises the very
+path P0-d closes** — a clean SIGTERM shutdown of both DPU services, i.e. `ResetSession → the funnel`, which
+previously unbound arena slots with **zero** drain.
+
+Both DPU logs, across the runs **and** the shutdown:
+
+| counter | result |
+|---|---|
+| `ALARM` | **0** |
+| `arena release waited for DMA` | **0** |
+| `phase 3 not complete` (an unbind refusal) | **0** |
+| `dropped grouped-control snapshot` (the Scenario-E backstop) | **0** |
+| `drain timed out` | **0** |
+| clean `T1 → T2 → T3 → T4` | **3× each**, one per session |
+
+**The new drain found every slot ALREADY DRAINED and pumped ZERO rounds.** That is the predicted healthy-run
+behavior *and* the proof it costs nothing on the normal path: the clean T4 teardown had already drained, so the
+funnel's drain is a single query and no pump. Services exited cleanly; no hang.
+
+### 15.6 ⚠ NEW OBSERVATION from the shutdown exercise — belongs to P0-a / P1-f, not P0-d
+
+The SIGTERM shutdown printed, once:
+
+```
+tuple-sink service: refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers
+quiesce session=1 index=0 current_sequence=39 current_kind=8 ... reset_complete=0
+```
+
+**A DIFFERENT resource — the peer command mailbox — correctly REFUSED to reset because its writers had not
+quiesced, and the service then exited anyway.** That is exactly the shape P0-a and P1-f exist to fix (a guard
+that refuses, followed by a leave that ignores the refusal), and it is the **first time we have seen it fire**.
+It is not a P0-d regression — P0-d covers the arena slot, not the peer mailbox. **Fold this log line into P0-a's
+acceptance criteria: after P0-a, a clean shutdown must not print it.**
+
+*Rule earned: exercising the SHUTDOWN path found a live contract violation in a subsystem the change did not
+touch. Shutdown is where every "we'll clean it up later" comes due at once — put it in the acceptance criteria,
+not the follow-ups.*
