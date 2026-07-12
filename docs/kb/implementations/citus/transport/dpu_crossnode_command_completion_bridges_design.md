@@ -2581,3 +2581,66 @@ FATALs.
 - **A happy path must not depend on the failure path to clean up after it.** That coupling is invisible
   while both work, and it converts any future strengthening of failure handling into a regression on every
   successful run.
+
+---
+
+## 16. P4.0 — Stage-5 ABI cleanup: design of record (July 12, 2026)
+
+### 16.1 What is actually wrong
+
+`CitusTupleSinkTransportHeader.generationSequence` is a **family-dependent** field in a **family-agnostic**
+transport envelope. Its own comment admits it:
+
+> *"Tuple-result DATA/EOS records still use generationSequence as their command-local sequence until the
+> Stage 5 EOS cleanup. Other object families must validate their semantic sequence in their own payload
+> header, not in this common transport envelope."*
+
+Basebackup writes 0; tuple results write a 1-based command-local sequence. A consumer that reads the
+envelope therefore has to know which family it is looking at — and in run 39 one did not, demanded the
+BASEBACKUP convention (`== 0`) on TUPLE records, and silently rejected every row forever (§10l). This
+field is the root of that bug family.
+
+### 16.2 The key finding: on the PACKED path the envelope field is already a pure duplicate
+
+`CitusTupleSinkBatchHeader.sinkSequence` is **already written and already validated** alongside it:
+
+- written: `homer_tuple_queue_frontend.c:1494, 1935`; `tuple_sink_service_process.c:22847, 30352`
+- validated: `homer_tuple_queue_frontend.c:2188`; `tuple_sink_service_process.c:29776, 30031`
+
+So for the packed wire form P4.0 is a **deletion**, not a migration: drop the envelope duplicate and its
+checks; the payload header already carries the truth.
+
+Only the **DECODED** form (the DPU two-ring deform relay -> role 7) lacks a payload-level sequence: its
+`HomerDecodedTupleBatchHeader` has none, so the sequence lives ONLY in the envelope. That is the one place
+where something must be added.
+
+### 16.3 DEVIATION from §12.4, and why
+
+§12.4 said to move the sequence into `HomerDecodedTupleBatchHeader.reserved0` — *"free, no struct growth"*.
+**That is wrong: `reserved0` is `uint32_t` and the sequence is `uint64_t` (`sinkSequence`).** Reusing it
+would silently TRUNCATE — in the very field whose mistyping caused this bug family.
+
+**Decision:** replace `uint32_t reserved0` with `uint64_t commandSequence`, growing the decoded batch header
+24 -> 32 bytes. Eight bytes on a record that already carries a 56-byte transport envelope is noise, the
+tuples after it are MAXALIGN(8) so no padding is wasted either way, and it makes the command sequence the
+SAME TYPE everywhere (`uint64_t`, mirroring `CitusTupleSinkBatchHeader.sinkSequence`). Correctness over a
+stale "free" claim.
+
+### 16.4 The change
+
+1. **`homer_decoded_tuple_abi.h`** — `reserved0` -> `uint64_t commandSequence`; bump
+   `HOMER_DECODED_TUPLE_BATCH_PROTOCOL_VERSION`.
+2. **`homer_tuple_abi.h`** — the envelope's `generationSequence` is RETIRED: same 8 bytes, renamed to a
+   reserved field that MUST BE ZERO for every family. Bump `CITUS_TUPLE_SINK_PROTOCOL_VERSION`.
+3. **Producers** stop writing a semantic sequence into the envelope (write 0).
+4. **The deform** (`homer_tuple_deform.c`) stamps `destBatchHeader->commandSequence` from
+   `sourceBatchHeader->sinkSequence` — it already holds the source header.
+5. **Consumers** drop every envelope-level `generationSequence` check. The packed path keeps its existing
+   `sinkSequence` checks; the decoded path (client `HomerClientSqlResultDeliverDecoded`) validates
+   `batchHeader->commandSequence` instead of `header->generationSequence`.
+6. **THE PERSISTENT-STREAM IDENTITY RULE (§10l) IS UNCHANGED** — per-COMMAND state still restarts
+   (`ordinal -> 0`, `sequence -> 1`); per-STREAM byte frontiers are still absolute. Only the FIELD the rule
+   reads changes. The client's `receiveExpectedGenerationSequence` is renamed to
+   `receiveExpectedCommandSequence` to match.
+
+Version bumps mean a stale binary fails LOUDLY (`BAD_PROTOCOL`), so all four machines must be rebuilt.
