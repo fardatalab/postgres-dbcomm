@@ -2029,3 +2029,102 @@ cheap for a local CPU `memset`, **absurd as a PCIe DMA**.
 *Rule earned: when a fix moves work from a CPU memset to a DMA, price it by what must ACTUALLY be written, not
 by what the old code happened to touch. The old code zeroed 13.7 MB because zeroing was free; naively porting
 that to the DPU would have made a ~400-byte correctness fix into a 13.7 MB per-session transfer.*
+
+---
+
+## 17. P0-e — THE REFUTATION BROKE OPTION A. Three defects, one of them self-inflicted by P0-d.
+
+I asked for refutation, not review. It delivered. **C1 survives; C2, C5 and C6 do not.**
+
+### 17.1 ✅ C1 SURVIVES — bodies genuinely never need zeroing (the load-bearing claim)
+
+Independently confirmed on **four** readers, all frontier-gated:
+
+- backend command reader waits for `publishedEpoch == expectedCommandSequence` before copying the record
+  (`remote_execution_backend_bridge.c:420-481`);
+- completion producer derives `nextEpoch` from the **reset** header and publishes only after the body is ready
+  (`:1828-1855`, `:1906-1908`);
+- the DPU reads the role-3 control header first and only then submits the slot read for the **discovered nonzero**
+  epoch (`homer_service_dpu_dma.c:12325-12357`);
+- `PollCitusTupleSinkRecord` compares `consumedHead`/`publishedTail` **before touching storage**, and wrap/trailer
+  handling never speculatively parses beyond the published frontier
+  (`homer_tuple_queue_frontend.c:2070-2149`);
+- DPU byte-ring pulls clamp to `acceptedPublishedTail` and independently reject ranges beyond it
+  (`homer_service_dpu_dma.c:3088-3130`, `:4089-4207`).
+
+> **Stale bodies are unreachable through every protocol reader once the control frontiers are reset. The
+> ~400-byte header-only re-init is CORRECT; the 13.7 MB body zero is data-remanence hygiene, not correctness.**
+
+### 17.2 ❌ C2 REFUTED — `tenancyBaselinePending` is NOT a universal arena gate
+
+It is checked by **grouped-control submission ONLY** (`homer_service_dpu_dma.c:11528-11535`).
+
+- **Role-3 completion polling does NOT check it** — it gates on binding + `pollQuiesced` + own in-flight
+  (`:1661-1679`) and can submit a control read at `:1733`. At re-init time the rings are **freshly bound** and
+  `pollQuiesced` is **false**, so **role-3 polling is ARMED while my re-init DMA would be writing that very
+  header.** A real race, introduced by my own design.
+- **Role-2 command publication has NO baseline/spawn/backend-live gate at all**
+  (`HomerDpuDmaSubmitBackendCommandPublication`, `:2168-2299`; executor `tuple_sink_service_process.c:46452-46482`).
+  Ordering is currently enforced only *higher up* (peer command landing waits for `backendLoopActive`,
+  `:42604-42617`) — **not at the arena/DMA layer.**
+
+**FIX:** `tenancyBaselinePending` must become the **UNIVERSAL** *"this ring has no trustworthy baseline yet — do
+not touch it"* gate, checked by **role-3 polling and role-2 publication as well**. Cost: one bool read on a cache
+line already being touched, on each path. Negligible.
+
+**Also:** extending CLEAR from one contiguous 192 B write to **four non-contiguous** ones requires an
+**AGGREGATE completion condition** — `arenaLinesCleared` must go true only after **ALL** writes physically
+retire, or a partially-initialized slot becomes observable.
+
+### 17.3 ❌ C5 REFUTED — the crash path has a LIVENESS leak, and P0-e does not fix it
+
+**The 30 s teardown deadline is set at T1** (`tuple_sink_service_process.c:42903-42906`), and **T1 only fires on a
+terminal backend completion** (`:42815-42889`). A hard-crashed backend produces **no terminal completion**, so:
+
+> **T1 never runs ⇒ the 30 s deadline NEVER STARTS ⇒ the DPU keeps polling the dead backend's slot
+> INDEFINITELY.** The host reaper edits **host** arena state only (`homer_frontend_agent.c:722-742`) and **sends
+> the DPU nothing.** There is **no DPU-visible signal that a backend died.**
+
+The slot is only reclaimed when some *other* lifecycle path fires (client disconnect → peer close → session reset
+→ the funnel). **So DPU-owned re-init fixes CORRUPTION but not AVAILABILITY: the slot is never re-nominated
+because the DPU never unbinds.** This is a **separate defect (call it P0-g)** and it is arguably the more
+serious of the two.
+
+### 17.4 ❌ C6 REFUTED — and P0-d ITSELF invalidated the certificate
+
+> **"A DPU nomination is a certificate that the slot was DRAINED" rests on "unbind requires a completed drain".
+> P0-d made that FALSE — by design.** `TupleSinkServiceReleaseDpuArenaBinding` falls back to
+> **`force = true` (Scenario E cancellation)** on `IN_FLIGHT` / `QUERY_INVALID`
+> (`tuple_sink_service_process.c:20005-20034`), which unbinds **with DMA still in flight**.
+>
+> **A forced unbind therefore leaves a slot that the DPU may RE-NOMINATE, and the nomination would certify a
+> drain that never happened.** The escape hatch I added in P0-d punched a hole in the certificate P0-e depends on.
+
+**FIX — a DPU-SIDE quarantine (the right side, at last):** the DPU must **refuse to re-nominate a slot whose
+unbind was FORCED**, until its rings actually drain. The party that knows is the party that enforces. **No
+protocol, no host involvement** — and it is the natural symmetry we kept missing: the quarantine belongs where
+the knowledge is.
+
+### 17.5 Other findings (smaller, all real)
+
+- **A THIRD caller of `ReleaseArenaSlot` I never enumerated:** the backend applies `BACKEND_SLOT_RELEASE`
+  **inside its command loop** (`remote_execution_backend_bridge.c:2660-2667`, from `:3074`, `:3201`, `:3252`) —
+  not only at `on_proc_exit` (`:2584`). My "two callers" was wrong.
+- **`BindArenaSlot` publishes `BOUND` BEFORE storing `ownerPid`** (`homer_frontend_agent.c:551` vs `:641`). A
+  crash in that window leaves a `BOUND` slot with `ownerPid == 0`, which the reaper **skips forever**
+  (`:726-729`). An unreapable slot, unrelated to the memset.
+- **The reaper logs success unconditionally** (`:739-742`) even when the checked release silently no-ops on an
+  owner mismatch (`:675-679`). *A diagnostic that lies.*
+- **C4 partly refuted:** the DPU also reads the role-3 completion **slot body** and role-5 result **storage** —
+  not merely the headers. (Does not break C1: those reads are frontier-gated.)
+
+### 17.6 Rules earned
+
+- **An escape hatch you add in one stage can invalidate a proof you rely on in the next.** P0-d's `force` was
+  correct *for P0-d*. It silently falsified P0-e's central argument, and only an adversarial pass caught it.
+  **When you add an exception, go re-check every invariant that was true before it.**
+- **"X gates Y" must be checked at the layer that PERFORMS Y, not the layer that usually calls it.** Role-2
+  publication is ordered correctly today by a caller several frames up. That is not a gate; it is a coincidence
+  with good manners.
+- **A fix for corruption is not a fix for availability.** I set out to stop a slot being poisoned and produced a
+  design under which the slot is never reused at all.
