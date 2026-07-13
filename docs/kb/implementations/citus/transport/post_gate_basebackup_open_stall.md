@@ -435,10 +435,29 @@ the DPU had been issuing a DMA read against **every one of them, on every scan p
 
 Plus **the late-clear guard**: a clear establishes a baseline *for the tenant that requested it*; if that tenant is
 already gone, clearing the flag re-arms discovery on a ring with **no** tenant — the same fatal from the other
-direction. The completion now refuses to clear a ring whose `boundServiceSessionId` is 0. *(Deliberately NOT fixed
-by adding the clear to the ring in-flight accounting, as the reviewer proposed: that needs the submit site and the
+direction. The completion refuses to clear a ring whose `boundServiceSessionId` is 0. *(Deliberately NOT fixed by
+adding the clear to the ring in-flight accounting, as the reviewer proposed: that needs the submit site and the
 retire whitelist to agree about a **union member** — exactly the shape of the global-vs-local bug fixed hours
 earlier — and a mis-paired count would wedge unbind FOREVER.)*
+
+> ### ⚠⚠ THAT GUARD IS INSUFFICIENT, AND I SAID IT WASN'T
+>
+> A later review caught it, and it is right: `boundServiceSessionId == 0` catches *"released underneath us"* but
+> **NOT *"released AND REBOUND"***. If the arena slot is rebound to a **new** tenant before the stale clear's
+> completion lands, the new tenant's session id is **nonzero**, the guard **passes**, and the stale completion
+> clears the **new** tenant's `tenancyBaselinePending` prematurely. The window is absurdly narrow — a DMA
+> completion would have to outlive a full release + rebind + respawn — but **the guard is not equivalent to what I
+> claimed, and I claimed it with confidence.**
+>
+> **The correct fix is the pattern this file already uses and trusts: stamp the tenancy generation on the clear
+> task at SUBMIT and compare it at COMPLETION** — exactly what grouped-control discovery does with
+> `slot->owner.u.groupedControl.tenancyGeneration`. The spawn owner carries no such field today
+> (`homer_service_dpu_dma.c:278`); submit records only `arenaSlotIndex` (`:7210`). Adding it is small, needs no
+> counters and no whitelist, and closes the hole properly. **In flight.**
+>
+> **The lesson is the one this whole document is about, applied to me:** I rejected the reviewer's fix for a good
+> reason (union-accounting fragility) and then reached for a *cheaper* one without checking that it covered the
+> same ground. *Rejecting a bad fix does not make your alternative a good one.*
 
 ### ⚠⚠ WHY VALIDATION MISSED IT: **OUR OWN CLEANUP PROTOCOL SCRUBBED THE TRIGGER**
 

@@ -98,18 +98,98 @@ completion for that exact sequence.** **Miss one reject path and the client hang
 libpq's `PGRES_PIPELINE_ABORTED` discipline (`fe-exec.c:3266`) — the server skips work, but *something* must still
 produce one result per issued command, or the two sides lose lockstep forever.
 
+## THE ADVERSARIAL REVIEW — what it changed (2026-07-13)
+
+### ✅ H1 IS **NOT** A BLOCKER — and the reviewer's own finding is why
+
+The reviewer called the missing FAILED-completion funnel a **BLOCKER**. **It is not**, and I verified why:
+
+```
+tuple_sink_service_process.c:42887  TupleSinkServiceSetOkResponse(&startResponse->header, ...START_COMMAND...)
+tuple_sink_service_process.c:43016  TupleSinkServiceSetOkResponse(&startResponse->header, ...START_COMMAND...)
+```
+**Two `SetOkResponse` sites. ZERO `SetErrorResponse` sites.** A START response can *only ever* say OK. START also
+bypasses the generic dispatcher (`:43956`), so it never reaches the generic error-response machinery.
+
+> **THERE IS NO SYNCHRONOUS START REJECTION TODAY.** A failed START writes **no response at all**, and the client
+> simply spins to its 30 s timeout. After the change, a failed START produces **no completion**, and the client
+> spins to its 30 s timeout. **IDENTICAL BEHAVIOR. Removing the wait loses nothing, because nothing was there.**
+
+So the FAILED-completion funnel is a **separate quality improvement** that fixes a hang which *already exists*
+today — **not a prerequisite.** The reviewer called it a blocker because it assumed the synchronous path was
+reporting errors. It never was. **Tracked separately; see "Deferred" below.**
+
+### The reviewer's four REAL findings (all folded in)
+
+- **R1 — THE SLOT LEASE MUST BE LIBRARY-OWNED.** My plan leaned on pgbench's `st->homer_command_pending`
+  (`pgbench.c:4216`) — i.e. **relying on a CALLER to maintain a LIBRARY invariant.** The client library has no
+  selected-DPU slot lease at all, and the completion ACK (`homer_client.c:6732`) advances only the event cursor,
+  touching nothing on the role-1 slot. **The library must own an "outstanding START" identity and mark the slot
+  FREE only when THAT command's terminal completion is acknowledged.**
+- **R2 — DELETING THE RESPONSE IS NOT ENOUGH; DELETE ITS CAPACITY GATES TOO.** START currently defers on
+  pending-response capacity (`:42805`, `:42950`) and the scheduler arms/clips on `pendingResponseFreeSlots`
+  (`:44707`, `:44719`). Leave those and **START still silently stalls behind unrelated OPEN/CLOSE responses**, on a
+  pool it no longer uses. ⚠ But **keep the pool itself** — non-START responses still need it — and **do not remove
+  `publishSlot->frontendCommand`**; close-drain ownership matching reads it (`:42374`).
+- **R3 — THERE ARE THREE OTHER START PRODUCERS.** `HomerFrontendDmaStartCommand` (`homer_frontend_control.c:1189`,
+  the citus.so frontend-agent path) and **both transport smokes**
+  (`homer_dpu_comch_transport_smoke.c:693`, `homer_dpu_tcp_transport_smoke.c:617`) construct a START request
+  directly. **An unconditional `commandSequence != 0` validator breaks all three.** Every producer must fill the
+  new field.
+- **R4 — ⚠ A "CLOSE" IS A START.** The SQL **semantic close** is a `START_COMMAND` whose `commandKind` is
+  `CLIENT_SQL_SESSION_CLOSE` (`homer_client.c:3530`) — a *verb the backend executes*, not a channel teardown. The
+  **lifecycle close** (`CLOSE_SESSION`) is the separate control request that tears the session down. Consequences:
+  **the semantic close CONSUMES a commandSequence** (miss it and every later sequence is off by one, so the DPU's
+  validator ALARMs on every subsequent command); it inherits fire-and-forget automatically (same function); and it
+  **already waits for its own completion** (`:3539`), so the role-1 slot is provably free before the lifecycle
+  CLOSE reuses it. *The ordering constraint holds already — but only by luck, so ASSERT it.*
+
+### ✅ Claims the review CONFIRMED
+
+- **C2 — sequence minting is safe.** `selectedSession->currentCommandSequence` has **four** writers, not eleven
+  (`:42925`, `:43044`, `:43352`, `:44456`). Three are consequences of client START admission. The one out-of-band
+  writer (teardown's synthetic `BACKEND_SLOT_RELEASE`, `:44434`) is reached **only after a terminal completion has
+  begun teardown** (`:43516`) and cannot desynchronize a live session. *(The other apparent writers act on
+  `TupleSinkServiceSessionState`, a different struct.)*
+- **C3 — no late READ of the request slot.** The DPU DMA-reads it once (`homer_service_dpu_dma.c:12177`), and all
+  later work uses a **service-owned copy** (`:43002`, `:47125`). ⚠ **But there IS a late WRITE** — see the ABSOLUTE
+  below.
+- **C4 — nothing but the client reads the START response.** (`homer_client.c:6391` is its sole consumer.)
+- **C5 — the basebackup does NOT issue START.** Scoping fire-and-forget to `START_COMMAND` is safe. *(Correction:
+  basebackup tail publication doesn't even use this helper — it publishes its host line directly, `:2385`.)*
+- **C6 — PENDING is correct on every explicit selected-DPU START path** (`:42885`, `:43014`). ⚠ **Preserve
+  `commandFlags`**, currently copied at `:42894`/`:43023`.
+
+### ⚠⚠ ABSOLUTE, from C3 — CEASING THE CLIENT'S WAIT IS NOT ENOUGH
+
+> **The DPU's START response DMA must be DELETED, not merely ignored.**
+
+The response is written as a body DMA + a `RESPONSE_READY` DMA (`homer_service_dpu_dma.c:1951`, `:2083`), and the
+scheduler services completion events **before** pending responses (`:47434`, `:47458`). So if the client stops
+waiting but the DPU still writes, **a late response DMA lands on a slot the client has already reused** for the
+next START — or for the lifecycle CLOSE. **Silent memory corruption of the next request.** Delete the write.
+
 ## HAZARDS (each must be discharged before this lands)
 
-- **H1 — an unenumerated reject path.** Enumerate **every** way the DPU can refuse a START and make each publish a
-  `FAILED` completion. This is the one that hangs the client.
-- **H2 — sequence desync.** `selectedSession->currentCommandSequence` has ~11 writers. If any advances it
-  out-of-band on a selected-DPU CLIENT_SQL session, the client's prediction diverges. Step 2's validation converts
-  that from silent corruption into a loud ALARM — but **enumerate the writers** and know which apply.
-- **H3 — the control slot is shared with OPEN/CLOSE** (`homer_client.c:3357`, `:3632`). OPEN precedes all commands;
-  CLOSE follows the last completion. Safe *by sequencing* — so **assert it**, do not assume it.
-- **H4 — ABI bump.** Both DPUs rebuilt. A stale DPU must fail LOUDLY on `protocolVersion`, not silently misparse.
-- **H5 — the basebackup shares this code.** `HomerClientDpuSubmitControlRequest` also carries basebackup OPEN/CLOSE
-  and tail publishes. **Scope fire-and-forget to `START_COMMAND` only**; the 4-role basebackup must still pass.
+- **H2 — sequence desync.** Resolved by C2, but keep step 2's validation: convert any divergence into a **loud
+  ALARM**, never silent corruption. (Today's P0 was a silent desync between two halves of one operation.)
+- **H3 — the control slot is shared with OPEN / semantic-close-as-START / lifecycle CLOSE.** Safe by sequencing —
+  so **assert it**, do not assume it. R1's library-owned lease is what makes the assertion possible.
+- **H4 — ABI bump.** `CITUS_REMOTE_EXEC_CONTROL_PROTOCOL_VERSION` 32 → 33. Both DPUs rebuilt. A stale DPU must fail
+  **LOUDLY** on `protocolVersion`, not silently misparse.
+- **H5 — the basebackup shares this code.** Resolved by C5; still validate it.
+
+## DEFERRED (real, tracked, NOT part of this change)
+
+- **The FAILED-completion funnel.** Today, *dozens* of DPU-side paths accept or drop a START and produce neither a
+  response nor a completion — pull-acceptance rejects (engine-fatal), stage-capacity deferrals that can defer
+  forever, materialization failures, a cross-DPU egress "dropping" path (`:4046`), receiver-side silent rejection
+  after backend teardown (`:43272`), and no DPU-side command deadline that manufactures a FAILED completion if the
+  backend simply never publishes one (`:42420`). **Each is a 30-second client hang TODAY.** Worse, several leave
+  the staged-queue head un-released (`homer_service_dpu_dma.c:5802`), which head-of-line-blocks every later ring —
+  the same disease as the discovery P0. **This deserves its own centralized funnel: reject START → release the
+  staged owner → advance/fence the sequence → publish exactly ONE FAILED completion.** It is not made worse by this
+  change, and it should not be smuggled into it.
 
 ## VALIDATION
 
