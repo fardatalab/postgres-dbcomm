@@ -472,13 +472,22 @@ done
 | **basebackup, 4-role DPU relay** | **DPU** | ✅ | the **only** validated basebackup topology |
 | **DPU TCP transport smoke** | **DPU** | ✅ | the **only** single-node host↔DPU DMA regression net |
 | `pgbench --homer` (local) | host | ✅ | local control path, `CLIENT_SQL_SESSION`, backend spawn, local result sink |
-| `pgbench --homer` (remote RDMA) | host | ✅ | host-service peer RDMA: farnet0 host service ↔ farnet1 host service |
+| `pgbench --homer` (remote RDMA) | host | 🔴 **BROKEN at HEAD** | fails at **session open** — `open request parameters mismatched existing sink` — before any payload flows; pgbench then **spins at 100% CPU instead of exiting**. Found 2026-07-12 the first time anyone ran it in weeks. **Not being fixed: host-service Homer is being removed.** |
 | backend-to-backend COPY | host | 🔴 **BROKEN at HEAD** | hangs; unbisected since citus `7a2eaed53` |
 | `pgbench --homer-dpu` (alone) | DPU result only | 🔴 **never completed e2e** | DPU result relay **without** the DPU command plane |
 
 **If you only run one thing, run the gate.** `pgbench --homer --homer-dpu-command` is the workload that
-exercises the DPU path end to end. The two `pgbench --homer` rows are the **host-service** path — useful as a
-cheap smoke and as the libpq-comparable baseline, but they do **not** touch a DPU.
+exercises the DPU path end to end.
+
+⚠ **THREE of the workloads above are broken at HEAD, and all three are HOST-SERVICE workloads.** That is not a
+coincidence: **host-service Homer is being removed** as the DPU command plane lands, and every host-service path
+has been rotting because nobody re-ran it while the substrate moved underneath. Do **not** spend time reviving
+them — the plan is deletion, not repair. See
+`docs/kb/implementations/citus/transport/copy_path_revival_contract.md`.
+
+The practical consequence for validation: **the DPU gate and the 4-role basebackup are the ONLY workloads that
+still prove anything.** There is currently **no working exerciser at all** for the host-service `SEND_QUEUE`
+payload arm — which is fine only because that arm is scheduled for removal.
 
 Broken command shapes — and why each *looks* plausible — are kept in
 `docs/kb/operations/farnet_diagnostics_and_baselines.md` §4, deliberately **out** of this runbook so nobody

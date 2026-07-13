@@ -1,4 +1,33 @@
-# The COPY revival contract — what to uphold when you come back to fix backend-to-backend COPY
+# The COPY revival contract — what to uphold when you come back to backend-to-backend COPY
+
+> ## ⚠ READ THIS BOX FIRST — IT CHANGES WHAT THIS DOCUMENT IS FOR (2026-07-12, owner's direction)
+>
+> **HOST-SERVICE HOMER IS BEING REMOVED.** Once the DPU command plane lands, the host-service arm goes away.
+>
+> b2b COPY today runs through **both host services**. So COPY is **NOT going to be "revived" on the arm it is
+> currently written against** — it has to be **RE-PLUMBED ONTO THE DPU COMMAND PLANE**. Anyone who reads the
+> sections below as "go fix the host-service COPY hang" will be fixing code that is scheduled for deletion.
+>
+> **What is still worth reading here, and why:**
+> - **§1** — the hang is bounded to COPY's **control plane** (before backend-spawn submission), and the
+>   `a3cdd5f3c` suspect is **REFUTED**. Keep this: whoever re-plumbs COPY must not inherit a wrong root cause.
+> - **§2.5** — the **COPY-only surface** (coordinator routing, exact receive attachment, START_COMMAND
+>   admission, worker ingest). **That is the list of what must be re-plumbed**, and it is the most valuable
+>   thing in this document.
+> - **§3** — the substrate invariants (resource contract, P0-i signalling, F7's no-CQE-destruction, §24's owner
+>   handles, P0-c's staging pools). **These apply to the DPU plane too** — they are transport-wide.
+> - **§5** — the perf landmine, which is also the `~450 µs/command` suspect. **Still live on the DPU plane.**
+>
+> **What is now MOOT:**
+> - **§2.2/§2.3's coverage worry.** `SEND_QUEUE` **IS** the host-service arm (a DPU service structurally never
+>   touches it). It is going away, so the "we must run `pgbench --homer` to cover it" action is withdrawn —
+>   and it could not be done anyway: **`pgbench --homer` remote is itself BROKEN at HEAD** (fails at session
+>   open; found 2026-07-12). Three broken workloads, all host-service. That is the pattern, not a coincidence.
+> - The **legacy fixed-slot / sequence payload path** (§2.4) — delete it with the rest.
+>
+> **The one thing that got MORE important:** the DPU gate and the 4-role basebackup are now the **only**
+> workloads that prove anything at all. Validate against those.
+
 
 **Status: LIVE NOTE, written 2026-07-12, while COPY is BROKEN and we are actively rebuilding the substrate
 underneath it. Keep current as P0 lands.**
