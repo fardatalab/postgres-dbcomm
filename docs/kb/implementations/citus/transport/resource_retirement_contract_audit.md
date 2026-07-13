@@ -4282,3 +4282,71 @@ mask TRUNCATES`.
   connections. The 1024-slot draft would have added ~900 KB per transport state; the corrected bound lets the
   tail pool be **512** (4 KB/connection), halving that. Heap-allocated; not a stack concern.
 - **T5 clean:** no reader of `RESERVED_TAIL_SLOTS` remains anywhere in either tree.
+
+---
+
+## §29 — NEW P0-LEVEL FINDING: the SEND QUEUE has no per-LANE admission control
+
+**Found 2026-07-12 while explaining P0-c's partial-post dependency. Not yet fixed. Needs an owner decision.**
+
+### 29.1 The mismatch — and it is the SAME one §23 already found, on a different resource
+
+| | bound | scope |
+|---|---|---|
+| RDMA send queue | **256 WRs** | **per CONNECTION (per QP / per lane)** |
+| the only outstanding-WR cap | `HOMER_SERVICE_PAYLOAD_MAX_OUTSTANDING_WRS` = **192** (`tuple_sink_service_process.c:335`) | **per STREAM** |
+| streams that may share one lane | up to **64** (`CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SINKS`) | — |
+
+**The transport tracks NO per-connection outstanding-WR count.** (Verified: no such counter exists.)
+
+So **two** concurrently-publishing streams on one lane permit `2 x 192 = 384` outstanding WRs against a
+**256**-entry send queue.
+
+⚠ **This is precisely the mismatch §23.5's F2 identified for the tail staging pool** — *"the pool is per-LANE
+while the flow control that bounds it is per-STREAM"* — **applied to the send queue itself.** We fixed the pool
+and left the queue.
+
+### 29.2 Why it matters: the failure mode is a PARTIAL POST, and a partial post costs a CONNECTION RESET
+
+`ibv_post_send()` takes a **chain** (N unsignalled body WRs + 1 signalled tail). The provider pushes WRs into the
+send queue one at a time; when it runs out of room **mid-chain** it posts the prefix, sets `bad_wr`, and returns
+`ENOMEM`. That is `HOMER_PEER_POST_FAILED_PARTIAL`.
+
+A partial post cannot be undone (verbs has no per-WR cancel), the accepted prefix is live and DMA-reading our
+registered source buffers, and the batch is a semantic unit (bytes + the doorbell that commits them). **The only
+way to stop the NIC reading is to DESTROY THE QP** — i.e. a full peer-connection reset.
+
+**So under multi-stream load, a routine resource condition triggers a full connection teardown on the hot path.**
+
+⚠ **And P0-c now DEPENDS on that reset** (§28.7): on a partial post the rejected suffix's staging reservations
+are retained, advancing the cursor with no WR behind it — bounded to one batch, but it accumulates without the
+reset. So the hammer is not optional.
+
+### 29.3 Why it has never bitten — and exactly when it will
+
+Every workload we run today has **ONE** payload stream per lane (the DPU gate; the 4-role basebackup). It becomes
+reachable the moment there are **two**:
+
+- **multi-shard COPY** (when it is re-plumbed onto the DPU plane), and
+- ⚠ **P7b CONNECTION POOLING — the original goal this entire P0 sequence exists to unblock.** Pooling multiplies
+  streams per lane by construction.
+
+### 29.4 The fix (proposed, NOT implemented — owner decision)
+
+**Admission control on the send queue:** track outstanding WRs per connection, and refuse a batch that does not
+fit **BEFORE** posting it — return `WOULD_BLOCK` (retry later, no reset) instead of discovering the limit as a
+partial post (reset). That makes the send queue an **explicit** backpressure source rather than an implicit
+failure mode, which is where backpressure belongs.
+
+**What it needs:**
+- a per-connection `outstandingSendWrs` counter, incremented by `postedWrCount` and decremented on CQE
+  retirement — ⚠ but unsignalled WRs produce no CQE, so the decrement must be attributed at the **signalled
+  checkpoint** (the batch's tail CQE retires the whole chain — P0-i's rule again);
+- a pre-post check: `outstanding + chainLength <= grantedSendWr` else `WOULD_BLOCK`;
+- the service already handles `WOULD_BLOCK` correctly (retry, no reset), so no service change.
+
+**Cost:** one counter and one compare on the publish path.
+**Benefit:** partial posts become (near-)unreachable, which removes a connection reset from the hot path AND
+removes P0-c's dependency on that reset.
+
+**Open question for the owner:** is this P0 (it blocks P7b, and P7b is the goal), or is it P7b's own first step?
