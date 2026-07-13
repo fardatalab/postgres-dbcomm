@@ -4580,3 +4580,71 @@ through a 512 KiB ring = ~44,000 LAPS** — it is the **only** workload that exe
 only one that can validate a byte-relay change (§28/§31). *That* is why `4382b65d65` could break it invisibly, and
 why the byte-relay WR-budget deletion could not be validated until it was fixed. **Run both. Neither substitutes
 for the other.**
+
+---
+
+## §31 — PLANNED: give the negotiated geometry a real home, and stop allocating two DEAD POSIX SHM RINGS per stream on the DPU
+
+**Not started. Scoped 2026-07-13, out of the §30 post-mortem. Deliberately NOT bundled into §29(b) — it touches
+stream creation and needs its own gate + basebackup validation.**
+
+### 31.1 The finding: on the DPU, BOTH shm queues are allocated and NEVER USED
+
+`HomerServiceMapProducerByteRingQueue` really does `shm_open()` (`tuple_sink_service_process.c:23765`).  And on a
+**selected-DPU** service, **neither** POSIX shm queue is on any data path — for **either** workload:
+
+- **`sendQueue`** is mapped for **EVERY** byte-ring stream, on the sending **and** the receiving service
+  (`:25732`).  But selected-DPU egress is **mirror-only**: `HomerServicePumpOutgoingPayloadStream` forks to
+  `HomerServicePumpOutgoingDpuMirrorByteRingPayload` when a DPU DMA engine is present (`:32251`), and its own
+  comment says falling through to the `sendQueue` pump would be wrong (`:32275`).  **So even the basebackup
+  receiver — carefully exempted from `receiveQueue` — still shm_opens a full `sendQueue` ring nothing reads.**
+- **`receiveQueue`** is mapped for every **non-basebackup** byte-ring stream (`:25758`).  On the DPU the aliasing
+  is deliberately skipped (`:17760`), so it is never the landing ring either.  Today that means **the pgbench DPU
+  SQL-result stream allocates a second dead ring, per stream, on the DPU.**
+
+**What the DPU path ACTUALLY uses** (and neither shm queue appears in it):
+
+| workload | receiver rings |
+|---|---|
+| **basebackup** — SINGLE-ring, dual purpose | peer RDMA → **landing ring** *(IS the DMA source; no deform)* → DMA → host **role-7** consumer ring |
+| **pgbench result** — TWO-ring | peer RDMA → **landing ring** → **deform** → **tuple source ring** → DMA → host **role-5/7** arena ring |
+
+### 31.2 Why they survive: THE GEOMETRY IS ANCHORED TO A DEAD RING
+
+They survive for exactly one reason — **they are the only place the negotiated geometry lives.**  §30's fix
+(`HomerServiceStreamNegotiatedByteRingBytes()`) reads `sendQueue.byteRingBytes`.  It is correct and it fixed the
+regression, but **it stands on the very object we want to delete.**  There is also still a *fourth* geometry read
+straight out of a queue at `:17745` (`ringBytes = streamEntry->stream.receiveQueue.byteRingBytes;`), which sizes the
+landing ring.
+
+⚠ **This reframes the `!IsBaseBackup` exemption.  Basebackup was never the weird one — it is the ONLY family that
+already got this right.**  The condition that actually matters is *"is there a LOCAL BACKEND PROCESS to poll a
+shm ring"*, and on a DPU the answer is always **no** (the worker lives on the host and cannot map the DPU's shm).
+The exemption was written against the wrong predicate.
+
+### 31.3 The plan (ordered; each step is safe on its own)
+
+1. **Hoist geometry to scalars on the stream** — `stream.byteRingBytes`, `stream.maxRecordBytes` — set at creation
+   from the open request.  Geometry finally owns itself instead of squatting inside a ring.
+2. **Point `HomerServiceStreamNegotiatedByteRingBytes()` at the scalar**, and route `:17745` through it too.
+   ⚠ This is a ONE-LINE change with no call-site churn — precisely the payoff of §30 having routed all three
+   geometry checks through the accessor first.  Do NOT skip step 2's ordering: the accessor is what makes this
+   cheap.
+3. **Re-gate BOTH queue mappings on "is this a host-service stream"** rather than `!IsBaseBackup`.  The DPU then
+   stops `shm_open`ing two dead rings per stream, and the basebackup special case disappears because it was never
+   about basebackup.
+4. When host-service Homer is deleted (see `copy_path_revival_contract.md`), both fields go entirely.
+
+### 31.4 Validation requirement
+
+⚠ **Gate AND 4-role basebackup, both.**  This changes stream *creation*, which is exactly the surface `4382b65d65`
+broke (§30) — and the gate cannot see it.  §30.6 applies: a green gate says nothing here.
+
+### 31.5 Related, and NOT the same thing
+
+The **rename** (`sendQueue` → `localProducerSourceQueue`, `receiveQueue` → `localConsumerDeliveryQueue`,
+`localReceiveByteRing` → `peerInboundLandingRing`; ~270 sites) is now **cosmetic** — the accessor already removed
+the ambiguity that caused §30.  Do it whenever, but do it AFTER §31 (there will be less left to rename).
+⚠ **clangd indexes only the ACTIVE build config**: references inside `#if HOMER_SERVICE_PAYLOAD_STATS` /
+`HOMER_DPU_P2_DIAG` will be **silently skipped**, compile clean, and break only the *diagnostic* build.  Cross-check
+with a textual grep and **build the diagnostic configs to prove it.**
