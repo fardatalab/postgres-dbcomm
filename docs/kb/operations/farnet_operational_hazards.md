@@ -175,6 +175,28 @@ set — and "no output" reads like a pass in both directions. The same applies t
 deploy landed on a DPU — for a literal you know is in the new code (`DPU setup-listener action selected`).
 **Verify a protocol/ABI deployment through the installed HEADER, not through a binary.**
 
+### 3.3b ⚠ `strings BIN | grep -qF <proof>` under `set -o pipefail` REPORTS FAILURE ON SUCCESS
+
+Hit on 2026-07-13, on the landed-proof of the discovery-starvation fix. The proof script said
+**`DPU DEPLOY PROOF FAILED`** on a binary that provably contained the literal.
+
+`grep -q` exits at the **first match**. `strings` is still writing, so it takes **`SIGPIPE`** and dies with status
+141 — and `pipefail` makes the *pipeline's* status that of the failing element. **So the pipeline reports failure
+precisely because the grep succeeded.** It cannot distinguish "the string is absent" from "the string was found
+immediately", which is the only thing it exists to distinguish.
+
+```sh
+# WRONG -- fails when it succeeds, under `set -o pipefail`
+if ! strings "$BIN" | grep -qF "$PROOF"; then echo "NOT LANDED"; exit 1; fi
+
+# RIGHT -- no -q, so grep drains its input, so no SIGPIPE
+if ! strings "$BIN" | grep -F "$PROOF" >/dev/null; then echo "NOT LANDED"; exit 1; fi
+```
+
+It failed *safe* (a false negative, not a false pass), which is the only reason it did not cost a run. But it is
+the same disease this whole KB keeps cataloguing: **a diagnostic whose success is indistinguishable from its
+failure.** The same trap arms any `... | head -1`, `... | grep -m1`, or `... | read` under `pipefail`.
+
 ### 3.4 Install order is load-bearing (since command-plane S2)
 
 `citus.so` is built `-fvisibility=hidden` and leaves `HomerDpuFrontend*` **undefined**; those symbols resolve
