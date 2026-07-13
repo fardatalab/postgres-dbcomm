@@ -4129,3 +4129,156 @@ branch** —- including its strings. Our host build (no LTO) keeps them.
 - **Never make a correctness decision out of a struct the API only fills in on SUCCESS.**
 - **A WR id must describe the WR that carries it, not the shape of its sibling.**
 - **A clean build is not evidence your edit landed. Read it back.**
+
+---
+
+## §28 — P0-c v2: THE FRONTIER IS DELETED. Size the pools out of the problem instead.
+
+**Owner's call, 2026-07-12, after v1 was fully built, reviewed twice, and validated on the gate.** v1 is
+recorded in §27 and is NOT what shipped. Both sides are here because the reasoning is the point.
+
+### 28.1 The question that killed v1
+
+> *"If we make sure the staging pool is as large as the NIC's send queue, then we won't ever hit a
+> staging-pool-full situation — only a NIC-queue-full situation, right?"*
+
+Right in spirit, and it exposed two things.
+
+**First, the numbers were the other way round.** The send queue is **256**; the tail pool was **128** — *half*.
+It looked sufficient because a byte-ring batch is **≥ 2 WRs** (≥1 body + 1 signalled tail) but consumes only
+**1 tail slot**, so 256 WRs ÷ 2 = 128 batches. Exactly coincident, zero margin.
+
+⚠ **But the ACK path breaks that 1:2 ratio.** A receiver-head ACK is **1 WR consuming 1 tail slot** — **1:1**.
+With `A` ACKs and `B` batches: send-queue usage ≥ `A + 2B`, tail usage = `A + B`. At `A = 128, B = 0` **the tail
+pool is FULL while the send queue is HALF EMPTY.** ACKs are capped at 64 *per stream*, so two streams sharing a
+lane get there. **The pool genuinely could bind before the NIC** — which is exactly what should not happen.
+
+### 28.2 ⚠ THE BOUND — and BOTH of my first two attempts at it were wrong, in OPPOSITE directions
+
+**Attempt 1 (mine): "size the pool to the send-queue depth."** Too small — and for the wrong reason, which I
+only found by trying to write the assert. A staging slot is not freed by anything software does; I reasoned
+about *observability* instead of *physics* and reached for a CQ term.
+
+**Attempt 2 (mine): "the bound is SQ + CQ, because a slot is live until its CQE is DRAINED."** ⚠ **REFUTED by
+the review, and it was wrong twice over:**
+
+- **Nothing retires a staging slot any more.** There is no frontier. The CQE is merely how software would
+  *learn* of a completion — **and we never ask.** So "live until drained" describes a mechanism that does not
+  exist.
+- **If it HAD been true, SQ + CQ would not even be a bound** — one undrained signalled CQE can stand for **32**
+  earlier header-bearing unsignalled WRs.
+- And it is **actively harmful**: `ibv_create_cq()` may **round the CQ up** far above what we asked, so a
+  setup-time check on SQ + CQ would **REFUSE perfectly good providers** for no reason.
+
+**THE CORRECT BOUND — and it needs nothing from the CQ:**
+
+> A slot is unsafe only while the NIC may still be **READING** it, i.e. while its WR has not completed. Slot `S`
+> is handed out again only after `POOL` more reservations, and — **thanks to the rollback** — every one of those
+> is backed by a **POSTED** WR. You cannot have more than the granted send-queue depth of WRs posted-and-
+> uncompleted. So once `POOL > SQ_DEPTH` further WRs have been posted, the WR that was using `S` **must** have
+> completed; an RC QP completes **in order**, so it is the oldest ones that have. The NIC is done with `S`.
+
+That argument holds under **every** provider model — it does not care whether a send-queue entry is reclaimed at
+completion or only when a later signalled CQE is polled (mlx5 does the latter), because **you cannot POST past
+the send queue without earlier WRs having completed**, which is the only thing being claimed.
+
+**THE RULE (compile-time asserted for both pools):**
+
+```
+POOL_SLOTS  >  SEND_QUEUE_DEPTH + max_slots_ONE_ATTEMPT_reserves
+```
+| pool | bound | size |
+|---|---|---|
+| tail | 256 + **1** = 257 | **512** (grown from 128) |
+| header | 256 + **32** = 288 | 1024 (unchanged — it was *accidentally* right) |
+
+⚠ **The last term is real**: an attempt RESERVES AND WRITES its slots **before** it posts. *A rollback that has
+not happened yet cannot save a slot that has already been scribbled on.*
+
+⚠ **AND THE PREMISE IS CHECKED, NOT ASSUMED.** `SEND_QUEUE_DEPTH` is what we **REQUEST**. `rdma_create_qp()`
+writes the **GRANTED** caps back into `qpInitAttr` — we already read `max_inline_data` out of it and **never
+looked at `max_send_wr`**. Connection setup now re-checks the rule against the **granted `cap.max_send_wr`** and
+**REFUSES the connection** if a provider hands us a deeper send queue than the pools can cover.
+
+### 28.3 THE DECISIVE ARGUMENT FOR DELETING THE FRONTIER
+
+Not "it is simpler". This:
+
+> **THE FRONTIER CREATES THE VERY FAILURE MODE ITS ALARM GUARDS AGAINST.**
+
+A frontier must be **TOLD** what each completion frees — so the WR id had to carry `RESERVED_TAIL_SLOTS`. **And a
+WR id that has to SAY what it frees can LIE about it.** One did: §24 threaded the count into **both** payload
+encoders, but the fixed-slot builder **reserves no tail slot at all** (it re-tags the last body write as the
+signalled `WRITE_WITH_IMM`). Its completion claimed to free a slot it never took → the frontier would
+**OVER-ADVANCE** and hand out **live** slots: *precisely the corruption P0-c exists to prevent.*
+
+Sizing the pools out of the problem deletes, in one move:
+- the reserve/retire frontier and its retirement wiring,
+- **`RESERVED_TAIL_SLOTS` from the WR id** (bits 0-7 are free again; the golden self-test constants were
+  recomputed and still pass),
+- the `WOULD_BLOCK` backpressure plumbing through all three publishers,
+- the divergence between the two pools — **both are now `rollback + capacity`, one rule**,
+- **and that entire bug class.**
+
+**What survives is the part that was always load-bearing: ROLLBACK.** The frontier was scaffolding around it.
+
+**Rule earned:** *the safest field is the one that does not exist. If a mechanism requires a completion to
+describe itself, ask first whether the mechanism can be sized away.*
+
+### 28.4 What v1 was still worth
+
+v1 was not wasted — it is what **found** the two latent bugs (§27.2) and the missing byte-ring rollback (§27.3),
+and it is what forced the sizing question to be asked precisely enough to be answered. **The bug it exposed in
+the fixed-slot encoder is the reason v2 exists.**
+
+### 28.5 The one thing that did NOT survive the change: the runtime self-check
+
+v1's frontier ALARMed on over-advance. v2 has no such runtime check — it has a **compile-time assert** plus a
+**setup-time refusal**. That is a deliberate trade: fewer premises to violate, and the two that remain are both
+mechanically enforced rather than reasoned about.
+
+### 28.6 ⚠ THE REVIEW FOUND A SHIP-BLOCKER — AND IT WAS A §24 BUG, NOT A P0-c ONE
+
+> **`HomerPeerDecodeSendWrId` truncated the 16-bit `OWNER_INCARNATION` to 8 bits with a stray `(uint8_t)` cast.**
+
+The mask is `0xffff`, the decoded struct member is `uint16_t`, the service's live incarnations are `uint16_t` —
+but the decoder cast to `uint8_t`. **From incarnation 256 onward, every legitimate payload CQE decodes an
+incarnation of 0**, `HomerServiceResolvePayloadSendOwnerToken` rejects it as *"named a RECYCLED owner slot"*, and
+the connection resets. It fires after **256 reuses of any single owner slot** — invisible in the gate's short
+runs, fatal in a long COPY or basebackup.
+
+It was introduced when §24.6 widened the incarnation 8 → 16 bits (a `.replace()` that updated the struct, the
+mask, and the encoder, but silently missed the decoder's cast).
+
+#### ⚠ AND MY OWN GOLDEN SELF-TEST DID NOT CATCH IT. That is the more useful lesson.
+
+§24.7 claimed the golden-literal self-test proves the layout. **It proved half of it.**
+
+- The **distinct-value** vector encodes *and* decodes — but all its values are small (`1/2/3/4/5`), so an 8-bit
+  truncation of a 16-bit field is invisible.
+- The **all-max boundary** vector checked **only the ENCODED integer** and **never decoded it**. So a
+  **decode-side** truncation walked straight through the test built to prove the layout.
+
+**Fixed:** the boundary vector now decodes the max-field id and verifies **every field**. Proven by the same
+negative test as §24: put the `(uint8_t)` cast back, and the build is clean, every `_Static_assert` passes, and
+the service **refuses to start** —
+`FATAL ... the max-field id 0x27ffbeefffffff00 does not DECODE back to its maximum fields -- a decoder cast or
+mask TRUNCATES`.
+
+**RULE EARNED (the second half of §24.7):**
+> **A layout test must exercise BOTH DIRECTIONS at the BOUNDARY.** One direction proves half a layout. And a
+> distinct-value vector cannot see a truncation that a max-value vector would — you need both, in both
+> directions.
+
+### 28.7 The other review findings
+
+- ⚠ **A PARTIAL POST *MUST* be followed by a connection reset — the capacity proof DEPENDS on it.** On a partial
+  post the **rejected suffix's** reservations are retained too (we cannot tell which belonged to accepted WRs),
+  so the cursor advances for slots **no WR is reading** — the very condition rollback exists to prevent. Bounded
+  to one batch, but it **accumulates** if a connection keeps partially posting. Every in-tree caller resets
+  (`HomerServiceHandlePayloadBatchPostFailure` maps `FAILED_PARTIAL` → reset). **Now stated in the code as a
+  contract rather than left as caller etiquette; enforcing it inside the transport is P1.**
+- **Memory.** The pools are embedded per connection, and a transport state holds 64 outgoing + 64 incoming
+  connections. The 1024-slot draft would have added ~900 KB per transport state; the corrected bound lets the
+  tail pool be **512** (4 KB/connection), halving that. Heap-allocated; not a stack concern.
+- **T5 clean:** no reader of `RESERVED_TAIL_SLOTS` remains anywhere in either tree.
