@@ -4283,6 +4283,40 @@ mask TRUNCATES`.
   tail pool be **512** (4 KB/connection), halving that. Heap-allocated; not a stack concern.
 - **T5 clean:** no reader of `RESERVED_TAIL_SLOTS` remains anywhere in either tree.
 
+### 28.8 ✅ LANDED + VALIDATED — citus `2836bc426` (2026-07-12)
+
+Deployed to both hosts and **both DPUs**, then run through **the DPU gate**
+(`pgbench --homer --homer-dpu-command`: farnet0 host → farnet0 DPU → DPU↔DPU RDMA → farnet1 DPU →
+DPU-spawned backend). **PASS.**
+
+| criterion | result |
+|---|---|
+| `ALARM` in ANY service log (host + both DPUs) | **0** — the single most important one: the new rollback/incarnation code ALARMs rather than aborting, so an ALARM is a silent failure only the log shows |
+| `RECYCLED owner slot` / `refused` / `connection reset` / `post failed` / `WOULD_BLOCK` in either DPU log | **none** |
+| `send WR-ID layout self-test PASSED` | exactly **once per service start**, all 3 services |
+| `transport:` line | `homer-dpu-command (implies dpu result relay)` on every run — never a bare `homer` |
+| `DPU backend spawn begin` / `COMPLETED … launched_pid=N` on the **farnet1 DPU** | present (5 spawns) — the anti-topology-trap proof |
+| farnet0 host service log | startup banner **only**; farnet1 host service **down** |
+| transactions | **5/5** and **2000/2000**, **0 failed**, distinct `abalance` values |
+
+⚠ **The `-t 2000` leg is the point of this validation, not a throughput exercise:** it is what drives
+`OWNER_INCARNATION` **past 256**, which is exactly where §28.6's truncation bug would have begun rejecting
+every legitimate payload CQE as a recycled slot and resetting the connection. A `-t 5` run cannot see it.
+
+**Performance, warmed steady state, `-t 2000 --debug`** (like-for-like against §24's band of
+**287.8 / 282.7 / 281.7**; warmup 283.74 discarded):
+
+**280.84 / 281.82 / 280.90 tps** — mean ≈ −1.0%, within noise. **No regression.**
+
+**Two operational findings from the deploy** (folded into `farnet_operational_hazards.md`):
+- farnet0's source trees had drifted to `jasonhu`-owned (postgres-citus) and ~1100 mixed-owner files
+  (citus-dbcomm), which made the standing rsync recipe fail **code 23** — the exact
+  *"leaves files untransferred without saying which"* trap. Normalized with `chown -R dbcomm:dbcomm` and
+  re-synced; proven by a per-file md5 diff (**0 differing files**).
+- `dbcomm` has **no working SSH key to farnet0**, so the source rsyncs must run as the calling user with
+  `--rsync-path='sudo -n -u dbcomm rsync'` (receiving side only) — which is what the runbook recipe already
+  says, and now we know *why* it is written that way.
+
 ---
 
 ## §29 — NEW P0-LEVEL FINDING: the SEND QUEUE has no per-LANE admission control
@@ -4350,3 +4384,115 @@ failure mode, which is where backpressure belongs.
 removes P0-c's dependency on that reset.
 
 **Open question for the owner:** is this P0 (it blocks P7b, and P7b is the goal), or is it P7b's own first step?
+
+### 29.5 OWNER CHALLENGE (2026-07-12): *"we have no chain — it's one at a time"*. REFUTED, but it sharpened the finding.
+
+The owner pushed back on §29.2 twice, and both challenges were worth running down.
+
+**Challenge 1 — *"I believe we don't have a chain. It's always one at a time, no?"*** — **HALF RIGHT.**
+There are exactly four `ibv_post_send` call sites:
+
+| site | tag | shape |
+|---|---|---|
+| `remote_execution_peer_transport_rdma.c:6010` | `generic-rdma-write` | **single WR** (scalar `&sendWorkRequest`) |
+| `remote_execution_peer_transport_rdma.c:10769` | `control-wimm` | **single WR** |
+| `remote_execution_peer_transport_rdma.c:11002` | `payload-batch` (fixed-slot / host-service arm) | **CHAIN**, `totalWorkRequests = payloadWriteCount` (`:10811`), 1..32 |
+| `remote_execution_peer_transport_rdma.c:11296` | `payload byte-ring publish` (**DPU arm**) | **CHAIN**, `totalWorkRequests = payloadWriteCount + 1` (`:11091`), **2..33** |
+
+On the **control plane the owner is exactly right**: one WR per post, `bad_wr` can only be the WR handed in,
+`HOMER_PEER_POST_FAILED_PARTIAL` is structurally unreachable. **Both payload paths chain** (`:11247` links the
+bodies, `:11288` terminates with the signalled tail, `:11296` posts the whole list in ONE call).
+
+**Challenge 2 — *"chaining is a design scar from when a record could wrap the ring; we now leave a gap and
+don't wrap, so we're not actively chaining anywhere on the DPU path."*** — **REFUTED. Chaining is active,
+unavoidable, and is not what the owner remembers it being.**
+
+1. **The byte-ring publish is a chain of ≥ 2, ALWAYS.** `payloadWriteCount == 0` is an early-out
+   (`tuple_sink_service_process.c:31733`), and the tail WR **cannot be merged into the last body write** —
+   it targets a *different remote address* (the ring's tail/frontier word at `tailRemoteAddress`, not
+   `peerStorage + offset`). So `payloadWriteCount + 1 >= 2` on **every single publish**. It is never one WR.
+   *(The fixed-slot arm CAN be a single WR — it re-tags its last body write as the `WRITE_WITH_IMM`. But that
+   is the dying host-service arm.)*
+2. **The ceiling of 32 is a default, not an accident:** `HomerServiceBuildDefaultPayloadEgressGrant`
+   (`tuple_sink_service_process.c:7055`) sets `transportGrant.maxWrCount = CITUS_REMOTE_EXEC_PEER_PAYLOAD_BATCH_MAX_WRITES`
+   = **32**, and the build loop `while (payloadWriteCount < grantMaxWrCount)` (`:31635`) runs to that budget.
+3. **The record-wrap protocol change removes NONE of the slicers.** `HomerByteRingRelayNextChunk`
+   (`tuple_sink_service_process.c:7796`) takes the **minimum of four** independent limits:
+   distance to the **destination ring wrap** · remote credit · the scheduler pacing cap (`grantMaxBytes`) ·
+   the substrate per-op cap (`UINT32_MAX` for RDMA). All four are live.
+
+   ⚠ **Why the wrap slice survives "records never wrap":** *this relay is byte-oriented, not record-oriented,
+   deliberately.* Its own doc comment (`:7782`) says so: *"There is deliberately NO record/header awareness
+   here: whole records (with their transport headers **and any producer wrap-gap padding**) are carried
+   byte-identically."* The gap-don't-wrap policy guarantees no single **record** straddles the physical wrap —
+   but the relay does not move a record, it moves a **contiguous absolute byte range spanning many records**,
+   and *that* crosses the ring boundary routinely. (`ringBytes=1024`; records 900–1000, gap 1000–1024, records
+   1024–1100; relaying `[900,1100)` must become two writes, at remote offsets 900 and 0.) **The wrap slice
+   fires once per ring lap on every stream that moves more than a ring's worth of bytes — i.e. all of them.**
+
+**What the owner IS right about, and it is the useful part: chaining is NOT semantically load-bearing.**
+The call-site comment (`tuple_sink_service_process.c:31615`) claims the chain is what makes "bytes before
+doorbell" safe. That is **imprecise**: on an RC QP, WRs execute **in order regardless of how they were
+posted** — N separate `ibv_post_send` calls on the same QP give the identical guarantee. The chain is a
+**performance** optimization (one doorbell MMIO instead of N), not a correctness mechanism.
+⚠ But **unrolling it would not fix §29**: if post #3 of 5 returns `ENOMEM`, the torn state is identical, just
+discovered one WR earlier. The fix is the same either way — **check before you post.**
+
+### 29.6 The REAL reason it has never torn: an UNASSERTED ARITHMETIC COINCIDENCE across two files
+
+§29.3 said "one stream per lane". That is true but is not the *mechanism*. The mechanism is three constants in
+**two different translation units** with **no static relationship between them**:
+
+```
+CITUS_REMOTE_EXEC_PEER_SEND_QUEUE_DEPTH          256   remote_execution_peer_transport_rdma.c:101
+HOMER_SERVICE_PAYLOAD_MAX_OUTSTANDING_WRS        192   tuple_sink_service_process.c:335       (per STREAM)
+CITUS_REMOTE_EXEC_PEER_PAYLOAD_BATCH_MAX_WRITES   32   remote_execution_peer_transport_rdma.h:54   (+1 tail = 33)
+```
+
+**ONE stream:** ≤ 192 outstanding on a 256-deep SQ ⇒ **≥ 64 entries always free**, and 64 ≥ 33 ⇒ **the chain
+always fits; partial post is UNREACHABLE.** **TWO streams:** 384 wanted vs 256 ⇒ free space can fall below 33
+⇒ **the chain tears.**
+
+> ⚠ **The margin is 64 vs 33 and NOTHING ENFORCES IT. Raise `BATCH_MAX_WRITES` from 32 to 64 and a partial post
+> becomes reachable with a SINGLE stream, today, with no other change — and the build stays green.** The
+> correctness of the *shipping* path rests on an unwritten inequality that a plausible tuning change silently
+> breaks. §29 is therefore not only a latent P7b problem.
+
+### 29.7 The fix is CHEAPER than §29.4 said: it is an EXISTING predicate at the WRONG SCOPE
+
+The per-**stream** path **already performs exactly the admission check §29.4 proposes** —
+`tuple_sink_service_process.c:31562`:
+
+```c
+streamEntry->stream.payloadSendOwnerOutstandingWrs + grantMaxWrCount + 1 >
+    HOMER_SERVICE_PAYLOAD_MAX_OUTSTANDING_WRS   /* 192 */
+```
+
+It correctly reserves for the **whole worst-case chain including the tail** (`+ grantMaxWrCount + 1`), *before*
+building the batch. **This is not missing machinery — it is the right predicate at the wrong scope.** §29 is
+that same check hoisted to the connection's send queue. That materially strengthens the case for doing it now
+rather than deferring to P7b: it is a copy of an existing, already-correct pattern, not new design.
+
+**Two parts, and part (a) should land regardless of the sequencing decision:**
+
+**(a) IMMEDIATE, CHEAP.** Hoist the per-stream cap next to the queue depth and pin the inequality so the
+compiler owns it:
+
+```c
+_Static_assert(HOMER_SERVICE_PAYLOAD_MAX_OUTSTANDING_WRS
+               + CITUS_REMOTE_EXEC_PEER_PAYLOAD_BATCH_MAX_WRITES + 1U
+               < CITUS_REMOTE_EXEC_PEER_SEND_QUEUE_DEPTH,
+               "one payload stream's outstanding WRs plus one maximal chain must fit the send queue, or "
+               "ibv_post_send() tears mid-chain -> PARTIAL POST -> QP destroy -> hot-path connection reset");
+```
+
+This converts *"we got lucky"* into *"the compiler enforces it"*, and makes the real fix an explicit,
+deliberate relaxation rather than an accident waiting to be re-broken.
+
+**(b) THE REAL FIX** — per-connection outstanding-WR counter + pre-post admission check, exactly as §29.4
+describes. ⚠ Decrement attribution is the one subtlety: the body WRs are UNSIGNALLED and produce **no CQE**, so
+the counter cannot be decremented per-completion. It must be released at the **signalled checkpoint** — the
+chain's tail CQE retires the whole chain's count. That is P0-i's rule again (defer retirement to a later
+signalled WR only when that WR is GUARANTEED — and here it is: same chain, same post).
+
+**Still open for the owner:** is (b) P0, or P7b's first step?
