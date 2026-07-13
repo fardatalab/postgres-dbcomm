@@ -694,6 +694,90 @@ ssh farnet0 "sudo -n -u dbcomm sh -c 'env \
 4. **Anti-fallback:** the farnet0 host service log holds its startup banner and **nothing else**; the farnet1
    host service is **down**.
 
+#### ⚠⚠ AFTER ANY **FAILED** GATE RUN, RESTART BOTH DPU SERVICES — A FAILED RUN LEAKS ARENA SLOTS
+
+**An aborted client does not release its arena slot.** Slot release runs only from the *semantic close*
+(`HomerDpuDmaUnbindRingSession`, whose sole caller is `tuple_sink_service_process.c:20428`); a client that
+times out and aborts logs `SKIPPED the semantic CLIENT_SQL_SESSION_CLOSE` and the slot **stays bound for the
+life of the DPU service process**. Nothing on the import host-detach/reclaim path releases it.
+
+**The arena has exactly `HOMER_FRONTEND_ARENA_SLOT_COUNT = 16` slots.** So one failed 16-client run consumes
+the *entire* arena, and **the next run then fails for a completely different and much more confusing reason** —
+observed 2026-07-13 as 16 × `DPU backend spawn begin` with **zero** `COMPLETED`, and a client timing out at
+*session open* rather than at command completion. Chasing that second failure is chasing a ghost.
+
+> **Rule: any gate run that aborts, times out, or is interrupted ⇒ restart both DPU services before the next
+> run.** Not just the backends — the *services*, because the leaked state lives in the DPU service's memory.
+> The reap loop does not fix this; it kills OS processes, not arena bindings.
+
+⚠ **This makes every post-failure run untrustworthy until the services are bounced.** It is the same shape as
+the post-gate discovery stall (hazards §8.1): *state carried over from a previous run, invisible until it
+isn't*. Treat a run that follows a failure without a service restart as **diagnostic-only**.
+
+#### CPU sets must be SIZED TO THE CLIENT COUNT, not just kept disjoint
+
+The socketless backends busy-poll (`remote_execution_backend_bridge.c:311`) and so does `pgbench --homer`. A
+descheduled busy-poller **does not yield** — it burns its slice spinning on a line that cannot change until the
+thread it is waiting for gets scheduled. So oversubscription does not degrade, it **collapses**.
+
+The runbook's `--client-cpus=8,9,10,11` example is for **4** clients. Carrying it to `-c 16` silently gives 16
+busy-polling workers 4 CPUs (and 16 busy-polling backends another 4) on a **96-CPU** machine. Size both sets to
+the client count and keep them disjoint:
+
+```sh
+HOMER_REMOTE_EXEC_BACKEND_CPUS=16,...,31   # one per backend  (set on the DPU service that spawns them)
+--client-cpus=32,...,47                    # one per pgbench worker
+```
+
+*(⚠ Sizing the CPU sets correctly did **not** fix the 16-client gate — see the concurrency cliff below. Do it
+anyway, or you cannot tell the two failures apart.)*
+
+#### ⚠⚠ THE GATE CAPS AT **8 CLIENTS** — the DPU byte-ring pool has 8 slots
+
+**Each client SQL session consumes ONE DPU byte-ring slot** for its result relay, and there are exactly
+`HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (4) × 2 regions = **8**. So:
+
+| clients | result |
+|---|---|
+| ≤ 8 | ✅ passes |
+| 10 | ❌ 8 sessions get a slot, **exactly 2 do not** — and the run partially fails |
+| 12, 16 | ❌ worse |
+
+**The DPU says so itself, in plain English, and names its own knob:**
+```
+service-owned P3 result peer-open failed session=6 sink=6 detail=byte-ring pool exhausted:
+  no free slot for session=6 stream=6 purpose=0 (all 8 slots in use;
+  raise HOMER_DPU_BYTE_RING_SLOTS_PER_REGION / regions)
+```
+**Run the gate with `-c 8` or fewer.** If you need more clients, raise
+`HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (`homer_service_dpu_dma.h:41`) and rebuild **both DPUs**.
+
+> ⚠ **A `-c 8` run is at exactly 8/8 — zero headroom.** Prefer `-c 4` when you want margin, and never read a
+> `-c > 8` failure as a regression.
+
+⚠ **This took four validation cycles and three refuted hypotheses (CPU oversubscription; a 16-deep pool cliff; a
+generic race) to find — and the answer was in the DPU log the whole time.** The client only ever prints the
+*symptom* (`DPU result relay peer-open failed for result stream 10`); the **DPU prints the cause**. When a client
+reports a Homer failure, **read the DPU log before touching the source.**
+
+#### ⚠⚠ GREPPING THE SERVICE LOGS FOR `ALARM` IS NOT ENOUGH — THE WORST LINE IS NOT TAGGED
+
+The DMA engine can **die**, and none of the lines it emits when it does contain the string `ALARM`:
+```
+homer DPU DMA: grouped-control semantic validation failed: ... [ring=.. bound_session=.. line_generation=..]
+tuple-sink service: DPU DMA PE drain failed:
+tuple-sink service: DPU command-pull submit failed: DPU DMA engine is in fatal error state
+```
+`engine->fatalError = true` — **one ring's identity check kills the WHOLE engine, and every session on that DPU.**
+
+**A run can PASS while the engine dies underneath it**, if the engine dies after the last transaction. Every
+"zero ALARMs, clean" verdict recorded before 2026-07-13 was blind to this. **Always grep with:**
+
+```sh
+grep -aiE 'ALARM|semantic validation failed|fatal error state|PE drain failed|pool exhausted|peer-open failed' \
+  <dpu_service.log>
+```
+
 #### After the run — MANDATORY
 
 The DPU-spawned `postgres: remote exec backend` **survives** and does **not** respond to `pg_ctl stop -m

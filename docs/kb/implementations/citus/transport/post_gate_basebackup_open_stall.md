@@ -330,15 +330,61 @@ elsewhere **since you arrived** and still never touched you."* Re-validated: **z
 > cost of one rebuild. That is the whole argument for building the detector even when the bug it targets is already
 > fixed.
 
+### ✅ Defect 2b CONFIRMED FIXED BY WORKLOAD (8-client gate, second tenancy)
+
+The single-client gate could never test 2b: the DPU allocates arena slots **first-free from 0**
+(`HomerDpuDmaBindRingSession`, `homer_service_dpu_dma.c:6113`), and slots **0–3 are all in export 0** — the range
+where `global == local` and the **old code is right by accident**. `SLOTS_PER_EXPORT` is 4, so **≥ 5 concurrent
+sessions** are needed to cross into export 1, and because the flag is only *set* on release, the slot must be bound
+**twice**.
+
+`pgbench --homer --homer-dpu-command -c 8 -j 8 -t 20`, run **twice with nothing restarted**: both **160/160
+processed, 0 failed**. The farnet1 DPU printed, identically on **both** tenancies:
+
+```
+arena slot 3 ... re-armed (import=0 local_rings=9..11  global_rings=9..11)   <-- local == global
+arena slot 4 ... re-armed (import=1 local_rings=0..2   global_rings=12..14)  <-- local != global
+arena slot 5 ... re-armed (import=1 local_rings=3..5   global_rings=15..17)
+arena slot 6 ... re-armed (import=1 local_rings=6..8   global_rings=18..20)
+arena slot 7 ... re-armed (import=1 local_rings=9..11  global_rings=21..23)
+```
+
+**This is the bug, printed.** From slot 4 the arena crosses into import 1 and the indices diverge: the old code
+would have written at global base 12/15/18/21 into a **12-entry** local array — every write out of range, every one
+silently swallowed by the bounds check. Zero ALARMs fired. **2b is real, and it is fixed.**
+
+### ⚠ NEW, UNRELATED: the 16-client gate FAILS — and it exposes an arena-slot LEAK
+
+`-c 16` failed on its **FIRST** tenancy (all 16 clients timed out after 30 s *waiting for command completion*, at
+sequence 4–7). A first-tenancy failure **cannot** be 2b (on a fresh import every `tenancyBaselinePending` is already
+`false`, so the clear is a no-op whichever index it uses), and no ALARM fired.
+
+**Leading hypothesis: busy-poll CPU oversubscription, i.e. an invocation error, not a code bug.** The socketless
+backends busy-poll (`remote_execution_backend_bridge.c:311`) and so does `pgbench --homer`. The run used
+`HOMER_REMOTE_EXEC_BACKEND_CPUS=4,5,6,7` (**4 CPUs for 16 backends**) and `--client-cpus=8,9,10,11` (**4 CPUs for 16
+pgbench threads**) — 4× oversubscribed on both sides, on a **96-CPU** machine. At 8 clients that was 2× and passed.
+A descheduled busy-poller does not yield, so this **collapses** rather than degrades, and a CPU-starved backend that
+never polls its command mailbox looks exactly like "client timed out waiting for completion". *(Status: HYPOTHESIS.
+Discriminating rerun with 16+16 dedicated CPUs is queued.)*
+
+⚠ **The runbook says "keep the CPU sets disjoint" but never says "and SIZE them to the client count."** That gap is
+what produced this.
+
+**Independently real, and worth its own item — AN ABORTED CLIENT LEAKS ITS ARENA SLOT.** After the 16-client abort,
+every client logged `SKIPPED the semantic CLIENT_SQL_SESSION_CLOSE`. The *next* 16-client run then produced **16
+`DPU backend spawn begin` lines and ZERO `COMPLETED`** — consistent with all 16 arena slots still being held
+(the arena has exactly `ARENA_SLOT_COUNT = 16`). The farnet0 DPU also emitted an **unbounded, actively growing**
+`DPU command response publication failed: command response import/ring is inactive` spew (≈1.5 M lines before
+teardown). Two defects there: a **retirement hole** (slot release depends on a semantic close that an abort skips),
+and an **unbounded error log on a hot retry path**.
+
 ### Still NOT established (do not read the PASS as covering these)
 
 1. **F3 has not been NEGATIVE-tested.** It is now genuinely negative-testable (revert F1 → the starved import gets
    no reads → it must fire). Until that is run, F3 is an **untested detector**, which by our own rule is decoration
    (hazards §3.2/§3.3).
-2. **Defect 2b is verified by READING, not by a workload.** It breaks arena slot **≥ 4 on its SECOND tenancy**, and
-   a single-client gate only ever touches slot 0 — every validated run above is in the one range the old code got
-   right. Needs a multi-client / churned-session workload.
-3. The full regression sweep (DPU TCP transport smoke in particular) has not been re-run against this change.
+2. The full regression sweep (DPU TCP transport smoke in particular) has not been re-run against this change.
+3. The 16-client failure above — CPU-provisioning hypothesis unconfirmed.
 
 ⚠ **Both DPUs must be rebuilt and redeployed** — this is DPU-side code. No ABI change (no struct layout touched),
 so no protocol-version bump and no `BAD_PROTOCOL`; but a stale DPU binary would silently keep the bug, so **prove
@@ -351,6 +397,71 @@ during *this* deploy: the landed-proof said FAILED on a binary that provably con
 indistinguishable from its failure is the same class of bug as the one being fixed here.**
 
 ---
+
+## ⚠⚠ THE FIX HAD A LATENT ENGINE-FATAL BEHIND IT (found + fixed same day, citus `a4d270ba0`)
+
+F1 is correct — but it made the scanner reach rings it had never reached, and one of those rings was holding a
+**loaded gun**.
+
+**The frontend arena is a POSIX shm object that OUTLIVES the postmaster.** On a restart the frontend agent
+*attaches* it — `HomerFrontendAgentAttachArena` "**deliberately does not create, resize, or initialize the shared
+object**" (`homer_frontend_agent.c:363`) — then mints a brand-new `bridgeGeneration`
+(`(pid << 32) ^ time ^ addr`, `:1515`), overwrites the arena header with it (`:1522`), and **clears no publish
+lines** (grep: there is *no* host-side publish-line clear at all). So every arena role-5 line still holds the
+**previous** generation's frontier, stamped with the **previous** generation.
+
+Meanwhile the DPU `calloc()`s each import's `ringRuntime` (`homer_service_dpu_dma.c:8176`), so **every ring was
+born with `tenancyBaselinePending = false` — immediately READABLE.** Discovery read such a line under the new
+import, found `line->generation != import->bridgeGeneration`, and latched **`engine->fatalError`** — killing
+command-pull, byte-ring pull and PE drain for **every session on the DPU**. There is no recovery short of a
+service restart.
+
+*(`line_tail=112` in the failing log is not a sentinel: 56-byte transport header + 40-byte batch header + 16-byte
+tuple = the first one-row `SELECT abalance` result. It was a **real result from a previous run's backend**.)*
+
+### THE FIX — the invariant is now uniform, with no "never used yet" exception
+
+> **A RING IS READABLE ONLY AFTER THE DPU HAS ESTABLISHED ITS BASELINE ITSELF.**
+
+Virgin arena role-5 `PUBLISH_LINE` rings are **suppressed at import**. The only transition to readable is a
+completed `ARENA_PUBLISH_LINE_CLEAR` DMA — the DPU has *seen* the bytes read zero, not merely believed they
+should. Safe against the converse hazard (suppressing forever ⇒ recreating the starvation P0):
+`CLEAR_ARENA_LINES` is the **first phase of every arena spawn** (`homer_service_dpu_spawn.c:312`), so a slot's
+first tenant always lifts it. **Scoped to arena role-5 only** — control-slot and payload rings have no clear-DMA,
+so suppressing *them* would strand them permanently.
+
+**Free side effect:** a 1-client gate leaves **15 of the 16** enrolled arena role-5 rings permanently empty — and
+the DPU had been issuing a DMA read against **every one of them, on every scan pass, forever**. Those are gone.
+
+Plus **the late-clear guard**: a clear establishes a baseline *for the tenant that requested it*; if that tenant is
+already gone, clearing the flag re-arms discovery on a ring with **no** tenant — the same fatal from the other
+direction. The completion now refuses to clear a ring whose `boundServiceSessionId` is 0. *(Deliberately NOT fixed
+by adding the clear to the ring in-flight accounting, as the reviewer proposed: that needs the submit site and the
+retire whitelist to agree about a **union member** — exactly the shape of the global-vs-local bug fixed hours
+earlier — and a mis-paired count would wedge unbind FOREVER.)*
+
+### ⚠⚠ WHY VALIDATION MISSED IT: **OUR OWN CLEANUP PROTOCOL SCRUBBED THE TRIGGER**
+
+The hard clean baseline **deletes the arena shm**. So every "clean" run started from a *fresh* arena with zeroed
+publish lines — the one condition under which the bug cannot fire. Four green validations in a row, and not one of
+them armed it.
+
+> **A passing test that removes the precondition is not evidence of absence.**
+
+The test that finally proved it is one we had **never run**: *gate → restart PostgreSQL **without** wiping shm →
+gate*. Validation (citus `a4d270ba0`): the two arena imports report **different** bridge generations
+(`821261985488943` → `795001396416614`) — proving the dangerous condition was actually **reproduced** rather than
+dodged — and both runs pass 80/80 with **zero** fatal lines. **Demand that a negative result prove it armed the
+trigger.**
+
+### ⚠ AND WE WERE GREPPING FOR THE WRONG STRING
+
+`engine->fatalError` is latched by lines containing **no `ALARM` tag**. Every "zero ALARMs, clean" verdict recorded
+before 2026-07-13 was blind to the engine dying — and because the engine can die *after* the last transaction,
+**a run can PASS while the engine is dead underneath it.** See `farnet_operational_hazards.md`; the grep is now:
+```sh
+grep -aiE 'ALARM|semantic validation failed|fatal error state|PE drain failed|pool exhausted|peer-open failed' …
+```
 
 ## What I got WRONG, and why it is worth recording
 
@@ -399,6 +510,22 @@ The root cause above was correct. **The fix plan built on it was not**, and a fr
 exits early, `strings` takes SIGPIPE, `pipefail` turns that into a failure. *A diagnostic whose success is
 indistinguishable from its failure* — the exact disease being cured, reproduced in four words of shell, while
 curing it.
+
+### F3 FALSE-POSITIVED **TWICE**, and the two failures are the same failure
+
+| # | what it did | why |
+|---|---|---|
+| 1 | fired on a **healthy new import** | it compared against the engine's **LIFETIME** read total, which on a long-lived service is already millions — so *every* newly-arrived import cleared the threshold in the window before its first read. **"A probe cannot tell NOT YET from NEVER"**, hit inside the instrument built to avoid it. Fixed by baselining the total at import activation. |
+| 2 | fired on **three legitimately silent arena exports** | the engine-fatal fix above created a brand-new **legitimate** reason for a ring never to be polled (an arena export nobody binds stays suppressed forever and genuinely has nothing to say). The alarm still treated "enrolled but never polled" as proof of starvation. Fixed by counting only **READABLE** enrolled rings — *"was any ring that COULD have been polled, polled?"* |
+
+> **A detector is only as good as its notion of what SHOULD have happened.** Both failures are that one sentence.
+> The second is the sharper lesson: **when you add a new legitimate reason for silence, you must update every
+> detector that treats silence as a bug — in the same breath, or it will lie.** I changed the meaning of an
+> observation and left a detector reading it with the old meaning.
+
+**Both were caught by the alarm itself, loudly, on passing runs, for the cost of one rebuild each.** That is the
+argument for building the detector even after the bug it targets is dead — and equally, for treating every alarm
+that fires as a claim to be *verified*, not inherited.
 
 ## Related
 - `farnet_operational_hazards.md` §8.1 — *an import being accepted proves nothing*. Violated here.
