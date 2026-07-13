@@ -4651,104 +4651,27 @@ with a textual grep and **build the diagnostic configs to prove it.**
 
 ---
 
-## §32 — GENERALIZED SEND-CQE COALESCING. One rule, no exceptions. (DESIGN — owner-driven, 2026-07-13)
+---
 
-**Not implemented. §29(b) is its prerequisite. Recorded now because the reasoning is the valuable part and it
-corrected me twice.**
+## §32 — MOVED. Send-CQE coalescing has its own plan doc.
 
-### 32.1 The one fact everything follows from
+The generalized send-CQE coalescing design **outgrew this audit and is a different topic** — this document is
+about the *resource-retirement contract* (correctness); coalescing is a *performance* generalization that merely
+*depends* on it. It now lives in:
 
-> **A send CQE carries exactly ONE bit: "this WR — and every WR posted before it — is done."**
-> Everything anyone waits on it for is **RESOURCE RETIREMENT**. There is no second semantic.
+**`docs/kb/future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md`**
 
-Verified against the two places that *looked* like exceptions:
+What stays here, because it IS retirement-contract business:
 
-- **Bootstrap** blocks on its CQE — but its own comment says that is *"in order to keep the mailbox-descriptor
-  exchange simple and easy to debug"* (`remote_execution_peer_transport_rdma.c:5917`). **Convenience, not
-  semantics.**
-- **Peer command-completion** blocks on its CQE — to fence *"reuse of the **single** scratch/tail source"*. That
-  **is** retirement — of a pool whose depth is **ONE**.
-
-### 32.2 THE RULE
-
-```
-  interval  <=  1/2  x  (depth of the pool that substrate's CQE drains)
-```
-
-⚠ **THE "EXCEPTIONS" WERE NOT EXCEPTIONS — THEY WERE DEPTH-1 POOLS.** Depth 1 ⇒ interval 0 ⇒ *must signal every
-WR*. That is not a carve-out; **that is the rule, evaluated at depth 1.**
-
-Which inverts the conclusion: the peer command-completion **blocking wait is not a constraint on coalescing — it
-is a BUG.** It blocks because someone gave that path **one** scratch buffer. **Deepen the pool ⇒ the frontier
-retires a range ⇒ the blocking wait disappears.** And that blocking wait is the prime suspect for the
-**~450 µs/command**. *The obstacle to coalescing turns out to be the biggest performance item on the list, and
-coalescing is what removes it.*
-
-⚠ **A SINGLE GLOBAL INTERVAL IS WRONG.** Each substrate's CQE drains a *different* pool with a *different* depth,
-so each needs its own interval. (And if one CQE drains several pools, the bound is `min(depth)/2`.) The deleted
-`RING_SLOTS / 2` (8 of a 16-slot completion-publish ring) was **not an arbitrary constant** — it was exactly this
-rule: *never let coalescing hold more than half the pool it drains hostage.*
-
-### 32.3 The mechanism is SCALARS, not a FIFO
-
-Per QP, two monotonic scalars:
-
-```
-  outstanding = postedSendWrs - retiredSendWrs
-  postedSendWrs  += chainWrs           on EVERY post (signalled or not)
-  retiredSendWrs  = max(retired, mark) on each signalled CQE
-```
-
-A signalled WR stamps the cumulative `postedSendWrs` onto **its own outstanding-WR record** — which already
-exists, and which its WR ID already points at (that is what §24's `OWNER_SLOT` / `INDEX` fields *are*). `max()`
-makes it monotone and idempotent.
-
-Per substrate, retirement is **"free everything at or below frontier F"** — a **RANGE on a ring**, not a queue
-walk.
-
-> ⚠ **I PROPOSED A FIFO AND THE OWNER WAS RIGHT TO REFUSE IT.** I had conflated two retirements that ride the
-> same CQE: **semantic owner retirement** (release each owner's *distinct* resource — that genuinely walks a
-> prefix, which is why the existing per-lane FIFO with `postOrdinal` exists) and **send-queue accounting**
-> (*"how many WQEs are outstanding?"* — a **count**). Counts do not need a queue; they need subtraction.
-> The frontier mark is a NUMBER CARRIED BY THE CHECKPOINT, and the checkpoint already has a record to carry it.
-
-> ⚠ **AND ON LATENCY, ALSO REFUTED:** I argued control was too latency-sensitive to coalesce.
-> **Retirement latency is not operation latency.** A control op takes the *next free* slot from a 64-slot ring;
-> when the *old* slot returns to the pool is irrelevant to it. Control coalesces fine.
-
-### 32.4 The machinery already exists, dormant
-
-`tuple_sink_service_process.c:6568`: *"A send CQE on an RC QP retires all earlier WRs posted to the same QP. The
-per-lane FIFO gives the exact source-owner prefix covered by this checkpoint."* Per-lane FIFOs with post-ordinals
-and prefix walks exist for the **command** and **peer-client-completion** lanes. They are **never exercised beyond
-one entry**, because every post currently signals. **Re-arming the interval feeds code that is already written.**
-
-### 32.5 THE TERMINAL FLUSH — the thing P0-i could not build, and why it can now
-
-P0-i **removed** the interval (both `*_SIGNAL_INTERVAL` macros are now `#error` tripwires,
-`tuple_sink_service_process.c:417` / `:442`) because coalescing leaves an **unsignalled tail at session close —
-and on ABORT paths, which have no terminal message to force-signal.** Those WRs' resources are never retired.
-
-**Coalescing is sound while traffic continues** (a later signalled WR always arrives). **It breaks at the END.**
-Every argument for it is about the hot path; the bug is entirely in the cold path. *That is why it shipped.*
-
-⚠ **§29(b) IS THE MISSING PIECE.** A terminal flush must ask *"do I have un-retired WRs?"* — and that is exactly
-`postedSendWrs - retiredSendWrs`. P0-i chose "only coalesce within a unit of work" because **there was no send-queue
-accounting to make the other branch safe.** With accounting, the other branch opens.
-
-⚠ **The hard case is not close — it is ABORT ON A SHARED CONNECTION.** On a full reset the QP is destroyed and every
-WR is flushed, so resources are released via the failure path. The leak bites when a **single session** closes or
-aborts while the **connection survives** (other sessions still on that QP). The flush must therefore be a
-**transport primitive**, not a protocol message. *(Open: a signalled zero-length RDMA_WRITE is the cheap way to
-manufacture a checkpoint; being verified.)*
-
-### 32.6 Order of work
-
-1. **§29(b)** — scalar frontier + admission. Needed regardless; produces `outstanding`.
-2. **Terminal flush** — close AND abort. Warrants its own design.
-3. **Re-arm the interval per substrate**, each `<= 1/2` its own pool, reusing the dormant retirement code.
-   Convert the P0-i tripwires from *"never"* to *"not without the flush."*
-4. **Deepen any depth-1 hot-path pool** (peer command-completion scratch) — which is also the ~450 µs/command fix.
-
-⚠ Doing (3) before (2) re-ships P0-i's bug. The tripwire would stop it at compile time — a rather good
-advertisement for tripwires.
+- **§29(b)** — per-connection send-queue admission (`postedSendWrs - retiredSendWrs`). It is the accounting that
+  the coalescing plan depends on, and it is a correctness fix in its own right (it replaces a hot-path connection
+  reset with a retry).
+- ⚠ **THE UNSIGNALLED-TAIL LEAK** — under investigation as of 2026-07-13. The client-SQL command INLINE fast path
+  (`tuple_sink_service_process.c:21686-21704`) posts TWO UNSIGNALLED WRs and never consults `signalCommandWrite`.
+  At session close they have no signalled successor, so their **send-queue entries** are never reclaimed.
+  ⚠ **P0-i cleaned two lanes and missed this one BECAUSE IT WAS COUNTING THE WRONG RESOURCE.** An INLINE write
+  copies its payload into the WQE, so its *source buffer* is free at post time — which is exactly why the path
+  looked safe to an audit hunting leaked *source slots*. **It leaks a WQE instead**, and nothing in this system
+  counted WQEs until §29(b). *The bug did not appear; the instrument did.*
+  This is the same shape as every §0 violation: someone proved the contract for ONE resource and missed a SECOND
+  riding the same completion.
