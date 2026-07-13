@@ -297,6 +297,24 @@ hosts**.
    **Count the pids you could not identify and say so** — an unreadable `/proc` must not masquerade as an
    empty one.
 
+   ⚠ **THIS RECIPE DOES NOT REAP THE DPU SERVICE, AND A STALE ONE WILL FAKE A PASS.** The pattern above only
+   matches `*/pg-citus/bin/*` — the **host** install prefix. The DPU-native service lives at
+   `~/dbcomm/citus-dbcomm/build/homer/citus_tuple_sink_service` and is invisible to it. On 2026-07-13 a stale
+   DPU service from a previous session was still bound to `9727`/`9728`; the **fresh** service therefore died
+   at startup with `could not initialize DPU TCP setup server: Address already in use` — **and the stale one
+   went on answering the port**, so the workload connected, ran, and looked healthy **against binaries that
+   did not contain the change under test.** That is a false pass, and only an elapsed-time check on `ps`
+   caught it. **Reap on each DPU too, by its own path**, and prove the service you are talking to is the one
+   you just started (check its start time, not just that the port answers):
+
+   ```sh
+   # ON EACH DPU (invoke from a script by path; never a double-hop ssh one-liner)
+   for d in /proc/[0-9]*; do
+     exe=$(readlink -f "$d/exe" 2>/dev/null) || exe=$(sudo -n readlink -f "$d/exe" 2>/dev/null)
+     case "$exe" in */citus-dbcomm/build/homer/citus_tuple_sink_service*) kill -9 "${d#/proc/}" ;; esac
+   done
+   ```
+
 3. **Remove only OUR shared memory**, by glob:
 
    ```sh
@@ -469,7 +487,7 @@ done
 | workload | path | status | validates |
 |---|---|---|---|
 | **`pgbench --homer --homer-dpu-command`** | **DPU** | ✅ **THE GATE** | the full cross-node DPU command plane: farnet0 DPU → DPU↔DPU RDMA → farnet1 DPU → **DPU-spawned** backend |
-| **basebackup, 4-role DPU relay** | **DPU** | ✅ | the **only** validated basebackup topology |
+| **basebackup, 4-role DPU relay** | **DPU** | ✅ (was silently 🔴 for 2 days — see below) | the **only** validated basebackup topology; the **only** workload that exercises the byte-ring **WRAP** |
 | **DPU TCP transport smoke** | **DPU** | ✅ | the **only** single-node host↔DPU DMA regression net |
 | `pgbench --homer` (local) | host | ✅ | local control path, `CLIENT_SQL_SESSION`, backend spawn, local result sink |
 | `pgbench --homer` (remote RDMA) | host | 🔴 **BROKEN at HEAD** | fails at **session open** — `open request parameters mismatched existing sink` — before any payload flows; pgbench then **spins at 100% CPU instead of exiting**. Found 2026-07-12 the first time anyone ran it in weeks. **Not being fixed: host-service Homer is being removed.** |
@@ -478,6 +496,20 @@ done
 
 **If you only run one thing, run the gate.** `pgbench --homer --homer-dpu-command` is the workload that
 exercises the DPU path end to end.
+
+> ⚠ **"RUN THE GATE" IS NOT "RUN ONLY THE GATE" — AND THAT MISREADING JUST COST TWO DAYS.**
+> citus `4382b65d65` (the commit that made the **gate** green) **broke the 4-role basebackup dead, at open, in
+> both roles, 100% of the time.** Nobody noticed, because the gate was the only workload re-run — and the gate
+> touches neither of the code paths it broke. Found only on 2026-07-13, when the basebackup was needed to
+> validate something else. Fixed in citus `ffe2c4ac9`.
+>
+> **The gate and the basebackup prove DIFFERENT things, and neither substitutes for the other:**
+> - the **gate** moves one tiny result at a time, so its byte-ring ready range is ~one record. It almost
+>   certainly **never wraps the ring**.
+> - the **basebackup** pushes ~21.6 GiB through a 512 KiB ring — **~44,000 laps**. It is the **only** workload
+>   that exercises the wrap split, and therefore the only one that can validate a byte-relay change.
+>
+> A green gate says nothing about the wrap. Run both.
 
 ⚠ **THREE of the workloads above are broken at HEAD, and all three are HOST-SERVICE workloads.** That is not a
 coincidence: **host-service Homer is being removed** as the DPU command plane lands, and every host-service path

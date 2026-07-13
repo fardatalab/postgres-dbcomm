@@ -4496,3 +4496,87 @@ chain's tail CQE retires the whole chain's count. That is P0-i's rule again (def
 signalled WR only when that WR is GUARANTEED — and here it is: same chain, same post).
 
 **Still open for the owner:** is (b) P0, or P7b's first step?
+
+---
+
+## §30 — THE 4-ROLE BASEBACKUP WAS BROKEN AT OPEN FOR TWO DAYS. Root cause: the negotiated geometry had no home.
+
+**Regression introduced by citus `4382b65d65` (2026-07-11). Found 2026-07-13. Fixed in citus `ffe2c4ac9`.**
+
+### 30.1 What broke, and why nobody saw it
+
+`4382b65d65` is **the commit that made the DPU gate green** (P3, "SQL result relay GREEN end-to-end"). It added
+**three structurally identical byte-ring geometry checks** — peer-open, local-open, async-open — and **each picked
+a queue BY NAME.** Two picked `receiveQueue`. A **basebackup stream never provisions `receiveQueue`**
+(`HomerServiceCreatePayloadStreamEntry` gates it on `!IsBaseBackup`, `tuple_sink_service_process.c:25758`), so both
+compared **ZERO** against the requested `524288` and failed deterministically, on the first open, before a byte
+moved — **in BOTH roles**:
+
+| role | check | message |
+|---|---|---|
+| sender (`pg_basebackup -t 'homer:...'`) | peer-open | `peer open request parameters mismatched existing sink` |
+| consumer (`pg_basebackup --homer-receive`) | local RECEIVE open | `open request parameters mismatched existing sink` |
+
+⚠ **It went unnoticed for a DAY because the DPU gate — the only workload re-run — touches neither path.** The
+commit's own subject line reads *"one rule, violated in both directions."* It was.
+
+### 30.2 The root cause is NOT "a wrong field". It is that GEOMETRY HAD NO HOME.
+
+The negotiated ring geometry lived **incidentally inside a queue object**, so three checks each had to **guess
+which queue held it** — and they guessed by **NAME**, in a scheme where the names describe **DIRECTION** while the
+contents describe **OWNERSHIP**:
+
+| object | what it ACTUALLY is |
+|---|---|
+| `stream.sendQueue` | **PRODUCER-owned** ring. Mapped for **EVERY** byte-ring stream, on the sending **and the receiving** service (`:25732`). On a receiver it carries **no data** — but it does carry the **geometry**. Hence canonical. |
+| `stream.receiveQueue` | **RECEIVER-owned**: a ring a **LOCAL BACKEND PROCESS polls**. ⚠ Not created for basebackup, which has no such backend — the DPU relays onward. **ZERO on a basebackup stream.** |
+| `stream.localReceiveByteRing` | The **peer-facing inbound RDMA LANDING ring**. A separate object (must live in DPU landing memory, registered as the peer-writable MR). It merely **ALIASES** `receiveQueue` on the host tuple path (`:17762`). **NOT redundant with it.** |
+
+**The model is SOUND and basebackup is NOT missing a ring** (reviewed and confirmed). *The names are the trap.*
+
+### 30.3 The fix: give geometry ONE home, and route EVERY check through it
+
+`HomerServiceStreamNegotiatedByteRingBytes()` (`tuple_sink_service_process.c:4339`) is now the single source of
+truth. **All three checks route through it** (`:28115`, `:37318`, `:38783`) — **including the one that was already
+correct**, because leaving *any* of them reading a queue member directly is exactly what let the other two drift
+apart. Zero direct queue reads remain in any geometry check; the three are now textually identical and cannot get
+inconsistent again.
+
+> **A one-line fix was NOT enough, and I nearly shipped one.** I read the *sender's* error, found a real bug, fixed
+> it, and stopped — never asking why the *consumer* also failed, **with a different message**. The second check was
+> live and on the critical path. **Stopping at the first cause that explains the symptom you happened to look at is
+> not root-causing.** Ask what ELSE failed, and whether it failed the same way.
+
+### 30.4 Deeper: the eager allocation is dead storage, and there is a FOURTH geometry-carrier read
+
+- On a **DPU tuple-receive** stream, `receiveQueue` is allocated, *validated as mapped* (`:17735`), and then
+  **never used as a data path** — the aliasing is deliberately skipped when the DPU DMA engine is active (`:17760`),
+  because the worker backend lives on the **host** and cannot map the **DPU's** shm. Its only surviving purpose is
+  `ringBytes = streamEntry->stream.receiveQueue.byteRingBytes;` at **`:17745`** — *a fourth site reading the
+  geometry out of whichever queue was handy.* Same disease, one layer down. Safe today only because that branch is
+  guarded and basebackup does not reach it. **Route it through the accessor, then the DPU's `receiveQueue`
+  allocation is provably dead and can go.**
+- **The rename is worth doing** (`sendQueue` → `localProducerSourceQueue`, `receiveQueue` →
+  `localConsumerDeliveryQueue`, `localReceiveByteRing` → `peerInboundLandingRing`; ~270 sites) but it is now
+  **cosmetic, not load-bearing** — the accessor already removed the ambiguity.
+  ⚠ **If you use clangd to do it: clangd indexes ONLY the active build config.** Every reference inside
+  `#if HOMER_SERVICE_PAYLOAD_STATS` / `HOMER_DPU_P2_DIAG` will be **silently skipped**, compile fine, and break only
+  the *diagnostic* build. Cross-check with a textual grep, and **build the diagnostic configs to prove it**.
+
+### 30.5 ✅ VALIDATED (2026-07-13, citus `ffe2c4ac9`)
+
+4-role DPU-relay basebackup, run **twice**: both **OPEN and COMPLETE**. Zero occurrences of either mismatch string.
+`delivered_bytes` = **23,245,076,093** and **23,245,102,717**; both closed with `CLOSE_ACK`.
+
+DPU gate: transport line correct, DPU backend spawn begin/COMPLETED, anti-fallback clean, 5/5 and 2000/2000 with 0
+failed. Warmed `-t 2000 --debug`: **292.66 / 286.89 / 285.22** tps vs the like-for-like band 284.51 / 280.97 /
+278.65. No regression.
+
+### 30.6 THE VALIDATION LESSON — the gate and the basebackup prove DIFFERENT things
+
+⚠ **A green gate says NOTHING about the ring wrap.** The gate moves one tiny result at a time, so its ready range
+is ~one record and it almost certainly **never takes the 2-write wrap path**. The basebackup pushes **21.6 GiB
+through a 512 KiB ring = ~44,000 LAPS** — it is the **only** workload that exercises the wrap, and therefore the
+only one that can validate a byte-relay change (§28/§31). *That* is why `4382b65d65` could break it invisibly, and
+why the byte-relay WR-budget deletion could not be validated until it was fixed. **Run both. Neither substitutes
+for the other.**
