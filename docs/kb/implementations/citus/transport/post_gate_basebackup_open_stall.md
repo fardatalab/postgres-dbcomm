@@ -530,21 +530,67 @@ exits early, `strings` takes SIGPIPE, `pipefail` turns that into a failure. *A d
 indistinguishable from its failure* — the exact disease being cured, reproduced in four words of shell, while
 curing it.
 
-### F3 FALSE-POSITIVED **TWICE**, and the two failures are the same failure
+### ✅ THE DETECTOR IS PROVEN — IN BOTH DIRECTIONS (citus `a551bcf6e`)
 
-| # | what it did | why |
+**Positive case, by deliberate sabotage.** A DPU binary was built with the scanner's `continue` reverted to a
+`return` — reintroducing this exact P0 on purpose — and deployed to **farnet1's DPU only**. Result:
+
+```
+ALARM ... has not REACHED import=1 for 100000 scans (... last_visited_scan=0 current_scan=100000)
+ALARM ... has not REACHED import=2 for 100000 scans (... last_visited_scan=0 current_scan=100000)
+ALARM ... has not REACHED import=3 for 100000 scans (... last_visited_scan=0 current_scan=100000)
+```
+…and then, **after** the basebackup attempt:
+```
+ALARM ... has not REACHED import=5 for 100000 scans (... last_visited_scan=18460162 current_scan=18560162)
+```
+The basebackup failed at `real 15.11` with the original error, verbatim. **farnet0's DPU (good code) stayed
+completely clean** — so the alarm fires on the sabotaged node and *only* there.
+
+> ⭐ **THE FOURTH LINE IS THE ONE THAT PROVES THE DETECTOR IS REAL.** The first three say
+> `last_visited_scan=0` — never reached. A dumb "count is zero" check could manage that. The fourth says
+> **`last_visited_scan=18460162`** — that import **was being reached, eighteen million times, and then STOPPED.**
+> That is the basebackup's own import, and that *transition* is this P0's exact signature: discovery working
+> normally, a baseline-pending ring appears ahead of it, the scan starts bailing early, and a healthy import goes
+> dark. **A "has it been polled?" proxy could never have told that apart from an import that was merely idle.**
+> Reach can — and it localizes the failure **in time**.
+
+**Negative case:** silent on healthy code, and silent on the exact 8-client shape that produced the third false
+positive.
+
+### The detector's history — F3 FALSE-POSITIVED **THREE TIMES**, and all three are one failure
+
+All three versions asked **"HAS THIS IMPORT BEEN POLLED?"** — and that question is a **PROXY**. A proxy inherits
+every innocent explanation it has, and this one had three. I found them one at a time, by shipping each in turn:
+
+| # | it fired on | the innocent cause I hadn't accounted for |
 |---|---|---|
-| 1 | fired on a **healthy new import** | it compared against the engine's **LIFETIME** read total, which on a long-lived service is already millions — so *every* newly-arrived import cleared the threshold in the window before its first read. **"A probe cannot tell NOT YET from NEVER"**, hit inside the instrument built to avoid it. Fixed by baselining the total at import activation. |
-| 2 | fired on **three legitimately silent arena exports** | the engine-fatal fix above created a brand-new **legitimate** reason for a ring never to be polled (an arena export nobody binds stays suppressed forever and genuinely has nothing to say). The alarm still treated "enrolled but never polled" as proof of starvation. Fixed by counting only **READABLE** enrolled rings — *"was any ring that COULD have been polled, polled?"* |
+| 1 | a **healthy new import** | **the import is YOUNG.** I compared against the engine's **LIFETIME** read total, already millions on a long-lived service — so every new import cleared the threshold in the window before its first read. *"A probe cannot tell NOT YET from NEVER"*, hit **inside the instrument built to avoid it.** |
+| 2 | **three legitimately silent arena exports** | **every enrolled ring is SUPPRESSED.** The engine-fatal fix above made that the common case — an arena export nobody binds stays suppressed forever and genuinely has nothing to say. *I created a new legitimate reason for silence and left a detector reading silence as a bug.* |
+| 3 | **an import whose ring had just become readable** | **the scanner hasn't come round yet.** One ring flipped readable and the alarm fired instantly, because "reads since activation" was already enormous. |
 
-> **A detector is only as good as its notion of what SHOULD have happened.** Both failures are that one sentence.
-> The second is the sharper lesson: **when you add a new legitimate reason for silence, you must update every
-> detector that treats silence as a bug — in the same breath, or it will lie.** I changed the meaning of an
-> observation and left a detector reading it with the old meaning.
+**Each fix bought exactly one innocent cause and left the next one live.**
 
-**Both were caught by the alarm itself, loudly, on passing runs, for the cost of one rebuild each.** That is the
-argument for building the detector even after the bug it targets is dead — and equally, for treating every alarm
-that fires as a claim to be *verified*, not inherited.
+> ### The lesson is NOT "try harder on the threshold"
+>
+> **POLLING IS A CONSEQUENCE. I kept measuring the consequence instead of the cause.**
+>
+> The invariant this P0 broke is exactly one thing: **THE SCANNER MUST REACH EVERY ACTIVE IMPORT.** So measure
+> **REACH** — an engine-wide scan ordinal, and per import the ordinal at which the scanner last *arrived*, whether
+> it then submitted, skipped every ring, or found nothing to do.
+>
+> **"NOT REACHED" HAS NO INNOCENT CAUSE.** The scanner arrives at every active import on any complete pass,
+> unconditionally — independent of readability, tenancy, work, or timing. Zero does not mean "quiet"; it means the
+> scan is not getting there, which is the bug and only the bug. No baselines, no clocks, no races. **And it is
+> smaller** (net −7 lines) and **cheaper** — the per-ring readability walk is gone from the polled facts path.
+
+**All three false positives were caught by the alarm itself, loudly, on PASSING runs, for one rebuild each.** That
+is the argument for building the detector even after its bug is dead — and equally for treating every alarm that
+fires as a claim to be **verified**, not inherited.
+
+⚠ **And a detector that has cried wolf three times is one people learn to scroll past, which is worse than not
+having it.** That is why the sabotage run above was mandatory, not optional: *a detector that has only ever been
+seen to stay silent is indistinguishable from a broken one.*
 
 ## Related
 - `farnet_operational_hazards.md` §8.1 — *an import being accepted proves nothing*. Violated here.
