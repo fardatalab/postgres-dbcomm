@@ -26,7 +26,7 @@
 > | item | state | where |
 > |---|---|---|
 > | **P2-i** — `HomerDpuDmaDestroy` drain on clean exit | ✅ **LANDED + VALIDATED** — citus **`2b37e8701`**. **AND IT IS A REAL BUG FIX:** `entered with 3 outstanding task(s)` when SIGTERM'd **mid-transfer**. | **§34.12** (the measurement) · §34 (spec) · §34.7 (my two self-refutations) · §34.9/§34.10 (3 review rounds, 8 defects, 6 mine) |
-> | 🔴 **NEW — an exit path that reaches `HomerDpuDmaDestroy` NEVER** | ⛔ **OPEN, PRE-EXISTING.** The **backend-side** DPU service **exits(1)** out of the session-reset path (*"refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers quiesce"*) and never tears the DMA engine down **at all**. Fires on SIGTERM shortly after a gate run. **This is the audit's own subject matter: an exit path that releases nothing.** | **§34.12** (bottom) |
+> | 🔴 **an exit path that reaches `HomerDpuDmaDestroy` NEVER** | ⛔ **OPEN, PRE-EXISTING.** The **backend-side** DPU service **exits(1)** out of the session-reset path (*"refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers quiesce"*) and never tears the DMA engine down **at all**. Fires on SIGTERM shortly after a gate run. **This is the audit's own subject matter: an exit path that releases nothing.** *(Re-observed under P2-N's tripwire; §48 adds the shutdown-ordering analysis. §48 called it "new" — it is not.)* | **§34.12** (bottom) · **§48** |
 > | **P2-j** — grouped-control reads outliving tenancy | ✅ accepted, **no action** | §4/P2-j |
 > | **§31** — dead DPU shm rings | 🧹 planned **cleanup**, not a bug | §31 |
 > | **§22.10.1** — P0-b's `RETIRING` branch | ⚠ **still unexercised — and the test this doc prescribed CANNOT WORK** | **§34.11.** `RETIRING` is gated on `ownerAbandoned`: it is the ZOMBIE path (owner timed out, THEN the response landed). A healthy run never abandons a control op **at any client count**, so `-c N` reports `retiring=0` **by construction**. ~~fold a `-c 4` run into P2-i's validation~~ — **STRUCK.** Needs fault injection. |
@@ -7344,7 +7344,18 @@ mirror. **Predicted from code, then confirmed by measurement.**
 
 ## §48 — 🔴 OPEN: teardown ordering. **A mid-COMMAND SIGTERM cannot exit cleanly, and the shutdown order contradicts the transport's own reset contract.**
 
-**Not caused by §47** — §47 merely stopped masking it. Bring to the user before starting; it is a stage, not a patch.
+> ⚠ **§48a IS NOT A NEW BUG — IT IS §34.12's ALREADY-OPEN ITEM, re-observed in P2-N's tripwire context.**
+> The header table's `🔴 exit path that reaches HomerDpuDmaDestroy NEVER` row and §34.12's bottom subsection
+> (*"NOT FIXED, AND IT BOUNDS P2-i"*) describe the SAME exit(1): same *"refusing to reset peer
+> CLIENT_SQL_SESSION before command-mailbox writers quiesce"*, same never-reaches-`HomerDpuDmaDestroy`, same
+> trigger (SIGTERM shortly after a gate run — §34.12 saw `current_sequence=14004`, §48 saw `19904`; both are
+> `2000 txns × 7 statements`, un-quiesced). **I filed it as "new" during P2-N — the exact append-vs-update
+> hazard this file's header box warns about.** What §48 genuinely ADDS beyond §34.12 is **§48b**: the
+> shutdown-ORDERING contradiction (streams→sessions→transport vs the transport's own destroy-QP-first
+> contract) and why the naive reorder is a UAF. The header's 🔴 row now points here for that analysis.
+
+**Not caused by §47** — §47 merely stopped masking it (and §34.12 had already recorded it). Bring to the user
+before starting; it is a stage, not a patch.
 
 **The symptom (MEASURED).** SIGTERM node B while the gate is mid-command:
 
