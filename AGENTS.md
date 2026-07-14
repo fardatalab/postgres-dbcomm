@@ -1039,6 +1039,7 @@ Then ask the two questions that an exit code cannot answer:
 
 | you want | read |
 |---|---|
+| **the CODE contract you are about to violate** — *"which session owns this ring?"*, *"why is everything 64?"*, *"can I trust `commandState`?"*, *"who decrements `activeSinkCount`?"* | **`docs/kb/implementations/citus/transport/homer_contracts_and_invariants_index.md`** — **the inverted index. Keyed by the QUESTION, not the function. Read it BEFORE writing code that touches session / ring / sink ownership.** A rule stated perfectly in a comment was violated in the same file, 1,000 lines below its own statement, and cost a day — because the question arises where the answer is *used*, not where it is *defined*. |
 | why a rule exists; the trap it prevents | `docs/kb/operations/farnet_operational_hazards.md` |
 | diagnostic builds, `starve-diag`, RDMA link battery, measurement history, broken command shapes | `docs/kb/operations/farnet_diagnostics_and_baselines.md` |
 | the selected-DPU architecture of record | `docs/kb/implementations/citus/transport/selected_dpu_session_rings_and_lifecycle.md` |
