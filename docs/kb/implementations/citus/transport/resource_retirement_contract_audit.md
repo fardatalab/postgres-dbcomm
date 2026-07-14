@@ -25,10 +25,16 @@
 >
 > | item | state | where |
 > |---|---|---|
-> | **P2-i** — `HomerDpuDmaDestroy` drain on clean exit | 📝 **SPEC** (facts verified in code) | **§34** — supersedes §9.3's sketch, which had a hole (`fatalError` ⇒ the drain can never converge, so "FATAL on non-convergence" would abort **every** dirty shutdown) |
+> | **P2-i** — `HomerDpuDmaDestroy` drain on clean exit | 🔨 **IMPLEMENTED, 3 review rounds, awaiting validation** | **§34** (spec + 13 verified facts) → **§34.7** (I refuted TWO of my own) → **§34.8** (what shipped) → **§34.9 / §34.10** (the reviews: 8 defects, 6 mine) |
 > | **P2-j** — grouped-control reads outliving tenancy | ✅ accepted, **no action** | §4/P2-j |
 > | **§31** — dead DPU shm rings | 🧹 planned **cleanup**, not a bug | §31 |
-> | **§22.10.1** — P0-b's `RETIRING` branch | ⚠ validated **by construction, never by execution** (`retiring=0` in every run) | fold a `-c 4` gate run into P2-i's validation |
+> | **§22.10.1** — P0-b's `RETIRING` branch | ⚠ **still unexercised — and the test this doc prescribed CANNOT WORK** | **§34.11.** `RETIRING` is gated on `ownerAbandoned`: it is the ZOMBIE path (owner timed out, THEN the response landed). A healthy run never abandons a control op **at any client count**, so `-c N` reports `retiring=0` **by construction**. ~~fold a `-c 4` run into P2-i's validation~~ — **STRUCK.** Needs fault injection. |
+>
+> ⛔ **This box PREVIOUSLY said P2-i's hole was "`fatalError` ⇒ the drain can never converge."** That claim is
+> **REFUTED (§34.7) and it is BACKWARDS**: `fatalError` is a software *"do not start new work"* latch, not a dead
+> device; already-submitted tasks still retire and **MUST** be harvested (`harvestEvenIfFatal=true`). Refusing to
+> drain under fatal is *itself* the hang — the code says so at `homer_service_dpu_dma.c:6535-6538`. **Do not
+> re-adopt the struck claim from this table's history.**
 >
 > ### ⚠ THE HAZARD THIS BOX EXISTS TO PREVENT — and it fired, on 2026-07-13
 >
