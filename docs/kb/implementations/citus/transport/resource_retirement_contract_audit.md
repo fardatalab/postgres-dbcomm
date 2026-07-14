@@ -5241,3 +5241,99 @@ the LOOP SHAPE** — and I had it exactly inverted.
 > **The pattern is now unmistakable: I write the spec, and THEN discover the mechanism.** Reverse it. The cheap
 > question — *"which function already does this, and what does its comment say?"* — found the answer in both
 > directions here, and it took ninety seconds.
+
+### 34.8 P2-i — WHAT SHIPPED (7 changes, all in `homer_service_dpu_dma.c`)
+
+| # | change | why |
+|---|---|---|
+| 1 | `engine->shuttingDown` latch, gated **inside `HomerDpuDmaFindFreeTaskSlot` / `...Excluding`** | that pair is the **single acquire choke point** for all 8 arm sites, so "you cannot submit a task you could not arm" holds **by construction**. Gating the submit *predicates* instead would have rested on the NEGATIVE claim "no submit escapes them" — the class of claim this project keeps getting wrong. |
+| 2 | new `HomerDpuDmaQuiesceAndDrainForDestroy()` | phases 2+3. Modelled on **`HomerDpuDmaDrainArenaSlot`**, not on `HomerDpuDmaDrainPeInternal`: wall-clock bound (5 s), **not** an iteration cap; `harvestEvenIfFatal=true`; spins on `totalInflightTaskCount == 0`. |
+| 3 | new `HomerDpuDmaLogTaskSlotCensus()` | a timeout that prints *"3 outstanding"* is a number; one that prints *"1× `BYTE_RING_WRITE_PRODUCED_TAIL_PUBLISH` **PREPARED**"* is a diagnosis. `SUBMITTED` ⇒ the device never completed it. `PREPARED` ⇒ armed, counted, never submitted — a successor pin. **DOCA-only** (its two name helpers are inside the `#ifdef`), with a non-DOCA stub. |
+| 4 | 🐛 **BUG FIX** at the `:10733` submit-failure branch: abort the prepared **grandchild** before retiring | the byte-ring write is a **3-task** chain; retiring only the middle hop left the terminal publish `PREPARED` **and counted forever** — a permanent silent pin of the very counter the drain waits on. The correct helper (`HomerDpuDmaAbortPreparedDpuToHostPublish`, which already recurses for exactly this chain, `:10868-10872`) existed; this branch just never called it. **Found by the adversarial accounting audit, not by me.** |
+| 5 | `HomerDpuDmaDestroy` calls the quiesce+drain before the DOCA teardown | closes V3 (§2.2). Its own block comment used to say the drain policy was missing. |
+| 6 | `HomerDpuDmaDestroyDocaLifecycle` **REORDERED**: `doca_ctx_stop` (return **checked**; `IN_PROGRESS` ⇒ pump the PE to `DOCA_CTX_STATE_IDLE`, bounded) now runs **before** the host-mmap-import clear | fixes **F3**. The old order destroyed the DMA **targets** (import mmaps, descriptors, `memset`) *before* stopping the DMA **contexts**. |
+| 7 | `doca_buf_inventory_stop/destroy` + `doca_pe_destroy` returns **checked and ALARMed** | fixes **F2**. These two are the **canaries**: the inventory refuses to stop while a `doca_buf` is checked out; the PE refuses to be destroyed while a ctx is still connected. A clean shutdown must see both succeed — and we were discarding the answer. |
+
+**Not fixed, deliberately (recorded, not hidden):** the prepared-successor pins on the **validation-failure** branches (`:10667-10730`, four `fatalError = true; return false;` sites) leak the same way. Different mechanism (validation, not submit failure), and they poison the engine regardless. The drain now **reports** them (census prints `PREPARED`) instead of hanging silently. Fix separately.
+
+#### 34.8.1 First evidence — the host DOCA smoke, BEFORE any DPU deploy
+
+`build/homer/homer_service_dpu_dma_doca_smoke --dev-pci 0000:21:00.0` (host, `-DHOMER_DPU_DMA_WITH_DOCA`):
+
+```
+homer DPU DMA: teardown drain COMPLETE: entered with 0 outstanding task(s),
+               converged after 0 progress round(s); free_slots=3072/3072 fatal=false
+homer DPU DMA: DOCA context state 2 -> 0      <-- RUNNING -> IDLE, x3
+homer_service_dpu_dma_smoke: ok
+```
+
+What this **does** prove: the drain is wired in and convergent; the slot-array cross-check (`3072/3072`) **agrees** with the class counters (independent of the `> 0` guard at `:11439` that can mask drift); the contexts are **observed** reaching IDLE rather than merely asserted to have; and **all five previously-`(void)`-discarded DOCA statuses returned `DOCA_SUCCESS`** — a fact nobody had ever been in a position to know. Zero ALARMs. The non-DOCA build of the same smoke also passes, so the `#else` stub path compiles *and* runs.
+
+⚠ What it does **NOT** prove, and must not be read as proving:
+
+- **`entered with 0 outstanding`.** The drain drained *nothing*. It is proven harmless, not proven effective. **The number we actually want — N at SIGTERM in the live DPU service — is still unknown** (§34.5).
+- **The `IN_PROGRESS` → pump-to-IDLE branch (change 6) never executed**, because with 0 outstanding, `doca_ctx_stop` returns `DOCA_SUCCESS` immediately. That branch is therefore **validated by construction, never by execution** — the same disease §22.10.1 records for P0-b's `RETIRING`, and it must be labelled the same way rather than rounded up to "covered".
+
+### 34.9 ⛔ ADVERSARIAL REVIEW OF THE P2-i DIFF — SIX FINDINGS, FOUR OF THEM MINE
+
+The reviewer **read the DOCA headers** (`/opt/mellanox/doca/include/{doca_ctx,doca_mmap,doca_buf_inventory,doca_pe}.h`),
+so its DOCA claims are VERIFIED, not inferred. Every load-bearing one was re-checked by me before acting.
+**It caught a hang I was about to ship.**
+
+| # | finding | verdict | whose |
+|---|---|---|---|
+| **R1** | **Blocking the in-callback resubmit (`:10733`) strands counted `PREPARED` slots** ⇒ `inflightTaskCount` never reaches 0 ⇒ **the drain hangs.** My §34.3 spec said to gate exactly that site. | **the fix would have BEEN the bug** | **mine** |
+| **R2** | `doca_ctx_get_state()` **failing** took the same `break` as reaching **IDLE**. | **"I don't know" laundered as "yes"** — the exact disease P0-f exists to cure, in code I wrote *to enforce my own rules* | **mine** |
+| **R3** | My comment *"these two functions are THE single choke point … by construction"* is **FALSE**: the byte-ring 3-chain acquires its **third** slot with a **raw `engine->taskSlots[]` scan** inlined at the call site (`:3936-3951`). The quiesce worked only **transitively** (the two gated calls run first and return NULL). | **REFUTED** | **mine** |
+| **R4** | My "independent second certificate" (`freeTaskSlotCount == taskSlotCount`) **is not independent** — both counters are maintained in the SAME retirement funnel, so a drift corrupts both in lock-step. It asks the funnel to grade its own homework. | **REFUTED** | **mine** |
+| **R5** | I named the **wrong canary**. `doca_buf_inventory_stop` merely *"stops element retrieval"* and *"does not have to be called before destroy"* (`doca_buf_inventory.h:116-132`). **`doca_buf_inventory_destroy`** is the one returning `DOCA_ERROR_IN_USE` *"if not all allocated elements had been returned"* (`:73-90`). | **REFUTED** — checking the wrong call *and believing it* is worse than checking neither | **mine** |
+| **R6** | The byte-ring 3-chain's **terminal publish** stays `PREPARED` **and counted forever** when the middle hop's submit fails. Also five (not four) validation-failure branches leak the same way. | **REAL BUG** | pre-existing |
+| **R7** | **The failure path still destroyed what it could not prove was safe to destroy.** `doca_mmap_destroy` returns **`NOT_PERMITTED`** while any `doca_buf` points into it (`doca_mmap.h:104-122`); `doca_buf_inventory_destroy` returns **`IN_USE`** while an element is checked out. So the destroys were **rejected by DOCA anyway** — and then we `free()`d the memory. | **REAL** | **mine** |
+
+#### 34.9.1 THE RELEASE GATE — an improvised design decision, recorded as such
+
+**Decision (owner-absent; flagged to the owner in the same turn):** *if any DOCA context cannot be **proven** IDLE,
+**abandon the teardown entirely** — destroy nothing, free nothing, ALARM loudly, and let process exit reclaim.*
+`HomerDpuDmaDestroyDocaLifecycle` now returns `bool`; on `false`, `HomerDpuDmaDestroy` skips
+`HomerDpuDmaFreeStage5Scaffolding()` **and** `free(engine)`, and says so.
+
+**Why "the process is exiting anyway" is NOT a licence — and this is the load-bearing bit:**
+
+> **`free()` IS NOT INERT.** glibc can return a large block to the kernel via `munmap()`, and **a device still
+> writing into an unmapped page raises an IOMMU fault, not a harmless scribble.** Leaking at exit costs nothing.
+> Destroying under live DMA does.
+
+And it is what §9.4 has always said Scenario E *means* — *"destroys … and then **ABANDONS** software owners,
+**explicitly recording what it discarded**"*. So this is read as **plan-consistent, not a deviation**: the previous
+code (and my first draft) dressed a cancellation up as a release, which is precisely the substitution this audit
+exists to end.
+
+#### 34.9.2 R3's real lesson, and the fix that makes the claim TRUE
+
+The raw scan was **in my own grep output** (`3879: candidate->state == HOMER_DPU_DMA_TASK_SLOT_FREE`) hours before
+I wrote the comment claiming there was *"no need to enumerate the submit sites and hope."*
+
+**The fix was NOT to soften the comment.** `HomerDpuDmaFindFreeTaskSlotExcludingTwo()` now exists, gated on
+`shuttingDown` like its two siblings, and the raw scan is gone. There are **three** acquisition points and the
+claim is now true rather than lucky.
+
+> **RULE. A comment asserting "by construction" while the property actually holds BY ACCIDENT is worse than no
+> comment at all** — the next person adds a fourth acquisition site and trusts it. If you cannot make the claim
+> true, do not make the claim.
+
+#### 34.9.3 N5 — a hole I found in my OWN fix while briefing the re-review
+
+Writing the re-review brief, I asked: *"could a **STOPPING** context be skipped by the `continue` and thereby be
+silently certified idle?"* — and then answered it myself instead of waiting.
+
+The skip condition was `if (ctxs[i] == NULL || !classes[i].docaContextStarted) continue;`. But
+`docaContextStarted = (nextState == DOCA_CTX_STATE_RUNNING)` — **so it is false for STOPPING too.** I had deleted
+the *comment* that trusted that flag, and left the *code* that trusted it. A STOPPING context would have fallen
+through the loop **without being stopped and without clearing `allContextsIdle`** — a false certificate, in the
+gate built to prevent false certificates.
+
+**Fix: stop asking the flag; ASK THE CONTEXT.** `doca_ctx_get_state()` distinguishes IDLE / RUNNING / STOPPING
+directly. "Never started" (IDLE) now skips honestly; everything else goes through stop-and-prove.
+
+> **RULE. When you discover that a flag lies, `grep` for EVERY reader of it — not just the one you were looking at.**
+> Deleting the comment that trusted it is not the fix.
