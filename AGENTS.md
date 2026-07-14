@@ -627,10 +627,12 @@ single-node engine smoke — a cheap check, **not** the gate).
 
 | role | what runs there |
 |---|---|
-| **farnet0 host** | `pgbench` client, **plus the host service UP** — see the caveat below |
+| **farnet0 host** | `pgbench` client. **NO host service** (see trap 2 — this changed at S7.0) |
 | **farnet0 DPU** (node A) | Homer service: DMA env **+ peer-bind** `10.10.1.200:9717` |
 | **farnet1 DPU** (node B) | Homer service: DMA env **+ peer-bind** `10.10.1.201:9717` |
-| **farnet1 host** | PostgreSQL with `citus.enable_homer_dpu_frontend_agent=on`. **Host service DOWN.** |
+| **farnet1 host** | PostgreSQL with `citus.enable_homer_dpu_frontend_agent=on`. **NO host service.** |
+
+**Start NO host `citus_tuple_sink_service` at all.** The gate touches neither.
 
 #### ⚠ Two traps that each cost a validation cycle
 
@@ -641,16 +643,27 @@ which spawns a backend through the deprecated host-service arm. **Everything "pa
 DPU, the arena spawn, and the arena backend arm are **never touched**. The only tell is the *absence* of
 `DPU backend spawn begin`/`COMPLETED` in the farnet1 DPU log.
 
-**2. The farnet0 (client-side) host service must be UP; the farnet1 (backend-side) one must be DOWN.**
-Not symmetric, and not what you would guess. `pgbench --homer` cannot **boot** without a local control
-region (`HomerClientOpenControl`, per thread, before any DPU logic), so the client-side host service must run
-— **for control-region hosting only.** Verify its log shows the startup banner and **zero** session/command/
-payload activity. The **backend-side** host service stays DOWN: that is the loud-failure guard that stops a
-silent host-relay fallback from masquerading as a pass.
+**2. ✅ FIXED AT S7.0 — START NEITHER HOST SERVICE. The old rule is retired; do not resurrect it.**
 
-> Runs 13–16 passed this way **by accident**: a stale `/citus_remote_execution_control_v27` satisfied the
-> client even with the farnet0 host service down. A **hard clean baseline** (which removes it) is what made
-> the topology error visible. Do the hard clean baseline.
+> **The old rule said:** *"the farnet0 (client-side) host service must be UP; the farnet1 (backend-side) one
+> must be DOWN — not symmetric, and not what you would guess."* It was true, and it was a **smell**, and
+> nobody chased it.
+>
+> **The reason it was true:** `pgbench --homer` opened a host-service control region **unconditionally**, and
+> `--homer-dpu-command` implies `--homer`. But the selected-DPU session open
+> (`HomerClientOpenSqlSessionSelectedDpu`) **takes no control region** — only the host-service
+> `HomerClientOpenSqlSession` does. **So the gate mapped a region it never used**, purely to satisfy a
+> `shm_open` that only the host service could create (`homer_client.c:400` — `shm_open`, *no* `O_CREAT`).
+>
+> **S7.0 gates that call on `!homer_dpu_command_mode`.** With no control region open, **a silent fall back to
+> the host-service arm cannot even be expressed.** The anti-fallback property stopped being a procedure
+> someone has to remember and became a structural fact — and host-service Homer lost its last hold on the DPU
+> path (it is the real precondition for S7.1's deletion).
+>
+> **Runs 13–16 passed by accident** on a **stale** `/dev/shm/citus_remote_execution_control_v27`, with the
+> farnet0 host service *down* — the dead mapping was satisfied by a corpse. **That object was STILL sitting on
+> farnet0 on 2026-07-13**, found by the S7.0 validation. **Still do the hard clean baseline** (the stale-arena
+> and stale-spawn-region traps are unaffected by S7.0).
 
 #### Run it
 
@@ -689,10 +702,32 @@ ssh farnet0 "sudo -n -u dbcomm sh -c 'env \
 2. **Decoded values, from `--debug`:** `client 0 Homer DPU result relay for sql_execute reached EOS: rows=1
    abalance=<N>` — one per transaction, **five distinct values**, `5/5` processed, `0` failed.
    ⚠ `-d` is `--dbname`, **not** `--debug`.
-3. **farnet1 DPU log:** `DPU backend spawn begin …` then `DPU backend spawn COMPLETED … launched_pid=N`, and
-   pid `N` appears in farnet1's `postgres.log`. **Absence of these = trap 1 fired.**
-4. **Anti-fallback:** the farnet0 host service log holds its startup banner and **nothing else**; the farnet1
-   host service is **down**.
+3. **farnet1 DPU log:** `DPU backend spawn begin …` then `DPU backend spawn COMPLETED … launched_pid=N`.
+   **Absence of these = trap 1 fired.**
+
+   > ⚠ **This proof used to add "…and pid `N` appears in farnet1's `postgres.log`". THAT WAS A DECOY — DELETED.**
+   > `remote_execution_backend_bridge.c` contains **zero** `elog(LOG)`/`ereport(LOG)` calls: every "remote exec
+   > backend" message in it is inside an `ereport(ERROR)`. **A healthy socketless backend logs NOTHING to
+   > `postgres.log`. Its pid appears there only if it ERRORS.** The check dates from **S3.3, when the spawned
+   > backend was erroring** — S3.3b retired that ERROR, the pid went silent, and the runbook kept asking for it.
+   > **It was a proof that the backend CRASHED, mis-labelled as a proof that it ran**, and on a green run it is
+   > unsatisfiable — so every correct validation reported it as a deviation, which trains the reader to skip the
+   > deviation section. *(Caught 2026-07-13 by the S7.0 validation, which reported it honestly rather than
+   > rounding it to a pass.)*
+   > **A check that can only pass when something is broken is worse than no check.**
+
+4. **Anti-fallback — SINCE S7.0, THE STRONGEST FORM: run the gate with BOTH host services DOWN, and it passes.**
+   `pgbench --homer --homer-dpu-command` no longer opens the host-service control region at all
+   (`HomerClientOpenControl` is gated on `!homer_dpu_command_mode`), so **a silent fall back to the
+   host-service arm cannot even be expressed** — there is no control region to fall back through.
+   Prove no host service ran, by `/proc/<pid>/exe` (never `pgrep -f`).
+
+   > ⚠ **The old asymmetric rule — "the farnet0 (client-side) host service must be UP, the farnet1 one DOWN" —
+   > is RETIRED.** It existed only because the gate's client mapped a control region it never used. That dead
+   > mapping is exactly what let runs 13–16 "pass" against a **stale**
+   > `/dev/shm/citus_remote_execution_control_v27` with no host service alive at all. **Start neither.**
+   > (The S7.0 validation found that very stale object still sitting on farnet0, removed it, started zero host
+   > services, and the gate passed twice.)
 
 #### ⚠⚠ AFTER ANY **FAILED** GATE RUN, RESTART BOTH DPU SERVICES — A FAILED RUN LEAKS ARENA SLOTS
 

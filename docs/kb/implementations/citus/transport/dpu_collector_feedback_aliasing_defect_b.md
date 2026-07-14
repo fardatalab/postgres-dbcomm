@@ -10,6 +10,96 @@ and were re-derived from the tree at this SHA — the numbers in
 
 ---
 
+> ## ⛔⛔ ADVERSARIAL REVIEW (2026-07-13): **THE LATENCY THEORY IS DEAD. THE FIX SURVIVES — AND ITS SHAPE CHANGED.**
+>
+> ### ❌ REFUTED: defect B CANNOT suppress command discovery, and does NOT explain the ~223 µs
+>
+> `HomerServiceAppendProgressCollectorCandidate(candidateSet, DPU_GROUPED_CONTROL_READ, /*candidateDue*/ true,`
+> **`/*knownExpectedWork*/ facts.groupedControlRingCount > 0`**`, …)` — `:44589`.
+> And `:10493`, *before any feedback test*:
+> ```c
+> if (collector->knownExpectedWork || collector->waitingMachineCount > 0) { return false; }  /* never suppressed */
+> ```
+> **Whenever ANY role-1 control ring is enrolled — i.e. whenever a session exists — grouped-control is
+> structurally immune to blind backoff.** §2's mechanism is real but **unreachable on the discovery path**.
+> (VERIFIED by me, not inherited.)
+>
+> **§3's "open question" is therefore CLOSED, in the negative.** Do not run FB-0 expecting a latency answer;
+> the skip cannot fire for this collector while a session is open.
+>
+> ### ⚠ AND THE ANSWER WAS THREE LINES FROM WHERE I WAS READING
+>
+> The comment immediately above `:10493` says: *"…which starved the sibling `DPU_PE_DRAIN` collector — and with
+> it the DPU setup-TCP accept loop — **permanently**."* The setup-listener incident produced **three** scars —
+> a private source, `knownExpectedWork`, and the bypass list — and one of them already immunized the very
+> collector I spent this analysis claiming was exposed.
+>
+> > **THE PROCESS FAILURE, NAMED: I established the mechanism LAST.** I asserted the latency cause, then
+> > argued it better, and only *then* went looking for what protected it. **"What makes this safe today?" is
+> > the FIRST question, not the last** — because on a codebase this scarred, the answer is usually already in
+> > the file, written by the last person who got burned.
+>
+> ### ✅ WHAT SURVIVES (C1, C2, C3 — all VERIFIED)
+>
+> - **C1 ✅** Every *admitted* collector gets its OWN action grant and its OWN `HomerProgressResult`
+>   (`HomerServiceExecuteProgressExecutionPlan` `:48124`/`:48128`; dispatcher `:47877`;
+>   `HomerServiceExecuteDpuDmaAction` has a local result, `:46751`). **So this is a routing fix, not a redesign.**
+>   ⚠ *Correction:* "each is granted" is FALSE — admission is not guaranteed (see the quota finding below). The
+>   right statement is *"every ADMITTED collector receives a separate grant and result."*
+>   ⚠ The builder is `HomerServiceBuildMachineBaselineProgressActionPlanPhase` (`:11646`) — the name
+>   `HomerMachineBaselineCompileExecutionPlan` used in CLAUDE.md and §4 is **stale**.
+> - **C2 ✅ (more strongly than claimed)** The legacy one-action compiler is dead: startup **rejects** DPU
+>   enablement unless the policy is machine-baseline (`:48633`), and the coarse ready-set builder admits no DPU
+>   source (`:14017`).
+> - **C3 ✅** Nothing reads `dpuDmaFeedback` as an engine-wide aggregate. The `repeatedlyEmpty` reader (`:12288`)
+>   is **dormant** — adaptive-bounded jumps over its only call site (`:12388`/`:12400`). **Safe to split.**
+>
+> ### 🆕 THE REVIEW FOUND A HALF-FIX I WOULD HAVE SHIPPED — a SECOND feedback writer
+>
+> **`HomerServiceRecordProgressGrantBudgetFeedback` (`:14663`)** resolves through
+> `HomerServiceProgressFeedbackForSource(&grant->source)` (`:14683`) — **outside** `FinishProgressGrant`, and it
+> is called after **every** executed action (`:48137`/`:48147`). FB-1 as written routed only the ~31
+> `FinishProgressGrant` sites, so **the budget feedback would have stayed aliased.** A fix that looks complete
+> and is not.
+>
+> ### ✅ THE BETTER DESIGN CAME OUT OF THE OBJECTION — key on `SourceId.index`, not on `actionKind`
+>
+> The source-ID contract **already says so** (`:2931`): *"**kind** selects the executor family, **index**
+> selects the fixed slot inside that family."* `COMMAND_RING` / `COMPLETION_RING` / `PAYLOAD_STREAM` already
+> route feedback by **kind + index** (`:14220`-`:14249`). **The DPU family is the only one that always uses
+> index 0.**
+>
+> **FB-1 (REVISED): give each DPU collector its own source INDEX, keep ONE source kind.**
+> `HomerServiceMachineBaselineCollectorSource` (`:10614`) already knows the collector kind when it builds the
+> source ref — stamp the index there. Then `HomerServiceProgressFeedbackForSource` routes both writers by
+> kind+index, and:
+> - **both** feedback writers are fixed, automatically;
+> - **zero** finish sites are touched (vs ~31);
+> - **no new `HomerProgressSourceKind`** — so CLAUDE.md's four-hand-edited-switch hazard is never armed.
+>
+> **This supersedes §4/FB-1's "route by action kind" entirely.** It is not a tweak of my design; it is a better
+> one, and it was *inside the objection*.
+>
+> ### 🆕 A SEPARATE STARVATION SURFACE, unrelated to feedback — **`MAX_COLLECTOR_GRANTS = 6`** (`:185`)
+>
+> **Twelve** DPU collectors, a **fixed append order**, and a **six**-grant collector quota per plan
+> (`:10571`). Grouped-control is appended early enough to be safe under defaults; **the later DPU pipeline
+> collectors are not guaranteed admission at all.** This has nothing to do with aliasing and is not fixed by
+> FB-1. **Record it; do not fold it in silently.**
+>
+> ### 🔎 THE ~223 µs IS UNEXPLAINED AGAIN — and my *alternative* was ALSO stale
+>
+> §3's fallback ("four 1024-slot scheduler-fact scans per pass") is **wrong**: the DPU candidate builder has
+> **one** call site (`:45898`) and the other phases return before it (`:45851`, `:45887`). **One scan per pass,
+> not four.**
+>
+> **The reviewer's hypothesis (INFERRED, NOT VERIFIED — do not act on it until the mechanism is proven):** the
+> cross-pass DPU pipeline. Grouped-control submission is explicitly **non-blocking and does not run
+> `doca_pe_progress`** (`homer_service_dpu_dma.c:1487`), and PE-drain candidacy is decided from facts sampled
+> **before** the phase executes (`:44497`, `:44623`). **So from an idle state, a newly submitted read cannot be
+> harvested until a LATER service pass.** The quantity to measure is therefore **the service pass cadence**, not
+> the feedback. *Measure it before believing it.*
+
 ## 0. The defect in one sentence
 
 > **`HomerServiceExecuteDpuDmaAction` (`:46743`) knows exactly which collector it just ran — it switched on

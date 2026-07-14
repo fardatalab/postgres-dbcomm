@@ -19,13 +19,35 @@
 > is supposed to release it. **No S6 number is attributable until this lands.** Plan + verified mechanism:
 > **[`dpu_collector_feedback_aliasing_defect_b.md`](./dpu_collector_feedback_aliasing_defect_b.md)**.
 >
-> ### ⚠ AND S7.1 HAS AN UNSATISFIABLE PRECONDITION — surface it before starting S7
+> ### ✅ S7.1's "capture the cross-node `--homer` baseline first" precondition is WAIVED (owner, July 13, 2026)
 >
-> S7.1 requires *"the cross-node `--homer` baseline has been captured and SHA-stamped"* **before** the
-> host-service path is gutted. That baseline **cannot be captured**: `pgbench --homer` remote-RDMA is
-> **🔴 BROKEN at HEAD** (fails at session open; CLAUDE.md workload table), and the standing decision is
-> *not to fix it* because host-service Homer is being deleted. **So the precondition must be either waived or
-> re-scoped — an owner decision, not an improvisation.**
+> It was written in June, when the host-service path still worked. **You cannot baseline a corpse:**
+> `pgbench --homer` remote-RDMA is 🔴 broken at HEAD and the standing decision is not to fix it, because
+> host-service Homer is being deleted. The purpose the baseline was meant to serve — *"do not gut a path until
+> its replacement has a regression net"* — is **already served by the DPU gate**, which is green and is the
+> project's standing net. Waiving costs nothing. **Struck.**
+>
+> ### 🆕 THE REAL S7 PRECONDITION IS **S7.0**, and it is one line
+>
+> **The DPU gate's own client boots through the host-service control region.** `HomerClientOpenControl`
+> (`homer_client.c:400`) is `shm_open` with **no `O_CREAT`** — the region is *created by
+> `citus_tuple_sink_service`* and only *mapped* by the client — and `pgbench.c` called it under
+> `if (homer_mode)`, which `--homer-dpu-command` also sets. But the selected-DPU session open
+> (`HomerClientOpenSqlSessionSelectedDpu`, `pgbench.c:9800`) **does not take a control region at all**; only the
+> host-service `HomerClientOpenSqlSession` (`:9814`) does. **So under `--homer-dpu-command` the mapping was
+> opened, never used, and closed.**
+>
+> **You cannot delete the host service while the gate's client still boots through a region only that service
+> creates.** S7.0 gates the `HomerClientOpenControl` call on `!homer_dpu_command_mode`, mirroring the
+> session-open fork, plus a loud guard if the two forks ever disagree.
+>
+> **It also kills an accident class.** That dead mapping is precisely why gate runs 13–16 passed with the
+> farnet0 host service **down**, satisfied by a *stale* `/citus_remote_execution_control_v27` (the gate's
+> "trap 2" in CLAUDE.md). With no control region open, **a silent fall back to the host-service arm cannot even
+> be expressed** — the anti-fallback property becomes structural instead of procedural.
+>
+> **Validation:** run the gate with **BOTH** host services down. It must pass. That is a stronger anti-fallback
+> proof than the current runbook's asymmetric "client-side UP, backend-side DOWN" dance, which it retires.
 
 **Status (July 10, 2026): IN PROGRESS. S0 ✅, S0b ✅, S1a ✅, S1b ✅, S2 ✅ (citus `008f4f20b`),
 S3.0 ✅ (citus `36a61a5a1`), S3.1 ✅ (citus `c2ec17852`), S3.1b ✅ (citus `84ac374ef`).
@@ -2862,10 +2884,20 @@ Only after S6.
 > **Every gutting must be preceded by its replacement's gate passing**, never the other way round. See the
 > S3.5 box: a retired path is frequently the only regression net for the thing replacing it.
 
+- **S7.0 — CUT THE GATE'S OWN DEPENDENCY ON THE HOST SERVICE. This is the real precondition; do it first.**
+  `pgbench` mapped the host-service control region under `if (homer_mode)`, which `--homer-dpu-command` also
+  sets — yet the selected-DPU session open takes no control region. Gate the `HomerClientOpenControl` call on
+  `!homer_dpu_command_mode`. **Until this lands, "delete the host service" breaks the gate at client boot.**
+  Retires the gate's trap-2 asymmetry (client-side host service UP / backend-side DOWN) and the whole
+  stale-control-region accident class. **Validate: the gate passes with BOTH host services down.**
 - **S7.1** `HomerClientOpenSqlSession` (host-SHM command path) for pgbench, **and** the `shm_open` arm of
   `TupleSinkServiceSubmitBackendSpawnRequest` (S3.5). Together these retire plain `pgbench --homer` and
-  backend-to-backend COPY. **Preconditions:** the S3 gate has passed (so `--homer-dpu-command` is the spawn
-  net), and the cross-node `--homer` baseline has been captured and SHA-stamped (see the box under S3.5).
+  backend-to-backend COPY. **Precondition:** the S3 gate has passed (so `--homer-dpu-command` is the spawn
+  net), **and S7.0 has landed**.
+  ⛔ **The old second precondition — "the cross-node `--homer` baseline has been captured and SHA-stamped" —
+  is WAIVED (owner, July 13, 2026).** It was written when the host path still worked; that workload is broken
+  at HEAD and is deliberately not being fixed. **You cannot baseline a corpse**, and the purpose the baseline
+  served (never gut a path whose replacement has no net) is already served by the DPU gate.
   Then: **dissolve D7** — delete the range constants, delete the host-arm CAS with the arm it protected, and
   restate the contract as **D7′ (exactly one claimant)**.
 - **S7.2** `citus_remote_exec_pgbench_transaction` + its UDF/extern/build refs (checkpoint "step 8").

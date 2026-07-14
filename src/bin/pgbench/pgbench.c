@@ -9334,12 +9334,39 @@ threadRun(void *arg)
 	{
 		char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
 
-		if (!HomerClientOpenControl(&thread->homer_control,
-									errorMessage,
-									sizeof(errorMessage)))
-			pg_fatal("could not open Homer control region in thread %d: %s",
-					 thread->tid, errorMessage);
-		thread->homer_control_open = true;
+		/*
+		 * S7.0: the host-service control region is opened ONLY for the host-service
+		 * command path.
+		 *
+		 * The control region is created by citus_tuple_sink_service and is merely
+		 * MAPPED here (HomerClientOpenControl -> shm_open with no O_CREAT,
+		 * homer_client.c:400).  It is consumed by exactly one caller:
+		 * HomerClientOpenSqlSession() in openHomerSession() below.  The selected-DPU
+		 * command path calls HomerClientOpenSqlSessionSelectedDpu() instead, which
+		 * does NOT take a control region -- its command plane lives on the DPU.
+		 *
+		 * So under --homer-dpu-command this mapping was pure dead weight, and it was
+		 * the ONLY thing forcing a host service to be running on the client host for
+		 * a run that never touches one.  That dependency was actively harmful: it is
+		 * what let gate runs 13-16 "pass" against a STALE control region left behind
+		 * by a previous session, with no host service alive at all (see the gate's
+		 * trap 2 in CLAUDE.md).  Removing the mapping makes the anti-fallback property
+		 * STRUCTURAL -- with no control region open, a silent fall back to the
+		 * host-service arm cannot even be expressed.
+		 *
+		 * This is also the real precondition for S7 (retire the host-service paths):
+		 * the host service cannot be deleted while the DPU gate's own client still
+		 * boots through a region only that service creates.
+		 */
+		if (!homer_dpu_command_mode)
+		{
+			if (!HomerClientOpenControl(&thread->homer_control,
+										errorMessage,
+										sizeof(errorMessage)))
+				pg_fatal("could not open Homer control region in thread %d: %s",
+						 thread->tid, errorMessage);
+			thread->homer_control_open = true;
+		}
 
 		for (int i = 0; i < nstate; i++)
 		{
@@ -9810,6 +9837,20 @@ openHomerSession(TState *thread, CState *st)
 					st->id,
 					(unsigned long long) st->homer_session.serviceSessionId,
 					st->homer_session.serviceSessionIndex);
+	}
+	/*
+	 * S7.0: this fork and the HomerClientOpenControl() fork in threadRun() are the
+	 * SAME condition (homer_dpu_command_mode) and must stay in lockstep: only this
+	 * branch consumes the control region, and it is only mapped for this branch.
+	 * Fail loudly rather than hand HomerClientOpenSqlSession() an unopened region --
+	 * that would be a use of a zeroed HomerClientControl, which reads as a bogus fd.
+	 */
+	else if (!thread->homer_control_open)
+	{
+		pg_log_error("client %d: host-service Homer SQL session requested but no control region is open "
+					 "(dpu_command_mode=%d) -- the control-region fork and the session-open fork disagree",
+					 st->id, homer_dpu_command_mode ? 1 : 0);
+		return false;
 	}
 	else if (!HomerClientOpenSqlSession(&thread->homer_control,
 									   &sessionOptions,
