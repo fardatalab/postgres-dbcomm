@@ -4733,6 +4733,11 @@ What stays here, because it IS retirement-contract business:
 
 ## §33 — P1-f: IMPLEMENTATION SPEC (write the invariants down, and ASSERT them)
 
+> ## ⛔ §33 AS FIRST WRITTEN IS **WRONG**. See §33.6 for the corrected spec — it is what to implement.
+> The sections below are kept because **the reasoning that produced the error is the instructive part**, and
+> because the error is a *repeat of a warning this very document already contains*. Read §33.6, then come back
+> if you want to know why the obvious design fails.
+
 **Status: SPEC. Ready to implement.** Closes the last substantive item in this audit.
 **All line numbers re-derived at citus `22a8f9951e6`** — §9.3's and §11.1's are STALE (thousands of lines
 have been inserted since). **Enforcement points are named by FUNCTION, not by line, precisely because of that.**
@@ -4819,3 +4824,137 @@ bool peerRemoteWriteTerminalPublished;
   basebackup is the only workload that exercises it (~44,000 laps). See CLAUDE.md.
 - **State explicitly that this changed no behavior.** It is an enforcement change. Do not let it collect credit
   for a fix it did not make.
+
+
+---
+
+### 33.6 ⛔ CORRECTED SPEC — §33.3's "one latch enforces all three" IS WRONG. Two of its three guards are DEAD CODE.
+
+**Found by adversarial review of the implemented diff, 2026-07-13. VERIFIED in code, not inherited.**
+
+#### The error, precisely
+
+§33.3 said *"one latch enforces close-is-last for all three."* **A latch set by one writer cannot gate a
+different writer.** And these three writers are **three different session roles — two of them in a different
+process, on a different machine** (`tuple_sink_service_process.c:1460`-`:1472`):
+
+> *"`clientSqlRemoteSender` lives on the **frontend node** service … `clientSqlPeerReceiver` lives on the
+> **backend node** service."*
+
+The latch's only set-site is inside the **I2** publisher, which runs **only on the backend node**. Therefore:
+
+| | writer's session role | reaches the latch set-site? | guard as specified |
+|---|---|---|---|
+| I1 | `clientSqlRemoteSender` (frontend node) | **NO** — that publisher runs on the other machine | ☠ **DEAD** |
+| I2 | `clientSqlPeerReceiver` (backend node) | yes | ✅ live |
+| I3 | an `OP_SQL_COMMAND` session (different op kind) | **NO** | ☠ **DEAD** |
+
+**§29.1 of this document is titled "THE GUARD IS DEAD CODE. Both branches return true."** The spec was about to
+ship two more of exactly that.
+
+> ### ⚠ AND IT IS A REPEAT OF A WARNING THIS DOCUMENT ALREADY CONTAINS
+> **§11.1:** *"P1-f is TWO invariants, each with its own proof. **Write them separately.** Merging them would
+> have documented a proof that does not apply to half the thing it claims to cover."*
+> §33 **quoted that**, and then merged them anyway — into one latch.
+>
+> **The rule, restated so it survives the next author (me):** *when a document tells you two things are
+> different, it is not making a stylistic point about documentation. **It is telling you the CODE is
+> different**, and any mechanism you build that treats them as one will be dead on arrival for the half you
+> were not looking at.*
+
+#### What P1-f actually is (§33.2 had the DIRECTION subtly wrong too)
+
+These MRs are **owned by me and written by the PEER**. The real question is **"when may the OWNER
+deregister?"**, and the owner **cannot see the remote writer's send CQEs at all** — they land in the *writer's*
+CQ, on the *writer's* machine. There is no RDMA primitive that tells a target "the writes into you have
+retired."
+
+**So the owner must infer it from a RECEIVED FACT** — and the enforcement therefore belongs **at each WRITER**,
+asserting it upholds the premise the remote owner is silently depending on. That premise is **not the same for
+all three**:
+
+| | the premise the remote owner's deregistration RESTS on | so the enforcement is |
+|---|---|---|
+| **I1** | **inference by ORDERING**: all writes *and* the close ride **one RC QP**, close is **last** ⇒ receiving the close proves every earlier write landed | a **close-is-last latch in ITS OWN writer** + **a same-QP-handle assert** |
+| **I2** | same as I1 | same as I1 (**the implemented I2 latch is already correct — keep it**) |
+| **I3** | **inference by the WRITER'S OWN FENCE**: it blocks on its own send CQE before writing `publishedEpoch` ⇒ seeing the epoch proves the record write retired. **It never relies on ordering.** | **NOT a latch.** A close-is-last latch is the wrong tool. |
+
+#### ⚠ THE SECOND PREMISE, WHICH NOTHING WATCHES — and it is the more fragile one
+
+I1/I2's whole proof is *"RC in-order **on one QP**."* **If a session's connection handle were ever re-pointed
+mid-life, RC ordering would prove nothing** and the owner's deregistration becomes a use-after-free across the
+fabric — **silently**. §11.1 verified the handle *"is assigned once and never re-pointed; failure ENDS the
+session, it does not migrate it"* — **a verified premise with nothing enforcing it.** Exactly the §0.1 shape.
+**Assert it at the writer: the handle used for the close must be the handle recorded at bind.**
+
+#### ⛔ I3 IS DROPPED — and NOT because it is hard. **ITS PATH DOES NOT EXECUTE.**
+
+`TupleSinkServicePublishPeerCommandCompletion` has **one** caller (`:21219`), reached only via the `else` at
+`:21214` — i.e. **only when `opKind != CITUS_REMOTE_EXEC_OP_CLIENT_SQL_SESSION`**. That is the
+`OP_SQL_COMMAND` / backend-to-backend arm, which is **🔴 BROKEN AT HEAD** (b2b COPY hangs) and is **scheduled
+for deletion at S7**. And `TupleSinkServiceWritePeerUint64PreparedRdma` — whose header calls it *"the hot-path
+companion"* — has **exactly one call site in the whole tree**: that publisher. **It is on no hot path. It is
+on no path.**
+
+**Do nothing to I3.** Not a guard, not a comment-only assert, and above all **not the optimization that was
+about to be proposed for it** (§33.7).
+
+#### 33.7 ⚠ THE ANALYSIS THAT WAS *CORRECT* AND *WORTHLESS* — record it so nobody redoes it
+
+While specifying I3's enforcement I established, correctly, that:
+
+- **the fence buys NO ordering.** RC already places two WRITEs on the same QP in order; the record lands before
+  the tail for free.
+- **what it actually buys is SOURCE-BUFFER REUSE.** `connectionState->outgoingPublishedTailBuffer`
+  (`remote_execution_peer_transport_rdma.c:11644`) is a **single per-connection scalar** registered as
+  `outgoingTailMr`. The next tail publish overwrites it, so a second write cannot be posted until the first
+  retires. **Blocking on the CQE IS the source-retirement mechanism** — Scenario A, exactly as §11.1 said.
+- **it is an expensive way to get that.** `TupleSinkServiceWaitForSendCompletion` busy-polls until *this*
+  `wr_id` completes; an RDMA-WRITE send CQE arrives when the **remote HCA ACKs**, so it stalls the service's
+  **single-threaded** loop for ~a network RTT **per publish** — head-of-line blocking across every session on
+  the node.
+- **and we already own the fix**: §29(b)'s cumulative `postedSendWrs`/`retiredSendWrs` frontiers. Give the tail
+  a small **ring** of slots instead of one scalar, stamp each with its post ordinal, reuse once
+  `retiredSendWrs >= stamp` — the same stamp-at-submit / compare-at-retirement pattern as P0-b and the arena
+  clear. Fence deleted, invariant preserved.
+
+**Every line of that is true, and every line of it is worthless**, because the code never runs.
+
+> ### 🔑 THE RULE THIS EARNS (it cost three attempts at the same spec)
+>
+> **"Is this correct?" and "is this fast?" are questions about the LIVE system, and they have no answer until
+> you know the code EXECUTES. Ask "does this run?" FIRST — reachability is far cheaper to check than
+> correctness, and it dominates it.**
+>
+> Twice in one hour a fully-verified mechanism turned out to be unreachable: defect B's blind-backoff
+> suppression (killed by `knownExpectedWork`, three lines from where I was reading —
+> [`dpu_collector_feedback_aliasing_defect_b.md`](./dpu_collector_feedback_aliasing_defect_b.md)), and this
+> fence. **A "verified mechanism" on a dead branch is not a finding. It is a very well-researched way to be
+> wrong.**
+
+#### 33.8 THE WORK, corrected
+
+1. **I2 — KEEP AS IMPLEMENTED.** The latch + guard in `TupleSinkServicePublishPeerClientCommandCompletion` is
+   correct and live. Keep its comment.
+2. **I1 — MAKE ITS GUARD LIVE.** Same latch field, but **set it in I1's OWN writer**:
+   `TupleSinkServicePostRemoteClientSqlCommandRecord`, when the posted record's `commandKind` is
+   `CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_SESSION_CLOSE` (the poster already switches on that kind, `:21643`).
+   ⚠ Latch **only after the post SUCCEEDS** — a failed post published nothing.
+   *(A session is either a sender or a receiver, never both, so ONE field safely serves I1 and I2 — each set by
+   its own role's terminal. **That, and not "one latch for all three", is the defensible version of the
+   original idea.**)*
+3. **I1 + I2 — ADD THE SAME-QP-HANDLE ASSERT.** At each writer, LOUD-ALARM if the peer connection handle in use
+   is not the one recorded for the session at bind. This protects the *ordering* premise the remote owner's
+   deregistration rests on, which today rests on nothing.
+4. **I3 — REMOVE the guard entirely.** Keep a short comment recording (a) its source-fence proof and (b) that
+   its path is dead and pending S7 deletion, with a pointer to §33.7 so the optimization is not re-derived.
+5. **All three comments stay** — they are the "write the invariants down" half of P1-f, and they are correct.
+
+#### 33.9 Acceptance (unchanged in spirit, sharpened)
+
+- The gate passes, **and the new ALARMs NEVER fire** — across the gate, a clean SIGTERM shutdown, and the
+  4-role basebackup (mandatory: the gate never wraps the byte ring; the basebackup does, ~44,000 times).
+- **Both surviving guards must be REACHABLE.** Before claiming P1-f complete, state *which node role and which
+  workload* executes each set-site. A guard whose latch is never set is not a guard — that is the whole lesson
+  of this section.
+- **State explicitly that this changed no behavior.** It is enforcement, not a fix.
