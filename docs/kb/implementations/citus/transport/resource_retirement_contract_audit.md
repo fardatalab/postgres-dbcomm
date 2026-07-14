@@ -6845,3 +6845,90 @@ retirement path — **including `AllocateSession`'s table-full reclaim (`:24273`
 **Full acceptance after L2:** 75-loop → **75/75**; `MACHINE-CANDIDATE OVERFLOW` == 0; gate band `-c 1 -t 2000`
 ×3 (**still owed — L1 is on the completion path; no perf check has been run yet**); 4-role basebackup; and
 P2-k Part 1's teardown result (exit 0 / 0 refusals / drain reached) must not regress.
+
+---
+
+## §43 — **L2 LANDED. THE PHANTOM SINK IS DEAD.** And it uncovered a wall nobody could ever have reached.
+
+**L2's own contract is MET and MEASURED. The 75-loop still does NOT pass — because L2 exposed a LATENT bug
+that was unreachable for the entire life of this code. Recorded honestly; NOT yet fixed. ⚠ STOPPED HERE.**
+
+### 43.1 What L2 fixed — measured
+
+| probe | before L2 | after L2 |
+|---|---|---|
+| `reclaiming sink session=` (the `activeSinkCount--`) | **0** | **64** ✅ |
+| `reclaiming idle non-reusable compatibility session` (**the retire**) | **0** | **64** ✅ |
+| `DPU backend spawn begin` / `COMPLETED` | 64 / 64 | **75 / 75** ✅ |
+| `MACHINE-CANDIDATE OVERFLOW` | 0 (L1) | **0** ✅ |
+| my three new L2 ALARMs | — | **0** ✅ |
+| ALARM sweep | clean | clean |
+
+> **⇒ SESSIONS NOW RETIRE. `activeSinkCount` reaches zero. The 64-slot session table recycles.**
+> **All three original walls are gone** — the machine-candidate saturation (L1), and now the session-table
+> exhaustion (L2). **75 sessions allocate, spawn, and run a backend, where 64 was the hard ceiling.**
+
+### 43.2 ⚠ WALL 4 — and it is the FIRST SLOT REUSE IN THIS CODE'S HISTORY
+
+**11 failures remain; the first is session 65.** Node B's own log, side by side:
+
+```
+session 63 (healthy, 59 lines):     session 65 (failing, 3 lines):
+  reserved DPU result stream          reserved DPU result stream
+  DPU backend spawn begin             DPU backend spawn begin
+  DPU backend spawn COMPLETED         DPU backend spawn COMPLETED
+  landed peer command sequence=1      ...  ...and NOTHING. EVER.
+  landed peer command sequence=2..5
+  finalized pending DPU result stream
+  started service-owned P3 result peer-open
+  payload connection allocate ...
+```
+
+> ## ⇒ SESSION 65 SPAWNS ITS BACKEND AND THEN **NOT ONE COMMAND EVER LANDS.**
+
+**WHY 65, AND WHY NOW.** Before L2, **sessions never retired, so every session got a FRESH table slot** —
+sessions 1-64 took slots 0-63 and **slot reuse was never exercised, ever.** L2 made retirement work.
+**Session 65 is the first session in this project's history to be handed a RECYCLED slot.** *L2 did not cause
+this bug; it made it reachable.*
+
+### 43.3 The suspects — **NONE VERIFIED. DO NOT ACT ON THESE WITHOUT INSTRUMENTING.**
+
+`HomerServiceDpuLandOnePeerCommand`'s admission test ANDs **six** conditions (`:43826`ff). Exactly one of them
+must now be false on a recycled slot. Also in play:
+
+- **`HomerServiceSetPeerCommandLandingActive` (`:24404`)** keeps a per-session **flag** and a global **counter**
+  (`peerCommandLandingSessionCount`) in sync, and **guards on the flag** (`if (flag == active) return;`). The
+  scheduler arms the command-landing collector **only when that counter is `> 0`** (`:45503`). A flag/counter
+  desync across reuse would produce EXACTLY "spawn works, nothing lands".
+  ⚠ **BUT I READ IT AND IT LOOKS CORRECT** — `ResetSession` deactivates *before* its memset (`:24477`), and the
+  reclaim path routes through `ResetSession` too. **So this suspect is PLAUSIBLE AND PROBABLY WRONG.**
+- **`ActiveSessionScanLimit`** (`:624`, shrunk at `:6284`) bounds several hot scans. Retirement now *shrinks*
+  it for the first time.
+- `TupleSinkServiceCreateSession` memsets (`:24596`); `ResetSession` memsets (`:24535`). Both look ordered.
+
+> ## ⛔ THE RULE THAT STOPS ME HERE, AND IT HAS BEEN PROVEN FIVE TIMES TODAY
+> **FIVE mechanisms of mine have been refuted in this one session** (allocator exhaustion; "§37.3 named the
+> wrong flag"; `connectionResetComplete` reclaim; "payload machines are dropped"; and the L1(a) FAILED arm that
+> would have wedged the session). **Each was coherent, evidence-backed, and wrong.** The suspect above is a
+> SIXTH story and it already smells wrong on a first read.
+> **DO NOT PATCH. INSTRUMENT.** The probe writes itself: on a recycled slot, print each of the six landing
+> conditions and the value of `peerCommandLandingSessionCount` — **the first condition that is false is the
+> bug.** That is a one-run answer; a guess is a one-cycle detour.
+
+### 43.4 ▶ STATE AND NEXT STEPS
+
+**LANDED AND VALIDATED:** L0 (the silent caps, given a voice — `e5fd7a210`), L1 (the zombie machines —
+`9ef06f224`), **L2 (the phantom sink — this commit).**
+
+**OPEN:**
+1. **WALL 4 (§43.2)** — instrument the six landing conditions on a recycled slot. **The next step, and it is a
+   probe, not a patch.**
+2. **The full acceptance is still owed** — 75/75; **the gate band `-c 1 -t 2000` ×3 (NO PERF CHECK HAS RUN for
+   L1 or L2, both of which touch the completion path)**; the 4-role basebackup; and P2-k Part 1's teardown
+   result must not regress.
+3. **D4 / L3** — the setup-TCP singleton close-drain wedge. **Out of scope by owner decision** (a client dying
+   mid-command is not an expected regime); **fail-stop-on-deadline is the chosen contract** when it is taken up.
+   ⚠ A bare deadline is *cheap to do badly*: `WAITING_CLOSE_DRAIN` certifies **four** conditions and collapses
+   them into one bool, so a useful ALARM needs a reason plumbed out of the callback.
+4. **§40.4's "next silent cliff"** — the 16/12/2 policy budget — is **instrumented and NOT firing** (`machines=0
+   payload=0` dropped). The collector budget (cap 6) *is* saturated. Watch, do not chase.
