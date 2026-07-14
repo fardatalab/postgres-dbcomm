@@ -5814,3 +5814,108 @@ it is **not** needed for safety. **Recorded; not in P2-k's scope.**
 > **When a review refutes your plan, re-check the sections you wrote EARLIER too.** §35.8's rejection of the
 > reorder was built on a premise (`dereg` after `dealloc_pd`) that I never verified and that is false. A
 > refutation of §35.3 does not automatically flag §35.8 — I had to go back and look.
+
+---
+
+## §36 — P2-k **ROOT-CAUSED**: the selected-DPU path NEVER RECORDS THE SESSION CLOSE. The `exit(1)` was a SYMPTOM.
+
+**Settled 2026-07-14 after two adversarial review rounds. The reviewer and I converged independently.**
+**This supersedes §35 and §35.3/§35.8/§35.9's fix proposals. The guard was never the bug.**
+
+### 36.1 THE ROOT CAUSE — VERIFIED
+
+`TupleSinkServiceApplyClientSqlPeerLifetimeCompletion` (`:24503`) is the **ONLY** setter of
+`peerLifetime.peerCloseCommandObserved` and `peerLifetime.peerWritersQuiesced` (`:24518-24521`) — the two flags
+`MayDeregister` consults. **It has exactly TWO call sites:**
+
+| call site | path |
+|---|---|
+| `:21175` | inside `TupleSinkServiceConsumeCompletionMailbox` — the **ordinary / host-service** completion path |
+| `:24700` | the **failed-backend cleanup** path |
+
+**NEITHER IS ON THE SELECTED-DPU PATH.** `HomerServiceDpuEgressOneSelectedCompletionEvent` (~`:43819`) calls
+`TupleSinkServicePublishPeerClientCommandCompletion` **directly** and clears the selected-session in-flight state
+(`:43853`) **without ever invoking the lifetime helper.**
+
+> ### ⇒ ON THE SELECTED-DPU PATH — **THE GATE, THE ONLY WORKLOAD THAT MATTERS** — A `CLIENT_SQL_SESSION_CLOSE` IS **NEVER RECORDED**. `peerWritersQuiesced` STAYS FALSE FOREVER. **THE SESSION CAN NEVER QUIESCE.**
+
+**And that is precisely what the failing log said: `peer_close=0 reset_complete=0`.**
+
+**⇒ `exit(1)` WAS DOING ITS JOB.** It correctly refused to deregister an MR whose remote writer it could not prove
+had quiesced (Scenario C). **The reason it could never prove it is that the DPU path forgot to record the close.**
+
+This is the classic **"the new path dropped a step the old path had"** — exactly what a migration produces. And
+the tell was already in the tree: **P1-f** (citus `91482c840`, landed the day before) added
+`peerRemoteWriteTerminalPublished` — a latch for **OUR** writes **to** the peer (`:19529`). **The selected-DPU
+path has a latch for one direction and NOTHING for the other.**
+
+### 36.2 THE FIX
+
+**PART 1 — THE ROOT CAUSE (this is the actual fix).**
+Make the selected-DPU terminal completion **record the peer lifetime**, exactly as the ordinary path does at
+`:21175`. Both `TupleSinkServiceConsumeCompletionMailbox` and the DPU egress must go through **one shared
+lifetime-update path** so a `CLIENT_SQL_SESSION_CLOSE` sets `peerCloseCommandObserved` / `peerWritersQuiesced`
+on **both** arms.
+
+**⇒ Then the guard PASSES at shutdown, `ResetSession` completes normally, and `HomerDpuDmaDestroy` runs and
+drains. No `exit(1)`, no fence, no leak, no wedge.**
+
+**PART 2 — THE BACKSTOP (hardening; keep it even though Part 1 makes the refusal unreachable in the normal case).**
+- **Move the guard to the TOP of `TupleSinkServiceResetSession`, before ANY mutation.** ✅ VERIFIED SAFE (M1):
+  none of the prologue helpers can touch any of the guard's five inputs, so the verdict is unchanged — **but the
+  side effects on refusal are.** A guard placed after the mutations it guards cannot refuse; it can only choose
+  how to die.
+- **DELETE the `exit(1)`**; return a `DEFERRED` outcome instead of `void`.
+- **OMIT the one-shot log latch.** ✅ VERIFIED UNNECESSARY (M5): there is no autonomous loop that re-resets a
+  fenced session. *(I invented that trap in §35.5, then invented a second reason to keep it. Delete it.)*
+- Handle the outcome at the **allocator** (on `DEFERRED`, **continue scanning later candidates** — do not return
+  `NULL`) and at **close** (`HandleCloseSession` CAN reach `DEFERRED` — it has already prepared a SUCCESS
+  response at `:40393` and performed clean-close side effects at `:40263`, so **do NOT convert a late `DEFERRED`
+  to ERROR**; define OK as *"close accepted; reclamation deferred to connection reset"*, which matches what
+  clients already do — they discard local session identity during teardown, `homer_client.c:1751`/`:3718`).
+- **`main()`'s shutdown loop deliberately IGNORES `DEFERRED` and continues.** That is the entire point.
+
+### 36.3 RECORDED, EXPLICITLY OUT OF SCOPE
+
+- **⛔ THE TEARDOWN REORDER IS DEAD — for a THIRD reason, and this one is fatal.** §35.8 rejected it on a false
+  premise; §35.9 revived it. **It is dead anyway:** `TupleSinkServiceDestroyPeerTransportState` **FREES THE
+  TRANSPORT OBJECT** (`remote_execution_peer_transport_rdma.c:10088`), while an ordinary `ResetSession` still
+  **dereferences stored connection handles** during send-owner and terminal-demand cleanup
+  (`tuple_sink_service_process.c:15423`, `:18425`). **Destroy-then-sweep is a use-after-free.** *(Three separate
+  analyses of the same idea, three different answers. The first two were wrong.)*
+- **Shutdown `activeSinkCount` reconciliation.** `HomerServiceResetPayloadStreamEntry` (`:25598`), used by the
+  shutdown stream loop (`:48822`), **does NOT decrement the parent session's `activeSinkCount`** — that decrement
+  lives only in the normal reclaim funnel (`:27393`). So connection-reset completion can set
+  `connectionResetComplete` and still **decline** the final reset because the stale count is nonzero (`:29714`),
+  stranding MR handles, placement history, the arena binding, mappings, FDs, and **named SHM objects** (unlinked
+  only at `:19913`/`:19941`/`:19969`/`:19994`). **⇒ the fence leaks MORE than a handle — it leaks /dev/shm
+  objects that survive the process.** My §35.9 "the fence costs essentially nothing" is **REFUTED**.
+- **Shutdown-aware send-owner cancellation.** Callback-driven final reset can spend up to **2 seconds per
+  deferred session** draining send owners (`:6776`) before cancelling (`:6834`), because the QP/CQs are already
+  destroyed.
+
+### 36.4 ACCEPTANCE (unchanged, still self-proving)
+
+> **SIGTERM the backend-side DPU service immediately after a gate run.**
+> **Today:** `RAW EXIT STATUS = 1`, `teardown drain lines: 0`.
+> **After P2-k:** exit **0** + `teardown drain COMPLETE`.
+> **And now, with Part 1, we expect the guard to PASS** — so `ResetSession` completes and there should be **no
+> refusal line at all**. If the refusal still appears, Part 1 did not take.
+
+### 36.5 Rules earned — and this is the expensive one
+
+> **THE GUARD THAT FIRES IS RARELY THE BUG. IT IS THE ONLY HONEST COMPONENT IN THE STORY.**
+> `exit(1)` refused to deregister an MR it could not prove was safe. It was **right**. I spent two review rounds
+> trying to make it stop complaining, and produced, in order: a fix that permanently wedges the session, a
+> teardown reorder that use-after-frees, and an invented spam trap whose invented cure would have broken
+> retirement. **The guard was the only thing in the whole area behaving correctly — and it was the thing I set
+> out to change.**
+>
+> **Ask what the guard is PROTECTING, and then ask why its premise is false.** The premise was
+> `peerWritersQuiesced == false`. **The bug was that nothing on the DPU path ever sets it.**
+
+> **A NEW PATH THAT BYPASSES A HELPER HAS SILENTLY DROPPED EVERY INVARIANT THAT HELPER MAINTAINED.**
+> The selected-DPU completion egress publishes the completion directly instead of going through
+> `ConsumeCompletionMailbox`. It gained speed and lost the peer-lifetime record. **`grep` for the ONE function
+> that sets the flag, and count its call sites against the paths that should reach it** — two call sites, three
+> paths, and the missing one is the one we actually run.
