@@ -4728,3 +4728,94 @@ What stays here, because it IS retirement-contract business:
   counted WQEs until §29(b). *The bug did not appear; the instrument did.*
   This is the same shape as every §0 violation: someone proved the contract for ONE resource and missed a SECOND
   riding the same completion.
+
+---
+
+## §33 — P1-f: IMPLEMENTATION SPEC (write the invariants down, and ASSERT them)
+
+**Status: SPEC. Ready to implement.** Closes the last substantive item in this audit.
+**All line numbers re-derived at citus `22a8f9951e6`** — §9.3's and §11.1's are STALE (thousands of lines
+have been inserted since). **Enforcement points are named by FUNCTION, not by line, precisely because of that.**
+
+### 33.1 Why this is worth doing when nothing is broken
+
+§11.1 verified that **all three** remote-writable-MR proofs **hold today**. So P1-f changes no behavior. It is
+worth doing anyway, and this document's own thesis is the reason:
+
+> **§0.1: "The contract is upheld EXACTLY where someone was previously burned, and nowhere else. That is scar
+> tissue, not design."**
+
+**A proof that is verified but unasserted is scar tissue waiting to happen.** We did the analysis; if we ship
+nothing that enforces it, the next person to touch the close path breaks it silently — which is the exact
+failure mode this audit exists to document. P1-f converts three proofs into one enforced invariant.
+
+*(Live demonstration, found the same day: the DPU setup-listener starvation produced **three** separate scars —
+a private source, `knownExpectedWork`, and a bypass list — each bolted on when someone got burned. The twelve
+still-aliased DPU collectors are the un-scarred complement. See
+[`dpu_collector_feedback_aliasing_defect_b.md`](./dpu_collector_feedback_aliasing_defect_b.md).)*
+
+### 33.2 THE THREE RESOURCES — three proofs, and they are NOT the same proof
+
+Each is a **remote-writable MR** (Scenario C: the peer writes into my memory; I cannot see their completions).
+**Merging them would document a proof that does not apply to half of what it claims to cover** (§11.1).
+
+| # | resource | who writes it | why it is safe TODAY (VERIFIED) |
+|---|---|---|---|
+| **I1** | peer **COMMAND mailbox** (`clientSqlPeerCommandMailboxDescriptor`, `:1525`) | the **peer**, into my memory | **Single writer**, one connection handle, no credit/completion/payload/alternate-class writer. RC in-order on one QP + **close-is-last** ⇒ *"no further write will arrive."* |
+| **I2** | client **COMPLETION mailbox** (`clientSqlPeerCompletionMailboxDescriptor`, `:1526`) | **`TupleSinkServicePublishPeerClientCommandCompletion` (`:19082`) — the SOLE remote publisher** | **The terminal close completion IS the last remote write.** The sender does **not** write `readyEpochSlots`/`readyVersion` — the *receiver's* CPU publishes those after WIMM validation, so they are **local stores, not later remote writes**. The QP is **stable for the session**: failure **ENDS** the session, it does not migrate it — no reconnect, no rebind, no traffic-class migration. So RC ordering is not broken by a hidden connection swap. |
+| **I3** | peer **command-completion RING** (`peerCommandCompletionRingDescriptor`, `:1527`) | the peer-command-completion publisher (`:19657`-`:19712`) | **It fences its own source SYNCHRONOUSLY.** An unsignalled record write is followed by a signalled `publishedEpoch` write through `TupleSinkServiceWritePeerUint64PreparedRdma` (`:19709`), which **blocks on its own send CQE** — `TupleSinkServiceWaitForSendCompletion`, `remote_execution_peer_transport_rdma.c:11648`. **(VERIFIED at implementation time, not inherited — §9.3's cited line was stale.)** ⚠ **A DIFFERENT op** from I2: different op kind (`OP_SQL_COMMAND`, not `CLIENT_SQL_SESSION`), different connection handle, different descriptor, and its publisher explicitly **excludes** client-SQL sessions. |
+
+### 33.3 THE FIX — ONE latch enforces "close is last" for all three
+
+**The client has a terminal latch; the SERVICE does not.** `sqlSessionTerminal` lives only in
+`homer_client.c` (`:3556`-`:3627`). That asymmetry is the gap: the service can, in principle, publish after
+its own terminal close and nothing says otherwise.
+
+**Add one service-side latch** on `TupleSinkServiceSessionState`:
+
+```c
+/*
+ * P1-f. Latched when the TERMINAL completion for this session has been published
+ * into the peer's memory.  After this point the session's remote-writable MRs
+ * (command mailbox, completion mailbox, peer command-completion ring) may be
+ * deregistered by the OWNER at any time -- so ANY later remote write by us is a
+ * use-after-free ACROSS THE FABRIC, into memory the peer is entitled to have
+ * reclaimed.  It is not a race we can win by being fast; it is a contract we must
+ * not violate.  The three resources are safe today for THREE DIFFERENT reasons
+ * (audit S33.2); this latch is the single thing that keeps all three true.
+ */
+bool peerRemoteWriteTerminalPublished;
+```
+
+- **SET** it in `TupleSinkServicePublishPeerClientCommandCompletion` (`:19082`) at the point the **terminal**
+  completion is successfully posted (`TupleSinkServiceCommandStateIsTerminal(...)` on a `CLIENT_SQL_SESSION`
+  close). ⚠ The **backend-FAILURE** path synthesizes its terminal close completion **through the same
+  machinery** — so it latches too, for free. **Verify that; do not assume it.**
+- **CHECK** it at the **entry** of every remote publisher — all three, by name:
+  `TupleSinkServicePublishPeerClientCommandCompletion` (I2), the peer command-mailbox publisher (I1,
+  `:21648`-`:21704`), and the peer command-completion-ring publisher (I3, `:19657`-`:19712`).
+  On a hit: **LOUD error, and REFUSE the publication.** Do not publish and warn — publishing is the bug.
+
+### 33.4 ⚠ CONSTRAINTS THE IMPLEMENTER MUST NOT GET WRONG
+
+1. **DO NOT use `assert()`.** `assert.h` is absent in this tree and `NDEBUG` is never set — it would **abort
+   the service**. Use `fprintf(stderr, "... ALARM ...")`-and-refuse, matching the existing style.
+2. **NO behavior change on the correct path.** If the new branch ever fires in a passing run, the *latch* is
+   wrong, not the code it caught. **The acceptance criterion is that it NEVER fires.**
+3. **Do not "fix" I1.** §9.3 is explicit: *"ALREADY CORRECT … write the invariant down + assert it. **Do not
+   change it.**"*
+4. **This is a CONTROL path.** The three publishers are per-command/per-session, not per-tuple. One predicate
+   is free. Do not micro-optimize it, and do not put it behind a stats macro — **a guard that can be compiled
+   out is not a guard.**
+5. **Comment each resource with its OWN proof from §33.2.** The whole point of P1-f is that the next reader
+   can see *why* each one is safe. Three near-identical comments would re-create the exact conflation §11.1
+   caught.
+
+### 33.5 Acceptance
+
+- The gate (`pgbench --homer --homer-dpu-command`) passes, **and the new ALARM never fires** — across the gate,
+  a clean SIGTERM shutdown, and the 4-role basebackup.
+- **The 4-role basebackup is mandatory here.** A green gate says nothing about the byte-ring **wrap**; the
+  basebackup is the only workload that exercises it (~44,000 laps). See CLAUDE.md.
+- **State explicitly that this changed no behavior.** It is an enforcement change. Do not let it collect credit
+  for a fix it did not make.
