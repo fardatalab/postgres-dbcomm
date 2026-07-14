@@ -5395,3 +5395,47 @@ requires **`allContextsIdle && drainedCleanly`**. The two are genuinely independ
   under live DMA is not.
 - **`shuttingDown` is a plain `bool`** and the acquisition helpers return unreserved pointers. Fine while the
   service is single-threaded (it is); it is **not** a thread-safe quiesce, and P7b's pooling must not assume it is.
+
+### 34.11 ⚠ CORRECTION TO §22.10.1 — THE TEST IT PRESCRIBES CANNOT WORK
+
+§22.10.1 records that P0-b's `RETIRING` branch is *"validated by construction, never by execution"* (`retiring=0`
+in every run), and prescribes: *"Driving it needs either **a multi-client run** or an artificially delayed send-CQ
+drain."*
+
+**The multi-client half is WRONG, and I was about to fold a `-c 4` gate run into P2-i's validation on the strength
+of it.**
+
+`remote_execution_peer_transport_rdma.c:8830-8843` — the branch, in full:
+
+```c
+opState->phase = CITUS_REMOTE_EXEC_PEER_CONTROL_OP_COMPLETED;
+if (opState->ownerAbandoned)                  /* <-- REQUIRES AN ABANDONED OWNER */
+{
+    if (opState->sendCompletionRetired)
+        TupleSinkServiceReleasePeerControlOp(connectionState, incomingMessage->opIndex);
+    else
+        opState->phase = CITUS_REMOTE_EXEC_PEER_CONTROL_OP_RETIRING;   /* <-- the untested branch */
+}
+```
+
+**`RETIRING` is gated on `ownerAbandoned`.** It is the ZOMBIE path: the owner gave up — timed out, aborted — and
+*then* the response arrived, and the send CQE had not yet retired. It has **nothing to do with concurrency.**
+
+⇒ **A healthy run NEVER abandons a control op, at ANY client count.** `-c 4`, `-c 8`, `-c 16` all report
+`retiring=0` **by construction**. Running one and reporting "still `retiring=0`, still unexercised" would be a
+TRUE statement that proves NOTHING, produced by a test that **could not have passed** — the same disease as the
+runbook's retired gate-proof decoy (a check whose success depends on something that never happens).
+
+**What would ACTUALLY exercise it (both are required):**
+1. an **abandoned** control op — a client that aborts or times out mid-command; **and**
+2. the response beating the send CQE — the rare race §22.6 predicted is essentially never won.
+
+That is **fault injection, not a workload**: e.g. kill the client mid-command *and* stall the send-CQ drain.
+(Note condition 1 is exactly the aborted-gate-run state the runbook already warns leaks arena slots — so the
+zombie path is reachable, just not by anything we would call a passing run.)
+
+**§22.10.1 is amended: `-c 4` is NOT a test for this. Do not run it and record the result as evidence.**
+
+> **RULE. Before running a test to exercise branch X, READ THE PREDICATE THAT GUARDS X.** A test that cannot
+> reach the branch produces a clean-looking negative result, and a clean-looking negative result is indistinguishable
+> from a passing one until someone reads the guard. *(I was one command away from filing exactly that.)*
