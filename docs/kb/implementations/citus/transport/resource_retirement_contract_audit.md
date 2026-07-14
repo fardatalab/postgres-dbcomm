@@ -5337,3 +5337,61 @@ directly. "Never started" (IDLE) now skips honestly; everything else goes throug
 
 > **RULE. When you discover that a flag lies, `grep` for EVERY reader of it — not just the one you were looking at.**
 > Deleting the comment that trusted it is not the fix.
+
+### 34.10 RE-REVIEW OF THE CORRECTED DIFF — N1/N2/N3 pass, and it found ONE MORE, also mine
+
+Corrections introduce new claims, and those are unreviewed. So the corrected diff went back. **N2 and N3 passed
+(*"no second raw acquisition remains"* — the three-helper choke point is now real), N1 passed for the current call
+graph, and the reviewer confirmed my own N5 self-fix had already landed in the working tree.** Then it found this:
+
+#### ⛔ THE PARTIAL-INIT PUMP CANNOT PUMP — a regression I introduced
+
+**VERIFIED, and it is exactly the shape of every other bug in this stage: a helper that silently declines.**
+
+- `HomerDpuDmaDrainPeInternal` **returns without ever calling `doca_pe_progress()`** whenever
+  `!engine->docaEnabled` (`:5704`).
+- `engine->docaEnabled = true` is set **only after EVERY context has started** (`:15356`).
+- My stop-flush loop pumped **through** `HomerDpuDmaDrainPeInternal`.
+
+⇒ On a **PARTIAL initialisation failure** — precisely the path that reaches teardown with a context in
+`STARTING`/`STOPPING` — the pump would **never progress the PE at all**. The loop would burn its full 5 s
+deadline, conclude the context could not be proven IDLE, and **abandon (= leak the engine) on what is merely a
+config typo at startup.** Conservative rather than unsafe, but a real regression: a bad `HOMER_SERVICE_DOCA_DEV_PCI`
+would now cost 5 seconds and leak.
+
+**Fix:** call `doca_pe_progress(engine->pe)` **directly** in the stop-flush loop. The `docaEnabled` gate exists so
+we never touch DOCA when DOCA is not configured; but by that point we have already *proven* a context exists and
+is stoppable, so the PE exists and pumping it is precisely correct.
+
+> **RULE. When you reuse a helper on a teardown path, re-read its EARLY RETURNS against the state teardown is
+> actually in.** Every guard in this codebase was written for the steady state. `!docaEnabled` means "DOCA is not
+> configured" during startup and "DOCA never *finished* configuring" during teardown — the same predicate, two
+> different meanings, and only one of them is the one the helper was written for.
+
+#### ✅ THE DRAIN'S VERDICT IS NOW A GATE, NOT A DIAGNOSTIC
+
+The reviewer also caught that my slot-disagreement check **ALARMed and then printed `COMPLETE` and proceeded
+anyway** — a check that tells you it failed and then shrugs.
+
+It is now an input to the release gate: `HomerDpuDmaQuiesceAndDrainForDestroy` returns `bool`, and the release
+requires **`allContextsIdle && drainedCleanly`**. The two are genuinely independent reasons to abandon:
+
+| condition | what it means | why release is unsafe |
+|---|---|---|
+| `!allContextsIdle` | the **device** may still be executing a task | freeing its target is the **IOMMU-fault** case |
+| `!drainedCleanly` | a task slot is stranded (`PREPARED`) | it still **owns its `doca_task` and `doca_buf`s** (released only in the retirement funnel), so `doca_mmap_destroy` → **`NOT_PERMITTED`** and `doca_buf_inventory_destroy` → **`IN_USE`**. The release *cannot* succeed — it can only fail quietly. |
+
+**Every context IDLE is NOT sufficient.** That was the gap: no live DMA does not imply no held buffers.
+
+#### Accepted, not fixed (recorded)
+
+- **`HomerDpuDmaDestroy` is still `void`** — callers cannot distinguish *destroyed* from *abandoned*. Safe today
+  because **every** caller is an exit path (verified: 13 call sites — the two `Create` failure paths, five smokes,
+  and the service exit), but it is a call-graph property, not an API contract. If anything ever calls
+  `HomerDpuDmaDestroy` and continues, this must become a returned status.
+- **`releasedCleanly == true` means "no live DMA", NOT "everything was released".** A failed
+  `doca_dma_destroy`/`doca_pe_destroy`/`doca_dev_close` is logged and leaks, but does not revoke the certificate —
+  correctly, because the certificate's only job is to license the `free()`. Leaks at exit are free; a `free()`
+  under live DMA is not.
+- **`shuttingDown` is a plain `bool`** and the acquisition helpers return unreserved pointers. Fine while the
+  service is single-threaded (it is); it is **not** a thread-safe quiesce, and P7b's pooling must not assume it is.

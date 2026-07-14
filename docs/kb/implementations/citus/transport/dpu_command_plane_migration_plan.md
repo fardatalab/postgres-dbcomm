@@ -27,7 +27,19 @@
 > its replacement has a regression net"* — is **already served by the DPU gate**, which is green and is the
 > project's standing net. Waiving costs nothing. **Struck.**
 >
-> ### 🆕 THE REAL S7 PRECONDITION IS **S7.0**, and it is one line
+> ### ✅ **S7.0 — LANDED + VALIDATED** (postgres `22a8f9951e6`, July 13, 2026)
+>
+> **The gate passed with BOTH host services DOWN**, on a machine that still had the stale
+> `/dev/shm/citus_remote_execution_control_v27` that had faked earlier passes (found and removed by that same
+> validation). The anti-fallback property is now **structural**: with no control region open, a silent fall back
+> to the host-service arm **cannot even be expressed**. The old asymmetric "client-side UP, backend-side DOWN"
+> rule is **RETIRED** — start neither.
+>
+> ⇒ **S7.1 (delete host-service Homer) is UNBLOCKED.** Its other precondition (the cross-node `--homer`
+> baseline) was waived above.
+>
+> *The description below is kept as the rationale — it is why S7.0 was needed, not a statement that it is
+> pending.*
 >
 > **The DPU gate's own client boots through the host-service control region.** `HomerClientOpenControl`
 > (`homer_client.c:400`) is `shm_open` with **no `O_CREAT`** — the region is *created by
