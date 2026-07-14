@@ -6157,3 +6157,43 @@ Generic retirement has **no explicit P2.T check**; today the normal node-B sessi
 retains a reserved result handle and a nonzero `activeSinkCount` until T4 (`:20530`, `:27377`). **A direct node-B
 lifecycle close, or a future early result-handle removal, would expose that gap.** Belongs with §37's lifecycle
 work.
+
+### 36.10 ▶ RESUME POINT — P2-k **Part 1 LANDED (citus `5a57e1cc9`), NOT YET VALIDATED**
+
+**Stopped here by owner request (2026-07-14). Everything below is the exact next-step list.**
+
+#### ✅ DONE — Part 1 (builds clean, formatted, committed; **no run yet**)
+
+| # | change | file:site |
+|---|---|---|
+| 1 | `TupleSinkServiceApplyClientSqlPeerLifetimeCompletion` now takes **three scalars** (`commandKind`, `commandState`, `postCommandState`) instead of reading the session cache | `tuple_sink_service_process.c` (definition + fwd decl) |
+| 2 | host caller passes its **already-captured session copies** (written before `consumedEpoch` credit) — **behaviour unchanged** | host consume path |
+| 3 | failed-backend cleanup ditto — **behaviour unchanged** | cleanup path |
+| 4 | **`HomerServiceDpuPopSelectedCompletionEvent` now returns `bool`** (it was `void` with two silent decline paths) | pop |
+| 5 | **THE FIX** — `HomerServiceDpuEgressOneSelectedCompletionEvent`: capture the three facts → only on `PUBLISH_PUBLISHED` → only after a **certified pop** → record the lifetime | DPU egress |
+
+#### ⏭ NEXT — in this order
+
+1. **BUILD + INSTALL + DEPLOY.** citus first (`make` + `install-headers install-service-bin install`), then relink postgres (`ninja -C build`), then `meson install`. Then rsync to farnet0 (verify md5-identical) and **redeploy BOTH DPUs** with the landed-proof grep.
+   ⚠ P2-k changes `tuple_sink_service_process.c` — **the DPU service binary. Both DPUs must be rebuilt.**
+2. **THE ACCEPTANCE RUN — and it is self-proving.** Clean baseline (both hosts + both DPUs), PG with the frontend agent, **no host services**, both DPU services. Run the gate (`-c 1 -t 2000`), then **SIGTERM the backend-side (farnet1) DPU service IMMEDIATELY AFTER**, capturing the **real exit status** (a vanished `/proc/<pid>` is NOT proof — use the traced start/sigterm scripts).
+
+   | | today (`91482c840`) | expected after Part 1 |
+   |---|---|---|
+   | `RAW EXIT STATUS` | **1** | **0** |
+   | `refusing to reset peer CLIENT_SQL_SESSION` | **1** | **0** — Codex S6 predicts **zero refusal lines on a clean gate** |
+   | `teardown drain COMPLETE` | **0 lines** | **1 line** — and **`N > 0` is plausible**, since the still-bound session's DMA is what is outstanding |
+
+   **If the refusal line still appears, Part 1 did not take.**
+3. **Re-run the DPU gate band** (`-c 1 -t 2000` ×3) — P2-k is on the command-completion path, so a perf check is mandatory. Current band: **285.6 / 291.0 / 299.1** at citus `2b37e8701` (**`-c 1`** — see the client-count rule).
+4. **4-role basebackup** (unaffected in principle, but it is the only byte-ring wrap exerciser).
+5. **THEN Part 2** (the backstop) — §36.7. Guard to the TOP of `ResetSession`; delete the `exit(1)`; return `DEFERRED`; **no log latch**; allocator keeps scanning; close does **not** convert a late `DEFERRED` to ERROR; shutdown ignores `DEFERRED`. *(Part 1 should make the refusal unreachable on a clean gate; Part 2 covers the abnormal paths Codex enumerated — client skipped/failed CLOSE, SIGTERM before egress, egress blocked, validation failure, late CLOSE into the teardown-rejection branch.)*
+6. **THEN §37 / P2-L** — the terminal service-state bookkeeping gap (**the reusable-dead-backend hazard**, stale `currentCommandState`, stale `backendLoopActive`/`launchedBackendPid`). Split out by owner decision.
+
+#### 🔭 And a hypothesis worth testing once P2-L lands
+
+**Stale `backendLoopActive` leaves a persistent owned `WAIT_BACKEND` scheduler candidate for EVERY completed
+session (`:13014` → `:45277`).** With sessions never retiring, that accumulates without bound.
+**Check it against the two standing open performance questions** — the unattributed ~10% (318 → ~285) and the
+~223 µs DPU discovery latency. **INFERRED, untested — but it is the first mechanism proposed for either that
+predicts a monotonically growing cost.**
