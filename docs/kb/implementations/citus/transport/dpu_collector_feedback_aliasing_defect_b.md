@@ -1,6 +1,7 @@
 # Defect B — twelve DPU collectors share one feedback struct, and it defeats the starvation escape hatch
 
-**Status:** PLAN, not yet implemented. **Blocks:** command-plane **S6** (the plan states this explicitly:
+**Status:** PLAN, not yet implemented. **FB-0 (instrumentation) DONE and MEASURED — see the banner: it refuted BOTH the prior review's mechanism AND my liveness escalation.**
+**Justification now rests on MEASURABILITY (S6 blocker) + a genuinely INVERTED feedback signal — not on latency, and not on liveness today.** **Blocks:** command-plane **S6** (the plan states this explicitly:
 *"⚠ PREREQUISITE: fix B (per-collector feedback) BEFORE recording any S6 number"*).
 **Code baseline:** citus `a551bcf6e`.
 **All line numbers below are `src/backend/distributed/utils/homer/tuple_sink_service_process.c` unless stated,
@@ -10,22 +11,51 @@ and were re-derived from the tree at this SHA — the numbers in
 
 ---
 
-> ## ⛔⛔ ADVERSARIAL REVIEW (2026-07-13): **THE LATENCY THEORY IS DEAD. THE FIX SURVIVES — AND ITS SHAPE CHANGED.**
+> ## ⛔⛔ MEASURED, 2026-07-14 (FB-0). **BOTH EARLIER STORIES WERE WRONG. HERE IS WHAT THE HARDWARE SAYS.**
 >
-> ### ❌ REFUTED: defect B CANNOT suppress command discovery, and does NOT explain the ~223 µs
+> ### ❌ REFUTED — "grouped-control is STRUCTURALLY IMMUNE to blind backoff"
 >
-> `HomerServiceAppendProgressCollectorCandidate(candidateSet, DPU_GROUPED_CONTROL_READ, /*candidateDue*/ true,`
-> **`/*knownExpectedWork*/ facts.groupedControlRingCount > 0`**`, …)` — `:44589`.
-> And `:10493`, *before any feedback test*:
-> ```c
-> if (collector->knownExpectedWork || collector->waitingMachineCount > 0) { return false; }  /* never suppressed */
+> That claim was VERIFIED-labelled here and it is **FALSE**. Widened starve-diag, real 4-machine gate run:
+>
 > ```
-> **Whenever ANY role-1 control ring is enrolled — i.e. whenever a session exists — grouped-control is
-> structurally immune to blind backoff.** §2's mechanism is real but **unreachable on the discovery path**.
-> (VERIFIED by me, not inherited.)
+> node B (farnet1 DPU):  DPU_GROUPED_CONTROL_READ   feedback-backoff   1,420,542
+> node A (farnet0 DPU):  DPU_GROUPED_CONTROL_READ   feedback-backoff   1,991,772
+> ```
 >
-> **§3's "open question" is therefore CLOSED, in the negative.** Do not run FB-0 expecting a latency answer;
-> the skip cannot fire for this collector while a session is open.
+> It is the **ONLY** collector suppressed by feedback-backoff on either node. The backoff predicate returns
+> "not suppressed" whenever `knownExpectedWork` holds — so **the measurement PROVES `knownExpectedWork` was
+> false 1.4M+ times.** The immunity was asserted from the *name* of a guard that was never checked to be armed.
+>
+> ### ❌ ALSO REFUTED — my own escalation: "the bound is defeated ⇒ this is a LIVENESS bug"
+>
+> Equally wrong, and refuted by the metric I built to test it:
+>
+> ```
+> DPU_GROUPED_CONTROL_READ:  max_backoff_since_grant = 1 (node B) / 2 (node A)     [bound = MAX_SKIP_GRANTS = 4]
+>                            grants                  = 4,549,555 / 3,816,775
+> ```
+>
+> **Bounded at 1–2, and granted 4.5 MILLION times.** The escape hatch is not defeated in practice: the
+> collector is granted so constantly that its OWN grants keep the shared clock fresh. **Aliasing only bites a
+> collector that is RARELY granted** — which is exactly the setup-TCP listener's situation for four days.
+>
+> ⇒ **It starves nothing today. It is NOT a latency fix and NOT a liveness fix on this workload.**
+>
+> ### ⛔ AND THE MECHANISM I PUBLISHED FOR IT WAS BUILT ON A STALE COMMENT
+>
+> I claimed `knownExpectedWork` is false because "the arena imports 49 rings of which ZERO are enrolled"
+> (`tuple_sink_service_process.c`, at the discovery-arming site). **That sentence was FALSE, and its own
+> correction had already been written a day earlier IN ANOTHER FILE** (`homer_service_dpu_dma.c`, *"CORRECTED
+> July 13, 2026"*): role-5 result rings carry `HOMER_DPU_BRIDGE_RING_FLAG_PUBLISH_LINE`
+> (`homer_frontend_agent.c:962`) and **are** enrolled. The stale sentence is now deleted.
+>
+> **What is actually true: `groupedControlRingCount == 0` at the moments of suppression (forced by the
+> predicate). WHY it is 0 so often is NOT established. Do not invent a reason — measure it.**
+>
+> > **THE LESSON, TWICE IN ONE DAY, IN BOTH DIRECTIONS:** the first review reasoned from the NAME of a guard;
+> > I reasoned from a COMMENT that had already been refuted elsewhere. **Neither of us reasoned from a NUMBER.**
+> > A guard you have not watched fire is a hypothesis. A comment that survives its own refutation is an
+> > instruction to write the next bug.
 >
 > ### ⚠ AND THE ANSWER WAS THREE LINES FROM WHERE I WAS READING
 >
@@ -300,3 +330,136 @@ statement. Fold in or split out — **decide, do not silently skip.**
 - [`resource_retirement_contract_audit.md`](./resource_retirement_contract_audit.md) — the P0 set, now COMPLETE.
 - [`post_gate_basebackup_open_stall.md`](./post_gate_basebackup_open_stall.md) — the ~223 µs discovery period
   was measured there; this doc proposes (but has NOT proven) a cause.
+
+---
+
+## FB-0 — LANDED. The instrumentation, and what the numbers actually said.
+
+**The old diagnostic could not have seen this bug.** `HOMER_DPU_SETUP_STARVE_DIAG` reported exactly FOUR
+collectors — `PE_DRAIN`, `SETUP_LISTENER`, `SPAWN`, `DOORBELL` — i.e. **the victims someone already knew about**
+(three of which have since been given their own un-aliased source kinds). It was structurally **blind to all
+twelve** collectors that still alias `dpuDmaFeedback`, including the one being starved.
+
+And its rate limiter was `static uint64_t dropN` **inside the macro body — one counter shared across every kind
+that site reported.** A shared rate limit across categories is a FILTER, not a limit: the noisiest collector
+eats the print budget and the STARVING one never prints. *(Identical to the defect fixed in L0's per-phase
+counters. Same shape, second occurrence.)*
+
+**FB-0 (renamed `HOMER_COLLECTOR_STARVE_DIAG`):** every collector kind, a `(kind, reason)`-keyed limiter, a
+name decoder with **no `default:` arm** (so `-Wswitch` fails the build when a collector is added), and a totals
+summary at teardown, printed **before** the session-reset loop — whose own unrelated fail-stop otherwise
+silences it on exactly the runs that need it.
+
+### ⚠ THE ACCEPTANCE METRIC IS NOT THE DROP TOTAL — AND GETTING THIS WRONG WOULD HAVE FAILED A WORKING FIX
+
+The defect is **UNBOUNDEDNESS, not frequency.** A total cannot see it:
+
+| | total | max run |
+|---|---|---|
+| broken (hatch defeated) | huge | huge |
+| **fixed** (hatch works) | **STILL HUGE** | tiny |
+
+I originally predicted "the 1.4M count collapses." **It would not have.** Grading FB-1 on the total would have
+marked a *working* fix as a failure.
+
+⚠ **AND THE FIRST REPLACEMENT METRIC WAS ALSO WRONG** (Codex, VERIFIED): "max consecutive rejections ≤ 4" is
+**not** the bound the scheduler implements. The predicate bounds *global-grant AGE*
+(`HomerProgressFeedbackTick - lastCollectedTick < MAX_SKIP_GRANTS`), not a rejection count — and several
+planning decisions can occur at the same tick. Worse, my counter reset on **plan append**, while the scheduler's
+clock advances on **execution**; an executor short-circuit falsely resets it.
+
+**⇒ THE CORRECT FB-1 CRITERION:** at every feedback-backoff rejection, record the rejected collector's **OWN**
+feedback age. **After FB-1 there must be ZERO rejections at own-age ≥ MAX_SKIP_GRANTS.** Separately measure
+eligible→executed distance, classified by final drop reason, because source-lookup and budget remain
+independent gates.
+
+### The measurements (gate, both DPUs)
+
+| collector | reason | node B | node A |
+|---|---|---|---|
+| **`DPU_GROUPED_CONTROL_READ`** | **feedback-backoff** | **1,420,542** | **1,991,772** |
+| `BACKEND_COMPLETION_RING` | no-source | 1,182,200 | — |
+| `PAYLOAD_FRONTIER` | no-source | 8,004 | 1,377,246 |
+| `PEER_SEND_CQ` | budget | 22,985 | 39,183 |
+| `COMMAND_SEND_CQ` | already-planned | — | 29,425 |
+
+- **`no-source` in the millions** — `BACKEND_COMPLETION_RING` and `PAYLOAD_FRONTIER` are appended by the generic
+  machine-wait bridge but have **no mapping** in `HomerServiceMachineBaselineCollectorSource`, so they hit
+  `default: return false` and are dropped on **every pass, forever**. VERIFIED: they consume **no budget**
+  (source lookup precedes reservation) and cannot exhaust the candidate array (the enum has < 64 kinds). Stale
+  scaffolding noise — wasted scans and a misleading diagnostic, **not** a liveness defect.
+- **`already-planned`** on `COMMAND_SEND_CQ` is expected double-consideration. Benign.
+
+---
+
+## §FB-1' — WHAT THE SHARED FEEDBACK IS ACTUALLY DOING. **It is not weak guidance. It is INVERTED guidance.**
+
+Tracing every LIVE consumer of `dpuDmaFeedback`:
+
+- the **adaptive-bounded** reader — **DEAD** (unconditional `goto` jumps its only call site; the comment says the
+  block "is intentionally retained as design scaffolding, but it is not safe to execute yet");
+- the **item budget** — does **not** read feedback (`readyItemCountHint` / `waitingMachineCount`);
+- the **blind backoff** — **the only live consumer**;
+- and of the twelve aliased collectors, those armed from exact counts have `knownExpectedWork = true` and never
+  reach the backoff test at all.
+
+> ### ⇒ **TWELVE COLLECTORS WRITE INTO A STRUCT THAT EXACTLY ONE OF THEM READS.**
+>
+> `DPU_GROUPED_CONTROL_READ` is the only collector that is **both aliased AND blind**. So the signal deciding
+> whether to suppress **discovery** is *"have the other eleven found work lately?"*
+>
+> **And that is ANTI-CORRELATED WITH NEED.** Discovery exists to find host commands nothing else can see — *"a
+> host tail update has NO SEPARATE DOORBELL"*. The eleven siblings all go empty **precisely when the DPU is
+> idle**, which is exactly when a freshly-published host command sits undiscovered. The shared empty-streak
+> crosses its threshold **at the moment discovery matters most.**
+>
+> What saves us today is luck: the collector is granted 4.5M times, so its OWN grants reset the streak faster
+> than the siblings can build it. **The mechanism is wrong; the workload hides it.**
+
+**⇒ This upgrades FB-1's justification, and it is the honest one:** per-collector feedback makes *"I have polled
+8 times and found nothing"* a statement **about the collector itself**, which is the intended semantics. Today it
+means *"the other eleven found nothing"* — a different question, and the wrong one.
+
+### ⚠ THE TEMPTING WRONG MOVE — putting DPU_GROUPED_CONTROL_READ on the bypass list
+
+It fits the bypass list's own stated criterion **exactly**: *"arrivals external and unobservable without a
+syscall; 'no arrivals so far' can never justify 'stop looking'."* One line. **DO NOT DO IT.**
+
+The bypass list's members are *lifecycle* collectors that poll a socket and are cheap when idle. Grouped-control
+**submits DMA reads** and competes for the 6-collector quota every pass. **A permanently-eligible discovery
+collector is exactly what starved PE_DRAIN and wedged the DPU setup-TCP accept loop for four days.** The backoff
+for it is LEGITIMATE. What is broken is the SIGNAL it backs off on. Fix the signal, not the eligibility.
+
+### Two corrections FB-1 must absorb (Codex, both VERIFIED by me)
+
+1. **THE CORE IS ALIASED TOO.** `HomerServiceProgressCoreForSource` ignores `id.index` for `DPU_DMA`, while
+   `COMMAND_RING` / `COMPLETION_RING` index theirs. `HomerProgressSourceCore` carries real mutable state
+   (`readyReasonMask`, `blockedReasonMask`, `creditBlocked`, `outstandingSignaledWrCount`) and every grant
+   last-writer-wins it. Feedback-only indexing yields an **INCOHERENT ref**: `(DPU_DMA, index=7)` resolves
+   feedback slot 7 but core slot **0**, and both resolvers are called side by side. Nothing live breaks today
+   (the adaptive path that would gate on it is dead), but the abstraction becomes dishonest. **Index the core
+   with the same map, or make it explicitly immutable family metadata and stop writing per-grant hints into it.**
+2. **FB-1 IS NOT A TWELVE-COLLECTOR LIVENESS FIX.** `MAX_COLLECTOR_GRANTS = 6` remains. Grouped-control is
+   budget-safe only by **fixed append order**, not by reservation (reserved admission names only the setup
+   listener and doorbell), and that safety is **configuration-dependent** (the caps are env-tunable to 1). Every
+   newly-admitted grouped grant consumes one of six collector slots, so FB-1 can **RELOCATE** the loss to later
+   DPU collectors. The measured `DPU_PAYLOAD_PULL budget` is exactly compatible with that residual defect.
+
+### Confirmed SAFE to split (VERIFIED)
+
+- Nothing reads `dpuDmaFeedback` as an engine-wide aggregate (its only such reader is behind the dead `goto`).
+- Nothing dedups on DPU source identity: `HomerProgressSourceRefSame`'s only consumer,
+  `HomerProgressSourcePlanContains`, is also behind that `goto`. Machine-baseline dedups by
+  `collectorPlanned[kind]`. The ready set does no identity dedup, and machine-baseline collector refs never
+  enter it.
+- **Zero `FinishProgressGrant` call sites need editing** — both feedback writers resolve through
+  `HomerServiceProgressFeedbackForSource`.
+
+### Stale comments deleted in this commit (all three were actively misleading)
+
+- *"the arena imports 49 rings of which ZERO are enrolled"* — **FALSE**, corrected a day earlier in another file.
+  **This one cost a wrong published mechanism.**
+- *"the ELEVEN DPU collectors"* ×2 — there are **TWELVE** (enumerated).
+- *"Do not add a TWELFTH aliasing collector"* — **a twelfth was added anyway.** A guard phrased as a magic count
+  rots the moment it is disobeyed, and then **the guard itself hides the regression.** Replaced with a rule that
+  names no number: *a new DPU collector must not join that shared case-label block; give it a 1:1 triple.*
