@@ -6777,3 +6777,71 @@ confirmed; it is now instrumented, which is what L0 was for.**
 on `commandKind` — never manufactured, §40.2) **directly kills the 63 zombies.**
 **Acceptance is now precise and self-proving:** `kept_in_WAIT_BACKEND` must go to **~0**, the machine-candidate
 overflow must **disappear**, and the 75-loop must reach **75/75**.
+
+---
+
+## §42 — **L1 LANDED AND VALIDATED. WALL 1 IS DEAD.** And wall 3 stepped forward exactly on cue.
+
+**PREDICTION RECORDED BEFORE THE RUN, AND CONFIRMED IN EVERY PARTICULAR.**
+
+### 42.1 The result
+
+| | before L1 | after L1 |
+|---|---|---|
+| first failure | session **64** — 30 s timeout (scheduler starvation) | session **65** ✅ |
+| failure mode | command never planned | **`peer service ran out of free command sessions`** ✅ |
+| `MACHINE-CANDIDATE OVERFLOW` | 35 lines | **0** ✅ |
+| flat ready-set overflow | 27 lines | **0** ✅ |
+| session 64 | FAILED | **ok** ✅ |
+| ALARM sweep | clean | clean |
+
+**Both overflows are ZERO. The 63 zombie `COMMAND_SESSION`/`WAIT_BACKEND` machines are gone.**
+
+### 42.2 The change (citus: this commit)
+
+In `HomerServiceDpuEgressOneSelectedCompletionEvent`, after the certified pop — **exactly where P2-k Part 1
+built the mechanism, using exactly the three scalars it already captures**:
+
+- **L1(a)** clear `backendLoopActive` + `launchedBackendPid` — kills the zombie machine at its gate (`:45717`)
+- **L1(b)** snapshot `currentCommandState` + `postCommandState` — **also closes §37.2's reusable-dead-backend
+  hazard**, whose reuse gate reads that stale field
+- **L1(c)** finalize completion ownership (`HomerServiceFinalizeCompletionPendingBit`), because clearing the
+  flag makes `HasWork()` *return* false but **nothing on this arm ever ASKS** — with a **loud ALARM** on
+  index-lookup failure, since both that lookup and the finalizer silently return on a miss
+
+**KEYED ON `commandKind == CLIENT_SQL_SESSION_CLOSE`, NEVER ON `commandState`** — §40.2. The FAILED arm is
+**deliberately not implemented** (the manufactured-FAILED wedge, plus the genuine-FAILED mailbox-ownership
+collision). **Key on the field that is never manufactured.**
+
+### 42.3 ✅ THE UN-RETRACTION (§40.1) IS NOW CONFIRMED BY MEASUREMENT
+
+Session 65 failed with **`peer service ran out of free command sessions`** — the string that read **0 in every
+previous run**, and which I once took as proof that *"the allocator coped."* **It meant the allocator was never
+asked.** The session table **is** a wall; `AllocateSession` **does** return NULL. **§36.8 was right; my §38.4
+retraction of it was wrong; §40.1 called it; L1 proved it.**
+
+> **⇒ THE THREE WALLS, NOW ALL THREE OBSERVED:**
+> **1.** machine-candidate saturation (session 64) — **KILLED by L1**
+> **2.** setup-TCP singleton wedge (65+) — **did not fire** this run: sessions 65-75 failed *fast* with an
+> honest error instead of hanging, so no client died mid-command. (D4 remains a latent hazard — out of scope
+> by owner decision; fail-stop-on-deadline is the chosen contract when it is taken up.)
+> **3.** session-table exhaustion (session 65) — **NOW EXPOSED. This is L2's target.**
+
+### 42.4 ⚠ An instrument gap found by the run
+
+The loop script greps node B's log for `"ran out of free command sessions"` and reads **0** — **but the client
+saw it.** `TupleSinkServiceSetPeerErrorResponse` puts that text in the peer *response*; **node B never fprintf's
+it.** ⇒ **That DPU-side check was decoration from the day it was written.** The client's error is the evidence.
+*(Left as-is: fixing it means adding an fprintf to a cold error path. Recorded so the next reader does not
+trust the 0.)*
+
+### 42.5 ▶ NEXT — L2, and the acceptance that follows
+
+**L2** (§40.3): the phantom sink. `activeSinkCount` is never decremented on the clean-close path, and every
+retirement path — **including `AllocateSession`'s table-full reclaim (`:24273`)** — is gated on
+`activeSinkCount == 0`. **PRIMARY: the T4 / teardown-cancellation owner-release helper. ADJUNCT: route the
+`peerResetAfterCleanClose` branch through `TupleSinkServiceMaybeReclaimSinkAndSession`.**
+
+**Full acceptance after L2:** 75-loop → **75/75**; `MACHINE-CANDIDATE OVERFLOW` == 0; gate band `-c 1 -t 2000`
+×3 (**still owed — L1 is on the completion path; no perf check has been run yet**); 4-role basebackup; and
+P2-k Part 1's teardown result (exit 0 / 0 refusals / drain reached) must not regress.
