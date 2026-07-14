@@ -5148,3 +5148,96 @@ P2-i is, like P1-f, primarily an **enforcement** item: on a healthy shutdown it 
 > `tuple_sink_service_process.c:44718-44723` correctly warns that the PE-drain sum double-counts, and cites
 > `homer_service_dpu_dma.c:8803-8804` — which today is two local variable declarations in an unrelated function.
 > **The claim turned out to be TRUE (F5), and it was checked, not trusted.** Citation repaired as part of P2-i.
+
+### 34.7 ⛔ SELF-REFUTATION — F7 AND F11 ARE BOTH WRONG, AND F7 IS WRONG IN THE DANGEROUS DIRECTION
+
+**Written within the hour, by continuing to read the file I had just claimed to understand.** §34.2 and the F11
+row above are preserved verbatim above, not deleted: the reasoning that produced them is the lesson.
+
+#### ⛔ F7 / §34.2 — REFUTED. My "fix" would have RE-INTRODUCED a deadlock the code records already fixing.
+
+I claimed: *"`engine->fatalError` ⇒ the engine cannot retire anything ⇒ draining it hangs ⇒ classify as CANCEL
+and do NOT drain."*
+
+**The code says the exact opposite, in a comment written by whoever fixed this before.**
+
+`homer_service_dpu_dma.c:5575-5584` (`HomerDpuDmaDrainPeInternal`, the `harvestEvenIfFatal` parameter):
+
+> *"The normal steady state (false) refuses to progress a fatally-errored engine, because a fatal error means new
+> work must not be started. **But `doca_pe_progress()` is the ONLY site that harvests DOCA completion/error
+> callbacks, and refusing to call it once `fatalError` is latched strands every already-submitted task as
+> `HOMER_DPU_DMA_TASK_SLOT_SUBMITTED` forever** — which pins `import->inflightTaskCount` above zero and
+> **deadlocks the setup close-drain** (CLOSE_ACK is never sent)."*
+
+`homer_service_dpu_dma.c:6535-6538` (`HomerDpuDmaDrainArenaSlot`), even blunter:
+
+> *"`harvestEvenIfFatal=true` is **load-bearing**. … **A teardown drain that will not harvest under fatal is
+> therefore a hang, not a drain.**"*
+
+**`engine->fatalError` is a SOFTWARE latch meaning "do not START new work." It does NOT mean the DEVICE is
+broken.** Already-submitted DMA tasks still complete normally and still MUST be harvested. P2-i's drain therefore
+**must pass `harvestEvenIfFatal=true`**, exactly like P0-d's `HomerDpuDmaDrainArenaSlot` already does — and the
+"CANCEL on fatalError" branch I specified in §34.3 step 1 **must be deleted**, because it is precisely the hang.
+
+**How I got it wrong:** I inferred the mechanism from the flag's NAME, and from the runbook's operational
+phrasing (*"the engine **dies**"*, *"a run can PASS while the engine dies underneath it"*). Both describe the
+**semantic** consequence (no new work is accepted; sessions fail). Neither says anything about whether
+**already-submitted physical DMA** still retires — and it does.
+
+> **RULE. An operational description of a failure ("the engine dies") is a statement about SERVICE, not about
+> PHYSICS. Do not derive a hardware/lifetime conclusion from a phrase that was written to describe a user-visible
+> outcome.** The physical question — *"can already-submitted work still complete?"* — has to be asked of the
+> code, separately, every time.
+
+#### ⛔ F11 — REFUTED (the count IS monotone). But what replaces it matters MORE.
+
+I claimed the completion callback at `:10733` **submits a new task**, so `totalInflightTaskCount` can grow during
+the drain and the loop has no fixed point.
+
+**It submits an ALREADY-ARMED, ALREADY-COUNTED slot.** Proof, in the same function: on submit failure it calls
+`HomerDpuDmaRetireTaskSlot(engine, publishSlot, true)` (`:10738`) — **you cannot retire a slot that was never
+armed.** The `+2U`/`+3U` admission checks (`:2038`, `:2211`, `:2415`, `:3541`, `:4096`, `:6997`, …) reserve BOTH
+slots up front; the **body** is submitted immediately and the **publish** is submitted later, from the body's
+completion callback. This is the ordered two-hop DMA (write payload → write tail), and the second hop must not
+start until the first retires.
+
+Two consequences, and the second one is the real design driver:
+
+1. **`inflightTaskCount` counts ARMED tasks, not device-resident tasks.** That is *stronger* than I assumed:
+   `totalInflightTaskCount == 0` proves nothing is armed AND nothing is awaiting submission. Good.
+2. ⚠ **THE DRAIN MUST NOT STOP ON "NO IMMEDIATE PROGRESS".** After the body retires, the publish is submitted but
+   may not complete in the same `doca_pe_progress()` round. **`HomerDpuDmaDrainPeInternal` stops as soon as the PE
+   reports zero immediate progress** — it says so at `:5570-5573`, and calls that the *scheduler invariant*
+   ("a drain grant is bounded and never spins waiting for future completions"). **Used as P2-i's drain it would
+   return with the second hop still outstanding, and we would tear down under it.**
+
+#### ✅ THE PRIMITIVE ALREADY EXISTS, AND IT IS THE OTHER ONE
+
+`HomerDpuDmaDrainArenaSlot` (`:6544`) is the exemplar, and its header comment (`:6528-6542`) is the whole design:
+
+- it **deliberately deviates** from the scheduler's bounded-grant invariant, *"because the resource being awaited
+  is physical DMA work"*;
+- it is bounded by a **wall-clock deadline, not an iteration count**;
+- it passes **`harvestEvenIfFatal=true`**;
+- and it already documents re-entrancy safety: *"`HomerDpuDmaTaskMemcpyComplete` never calls service code, so this
+  release funnel cannot be reached from a completion callback and cannot recurse into `doca_pe_progress()`."*
+
+> **P2-i is therefore: do what `HomerDpuDmaDrainArenaSlot` does, but for the WHOLE ENGINE rather than one arena
+> slot** — spin to `totalInflightTaskCount == 0` (F5) under a wall-clock bound, harvesting even under fatal.
+
+**§34.3 step 1 (DECIDE/CANCEL-on-fatal) is DELETED. §34.3 step 2 (QUIESCE) is DEMOTED** from "the load-bearing
+part" to a defensive backstop — with arming stopped by the service loop having already exited, the count is
+monotone non-increasing. It is still worth having (a `shuttingDown` flag makes that a *fact* rather than a
+property of the caller), but it is no longer what the correctness rests on. **What the correctness rests on is
+the LOOP SHAPE** — and I had it exactly inverted.
+
+#### The rule, and it is the same rule three times now
+
+> **This is the THIRD time in two days that a claim of mine about this file was an ASSERTION ABOUT CODE I HAD NOT
+> READ, dressed as an inference from something I had.** P1-f: "nothing enforces the same-QP premise" (it did).
+> P1-f: "I3 needs hardening" (I3 does not execute). P2-i: "a fatal engine cannot drain" (it can, and must).
+> **Each cost exactly one `grep` to check. Each was committed before I checked.**
+>
+> **The pattern is now unmistakable: I write the spec, and THEN discover the mechanism.** Reverse it. The cheap
+> question — *"which function already does this, and what does its comment say?"* — found the answer in both
+> directions here, and it took ninety seconds.
