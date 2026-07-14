@@ -5445,3 +5445,106 @@ zombie path is reachable, just not by anything we would call a passing run.)
 > **RULE. Before running a test to exercise branch X, READ THE PREDICATE THAT GUARDS X.** A test that cannot
 > reach the branch produces a clean-looking negative result, and a clean-looking negative result is indistinguishable
 > from a passing one until someone reads the guard. *(I was one command away from filing exactly that.)*
+
+### 34.12 ✅ P2-i VALIDATED (citus `2b37e8701`) — AND IT IS A REAL BUG FIX, NOT ENFORCEMENT
+
+**The measurement the whole stage existed to produce — and the only way to get it was to stop the service while
+it was WORKING:**
+
+```
+SIGTERM the DPU service MID-TRANSFER (a 23 GB basebackup in flight):
+
+  homer DPU DMA: teardown drain COMPLETE: entered with 3 outstanding task(s),
+                 converged after 1 progress round(s); free_slots=3072/3072 fatal=false
+```
+
+**N = 3.** Three DOCA tasks live in the device at teardown. **Before P2-i they were simply abandoned:** the old
+path destroyed the import mmaps and `free()`d their descriptors and `memset` the import, *then* called
+`doca_ctx_stop` and discarded its `IN_PROGRESS`, *then* `doca_dma_destroy` → `doca_pe_destroy` → `free(engine)`
+— with DMA still live, writing into memory being handed back to the allocator. **That is V3, and it is reachable
+by SIGTERMing a busy service, which is how this thing is normally stopped.**
+
+Convergence cost: **one** progress round.
+
+> ⚠ **EVERY EARLIER READING SAID `entered with 0`** — the host DOCA smoke, the idle-DPU probe, after the gate,
+> after two full basebackups, on both DPUs. All of them were taken **after the workload had finished.** The drain
+> looked like a no-op and P2-i looked like an enforcement item (a P1-f-shaped "prove what already holds").
+>
+> **RULE. To measure what a teardown drains, you must tear down DURING the work, not after it.** A quiescent
+> system tells you nothing about a quiesce. *(I recorded "P2-i is an enforcement item, N=0" as a finding, twice,
+> before it occurred to me to kill the service mid-flight.)*
+
+#### Full validation set (P2-i round 3, both DPUs)
+
+| check | result |
+|---|---|
+| mid-flight SIGTERM (23 GB in flight) | **`entered with 3 outstanding, converged after 1 round`**, exit **0**, no alarms |
+| DPU gate, `-c 1 -t 2000` ×3 | `2000/2000`, **0 failed**, `transport: homer-dpu-command (implies dpu result relay)` |
+| gate tps | **285.6 / 291.0 / 299.1** vs band **291.0 / 295.8 / 304.1**. At/marginally below, with a **monotone within-set decline** (299→291→286) ⇒ machine drift after an hour of 23 GB transfers, not a step change. **Re-measure on a rested machine before quoting.** |
+| 4-role basebackup ×2 back-to-back | 23.25 GB each, `CLOSE_ACK`, ~44k byte-ring wraps each |
+| ALARM sweep (full pattern) | **zero** hits, both DPUs, every run |
+| both `#ifdef` configs | compile; DOCA **and** non-DOCA smokes pass |
+
+#### ⚠ THE tps NUMBER FROM THE FIRST VALIDATION WAS A PHANTOM — AND THE BRIEFING ERROR WAS MINE
+
+The first validation reported **404–424 tps** against the **291–304** band and honestly refused to call it a pass
+or a regression. **It was measured at `-c 4`; the band is a `-c 1` band** (P1-f's runs were `2000/2000` = 1×2000;
+the `-c 4` runs were `8000/8000`). pgbench reports **aggregate** tps, so `-c 4 → ~420` is **~105 tps/client** —
+a 3× per-client fall under 4-way concurrency, i.e. the known command/control **scaling** problem, not a change.
+
+**I asked for `-c 4` in order to exercise `RETIRING` — which §34.11 then proved cannot be exercised that way at
+all.** So the client count bought nothing and cost a false signal.
+
+> **RULE. A performance band is only a band AT ITS CLIENT COUNT. Record the client count WITH the band, or the
+> next comparison is a coin flip.** The band table in `farnet_diagnostics_and_baselines.md` §3.3 does not state
+> it — **fixed there.**
+
+#### ⛔ NOT FIXED, AND IT BOUNDS P2-i: AN EXIT PATH THAT REACHES `HomerDpuDmaDestroy` NEVER
+
+**VERIFIED, pre-existing** (P2-i's diff touches exactly ONE file, `homer_service_dpu_dma.c`; `main()` and
+`TupleSinkServiceResetSession` live in `tuple_sink_service_process.c`, untouched):
+
+```
+[farnet1 DPU]  RAW EXIT STATUS = 1        teardown drain lines: 0
+               LAST LINE: refusing to reset peer CLIENT_SQL_SESSION before
+                          command-mailbox writers quiesce  session=1 ... reset_complete=0
+[farnet0 DPU]  RAW EXIT STATUS = 0        teardown drain lines: 1   (converged)
+```
+
+**The BACKEND-side DPU service exits(1) out of the session-reset path and NEVER REACHES `HomerDpuDmaDestroy`.**
+No drain, no `doca_ctx_stop`, no release — **the DMA engine is not torn down at all.** Exit **1**, not a signal:
+a deliberate failure exit, not a crash.
+
+**Reproduces when the service is SIGTERM'd shortly after a gate run**, while session 1's command-mailbox writers
+are still un-quiesced (`current_sequence=14004` = the warmup's 2000 txns × 7 statements). **Nobody saw it because
+nobody SIGTERMs the service right after the gate** — the first validation killed it after the basebackup *and*
+the smoke, by which time the sessions had drained, and it saw exit 0.
+
+**This is exactly what this audit exists to find: an exit path that releases nothing.** It also bounds P2-i
+honestly — **the drain is correct where it runs, and here it does not run.** Tracked as the next item.
+
+### 34.13 THE BASEBACKUP STALL IS **NOT** P2-i — settled by a controlled A/B
+
+The first validation's most alarming result was a **reproducible basebackup stall** on a clean machine (runs 2
+and 3 hung at `waiting for checkpoint to complete`, walsender pinned at 100% CPU, unresponsive even to
+`pg_ctl stop -m fast`). Its run 1 had passed. **Bisected:**
+
+| binary | run 1 | run 2 |
+|---|---|---|
+| pre-P2-i (`91482c840`) | ✅ 7 s, 23.25 GB, CLOSE_ACK | ✅ 7 s, 23.25 GB, CLOSE_ACK |
+| **P2-i (round 3)** | ✅ 7 s, 23.25 GB, CLOSE_ACK | ✅ 7 s, 23.25 GB, CLOSE_ACK |
+
+**The stall did not reproduce on either binary under a clean controlled procedure. P2-i is exonerated.**
+
+**⚠ AND THE BISECT SCRIPT'S OWN VERDICT LINE LIED.** After the first arm it printed *"RUN 2 PASSED ON PRE-P2-i
+==> P2-i IS IMPLICATED. DO NOT SHIP."* — because that was the branch I wrote before I had the second arm. **Had
+I stopped there I would have reverted a correct change.** A verdict line is not a verdict; it is a *guess you
+wrote earlier*.
+
+**What the failing environment had that the clean one did not:** the validator **built and ran the DPU TCP
+transport smoke between basebackup runs 1 and 2** — and **that smoke server binds port 9727, the DPU service's
+own setup-listener port.** It also found the DPU's smoke binary was **x86-64**, i.e. that server had never
+actually run there before. **And the documented DPU reap recipe matches only `*/citus_tuple_sink_service*` — a
+leftover `homer_dpu_tcp_transport_smoke` holding 9727 is INVISIBLE to it.**
+
+**INFERRED, not verified.** Recorded as the leading hypothesis for a separate investigation, not as a diagnosis.
