@@ -5662,3 +5662,75 @@ use-after-free.
 > **A GUARD THAT CANNOT PROVE SAFETY MUST REFUSE THE UNSAFE ACT — NOT ABORT THE SAFE ONES AROUND IT.**
 > `exit(1)` in the middle of a teardown does not prevent the hazard it names; it prevents every *remaining*
 > teardown step, and those steps were the ones actually holding the line.
+
+### 35.8 ⛔ THE OBVIOUS BETTER FIX — A TEARDOWN REORDER — IS **DEAD**, AND THE REASON IS THE REAL FINDING
+
+Before implementing the fence, I asked the question §35 should have asked first: **"what makes this guard PASS,
+and does the teardown ever DO that?"**
+
+**It does — and it does it in the wrong order.** The two ways the guard can pass (`:24534`):
+
+| flag | set by | when |
+|---|---|---|
+| `peerWritersQuiesced` | `TupleSinkServiceApplyClientSqlPeerLifetimeCompletion` (`:24521`) | the peer sent a semantic **`CLIENT_SQL_SESSION_CLOSE`** |
+| `connectionResetComplete` | `HomerServiceMarkClientSqlPeerSessionsResetComplete` (`:29705`), from the **`onResetComplete` observer** | the RDMA connection is **physically torn down** — its own log line says *"command mailbox **quiesced by connection reset**"* |
+
+And `TupleSinkServiceDestroyPeerTransportState` (`remote_execution_peer_transport_rdma.c:10034`) calls
+`TupleSinkServiceResetPeerConnection(..., force=true, "transport-destroy")` on **every** active connection — which
+**fires that very observer** (`NotifyPeerConnectionResetBegin`/`...Complete`, `:6474`/`:6492`).
+
+```
+:48832   reset sessions            <-- guard FAILS (writers not quiesced) -> exit(1)
+:48843   DESTROY PEER TRANSPORT    <-- *THIS* is what would have quiesced them
+:48846   HomerDpuDmaDestroy        <-- never reached
+```
+
+**The teardown performs the quiescing step AFTER the step that requires it.** So the obvious fix is a reorder:
+destroy the peer transport first, let the observer set `connectionResetComplete`, and the guard passes
+**honestly** — MRs properly deregistered, **no leak, no fence.**
+
+#### ⛔ AND IT CANNOT BE DONE, BECAUSE THE TEARDOWN **FUSES** TWO OPERATIONS THAT MUST BE SPLIT
+
+**`remote_execution_peer_transport_rdma.c:5715` — `ibv_dealloc_pd(connectionState->protectionDomain)`.**
+**The protection domain is PER-CONNECTION, and it is deallocated INSIDE `TupleSinkServiceResetPeerConnection`** —
+the same function whose observer would set the flag.
+
+> **The thing that QUIESCES the writer is the same thing that DESTROYS THE PD THE MRs LIVE IN.**
+
+Reset the connections early and the session-reset loop would then call `ibv_dereg_mr` on MRs whose **PD has
+already been deallocated** — trading a loud `exit(1)` for a genuine use-after-free. **The current order is
+CORRECT for MR/PD lifetime and WRONG for the quiesce flag, and no ordering satisfies both.**
+
+**⇒ REJECTED. Recorded, not silently dropped.**
+
+#### ✅ WHAT THIS MEANS FOR THE FIX (and it CONFIRMS the fence — for a reason, not by default)
+
+The fence's "leak" is not a wart, it is the **only available outcome**, and it is free:
+
+1. session reset refuses → **fence, return** (MRs stay registered);
+2. `DestroyPeerTransportState` → destroys the QPs (**the peer physically cannot write any more**), fires the
+   observer, then `ibv_dealloc_pd` → **fails `EBUSY`** because the MRs are still registered → the PD leaks;
+3. **`HomerDpuDmaDestroy` RUNS AND DRAINS** ✅;
+4. process exits → the kernel reclaims the MR, the PD, everything.
+
+**That is §9.4's Scenario E, exactly: cancel, abandon, and RECORD what was discarded. Leaking at process exit is
+free. Skipping the DMA drain is not.**
+
+#### 🔭 THE STRICTLY-CORRECT FIX, recorded as FUTURE WORK (not now)
+
+**Split `TupleSinkServiceResetPeerConnection` into QUIESCE and RELEASE:**
+- **quiesce** — destroy the QP (⇒ the remote writer physically cannot write) and fire `onResetComplete`;
+- **release** — `ibv_dealloc_pd` and the rest.
+
+Then the teardown becomes: quiesce all connections → reset sessions (**guard passes honestly, MRs deregistered
+cleanly**) → release the connections → `HomerDpuDmaDestroy`. **No leak at all.**
+
+This is a real refactor of the RDMA connection teardown and it is **also exactly what P7b (connection pooling)
+will need** — pooling must be able to quiesce a connection's writers without destroying its PD. **Do it there,
+not here.**
+
+> **RULE. "What makes this guard PASS, and does the system ever DO that?" is the FIRST question, not the last.**
+> Asking it here found a better fix in ten minutes — and then found, in ten more, exactly WHY the better fix is
+> impossible today. **Both halves are worth more than the patch.** *(Third time this stage that establishing the
+> mechanism first turned out to matter more than the fix: §34.7's `fatalError`, defect B's `knownExpectedWork`,
+> and now this.)*
