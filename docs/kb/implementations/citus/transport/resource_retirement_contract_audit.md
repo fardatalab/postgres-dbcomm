@@ -6932,3 +6932,90 @@ must now be false on a recycled slot. Also in play:
    them into one bool, so a useful ALARM needs a reason plumbed out of the callback.
 4. **§40.4's "next silent cliff"** — the 16/12/2 policy budget — is **instrumented and NOT firing** (`machines=0
    payload=0` dropped). The collector budget (cap 6) *is* saturated. Watch, do not chase.
+
+---
+
+## §44 — 🔴 **WALL 5 FOUND, AND IT WAS IN THE LOG I NEVER OPENED.** Node A leaks 100% of its selected sessions.
+
+**Status: CAUSE PROVEN (two-directional). NOT FIXED. Out with Codex for the fix design.**
+**This supersedes §43.3's suspects — every one of them was wrong. The bug is not on node B at all.**
+
+### 44.1 THE SMOKING GUN — node A's log
+
+**Node B's log for session 65 is three lines and then silence.** So I finally read **node A's**, which I had
+never opened. It is **9,422,990 lines**, and **9,416,076 of them are one message**:
+
+```
+tuple-sink service: DPU backend-command stage failed: selected-DPU session table is full
+```
+
+**THE TWO-DIRECTIONAL PROOF:**
+
+| | **node A** (client-side DPU) | **node B** (backend-side) |
+|---|---|---|
+| `reset selected-DPU session on close` — **the ONLY release log line** | **0** | **64** |
+| `selected-DPU session table is full` | **9,416,076** | **0** |
+| `DPU backend spawn begin` | 0 *(correct — node A never spawns)* | 75 |
+
+> ## ⇒ NODE A HAS NEVER RELEASED A SINGLE SELECTED SESSION. NOT ONE. ITS 64-SLOT TABLE FILLS AND STAYS FULL.
+
+### 44.2 The mechanism — VERIFIED
+
+`dpuDmaState->selectedSessions[]` is capped at **64**. `selectedSessionCount++` at `:42960`; *"selected-DPU
+session table is full"* at `:42953`. It has **exactly two release sites**:
+
+| site | function | arm |
+|---|---|---|
+| `:42395` | `HomerServiceDpuResetSelectedSessionForClose` | **node B — called by T4** |
+| `:45100` | `HomerServiceDpuAbandonArenaTeardown` | **node B — T4's cancellation twin** |
+
+**BOTH ARE ON THE NODE-B ARENA-TEARDOWN PATH. NODE A HAS NO ARENA BACKEND AND STRUCTURALLY NEVER RUNS EITHER.**
+⇒ **Node A's selected-session table leaks 100%, permanently.** Once full, `HomerServiceDpuStageBackendCommand`
+cannot stage the client's command, so **the command is never routed to node B** — which is exactly why node B
+spawns a backend and then logs `landed peer command` **zero** times.
+
+### 44.3 ⚠ IT WAS PERFECTLY MASKED — **TWO 64-CAPS, ONE BEHIND THE OTHER**
+
+Node B's session table caps at 64 **and so does node A's selected-session table.** Node B's cliff fired at
+session **64**, so **in the entire history of this code nobody ever reached session 65 to discover node A's
+table was also full.** Kill node B's wall and node A's steps straight into the gap — which is precisely what
+was observed.
+
+> **⇒ THIS IS NOW THE SIXTH 64-SIZED RESOURCE IN ONE INVESTIGATION:**
+> node-B session table · machine candidate set · flat ready set · `MAX_LOCAL_SINKS` payload streams ·
+> peer-transport outgoing connections · **selected-DPU session table (both nodes)**.
+> **When every resource shares a magic number, one exhaustion masks the next, and each fix reveals a new
+> "regression" that was there all along.**
+
+### 44.4 ⛔ THE RULE I BROKE, AND IT IS WRITTEN IN OUR OWN RUNBOOK
+
+> **CLAUDE.md, verbatim:** *"The client only ever prints the SYMPTOM … **the DPU prints the cause**. When a
+> client reports a Homer failure, **READ THE DPU LOG** before touching the source."*
+>
+> **I read node B's log. I never opened node A's.** I then built a suspect list (§43.3) entirely out of node-B
+> code — a flag/counter desync, `ActiveSessionScanLimit`, the memsets — **and every one of them was wrong,
+> because the bug is not on node B at all.**
+>
+> ## RULE: THE GATE HAS **TWO** DPUs. "READ THE DPU LOG" MEANS **BOTH** OF THEM.
+> A failure on one node is routinely *caused* on the other. §43.3's suspect list is retracted in full.
+
+### 44.5 ⚠ A SECOND, INDEPENDENT BUG: **9.4 MILLION LINES OF UNBOUNDED ERROR LOG**
+
+That message is printed from a **hot retry loop with no rate limit at all**. It produced **9.4 M identical
+lines**, timed out a `cat`, and would eventually fill the disk. **This project's own rule:** *"Always bound the
+output. Retry/poll paths run millions of times per second: use first-N-then-every-Nth. A diagnostic that can
+fill a disk is a bug."*
+
+**And note the irony: it is simultaneously TOO LOUD and USELESS** — nine million copies of a message nobody was
+reading, on the one node nobody was looking at.
+
+### 44.6 ▶ NEXT
+
+**The fix is NOT obvious and I have no plan for it yet** — `HomerServiceDpuResetSelectedSessionForClose`
+certifies `commandInFlight`/`completionEventCount` and takes a `bridgeGeneration`, which are **backend/arena**
+concepts. **What is node A's semantic equivalent of T4?** Out with Codex (round 3): where node A should release,
+whether that function is even the right one, **what ELSE on node A leaks per session** (its log also shows
+64× orphaned-stream reclaims, 64× byte-ring receive-queue failures, 64× discarded control state — *all stopping
+at 64*), and the unbounded-log fix.
+
+**Still owed regardless:** the gate band (**no perf check has run for L1 or L2**) and the 4-role basebackup.
