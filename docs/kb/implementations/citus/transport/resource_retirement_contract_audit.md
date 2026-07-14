@@ -5734,3 +5734,83 @@ not here.**
 > impossible today. **Both halves are worth more than the patch.** *(Third time this stage that establishing the
 > mechanism first turned out to matter more than the fix: §34.7's `fatalError`, defect B's `knownExpectedWork`,
 > and now this.)*
+
+### 35.9 ⛔⛔ THE §35 PLAN WAS WRONG IN **SIX** WAYS — AND MY "FIX" WOULD HAVE PERMANENTLY WEDGED THE SESSION
+
+**Adversarial review of the P2-k plan, 2026-07-14. Every finding VERIFIED by me against the code before
+acceptance. This is the worst review of the stage and all six defects are mine.**
+
+| # | my claim in §35 | reality |
+|---|---|---|
+| **1** | *"8 callers of `TupleSinkServiceResetSession`"* (grep) | **26** (clangd). A `grep` count is not a caller audit. |
+| **2** | cited `:27420` as a caller | **it is inside a preserved COMMENTED-OUT block** (`:27411`). The live call is `:27433`. |
+| **3** | *"no caller assumes the reset succeeded"* | **FALSE.** `TupleSinkServiceAllocateSession` (`:24232`) calls reset at `:24263` and **unconditionally returns that slot** at `:24268`; `CreateSession` then `memset`s it (`:24281`). Safe **today** only because the reclaim candidate must pass `ShouldRetireWhenIdle` (`:24260`), which for peer receivers is **the same quiescence predicate** — a **cross-function invariant, not a contract.** |
+| **4** | *"the refusal will SPAM from the per-pass idle-retire scan at `:24263`; fix by making `ShouldRetireWhenIdle` return false for a fenced session"* | **INVENTED, BOTH HALVES.** `:24263` is the **table-full FALLBACK** inside `AllocateSession`, reached only after the free-slot scan fails — **not** a per-pass scan. **And `ShouldRetireWhenIdle` ALREADY returns false for the unsafe state** (`:24366` *is* `peerWritersQuiesced \|\| connectionResetComplete`). **My prescribed change would have BROKEN legitimate final retirement.** |
+| **5** | *"fence and **return without resetting**"* | **⚠ THE WORST ONE — see below.** |
+| **6** | §35.8: *"the teardown reorder is IMPOSSIBLE — the session reset would `ibv_dereg_mr` against a deallocated PD"* | **FALSE.** `TupleSinkServiceInvalidateRegisteredMemoryRegions` (`remote_execution_peer_transport_rdma.c:5030`) **deregisters every registered MR and NULLs the pointer BEFORE** `ibv_dealloc_pd` (`:5713`), and `DeregisterPeerMemoryRegionRdma` (`:10214`) is **NULL-safe** afterwards (`:10246` frees only the handle). **The reorder is viable. I rejected it on a premise I never checked.** |
+
+#### ⛔ #5 — MY FIX WOULD HAVE CREATED A PERMANENT WEDGE. STRICTLY WORSE THAN THE `exit(1)`.
+
+**`TupleSinkServiceResetSession` MUTATES BEFORE ITS OWN GUARD.** Between the entry (`:24120`) and the guard
+(`:24166`) it already:
+
+- clears session pending state (`:24131`),
+- clears the deferred peer-client completion + remote-command terminal (`:24150`, `:24151`),
+- **retires the session's send completions** (`:24161`),
+- **DISABLES `dpuPeerCommandLandingActive`** (`:24164`). ⚠
+
+And `HomerServiceDpuLandOnePeerCommand` (`:43270`) **REQUIRES `dpuPeerCommandLandingActive`** (`:43297`) — its
+own comment says it *"must still consume/reject peer mailbox records for the lingering session."*
+
+> **⇒ "Fence and return" would leave the session with peer-command landing DISABLED — so the peer's later
+> `CLIENT_SQL_SESSION_CLOSE` COULD NEVER LAND — so `peerWritersQuiesced` could never be set — so the session
+> could NEVER quiesce and NEVER be retired. A permanent wedge holding its MRs and its arena slot, forever.**
+
+**It replaces a loud `exit(1)` with a silent, permanent leak.** *Fifth time this stage that a "fix" of mine
+would have BEEN the bug.*
+
+#### ✅ THE CORRECTED FIX — and it is now SMALLER, not bigger
+
+1. **MOVE THE GUARD TO THE VERY TOP of `TupleSinkServiceResetSession`, before ANY mutation.** This is not a
+   refinement; it is the whole fix. A guard that fires *after* the destructive half of its own function has run
+   cannot "refuse" anything — it can only decide how to die.
+2. **DELETE the `exit(1)`.** On refusal: log through a **DEDICATED one-shot latch** — **NOT**
+   `dpuBackendTeardownStarted`, which ordinary selected-DPU teardown already sets before reset (`:43556`) and
+   which would therefore **suppress the very first refusal** — apply the fence, and **return `DEFERRED`**.
+3. **Change `TupleSinkServiceResetSession` from `void` to an outcome.** `void` is exactly why defect #3 exists.
+4. **Handle the outcome at the two callers that need it:** the **allocator** (`:24263`/`:24268` — it must NOT
+   hand out a slot whose reset was deferred) and **close** (`:40399` — it prepares a SUCCESS response at
+   `:40393` and must be able to tell a deferred reset from a completed one). **Shutdown may deliberately ignore
+   `DEFERRED` and continue** — that is the entire point.
+5. **LEAVE `ShouldRetireWhenIdle` ALONE.**
+
+**With the guard at the top, the refusal is now harmless:** landing stays ACTIVE, so the peer's close can still
+land, `peerWritersQuiesced` gets set, and the session retires **through the normal lifecycle** — which is
+precisely the documented *"leave final reset to peer-close/connection-reset lifecycle ownership."*
+
+#### ✅ AND THE "LEAK" I WORRIED ABOUT DOES NOT EXIST EITHER
+
+At shutdown, after the fence, `TupleSinkServiceDestroyPeerTransportState` (`:48843`) resets every connection,
+and **that path already `ibv_dereg_mr`s the session's command-mailbox MR** (it is linked into
+`connectionState->registeredMemoryRegions`, `remote_execution_peer_transport_rdma.c:10149`). Only the small
+**handle** struct leaks, at process exit. **The fence costs essentially nothing.**
+
+**⇒ The teardown reorder (§35.8) is therefore OPTIONAL, not required.** It would let the session reset complete
+*fully* rather than being deferred — nicer, and it is still the right long-term shape (and what P7b needs) — but
+it is **not** needed for safety. **Recorded; not in P2-k's scope.**
+
+#### Rules earned
+
+> **A `grep` COUNT IS NOT A CALLER AUDIT.** I reported 8; clangd found 26, and one of my 8 was inside a
+> commented-out block. CLAUDE.md already says to prefer clangd for symbol-level questions. I used `grep` because
+> it was in my fingers.
+
+> **A GUARD PLACED AFTER THE MUTATIONS IT GUARDS IS NOT A GUARD.** It cannot refuse; it can only choose how to
+> die. The `exit(1)` was not an over-reaction to an unsafe state — **it was the ONLY remaining option**, because
+> by the time the guard ran, the function had already destroyed the state needed to recover. *Move the guard,
+> and the `exit(1)` becomes deletable. Leave the guard where it is, and deleting the `exit(1)` creates a WORSE
+> bug.* **The placement was the bug; the `exit(1)` was the symptom.**
+
+> **When a review refutes your plan, re-check the sections you wrote EARLIER too.** §35.8's rejection of the
+> reorder was built on a premise (`dereg` after `dealloc_pd`) that I never verified and that is false. A
+> refutation of §35.3 does not automatically flag §35.8 — I had to go back and look.
