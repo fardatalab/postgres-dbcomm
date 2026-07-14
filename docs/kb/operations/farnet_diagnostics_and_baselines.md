@@ -241,8 +241,48 @@ Measured on a **fully stripped** stack (no `cmtrace`, no `p3trace`, no `p2diag`,
 | pgbench latency avg (`-t 5`, setup-dominated) | 290–435 ms | **7.5–7.8 ms** |
 | steady state (`-t 2000`) | — | **3.14 ms/tx, 318 tps** |
 
+> ## ⛔ THE `318 tps` FIGURE IS **POST-P7 (citus `d33f6ded3`)**. IT IS NOT THE CURRENT BAND. DO NOT COMPARE AGAINST IT.
+>
+> **On 2026-07-13 a validation dutifully reported an "8% regression" against this number. There was no
+> regression.** The figure predates the *entire* P0 resource-retirement series. Quoting it as *the* band is
+> **exactly what Non-negotiable #8 forbids** — *"a dated baseline reads like a standing fact; it is a
+> timestamped observation."* It was stamped, and it still misled, because it was the number the runbook
+> **pointed at**.
+>
+> ### The `-t 2000` gate band, by SHA
+>
+> | when | citus SHA | tps | note |
+> |---|---|---|---|
+> | post-P7 | `d33f6ded3` | **318** | the number below. **Stale.** |
+> | after the P0 series, pre-P-START | ~`e85abe531` | 286.7 / 285.1 / **282.4** | ⚠ measured with the START-wait instrumentation ON |
+> | after P-START | `91107bc11` | 290.2 / 295.5 / 292.2 | |
+> | **after P1-f (CURRENT)** | **`91482c840`** | **291.0 / 295.8 / 304.1** | stripped stack, no host service (S7.0) |
+>
+> **P1-f is at or above the current band — no regression.** Compare against the CURRENT row, and add a row when
+> you move it.
+>
+> ### 🔴 OPEN: an unattributed ~10% between `318` and `~285`, and NOBODY NOTICED IT
+>
+> The P0 safety series cost roughly **10%** and **no stage ever saw it**, because every stage compared itself to
+> the stage *immediately before* it. The drop is only visible end-to-end. **Suspects (UNVERIFIED — none has been
+> measured):**
+> - **P0-i** (`67ebc0167`) deleted the opportunistic signal interval ⇒ **more signalled WRs ⇒ more CQEs**.
+> - **§24** (`1d379b333`) added a WR-ID decode on **every** completion.
+> - **§29(b)** (`e85abe531`) added a per-connection admission predicate on **every** post.
+>
+> **This is a real, open performance question — not a pass/fail criterion, and not being chased now** (perf is
+> deferred until the migration lands). It is recorded so it is not "discovered" later as a mystery regression.
+>
+> > **The methodology rule this earns: a stage-by-stage comparison can hide an arbitrarily large cumulative
+> > drift. Every stage was green against its predecessor, and the series lost 10%.** Re-anchor to the *milestone*
+> > baseline periodically, not only to the last stage.
+
 **The steady-state 3.14 ms/tx (≈450 µs/command) is still far from the microsecond target — that is a NEW and
 separate performance question.**
+
+⚠ **The "≈450 µs/command" here is ARITHMETIC and it is 2× WRONG** (3.14 ms ÷ ~7 statements). The **measured**
+per-command control wait is **235.4 µs** — see
+[`remove_synchronous_start_round_trip.md`](../../future-directions/citus/transport/remove_synchronous_start_round_trip.md).
 
 Two methodological notes worth keeping:
 

@@ -826,9 +826,24 @@ amortizes away and the same system reports **~285–320**. They are not comparab
 quantity that actually is.** Separately, `--debug` (needed for proof #2) prints ~12k lines onto the measured
 path and depresses tps by ~10%. **Never compare a `--debug` run to a stripped one** (KB audit §22.10.2).
 
-Warmed steady state after P7: **3.14 ms/tx, 318 tps** (`-t 2000`), on a fully stripped stack. That is
-≈450 µs/command and **still far from the microsecond target** — an open performance question, not a pass/fail
-criterion (diagnostics §3.3).
+**Warmed steady-state gate band (`-t 2000`, stripped stack, no host service) — CURRENT: `291–304 tps`,
+citus `91482c840`.**
+
+> ⛔ **This used to read "3.14 ms/tx, **318 tps** after P7". THAT IS A POST-P7 (`d33f6ded3`) NUMBER AND IT
+> PREDATES THE ENTIRE P0 SERIES.** On 2026-07-13 a validation compared against it and dutifully reported an
+> **8% regression that does not exist**. **Compare against the CURRENT row in
+> `docs/kb/operations/farnet_diagnostics_and_baselines.md` §3.3, and add a row when you move it** — the band is
+> tracked there by SHA.
+>
+> ⚠ And the `≈450 µs/command` that used to sit here was **ARITHMETIC, and 2× wrong** (3.14 ms ÷ ~7 statements).
+> The **measured** per-command control wait is **235.4 µs**.
+>
+> 🔴 **Separately and genuinely open:** the P0 safety series cost an unattributed **~10%** (`318 → ~285`), and
+> **no stage saw it**, because each compared itself only to the stage before. *A stage-by-stage comparison can
+> hide an arbitrarily large cumulative drift.* Suspects (unverified): P0-i's signal-policy change, §24's WR-ID
+> decode, §29(b)'s per-post admission check. Not being chased now.
+
+The gate is **still far from the microsecond target** — an open performance question, not a pass/fail criterion.
 
 ### Basebackup — the validated 4-role DPU relay (USE THIS)
 
