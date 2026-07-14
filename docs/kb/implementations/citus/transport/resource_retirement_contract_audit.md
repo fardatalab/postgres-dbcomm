@@ -25,10 +25,12 @@
 >
 > | item | state | where |
 > |---|---|---|
-> | **P2-i** — `HomerDpuDmaDestroy` drain on clean exit | 🔨 **IMPLEMENTED, 3 review rounds, awaiting validation** | **§34** (spec + 13 verified facts) → **§34.7** (I refuted TWO of my own) → **§34.8** (what shipped) → **§34.9 / §34.10** (the reviews: 8 defects, 6 mine) |
+> | **P2-i** — `HomerDpuDmaDestroy` drain on clean exit | ✅ **LANDED + VALIDATED** — citus **`2b37e8701`**. **AND IT IS A REAL BUG FIX:** `entered with 3 outstanding task(s)` when SIGTERM'd **mid-transfer**. | **§34.12** (the measurement) · §34 (spec) · §34.7 (my two self-refutations) · §34.9/§34.10 (3 review rounds, 8 defects, 6 mine) |
+> | 🔴 **NEW — an exit path that reaches `HomerDpuDmaDestroy` NEVER** | ⛔ **OPEN, PRE-EXISTING.** The **backend-side** DPU service **exits(1)** out of the session-reset path (*"refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers quiesce"*) and never tears the DMA engine down **at all**. Fires on SIGTERM shortly after a gate run. **This is the audit's own subject matter: an exit path that releases nothing.** | **§34.12** (bottom) |
 > | **P2-j** — grouped-control reads outliving tenancy | ✅ accepted, **no action** | §4/P2-j |
 > | **§31** — dead DPU shm rings | 🧹 planned **cleanup**, not a bug | §31 |
 > | **§22.10.1** — P0-b's `RETIRING` branch | ⚠ **still unexercised — and the test this doc prescribed CANNOT WORK** | **§34.11.** `RETIRING` is gated on `ownerAbandoned`: it is the ZOMBIE path (owner timed out, THEN the response landed). A healthy run never abandons a control op **at any client count**, so `-c N` reports `retiring=0` **by construction**. ~~fold a `-c 4` run into P2-i's validation~~ — **STRUCK.** Needs fault injection. |
+> | 🟡 **The 4-role basebackup stall** | **NOT P2-i** (controlled A/B: 2/2 pass on *both* binaries). Environmental; leading hypothesis is the DPU TCP smoke server binding **9727**, the DPU service's own setup port — and the documented DPU reap recipe **cannot see** the smoke binary. **INFERRED.** | **§34.13** |
 >
 > ⛔ **This box PREVIOUSLY said P2-i's hole was "`fatalError` ⇒ the drain can never converge."** That claim is
 > **REFUTED (§34.7) and it is BACKWARDS**: `fatalError` is a software *"do not start new work"* latch, not a dead

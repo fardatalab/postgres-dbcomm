@@ -249,17 +249,28 @@ Measured on a **fully stripped** stack (no `cmtrace`, no `p3trace`, no `p2diag`,
 > timestamped observation."* It was stamped, and it still misled, because it was the number the runbook
 > **pointed at**.
 >
-> ### The `-t 2000` gate band, by SHA
+> ### The `-t 2000` gate band, by SHA — ⚠ **AND IT IS A `-c 1` BAND**
 >
-> | when | citus SHA | tps | note |
-> |---|---|---|---|
-> | post-P7 | `d33f6ded3` | **318** | the number below. **Stale.** |
-> | after the P0 series, pre-P-START | ~`e85abe531` | 286.7 / 285.1 / **282.4** | ⚠ measured with the START-wait instrumentation ON |
-> | after P-START | `91107bc11` | 290.2 / 295.5 / 292.2 | |
-> | **after P1-f (CURRENT)** | **`91482c840`** | **291.0 / 295.8 / 304.1** | stripped stack, no host service (S7.0) |
+> **🔴 EVERY ROW BELOW IS `-c 1 -j 1 -t 2000`.** The client count was NEVER recorded here, and on 2026-07-14 a
+> validation ran the gate at **`-c 4`**, got **404–424 tps**, and reported it against this band — which reads as a
+> **40% improvement** and is nothing of the kind. **pgbench reports AGGREGATE tps**, so `-c 4 → ~420` is
+> **~105 tps/client** against ~300 at `-c 1`: a 3× per-client fall under 4-way concurrency, i.e. the known
+> command/control **scaling** problem. Not a change, not a regression, not comparable.
 >
-> **P1-f is at or above the current band — no regression.** Compare against the CURRENT row, and add a row when
-> you move it.
+> > **RULE. A performance band is only a band AT ITS CLIENT COUNT.** Record the client count WITH the band, or
+> > the next comparison is a coin flip. *(This is the SECOND phantom this one table has produced: the first was
+> > the stale `318` row. Non-negotiable #8 says stamp the SHA — that is necessary and it is not sufficient.)*
+>
+> | when | citus SHA | clients | tps | note |
+> |---|---|---|---|---|
+> | post-P7 | `d33f6ded3` | `-c 1` | **318** | **STALE.** Predates the entire P0 series. |
+> | after the P0 series, pre-P-START | ~`e85abe531` | `-c 1` | 286.7 / 285.1 / **282.4** | ⚠ measured with the START-wait instrumentation ON |
+> | after P-START | `91107bc11` | `-c 1` | 290.2 / 295.5 / 292.2 | |
+> | after P1-f | `91482c840` | `-c 1` | 291.0 / 295.8 / 304.1 | stripped stack, no host service (S7.0) |
+> | **after P2-i (CURRENT)** | **`2b37e8701`** | **`-c 1`** | **285.6 / 291.0 / 299.1** | at/marginally below the P1-f row, with a **monotone within-set decline** (299→291→286) ⇒ machine drift after an hour of 23 GB transfers, **not** a step change. **Re-measure on a rested machine before quoting.** |
+> | *(reference, NOT comparable)* | `91482c840` | `-c 4` | 404–424 **aggregate** | ≈105 tps/**client**. Kept here only so nobody re-derives the phantom. |
+>
+> Compare against the CURRENT row **at the same client count**, and add a row when you move it.
 >
 > ### 🔴 OPEN: an unattributed ~10% between `318` and `~285`, and NOBODY NOTICED IT
 >
