@@ -17,11 +17,18 @@
 > | **§24** WR-ID contract | ✅ LANDED + VALIDATED (§24.8) | citus `1d379b333` |
 > | **§25 / F7** | ✅ LANDED + VALIDATED (§25.6) | citus `16e4bdf3e` |
 > | **§29a / §29b** | ✅ LANDED | citus `c3e3f3e56` / `e85abe531` |
+> | **P1-f** | ✅ LANDED + VALIDATED (§33.11) | citus `91482c840` |
 >
 > **⇒ P7b IS UNBLOCKED.** P7b.0 *is* P0-b, already landed. P7b.1 is small (§26.6).
 >
-> **STILL OPEN:** P1-f (ready, and FREE — §11.1); P2-i (§9.3); P2-j (accepted, no action); §31 (dead DPU shm
-> rings); §22.10.1 (the `RETIRING` branch is validated by construction, **never by execution**).
+> **STILL OPEN — and P2-i is the LAST CODE ITEM:**
+>
+> | item | state | where |
+> |---|---|---|
+> | **P2-i** — `HomerDpuDmaDestroy` drain on clean exit | 📝 **SPEC** (facts verified in code) | **§34** — supersedes §9.3's sketch, which had a hole (`fatalError` ⇒ the drain can never converge, so "FATAL on non-convergence" would abort **every** dirty shutdown) |
+> | **P2-j** — grouped-control reads outliving tenancy | ✅ accepted, **no action** | §4/P2-j |
+> | **§31** — dead DPU shm rings | 🧹 planned **cleanup**, not a bug | §31 |
+> | **§22.10.1** — P0-b's `RETIRING` branch | ⚠ validated **by construction, never by execution** (`retiring=0` in every run) | fold a `-c 4` gate run into P2-i's validation |
 >
 > ### ⚠ THE HAZARD THIS BOX EXISTS TO PREVENT — and it fired, on 2026-07-13
 >
@@ -5010,3 +5017,134 @@ and it is why this belongs in the audit rather than in a cleanup commit.
 > was already calling. **All three were assertions of ABSENCE, and none of the three cost more than one `grep`
 > to check.** Asserting a presence gets checked by the compiler and by review. **Asserting an absence gets
 > checked by nobody but you.**
+
+---
+
+## §34 — P2-i: `HomerDpuDmaDestroy` drain on CLEAN exit. THE LAST CODE ITEM OF THIS AUDIT.
+
+**Status: SPEC (2026-07-13).** §9.3's one-paragraph sketch was *directionally* right and had **one hole big
+enough to crash every dirty shutdown** (F7 below). Everything here was verified in code first — the discipline
+that P1-f's three wrong claims earned.
+
+### 34.1 VERIFIED FACTS — established BEFORE any design
+
+| # | fact | evidence |
+|---|---|---|
+| **F1** | `HomerDpuDmaDestroy` has **no drain**, and says so | `homer_service_dpu_dma.c:1277-1289`: DestroyDocaLifecycle → FreeStage5Scaffolding → `free()`. Its own block comment (`:1273-1276`) — *"later stages must add explicit drain-before-destroy policy."* |
+| **F2** | **Every DOCA return on the teardown path is `(void)`-discarded** | `:14897` `doca_ctx_stop`, `:14905` `doca_dma_destroy`, `:15030/:15033` inventory, `:15038` `doca_pe_destroy`, `:15043` `doca_dev_close`. And `docaContextStarted = false` is set **unconditionally** (`:14898`) — so if `ctx_stop` returned `IN_PROGRESS` (ctx is **STOPPING**, not stopped), **the flag is a lie.** |
+| **F3** | **Imports are cleared BEFORE the contexts are stopped** — free-the-target-then-stop-the-engine | `:14885-14888` (clear ALL imports) precedes `:14893-14900` (`ctx_stop`). `HomerDpuDmaClearHostMmapImport` (`:8912`) destroys the DOCA mmap (`:8949`), `free()`s `descriptors`/`ringRuntime` (`:8954-8955`), and **`memset`s the import to zero** (`:8956`) — **without ever consulting `import->inflightTaskCount`.** The `memset` also **destroys the evidence** that anything was in flight. |
+| **F4** | the **global** physical-outstanding count **already exists** | `facts->totalInflightTaskCount` (`:1467`), via `HomerDpuDmaGetSchedulerFacts` (`:1295`). P2-i does not need a new counter. |
+| **F5** | ✅ **`totalInflightTaskCount` is COMPLETE** — the four sub-counters are strict **SUBSETS** | each is incremented **on the line immediately after** an `inflightTaskCount++`, same function, same path: control-read `:12070`/`:12069`; command-pull `:12249`/`:12248`; backend-cmd-publish `:12680`/`:12679`; backend-completion-pull `:12900`/`:12899`. All five decrements sit in **one block**, `:11439-11471`. ⇒ **`totalInflightTaskCount == 0` ⟹ all four are 0.** The drain predicate is that ONE term, and we can say why. |
+| **F6** | `HomerDpuDmaDestroy` runs **only at process exit or Create-failure** | callers: `tuple_sink_service_process.c:48846` (service exit), `homer_service_dpu_dma.c:1256`/`:1263` (Create failure — nothing is in flight yet), and the smoke binaries. **This is exactly why it is P2 and not P0**, and it must be said out loud rather than quietly inflated. |
+| **F7** | ⚠ **`engine->fatalError` does NOT exit the service** | set at ~10 sites (`:2093`, `:2273`, `:2475`, `:2511`, …); it only poisons progress. The service **runs on with a dead engine** and reaches the SAME teardown at SIGTERM. (The runbook already records the operational half of this: *"a run can PASS while the engine dies underneath it."*) **⇒ the drain can be entered with an engine whose tasks will NEVER complete.** |
+| **F8** | SIGTERM **is** the clean-exit path | `KeepTupleSinkServiceRunning` (`tuple_sink_service_process.c:3861`); SIGINT/SIGTERM installed at `:23565-23566`; the loop exit falls straight through to the teardown. |
+| **F9** | **Nothing progresses the PE after the loop exits** | between `:48811` and `:48846` there are only the stream/session resets. P0-d's drain lives in the `ResetSession` funnel and is **per-arena-slot**; engine-level work (grouped-control reads, command pulls, spawn ops) belongs to **no arena slot** and is structurally invisible to it. |
+| **F10** | ⚠ a per-import teardown/detach drain gate **already exists, and it already deadlocked once — for exactly the reason P2-i must avoid** | `homer_service_dpu_dma.c:1539-1549` records it verbatim: a **perpetual poller** that kept re-arming through CLOSING pinned `import->inflightTaskCount` above 0 and produced *"an endless teardown-drain-wait spin."* |
+| **F11** | ⚠ **A COMPLETION CALLBACK SUBMITS A NEW TASK** | `:10733` — `doca_task_submit_ex(...)`, whose error string is *"DPU-to-host publish failed **from callback**"*. **⇒ `totalInflightTaskCount` is NOT monotonically decreasing under `doca_pe_progress()`.** Draining one task can create one. A bare `while (total > 0) progress();` **has no guaranteed fixed point.** |
+| **F12** | there is **NO centralized task-slot acquire** | **8** `freeTaskSlotCount--` sites (`:11855, :12067, :12246, :12379, :12511, :12677, :12897, :13188`) — exactly coinciding with the 8 `inflightTaskCount++` sites — and **one** release (`:11492`). The arm sequence is **duplicated inline 8×**. The accounting invariant therefore holds **by eight repetitions, not by construction.** |
+| **F13** | each arming predicate has **TWO definitions** (`#ifdef HOMER_DPU_DMA_WITH_DOCA` / `#else`) | `CanSubmit` `:9547`/`:9686`; `CanDrainHostRing` `:9571`/`:9696`; `CanEgressMirror` `:9586`/`:9701`. **clangd indexes only the active config** — an edit to one copy silently diverges the other build. Touch both. |
+
+### 34.2 ⚠ THE §9.3 SPEC HAS A HOLE, AND IT IS F7
+
+§9.3 said, in full: *"3 DRAIN: progress the PE until the global outstanding count is zero (bounded; **FATAL on
+non-convergence**)."*
+
+**Implemented as written, every fatal-engine shutdown now FATALs** — because a dead engine cannot retire its
+tasks (F7), so the drain burns its bound and then aborts. That converts a survivable dirty exit into a crash **at
+exactly the moment the logs matter most**, and it would have looked like P2-i *introduced* a shutdown bug.
+
+§10.6 of this very document already stated the rule, and I nearly walked straight past it:
+
+> **"SCENARIO E IS NOT THE ONLY NON-DRAINING OUTCOME — CLASSIFY BEFORE YOU CANCEL."**
+
+**The drain must ask "can this engine still complete work?" BEFORE it asks "is it drained?"**
+
+### 34.3 THE DESIGN
+
+`HomerDpuDmaDestroy(engine)` **keeps its signature.** Per F6 every caller is an exit path and none of them holds
+a policy to pass; the classification is **derived from the engine's own state**, not supplied.
+
+```
+HomerDpuDmaDestroy(engine):
+
+  1 DECIDE   -- classify the exit (F7, §10.6):
+       engine->fatalError      -> CANCEL   (Scenario E: the engine CANNOT retire anything. Say so, loudly,
+                                            and do NOT drain -- draining a dead engine is the hang.)
+       !engine->docaEnabled    -> TRIVIAL  (no DOCA: nothing can be in flight)
+       otherwise               -> DRAIN
+
+  2 QUIESCE  -- engine->shuttingDown = true.   *** THIS IS THE LOAD-BEARING PART, NOT THE LOOP (F11). ***
+               Without it the drain has no fixed point: a completion callback re-submits (:10733).
+               It must stop every PRODUCER -- and NOT the bookkeeping (see the trap below).
+
+  3 DRAIN    -- loop doca_pe_progress(engine->pe) until GetSchedulerFacts().totalInflightTaskCount == 0  (F5).
+               Bounded by BOTH an iteration cap AND a wall-clock deadline.
+               REPORT UNCONDITIONALLY: entered-with N outstanding, converged in K iters / T us.
+                 (N is a number we do not have today and cannot currently guess -- see 34.5.)
+               Non-convergence, or fatalError raised MID-drain  -> LOUD (fprintf ALARM; never assert --
+               assert() would abort the service) -> then fall through to CANCEL. Do NOT abort.
+
+  4 RELEASE  -- REORDER, which is the fix for F3:
+               a. doca_ctx_stop() per started ctx -- *** CHECK THE RETURN ***. DOCA_ERROR_IN_PROGRESS means
+                  STOPPING, not stopped: progress the PE until the ctx reports IDLE (bounded). Only then may
+                  docaContextStarted be cleared (F2 -- today that flag is set to false regardless, i.e. it lies).
+               b. ONLY NOW clear the host mmap imports. They are the DMA TARGETS; today they are destroyed
+                  first (F3).
+               c. destroy dma ctxs / mmaps / inventory / PE / dev -- check every return, log every failure.
+```
+
+#### ⚠ The quiesce trap — do NOT gate all three arming predicates
+
+`HomerDpuDmaImportCanEgressMirror` gates **bookkeeping, not a submit** — it guards
+`HomerDpuDmaRequeueDiscoveredReady` (`:8799`), and that function's own comment (`:8806-8810`) says that when it
+returns false **"the send-CQ drain caller escalated that to `engine->fatalError`."**
+
+**Gating `CanEgressMirror` on `shuttingDown` would therefore set `fatalError` from inside our own drain** — a
+self-inflicted wound, and precisely the "my fix contradicts the contract stated in the same document" shape that
+§7.8 already caught once. Quiesce the **submit** paths; leave the **bookkeeping** paths alone.
+
+### 34.4 TWO OPTIONS FOR THE QUIESCE — decision pending the accounting audit
+
+|  | **Option A — gate the predicates** | **Option B — funnel the arm** |
+|---|---|---|
+| what | `shuttingDown` checked inside `CanSubmit` + `CanDrainHostRing` (both `#ifdef` copies, F13) + the in-callback resubmit (`:10733`) | extract the 8×-duplicated arm sequence (F12) into one `HomerDpuDmaArmTaskSlot()`; check `shuttingDown` **there** |
+| size | ~6 edits | 8 call sites + 1 helper |
+| correctness | **rests on a NEGATIVE claim**: *"no submit escapes those two predicates."* | **correct by construction**: you cannot submit a task you could not arm |
+| bonus | none | makes the F5/F12 accounting invariant (`arm ⇒ inflight++`) **structural** instead of eight coincidences |
+| hot path | none | one cold-branch predicate on the DMA arm path |
+
+**DECISION CRITERION (deliberately written down BEFORE the answer is known):** Option A is viable **iff** every
+`doca_task_submit*` site is behind `CanSubmit` or `CanDrainHostRing`. That is an **assertion of absence** — the
+exact class of claim that produced *all three* of P1-f's wrong calls (§33.10) — so it is being **searched**, not
+assumed. **If even one submit escapes, Option B is mandatory.**
+
+### 34.5 ACCEPTANCE — and the number we do not have
+
+P2-i is, like P1-f, primarily an **enforcement** item: on a healthy shutdown it should change nothing.
+
+1. **The drain reports, every run.** `entered-with N outstanding, converged in K iters / T us`.
+   **`N` is currently UNKNOWN and unguessable** — nothing progresses the PE after the loop exits (F9), so
+   whatever was in flight when SIGTERM landed is still in flight at destroy. **If N is consistently 0**, P2-i
+   proves what today merely *happens* to hold, and the fix is free. **If N > 0**, the current code has been
+   destroying DOCA mmaps and `free()`ing descriptors out from under live DMA tasks (F3) on every shutdown, and
+   P2-i is a real bug fix. **Either way we learn a fact we do not have today.**
+2. **Zero non-convergence ALARMs** on a clean (non-fatalError) shutdown.
+3. **A fatalError shutdown must NOT hang and must NOT abort** — it must classify as CANCEL, say so, and exit.
+4. Gate (`-c 4`) + 4-role basebackup unchanged; both services SIGTERM cleanly.
+
+### 34.6 Rules earned (before writing a line of code)
+
+> **The `(void)` cast is the `catch {}` of C.** Five DOCA calls on this teardown path discard their return, and
+> one of them (`ctx_stop`) has a documented "not done yet" return that the code then contradicts by setting
+> `docaContextStarted = false` anyway (F2). **A status you do not read is a status that will be wrong, silently,
+> in the direction you assumed.**
+
+> **A drain is only as good as its quiesce, and a quiesce is only as good as its enumeration of PRODUCERS.**
+> This file has already paid for that lesson once (F10: an "endless teardown-drain-wait spin"), and F11 shows the
+> producer set includes **the completion callback itself**. *A loop that waits for a counter to reach zero, while
+> something can still increment it, is not a drain — it is a bet.*
+
+> **A stale `file:line` in a comment does not make its claim false; it makes it UNVERIFIED.**
+> `tuple_sink_service_process.c:44718-44723` correctly warns that the PE-drain sum double-counts, and cites
+> `homer_service_dpu_dma.c:8803-8804` — which today is two local variable declarations in an unrelated function.
+> **The claim turned out to be TRUE (F5), and it was checked, not trusted.** Citation repaired as part of P2-i.
