@@ -463,3 +463,193 @@ for it is LEGITIMATE. What is broken is the SIGNAL it backs off on. Fix the sign
 - *"Do not add a TWELFTH aliasing collector"* — **a twelfth was added anyway.** A guard phrased as a magic count
   rots the moment it is disobeyed, and then **the guard itself hides the regression.** Replaced with a rule that
   names no number: *a new DPU collector must not join that shared case-label block; give it a 1:1 triple.*
+
+---
+
+## §FB-1 THE PLAN — de-alias the feedback (and the core), minimally. **Goal: STOP the inverted guidance. NOT to be clever.**
+
+**Design bar (user, 2026-07-14):** it must not be *wrong or obviously bad on paper*. It need not be smart or
+fast yet. So: give each DPU collector honest, self-referential feedback, and stop there. No new policy, no new
+knob, no attempt to actually exploit the now-correct signal.
+
+**Baseline facts (all VERIFIED at HEAD this session):**
+- `HomerProgressSourceId` = `{uint16 kind; uint16 index; uint16 generation; uint16 reserved}`. `index` is free
+  for the DPU family (all twelve currently ship `index = 0`).
+- Registry init: `HomerServiceInitializeProgressSourceCore(&…dpuDmaSource, HOMER_PROGRESS_SOURCE_DPU_DMA, 0, …)`
+  (`:16797`) — the single source every DPU collector copies.
+- Stamp point: `HomerServiceMachineBaselineCollectorSource` (`:10944`) hands all twelve
+  `ProgressRegistry.dpuDmaSource.source` verbatim.
+- WRITE resolver: `HomerServiceProgressFeedbackForSource` (`:14566`) — `DPU_DMA` returns `&…dpuDmaFeedback`, no
+  index. Both feedback writers (`UpdateProgressFeedbackAtTick`, `RecordProgressGrantBudgetFeedback`) route here.
+- READ resolver: `HomerServiceProgressCollectorFeedbackForKind` (`:42898`) — twelve `case`s → `&…dpuDmaFeedback`.
+- CORE resolver: `HomerServiceProgressCoreForSource` (`:14633`) — `DPU_DMA` returns `&…dpuDmaSource`, no index.
+
+### THE ONE IDEA THAT MAKES IT SAFE: a SINGLE canonical `collectorKind → dpuIndex` map — CHECKED, not merely shared
+
+> ⚠ **REVIEW CORRECTION (Codex, VERIFIED):** "one function, used by both paths" is necessary but **NOT
+> sufficient**, and my `static_assert`/`-Wswitch` guards do not prove what I claimed:
+> - **`-Wswitch` is NOT promoted to an error in a normal build.** Our build promotes only
+>   `implicit-function-declaration`, `implicit-int`, `return-type`, `vla` (`configure.ac:179-182`); global
+>   `-Werror` is **CI-only** (`ci/build-citus.sh:33`). So a missing `case` compiles clean locally. A
+>   no-`default:` switch is good practice, **not** a guarantee.
+> - **`static_assert(SLOTS >= 12)` proves CAPACITY only** — not that the map is injective (two collectors →
+>   one slot) or total (a DPU collector → `_NONE`). Either bug silently re-aliases or crashes.
+>
+> ⇒ **The map must be validated at INIT with a seen-bitmask**: walk all `HOMER_PROGRESS_COLLECTOR_*`, assert
+> every DPU collector maps to a distinct in-range slot and every non-DPU maps to `_NONE`, and `exit(1)` with a
+> named ALARM otherwise. A one-to-one map PROVEN at startup is the real invariant; the single function is just
+> how the two paths share it.
+> ⇒ **ALL FOUR sites bounds-check** (`slot == _NONE || slot >= SLOTS` → NULL/skip), not just WRITE and CORE.
+> The stamp and READ paths index the map result directly and must reject `_NONE` before indexing.
+
+The failure mode of a split is **drift**: if the WRITE path stamps index 7 and the READ path computes index 3,
+feedback is written to slot 7 and read from slot 3 — *silently worse than today's consistent aliasing*, because
+now it is wrong AND unattributable. **Every path must derive the index from ONE function.** No open-coded
+per-site index arithmetic anywhere.
+
+```c
+/* The ONLY place a DPU collector's feedback/core slot is decided. Returns 0..HOMER_DPU_FEEDBACK_SLOTS-1
+ * for a DPU-family collector, or HOMER_DPU_FEEDBACK_SLOT_NONE for a non-DPU kind.
+ * NO default: arm -> -Wswitch fails the build when a collector is added. */
+static uint16_t HomerServiceDpuFeedbackSlotForCollector(HomerProgressCollectorKind kind);
+```
+
+Twelve DMA collectors → slots 0..11. It maps ONLY the twelve that alias today; every other collector kind
+(including the already-split SETUP_LISTENER / DOORBELL / SPAWN, which have their OWN source kinds and must NOT be
+perturbed) returns `_NONE`. Capacity `HOMER_DPU_FEEDBACK_SLOTS = 12`, `static_assert`-guarded against the count.
+
+### THE EDITS (small, mechanical, all in tuple_sink_service_process.c)
+
+1. **Registry:** replace the scalar `dpuDmaFeedback` with `dpuDmaFeedbacks[HOMER_DPU_FEEDBACK_SLOTS]`, and the
+   scalar `dpuDmaSource` core with `dpuDmaSources[HOMER_DPU_FEEDBACK_SLOTS]`. Init each with its own index
+   stamped (`HomerProgressMakeSourceRef(DPU_DMA, slot, owner)`), same owner for all (the owner is the engine).
+   ⚠ **Owner stays identical** — the executor validates `kind` + `owner` (`:48190`) and must keep passing.
+2. **Stamp (`:10944`):** for a DPU collector, `sourceRef = dpuDmaSources[slot].source` where
+   `slot = HomerServiceDpuFeedbackSlotForCollector(kind)`. One lookup; no arithmetic.
+3. **WRITE resolver (`:14566`):** `DPU_DMA` → `&dpuDmaFeedbacks[sourceRef->id.index]`, bounds-checked
+   (`>= SLOTS` → return NULL, exactly as PAYLOAD_STREAM already does).
+4. **READ resolver (`:42898`):** each of the twelve `case`s →
+   `&dpuDmaFeedbacks[HomerServiceDpuFeedbackSlotForCollector(kind)]`. **Derived from the SAME map as the stamp**,
+   so WRITE(stamp index) and READ(kind→index) cannot disagree.
+5. **CORE resolver (`:14633`):** `DPU_DMA` → `&dpuDmaSources[sourceRef->id.index]`, bounds-checked. Fixes the
+   incoherent-ref trap (feedback slot 7 / core slot 0) Codex found — cheap, and done here so it never becomes a
+   latent surprise.
+6. **`HomerServiceDpuDmaSchedulerStateForProgress`-style owner reads** (e.g. `:42949`
+   `dpuDmaSource.source.owner`) → read `dpuDmaSources[0].source.owner`; the owner is identical across slots.
+   ⚠ Grep every `dpuDmaSource` / `dpuDmaFeedback` reference and reroute; a missed one reads the deleted scalar.
+
+### EXPLICITLY OUT OF SCOPE (record; do not fold in)
+
+- **Not touched:** the blind-backoff predicate, `runnableMachineWork`, `MAX_SKIP_GRANTS`, `MAX_COLLECTOR_GRANTS`.
+  The signal becomes correct; nothing *acts* on the correctness yet. That is the point.
+- **The bypass list** — DO NOT add GROUPED_CONTROL_READ (see the TEMPTING WRONG MOVE above). The backoff is
+  legitimate; the signal was the bug.
+- **The 6-collector quota** — FB-1 may relocate a drop into it. Report it; it is not a regression of FB-1.
+- **`no-source` collectors** (BACKEND_COMPLETION_RING, PAYLOAD_FRONTIER) — separate scaffolding noise.
+
+### ACCEPTANCE (the corrected criterion — I had it wrong twice, see §FB-0)
+
+- **Primary — WRITER ATTRIBUTION, on the diag build.**
+  > ⚠ **REVIEW CORRECTION (Codex, VERIFIED): my "own-age at rejection" probe is TAUTOLOGICAL.** The backoff
+  > *refuses to reject* precisely when `age >= MAX_SKIP_GRANTS` (`:10851`). So recording the age AT the rejection
+  > site can only ever report `< MAX_SKIP_GRANTS` — **whether or not the split worked.** It would paint a broken
+  > fix green. This is exactly the "diagnostic that lies is worse than none" trap.
+  >
+  > **The property to prove is not age, it is WHO WROTE WHICH SLOT.** So the acceptance instrument asserts, per
+  > DPU action kind, that its grant updates EXACTLY its canonical slot, and that each of the twelve slots has
+  > exactly ONE collector owner over the whole run. Concretely: on every DPU feedback write, record
+  > `(id.index, executing collector kind)`; at teardown assert the relation is a bijection matching the canonical
+  > map. **A slot touched by two kinds = still aliased = FAIL.** (The age/max-run number stays as a secondary
+  > sanity read, never the pass/fail.)
+- **Perf/correctness (perf build):** gate `-c 1 -t 2000`, 2000/2000, 4-role basebackup PASS, full ALARM sweep
+  clean on BOTH DPUs.
+  > ⚠ **REVIEW CORRECTION (Codex, VERIFIED): "throughput must not move" is an INVALID blocker.** The corrected
+  > streak is READ by the candidate builder (`:46295`) and feeds a real admission decision in the backoff
+  > (`:10837`). So de-aliasing CAN legitimately change suppression frequency, grant mix, and therefore
+  > throughput — **without any new policy.** A throughput *delta is expected and allowed*; an *unexplained* one
+  > is what blocks. Report the band with the delta and its explanation, do not require it to be zero.
+- **Honest null result is still a PASS.** The measured harm today is ~nil (own-age 1–2), so the guaranteed win
+  is *attributability + a non-inverted signal*, not latency. If throughput is flat, say so; if it moves, explain
+  it from the grant mix.
+- **Instrumentation the split MUST update (or it plants the inversion it removes):** the FB-0 diagnostic marks
+  all twelve names with `*` and legends `* = aliases dpuDmaFeedback` (`:11160`, `:11291`). After the split those
+  are FALSE. Drop the `*` and fix the legend in the SAME commit.
+
+### RISKS (each with its mitigation)
+
+- **Drift between READ and WRITE** → single canonical map, used by both; no per-site arithmetic. *The* invariant.
+- **A missed `dpuDmaFeedback`/`dpuDmaSource` reference reads a deleted scalar** → grep both symbols to zero
+  before building; the compiler catches the type change but not a semantic mis-route.
+- **Owner-identity break in the executor** → keep `owner` identical across slots; validated at `:48190`.
+- **`static_assert(HOMER_DPU_FEEDBACK_SLOTS >= <count of DMA collectors>)`** so adding a collector fails the
+  build rather than silently indexing out of range.
+
+---
+
+## §FB-1 LANDED AND VALIDATED. The DMA family is de-aliased; the guidance is no longer inverted.
+
+**Status: DONE** (citus: this commit). Minimal split, exactly to the user's bar ("not wrong or obviously bad
+on paper; need not be clever"). No new policy; nothing yet EXPLOITS the now-correct signal.
+
+### What shipped
+
+- `HomerServiceDpuFeedbackSlotForCollector(kind)` — the ONE canonical `collector -> 0..11 / _NONE` map, used
+  by the stamp, the READ resolver, the CORE resolver, and the acceptance probe. No open-coded index anywhere.
+- `dpuDmaFeedback` scalar → `dpuDmaFeedbacks[12]`; `dpuDmaSource` core scalar → `dpuDmaSources[12]`, each init
+  with its own index stamped, same owner (`HomerServiceDpuDmaSchedulerState *`) for all slots.
+- All four resolvers (stamp `:~11065`, WRITE `:~14894`, READ `:~42987`, CORE `:~14833`) bounds-check and reject
+  `_NONE`/out-of-range before indexing.
+- `HomerServiceValidateDpuFeedbackSlotMap()` at registry init: proves the map is a BIJECTION (injective +
+  total over the twelve) and `exit(1)`s otherwise. This -- not `-Wswitch`, not `static_assert` -- is the guard.
+
+### The four review corrections, all absorbed
+
+1. **`-Wswitch` is NOT the guard** (not promoted to error in a normal build; CI-only). → runtime bijection
+   validator. **PROVEN by negative test:** injecting `PE_DRAIN -> slot 0` (collides with GROUPED_CONTROL_READ)
+   **compiled clean, 0 errors**, and the service `exit(1)`'d at init with `ALARM FB-1: slot 0 claimed by TWO
+   collectors ... kind 11 collided`. The compiler cannot catch a same-slot collision; the validator does.
+2. **The acceptance metric is WRITER ATTRIBUTION, not own-age** (own-age at a rejection is `< MAX_SKIP_GRANTS`
+   by construction -- tautological). → per-slot single-owner check. **Result: `slot-owner MISMATCHES = 0` on
+   BOTH DPUs.** Every granted slot maps to exactly one collector kind; the two nodes exercise different
+   collectors and both show a clean bijection.
+3. **"Throughput must not move" was an INVALID blocker** (the streak feeds a live admission decision). → a
+   delta is allowed if explained. **Result: no delta** -- band 296.8 / 294.5 / 295.6 (285-303), because the
+   suppression was already bounded (own grants keep the clock fresh).
+4. **The CORE is aliased too** → split it as well; owner identical across slots (executor validates kind+owner,
+   `:48230`).
+
+### Validation (both DPUs; diag build for attribution, perf build for the band)
+
+| check | result |
+|---|---|
+| **writer attribution** | `slot-owner MISMATCHES = 0` on node A AND node B -- **the split took** |
+| bijection validator | fail-stops on a deliberate collision; silent on the correct map (both directions proven) |
+| perf band `-c 1 -t 2000` x3 | 296.8 / 294.5 / 295.6 -- no regression |
+| 4-role basebackup | PASS, 23,260,201,927 B, CLOSE_ACK, 0 alarms |
+| gate 2000/2000, 0 failed | ✅ both diag and perf runs |
+| perf build | `starve-diag`/`writer attribution` strings ABSENT on both DPUs (sticky -B diag build exited) |
+
+### What FB-1 did and did NOT change (measured, both nodes)
+
+- **`DPU_GROUPED_CONTROL_READ feedback-backoff` still ~1.4M/1.9M** -- but that number now means "THIS collector
+  polled and found nothing", not "the other eleven did". **The signal is self-referential; the inversion is
+  gone.** That is the whole deliverable.
+- **Boundedness unchanged (max 1-2)** -- expected: it was already bounded because the collector is granted
+  ~4.4M times, so its own grants keep the shared... now private... clock fresh. A flat max-run is a PASS.
+- **The `budget` drop did NOT relocate** (Codex's Q4 risk): `DPU_PAYLOAD_PULL budget` flat at 26,
+  `PEER_SEND_CQ budget` +1% (noise). Nothing new landed in the 6-collector quota.
+
+### Still open (recorded, NOT part of FB-1)
+
+- **`MAX_COLLECTOR_GRANTS = 6` vs 12+ collectors.** FB-1 did not relocate a drop into it on THIS workload, but
+  the quota is real and config-tunable to 1. Not chased.
+- **`no-source` collectors** (`BACKEND_COMPLETION_RING`, `PAYLOAD_FRONTIER`, ~1M drops/run) -- appended by the
+  generic machine-wait bridge, absent from the source map, dropped every pass. Consume no budget, cannot
+  overflow the 64-slot candidate array. Stale scaffolding; a separate cleanup.
+- **The `+` cluster** (`DPU_PEER_COMMAND_EGRESS` / `DPU_PEER_COMPLETION_EGRESS` share `peerSendCqFeedback` with
+  `PEER_SEND_CQ`) -- a DIFFERENT aliasing, out of FB-1's scope, still marked `+` in the diagnostic.
+
+### ⇒ S6 is now unblocked
+
+Its stated prerequisite ("fix B before recording any S6 number") is met: DPU collector feedback is per-collector,
+so a cadence/latency number measured at S6 is now attributable to a collector and survives re-measurement.
