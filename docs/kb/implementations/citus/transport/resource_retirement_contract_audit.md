@@ -5919,3 +5919,127 @@ drains. No `exit(1)`, no fence, no leak, no wedge.**
 > `ConsumeCompletionMailbox`. It gained speed and lost the peer-lifetime record. **`grep` for the ONE function
 > that sets the flag, and count its call sites against the paths that should reach it** — two call sites, three
 > paths, and the missing one is the one we actually run.
+
+### 36.6 ⛔ P2-k v3's PART 1 WAS A **NO-OP**. The helper early-returns on the STALE cached state.
+
+**Third review round. VERIFIED, and it is the most valuable catch of the stage** — this would have been built,
+deployed to both DPUs, run, SIGTERM'd, and produced **the identical `exit(1)`**, followed by a cycle spent
+hunting for why.
+
+```c
+static void TupleSinkServiceApplyClientSqlPeerLifetimeCompletion(TupleSinkServiceSessionState *sessionState)
+{
+	if (sessionState == NULL || !sessionState->clientSqlPeerReceiver ||
+		!TupleSinkServiceCommandStateIsTerminal(sessionState->currentCommandState))   /* <<<< EARLY RETURN */
+	{
+		return;
+	}
+	...
+}
+```
+
+**It reads the CACHED `sessionState->currentCommandState`.** Every write site of that field — `:21120` (the
+**host** completion snapshot), `:21547` (PENDING), `:22203`/`:22246`/`:22430` (FAILED error paths) — is on the
+**host** arm or an error path. **NONE is on the selected-DPU completion path.** Landing copies only
+sequence/kind/flags (`:43399`); completion acceptance only validates and enqueues the completion body (`:43461`).
+
+> **⇒ On the DPU arm `currentCommandState` is NEVER advanced to a terminal value, so a bare
+> `ApplyClientSqlPeerLifetimeCompletion(sessionState)` at the DPU egress EARLY-RETURNS AND DOES NOTHING.**
+
+**And the codebase already knew the cache was unreliable here** — `:19031` and `:19213` read
+`queuedCompletion == NULL ? sessionState->currentCommandState : queuedCompletion->commandState`. The lifetime
+helper is one of the places that never got that memo.
+
+### 36.7 P2-k v4 — THE PLAN OF RECORD
+
+**PART 1 — the fix.**
+- **REFACTOR `ApplyClientSqlPeerLifetimeCompletion` to take the AUTHORITATIVE COMPLETION** (`commandKind`,
+  `commandState`, `postCommandState` — or the `CitusRemoteExecCommandCompletion` itself) **instead of reading
+  cached session state.** Host path (`:21175`) and failed-backend cleanup (`:24700`) pass their completion; node
+  B passes the queued one.
+- **Call it on node B in `HomerServiceDpuEgressOneSelectedCompletionEvent`: AFTER `publishResult == PUBLISHED`
+  (`:43834`) and BEFORE `HomerServiceDpuPopSelectedCompletionEvent` (`:43853`).**
+- **Do NOT record on `NOT_READY` / `BLOCKED` / `FAILED`** — the event is not popped and stays retry-owned.
+- ⚠ **Do NOT record at ACCEPTANCE time (`:43453`).** VERIFIED unsafe: `TupleSinkServiceCommandStillInFlight`
+  (`:22727`) does not know about selected-session `commandInFlight`/`completionEventCount`, so setting
+  `peerWritersQuiesced` while publication is still `NOT_READY`/`BLOCKED` would make a **sinkless session
+  retireable while its queued CLOSE completion is unpublished.**
+- ⚠ **`TX_ABORT` must NOT quiesce writers** — the peer may still legally send CLOSE (documented at `:24494`).
+
+**PART 2 — the backstop (unchanged).** Guard to the TOP of `ResetSession`; delete the `exit(1)`; return
+`DEFERRED`; **no log latch**; allocator keeps scanning on `DEFERRED`; close does **not** convert a late
+`DEFERRED` to ERROR; shutdown deliberately ignores `DEFERRED`.
+**Still necessary** — VERIFIED: a bound peer receiver legitimately stays `false/false` when the client skips or
+fails its semantic CLOSE, when SIGTERM lands before terminal acceptance or egress, when egress stays blocked,
+when teardown-landing consumes/rejects the CLOSE, or when completion validation fails before enqueue.
+
+**NOT IN P2-k (owner decision, 2026-07-14):**
+- **§37 — the selected-DPU terminal bookkeeping gap**, incl. the **reusable-dead-backend** hazard. Split out.
+- **The `dpuBackendTeardownStarted` rejection branch (`:43312`).** ⚠ **DELIBERATELY NOT TOUCHED.** It fires only
+  when the arena backend is *already released* — and the normal CLOSE arrives BEFORE that (client sends CLOSE →
+  backend executes → publishes `COMPLETED/DO_NOT_REUSE` → exits → *then* P2.T releases the arena). **The gate's
+  CLOSE never reaches it.** Its comment states the policy: a CLOSE there is *"expected while the service/peer
+  session lingers"* and *"the existing peer-close/lifetime machinery remains the sole owner of actual session
+  reclamation."* **Part 2 already covers its only consequence.** Recorded as a known gap; **not a bug to fix.**
+  *(Owner pushed back on changing this. Correct call — it removed scope.)*
+
+---
+
+## §37 — P2-L: THE SELECTED-DPU ARM NEVER DOES TERMINAL SERVICE-STATE BOOKKEEPING
+
+**Status: OPEN. Split out of P2-k by owner decision (2026-07-14) — it is a CORRECTNESS bug in its own right and
+must not ride along inside a teardown fix.**
+
+### 37.1 THE GAP — three things the host arm does on terminal completion, and the DPU arm does NONE of
+
+| host (`TupleSinkServiceConsumeCompletionMailbox`) | selected-DPU accept/egress |
+|---|---|
+| `:21119-21120` — records the completion snapshot (`currentCommandState`, `postCommandState`, rows/result/detail) | ❌ |
+| `:21175` — applies lifetime / reuse | ❌ *(this is P2-k)* |
+| `:21188` — clears **`backendLoopActive`** and **`launchedBackendPid`** on terminal CLOSE or FAILED | ❌ |
+
+### 37.2 ⚠ THE SERIOUS ONE — **A DEAD DPU BACKEND'S SESSION STILL LOOKS REUSABLE**
+
+1. `sessionState->postCommandState` is **initialised to `CITUS_REMOTE_EXEC_POST_COMMAND_STATE_REUSABLE_IDLE`**
+   (`:24303`).
+2. The socketless backend publishes its **real** post-command state — **`COMPLETED` / `DO_NOT_REUSE`** — inside the
+   completion (`remote_execution_backend_bridge.c:3181`) and then **exits**.
+3. The **host** arm copies it into the session (`:21120`). **The selected-DPU arm never does.**
+4. `TupleSinkServiceSessionAllowsReuse` (`:23498`) gates on
+   `TupleSinkServiceSessionPostCommandStateForbidsReuse(sessionState)` (`:22711`) — **which reads that stale field.**
+
+> **⇒ ON THE SELECTED-DPU ARM, A SESSION WHOSE BACKEND PUBLISHED `DO_NOT_REUSE` AND THEN EXITED STILL REPORTS
+> `REUSABLE_IDLE`. `SessionAllowsReuse` CAN RETURN TRUE, AND `TupleSinkServiceFindReusableSession` (`:24036`) CAN
+> HAND THAT SESSION TO A NEW CLIENT.**
+
+**Note the seam that makes the P2-k/P2-L split clean:** the **reuse gate** reads `postCommandState`, while
+`backendReuseState` (which P2-k's refactored helper *does* set) is consumed only by failed-backend cleanup
+readiness (`:24587`) — *"selected-DPU admission does not consult `backendReuseState`"* (VERIFIED). **So P2-k fixes
+the lifetime and leaves this hazard entirely intact — no half-fix, no inconsistent intermediate state.**
+
+### 37.3 The other two
+
+- **Stale `currentCommandState` (stays `NONE`/`PENDING` forever).** Read by `CommandStillInFlight` (`:22727`) and
+  several terminal predicates (`:18716`, `:19715`, `:21194`). Some readers already work around it
+  (`:19031`, `:19213` prefer `queuedCompletion->commandState`) — **piecemeal, which is how the bug survived.**
+- **Stale `backendLoopActive` / `launchedBackendPid`.** Retains completion-machine ownership
+  (`HomerServiceCompletionMachineHasWork`, `:13014`) and leaves a **persistent owned `WAIT_BACKEND` candidate** in
+  the scheduler (`:45277`) for **every completed session**. Exact CPU cost is **INFERRED** (runnable filtering may
+  reject an empty CPU completion mailbox at `:13037`) — **but it is a standing open question worth checking
+  against the unattributed ~10% and the ~223 µs discovery latency.**
+
+### 37.4 EXPLICITLY OUT OF SCOPE FOR P2-L
+
+**Do NOT blindly copy the host path.** VERIFIED constraints:
+- **Do NOT import host immediate retirement (`:21247`)** — node-B selected-DPU state **must survive until P2.T T4
+  releases the arena and resets the selected state** (`:44527`).
+- Do NOT import host mailbox-credit or staged-publication logic.
+- **rows / result / detail: probably NOT needed** on this arm (the result reaches the client via the byte ring,
+  not the service's cached copy). **Verify what actually reads them before copying anything.**
+
+### 37.5 Rule earned
+
+> **"THE NEW PATH DROPPED A STEP" IS ALMOST NEVER ONE STEP.** The lifetime record was the symptom that shouted.
+> Beside it, silently: the reuse gate's input, the in-flight predicate's input, and the scheduler's
+> backend-ownership flag. **When you find one invariant a new path skipped, DIFF THE WHOLE FUNNEL — the one you
+> noticed is the one that happened to be load-bearing for the bug you were chasing, not the only one.**
