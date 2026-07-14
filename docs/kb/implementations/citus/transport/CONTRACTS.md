@@ -160,6 +160,30 @@ the call site. If it is not on the list, **it has not been checked.**
   checking whether it may deregister. **A guard placed after the mutations it guards is not a guard**; it cannot
   refuse, only choose how to die. (Audit §36.)
 
+## `streamEntry->stream.peerResetAfterCleanClose` — **ONCE CLEAN, ALWAYS CLEAN**
+
+- **MEANS:** the owner asked for a **clean close**, and stamped that decision **onto the stream itself**.
+- **DOES NOT MEAN:** anything about whether the owning *session* still exists.
+  ⚠ **`sessionState == NULL` IS NOT EVIDENCE OF FAILURE.** On **node A** the owner session is routinely **gone**
+  by the time the reset runs — the client's `CLOSE_SESSION` destroyed it milliseconds earlier. **A missing owner
+  is the EXPECTED state here.** The flag lives on the stream *precisely so it survives the owner's departure*.
+- **CONTRACT:** **cleanliness is decided the moment the owner asks to close. A later lookup that cannot find the
+  session must NOT un-decide it.** ⛔ **Never publish a peer FAILURE on a stream whose `peerResetAfterCleanClose`
+  is set** — check it **before** any orphan/failure branch, not after.
+- **ENFORCES — every site that resolves an owner and may publish a failure:**
+  - `HomerServiceMarkPayloadStreamAbortingOnConnectionReset()` (`tuple_sink_service_process.c:~29309`) — the
+    **marking** pass. *Already obeyed it; the rule is stated here.*
+  - `HomerServiceClearAbortedPayloadStreamAfterReset()` (`tuple_sink_service_process.c:~30048`) — the
+    **clearing** pass. **VIOLATED IT until citus `<this commit>`.**
+  - *(A new site that resolves an owning session and can publish a failure belongs on this list.)*
+- **COST:** the clearing pass took the orphan-**failure** branch on `sessionState == NULL` *before* consulting the
+  flag ⇒ **every clean close on node A was published as a REAL PEER FAILURE, on every successful run** (64× in a
+  75-session run: `abort payload clear could not find owning session` + `reason=peer-reset-orphan`).
+  **A lying diagnostic, on the happy path, at exactly the place a future debugger looks first.**
+- ⚠ **THE SHAPE, FOR THE THIRD TIME THIS WEEK:** *the rule was written down, enforced at ONE site, and violated at
+  the other.* Same as Wall 5 (`descriptor->serviceSessionId`). **This entry's `ENFORCES` list is the thing that
+  catches it — nothing else does.**
+
 ## The clean-close payload reclaim — **funnel, then check you were not declined**
 
 - **THE ORDER:** clear the peer binding → `TupleSinkServiceMaybeReclaimSinkAndSession()` → **verify the stream is

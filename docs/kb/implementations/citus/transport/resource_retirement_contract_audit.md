@@ -7140,3 +7140,90 @@ service.**
 4. **Watch the 1,024-entry import table** — verify every host-detached import gets a matching reclaim, or a
    growing delta predicts a **1,024-session wall**.
 5. **D4 / L3** — setup-TCP close-drain wedge. Out of scope by owner decision; **fail-stop on deadline** chosen.
+
+---
+
+## §46 — P2-M: the leftovers, triaged. **ONE FIXED. ONE REFUTED. ONE DEFERRED (and it is real).**
+
+**Codex's three round-3 findings, each VERIFIED BY ME IN THE CODE before acting. Its `VERIFIED` label is not
+evidence — and one of the three did not survive.**
+
+### 46.1 ✅ FIXED — the clean-close misclassification. **A LYING DIAGNOSTIC ON THE HAPPY PATH.**
+
+`HomerServiceClearAbortedPayloadStreamAfterReset()` took the orphan-**FAILURE** branch on
+`sessionState == NULL` **before** consulting `streamEntry->stream.peerResetAfterCleanClose`.
+
+**⇒ EVERY CLEAN CLOSE ON NODE A WAS PUBLISHED AS A REAL PEER FAILURE, ON EVERY SUCCESSFUL RUN.**
+A 75-session run produced **64× `abort payload clear could not find owning session`** and **64×
+`marked byte-ring receive queue failed … reason=peer-reset-orphan`** — on runs that succeeded end to end.
+
+> ## ⛔ THE RULE WAS ALREADY WRITTEN. ENFORCED AT ONE SITE. VIOLATED AT THE OTHER.
+> The **marking** pass (`…MarkPayloadStreamAbortingOnConnectionReset`, `:~29309`) states it verbatim:
+> > *"On node A the owner session is GONE by the time the reset runs … `ownerSession == NULL` was therefore read
+> > as 'NOT a clean close' when it actually means 'the owner already left'; **the stream was then relabelled a
+> > REAL PEER FAILURE on every successful run.** … **A later lookup that cannot find the session must not
+> > un-decide it. So: once clean, always clean.**"*
+>
+> Someone found this exact bug, wrote the rule, and fixed it **there**. The **clearing** pass never got the memo.
+> **THIS IS WALL 5'S SHAPE, FOR THE THIRD TIME THIS WEEK.** ⇒ Now a `CONTRACTS.md` entry **with an `ENFORCES`
+> list** — *the only mechanism that catches this class.*
+
+**RESULT:** phantom failures **64 → 0**; honest clean reclaims **0 → 75**. Loop **75/75**. ALARMs 0.
+**Gate band `298.9 / 299.8 / 303.0`** (band `285.6 / 291.0 / 299.1`) — no regression. **Basebackup PASS**
+(23.26 GB, `CLOSE_ACK`, 0 alarms — it is on the payload-reclaim path this fix touches). Teardown ACCEPT ×2.
+
+### 46.2 ⛔ REFUTED — the "selected-session allocation rollback leak". **CODEX WAS WRONG.**
+
+Codex: *"a new entry is created before materialization; either subsequent failure returns without rolling back
+the newly occupied entry."* **True as a statement about the code. NOT a leak.**
+
+- **It is `FindOrCreate`.** On a retry the record is **found**, not re-created ⇒ **no per-retry leak.**
+- **Release is keyed by SESSION CLOSE** (the setup-close finalizer / T4), **not by staging success** ⇒ there is
+  **nothing to roll back.** The record is reclaimed when the session closes, whether or not a command ever staged.
+- **The early create is DELIBERATE and documented** (`:~43444`): *"Create it BEFORE any irreversible step … so a
+  failure is a clean early return."*
+- **⚠ THE RESIDUAL RISK IS REAL BUT IT IS A DIFFERENT LINE:** `HomerServiceDpuResetSelectedSessionForClose()`
+  **REFUSES to reset** a session with `commandInFlight` or `completionEventCount > 0` — *that* could strand a
+  record. All three post-create failures are **ALARM-grade protocol violations** that never fire on a healthy run.
+- **⇒ NOT FIXED. Recorded.** *(And it is **not** the Homer frontend API — all three call sites are inside the DPU
+  service's own scheduler: `…StageOneBackendCommandForPublish` and `…LandOnePeerCommand`.)*
+
+### 46.3 🔴 DEFERRED, AND IT IS A REAL LEAK — the sender head-mirror MR/heap leak
+
+**VERIFIED.** `HomerServiceResetPayloadStreamEntry()`:
+
+```c
+if (!deferSenderHeadMirrorDeregistration) { DeregisterPeerMemoryRegionRdma(...); handle = NULL; }
+if (!deferSenderHeadMirrorDeregistration && counters != NULL) { free(counters); counters = NULL; }
+...
+memset(streamEntry, 0, sizeof(*streamEntry));      /* <<<< ERASES BOTH POINTERS */
+```
+
+**When the defer flag is set, neither the MR nor the `calloc` is released — and the `memset` then destroys the
+only pointers to them.** `deferSenderHeadMirrorDeregistration` is **set in ONE place, read in TWO, and NEVER
+CLEARED. There is no "later."**
+
+**And its condition is the gate's hot path:** locally-initiated + `TUPLE_VIEW_BATCH` + byte-ring + has an MR —
+**that is node B's result sender on EVERY session.** ⇒ **one leaked RDMA memory region per gate session.**
+
+> **⚠ THE FIX IS NOT "MOVE THE `free()`."** The defer is **protective**: it exists because RDMA may still be
+> writing into that MR. Deregistering early re-creates precisely the hazard P2-i was about — ***`free()` is not
+> inert***. **The fix needs a QUIESCENCE PROOF first** (no outstanding sends against that MR), then dereg + free.
+> Same shape as P2-i's drain-before-destroy.
+>
+> **⇒ A "correct-but-incomplete" defer: it avoids a use-after-free by never freeing.**
+
+**Why deferred:** MRs are finite but plentiful; we restart services between runs, so it never accumulates on this
+harness. **Real, unbounded in a long-lived service, non-trivial to fix. Recorded, not urgent.**
+
+### 46.4 Also settled with the owner (2026-07-14)
+
+- **The staging spin / bounded overload rejection — DEFERRED.** Only reachable with **65+ CONCURRENT** sessions;
+  **the gate caps at 8** (byte-ring pool). If we need more, **raise the constant**. The 9.4 M-line log flood is
+  already bounded.
+- **D4 (setup-TCP close-drain wedge) — NOT FIXED, and the reasoning is better than mine.** The thing that should
+  be loud is **the client dying mid-command** — the abnormal event — and it already *is* (pgbench errors, the run
+  fails). The DPU's silent wedge afterwards is a *consequence*, and the standing rule already covers it: **any
+  aborted/timed-out run ⇒ restart both DPU services before the next.** *(If ever taken up: **fail-stop on
+  deadline**, and a bare deadline is not enough — `WAITING_CLOSE_DRAIN` ANDs **four** conditions into one bool, so
+  a useful ALARM must plumb out **which** one failed.)*
