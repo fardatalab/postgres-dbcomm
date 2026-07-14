@@ -6371,3 +6371,163 @@ runs**. ⚠ **INFERRED. NOT VERIFIED. This is theory #4 and the previous three w
    normal one.
 4. **§38.5 must be settled before any code is written.** Three refuted mechanisms is the signal to stop
    theorising and have the diagnosis attacked.
+
+---
+
+## §39 — **SETTLED**: the 64-session cliff is THREE defects, and the one that kills is SILENT
+
+**Status: DIAGNOSIS SETTLED (2026-07-14). Adversarial round with Codex; it refuted me on three load-bearing
+claims and I VERIFIED every one of its corrections myself in the code. This section is the agreed ground.**
+**§38's chain is SUPERSEDED where it conflicts with this — see §39.5.**
+
+### 39.1 D1 — **THE SINK-ACCOUNTING LEAK.** One line. It is the root of the retention.
+
+`HomerServiceReclaimPayloadStreamAfterPeerReset`, the `peerResetAfterCleanClose` branch
+(`tuple_sink_service_process.c:29693-29704`):
+
+```c
+if (streamEntry->stream.peerResetAfterCleanClose)
+{
+	fprintf(stderr, "... reclaimed payload stream after a CLEAN CLOSE (no failure published) ...");
+	HomerServiceClearPayloadStreamPeerBinding(streamEntry);
+	PayloadBindingsCleanReclaimed++;
+	HomerServiceResetPayloadStreamEntry(streamEntry, true);   /* frees the stream */
+	return;                                                   /* <<<< AND RETURNS */
+}
+```
+
+**It frees the stream and returns, bypassing `TupleSinkServiceMaybeReclaimSinkAndSession` (`:27423`) —
+so `sessionState->activeSinkCount` is NEVER DECREMENTED and the retirement funnel (`:27458`-`:27490`)
+NEVER RUNS.**
+
+> **⇒ `activeSinkCount` IS STUCK ≥ 1 FOREVER. AND EVERY RETIREMENT PATH IS GATED ON `activeSinkCount == 0`.**
+> It is **not** that the retirement paths are unreachable. **A phantom sink makes all of them refuse.**
+> That single line explains all three of §38.5's zero-counts at once.
+
+⚠ **Directly above this branch is a comment block enumerating what is *"Deliberately NOT called here"* — three
+functions, each with a reason.** Someone thought hard about what not to call **and never noticed they were also
+skipping the sink accounting.** *A carefully-reasoned exclusion list is silent about the thing it forgot.*
+
+### 39.2 D2 — stale `backendLoopActive` → the **MACHINE** candidate set → payload machines dropped
+
+**§37.3 WAS RIGHT, AND I OVERRODE IT TWICE.** It named the **`WAIT_BACKEND` scheduler candidate**. I "corrected"
+it to COMPLETION_RING/ready-set because that is what the **log** showed. The log showed a *companion symptom*.
+
+| link | site | status |
+|---|---|---|
+| DPU egress never clears `backendLoopActive`/`launchedBackendPid` on terminal | `:43832`-`:43987` (host does it at `:21201`-`:21216`) | **VERIFIED** |
+| ⇒ `HomerServiceCompletionMachineHasWork` true (disjunct) | `:13018`-`:13031` | **VERIFIED** |
+| ⇒ stale completion **ownership** retained (`completionOwnedSessions`) | set at spawn `:13202`-`:13214`; the finalizer `:13469`-`:13493` is **never called on the DPU arm** (sole exec call `:15803`) | **VERIFIED (Codex)** |
+| ⇒ every stale owner becomes an actionless **`WAIT_BACKEND` machine** | `:45414`-`:45450` | **VERIFIED** |
+| ⇒ **session** machines are built **BEFORE** payload machines | `:45801` vs `:45806` | **VERIFIED** |
+| ⇒ the **MACHINE CANDIDATE SET** (`machines[HOMER_PROGRESS_PLAN_MAX_GRANTS]`, **cap 64**) fills | `:3285`-`:3303` | **VERIFIED** |
+| ⇒ payload machines **SILENTLY DROPPED** at `machineCount == 64` | `:9484`-`:9488` | **VERIFIED** |
+| ⇒ session 64's result never moves ⇒ **30 s timeout** | — | **MEASURED** |
+
+### 39.3 D3 — **THE SILENT CAP.** This is why it cost a day.
+
+**`candidateSet->droppedMachineCount` is written (`:9487`) and NEVER READ. `candidateSet->overflowed` is set at
+SIX sites and NEVER READ.** The *ready set* has `HomerServiceReportReadySetOverflow` (`:9715`, called at
+`:48446`/`:48617`). **The machine candidate set has NOTHING.**
+
+> **⇒ THE OVERFLOW THAT ACTUALLY KILLED THE RUN EMITTED ZERO DIAGNOSTICS.** The one I found, chased, and built
+> a whole root-cause chain on (`progress ready-set overflow … first_dropped_kind=10`) is the **VISIBLE
+> COMPANION** of the invisible one. **I diagnosed the symptom that had a printf.**
+>
+> **This is the P0-b write-only-counter disease, which THIS KB ALREADY DOCUMENTS** (`:29791`: *"the abort
+> classifier's control-op counters used to be WRITE-ONLY — it carefully classified every discarded op and
+> nobody ever printed the result"*). **Same bug, same file, a second time.**
+> **RULE: NO SILENT CAPS. A bounded set that drops work MUST say what it dropped, or the next reader will
+> diagnose whichever neighbouring failure happens to have a printf.**
+
+### 39.4 D4 — **THE SETUP-TCP SINGLETON WEDGE** (independent defect; explains the 12-failure cascade)
+
+`homer_service_dpu_setup_tcp.c` — the DPU setup listener (port 9727) is **CAPACITY ONE**: a single
+`int clientFd` (`:48`), and it accepts only when free (`:345`). And `WAITING_CLOSE_DRAIN` has **no deadline and
+no EOF escape** (`:697`-`:709`):
+
+```c
+if (!drained) { return true; }     /* "keep waiting" -- FOREVER */
+```
+
+Session 64's unresolved command ⇒ close certification returns `drained=false` (`:42526`-`:42530`, **INFERRED**)
+⇒ the server wedges ⇒ `clientFd` is never released ⇒ **sessions 65-75 CANNOT CONNECT AT ALL.** That is why
+`DPU backend spawn begin` is exactly **64** and never increments again.
+
+> **⇒ ANY CLIENT THAT DIES MID-COMMAND PERMANENTLY WEDGES THE DPU SETUP LISTENER FOR EVERY FUTURE CLIENT.**
+> This is far broader than the 64-session cliff. **It is a candidate mechanism for the known-but-unexplained
+> hazard in CLAUDE.md §8.1** — *"wedged the DPU setup listener for four days without a single log line."*
+
+### 39.5 ⛔ WHAT §38 GOT WRONG (and it was mine)
+
+- **§38.3 CLAIM 5 — REFUTED.** A failed ready-set append breaks only the completion-bitmap helper (`:13577`);
+  **coarse construction CONTINUES into payload construction** (`:14137`-`:14165`). And under machine-baseline
+  (which DPU mode *requires*, `:48859`-`:48866`) the kept `CQ_DRAIN` still mints a `PAYLOAD_FRONTIER` collector
+  (`:46105`-`:46109`) which still requests payload machines. **The dropped flat `PAYLOAD_STREAM` source does not
+  by itself starve payload.** The starvation is one layer later, in the machine set (§39.2).
+- **§38.3 CLAIM 3 — REFUTED as stated.** `FinalizeCompletionPendingBit` *does* clear the runnable bit when
+  `HasWork()` is true but `Runnable()` is false (`:13481`-`:13492`). The bit is stale because **the finalizer is
+  never CALLED on the DPU arm** — not because `HasWork()` is true.
+- **§38.5 theory #4 — REFUTED.** `"reason=peer-binding-cleared"` is the **payload** field
+  `stream.peerBindingActive` (`:26956`), **NOT** the session field `peerLifetime.peerBindingOpen`. Two
+  similarly-named fields on different objects; I conflated them. The real skip is the **connection-handle
+  comparison** at `:29755`: the session holds the **CRITICAL_CONTROL** connection (`:41156`), while the 63
+  disconnects are **FOREGROUND_PAYLOAD** connections. The control connection is **persistent** (log: *"accepted
+  persistent incoming RDMA peer transport"* = **1**, for the whole run) and never disconnects. **⇒
+  `connectionResetComplete` is STRUCTURALLY UNREACHABLE on this arm.**
+
+### 39.6 ⛔ THE FIX I WAS ABOUT TO WRITE WOULD HAVE BROKEN THE GATE ON COMMAND #2
+
+**§38's CLAIM 6: "clear `backendLoopActive` on terminal completion."** DPU command **landing** rejects a
+non-teardown session whose `backendLoopActive` is false (`:43363`-`:43367`):
+
+```c
+if (... || ((!sessionState->backendLoopActive || !sessionState->dpuArenaSlotBound) &&
+            !sessionState->dpuBackendTeardownStarted) || ...) { continue; }   /* command REJECTED */
+```
+
+**The gate runs ~14,000 commands (2000 tx × ~7 statements) on ONE session.** Clearing the flag on *every*
+terminal completion would have killed it at command #2. **The host's predicate (`:21201`-`:21216`) clears ONLY
+on `CLIENT_SQL_SESSION_CLOSE`, `FAILED`, or `TX_COMMIT`/`TX_ABORT` for non-client-SQL opKinds** — its comment
+says it outright: *"For persistent client SQL sessions, COMMIT/ABORT are no longer terminal."*
+
+> **This is the FOURTH proposed fix of mine in this audit that would have been a bug.** (The others: the
+> fence-and-return permanent wedge; the teardown reorder use-after-free; the silent no-op helper call.)
+> **RULE, again: WHEN A GUARD READS A FLAG, FIND EVERY OTHER READER BEFORE YOU CHANGE WHO WRITES IT.**
+
+### 39.7 ▶ THE P2-L FIX PLAN (ordered; diagnostic FIRST)
+
+**L0 — MAKE THE SILENT CAP LOUD, AND RE-MEASURE BEFORE FIXING ANYTHING.**
+Add `HomerServiceReportMachineCandidateOverflow`, mirroring `HomerServiceReportReadySetOverflow` (`:9715`) —
+**same first-8-then-powers-of-2 rate limit** (it is on the scheduler pass; an unbounded printf here is a bug).
+Report `machineCount`, `droppedMachineCount`, and **the kind/index of the first dropped machine**.
+**Then re-run the 75-session loop and SEE the drop.** This converts the fix from a hope into a measured
+before/after — and it is the diagnostic whose absence cost a day.
+
+**L1 — terminal bookkeeping on the selected-DPU egress.** In
+`HomerServiceDpuEgressOneSelectedCompletionEvent`, right after the **certified pop** — *exactly where P2-k Part 1
+already records the lifetime, using exactly the three scalars it already captures* (`commandKind`,
+`commandState`, `postCommandState`):
+  - apply the **host's predicate verbatim** (`:21201`-`:21216`) to clear `backendLoopActive` + `launchedBackendPid`;
+  - record the completion snapshot (`currentCommandState`, `postCommandState`) — **this also kills §37.2's
+    reusable-dead-backend hazard**, whose reuse gate reads the stale `postCommandState` (`:22723`, `:23527`);
+  - explicitly finalize completion ownership (`:13469`-`:13493`) rather than hoping for an incidental refresh.
+  ⚠ **NOT on every terminal completion — §39.6.**
+
+**L2 — fix the sink accounting (D1, the root).** Route the `peerResetAfterCleanClose` branch (`:29702`) through
+`TupleSinkServiceMaybeReclaimSinkAndSession` so `activeSinkCount--` and the retirement check run **exactly
+once**. ⚠ **It will not work naively:** the funnel's local-handle guard (`:27433`) returns early while the
+**synthetic service-owned SEND handle** is open — `SERVICE_RESULT_OPEN` sets `sendHandleOpen=true` (`:39113`) and
+**has no frontend response owner** (`:39141`-`:39149`), so nothing ever releases it. **The synthetic owner must
+be released/waived first.** *(This is the piece with the most design risk.)*
+
+**L3 — bound `WAITING_CLOSE_DRAIN` (D4).** A deadline + EOF escape so one dead client cannot permanently wedge
+the singleton setup listener. **Separate defect, separate commit** — it is not part of the cliff, it is the
+cascade, and it is a standing project-wide hazard.
+
+**ACCEPTANCE (and note what the old acceptance could not see):**
+1. **75-session loop → 75/75.** *A cap test must exceed the cap; all three caps here are 64.*
+2. **`droppedMachineCount` == 0** in the new L0 diagnostic. *This is the real signal.*
+3. gate band `-c 1 -t 2000` ×3 — no regression.
+4. 4-role basebackup — the only byte-ring wrap exerciser.
+5. SIGTERM teardown still exit 0 / zero refusals / drain reached (P2-k Part 1's result must not regress).
