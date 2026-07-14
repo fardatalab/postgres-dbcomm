@@ -1,8 +1,42 @@
 # The resource-retirement contract: audit and remediation plan
 
-**Status:** OPEN. **Audit COMPLETE** (RDMA + DOCA DMA). Remediation plan in section 4; P0 items block P7b.1.
+> ## ⚠⚠ READ THIS BOX BEFORE ANY OTHER SECTION OF THIS FILE
+>
+> **THE P0 SET IS COMPLETE. `§4` IS SUPERSEDED AND ITS "OPEN" MARKERS ARE STALE — DO NOT READ §4 AS STATUS.**
+> The plan of record is **§9** (the merged protocol); the per-item outcomes are **§14–§29**, each with a SHA.
+>
+> | item | state | commit |
+> |---|---|---|
+> | **P0-a** | ✅ LANDED + VALIDATED (§20) | citus `71b523757` |
+> | **P0-b** (= P7b.0) | ✅ LANDED + VALIDATED (§22.10) | citus `81593cdf9` |
+> | **P0-c** | ✅ LANDED + VALIDATED (§28.8) | citus `2836bc426` |
+> | **P0-d** | ✅ LANDED + VALIDATED (§15.5) | citus `9a6f68257` |
+> | **P0-e** | ⛔ **DROPPED — THE BUG WAS REFUTED** (§19) | — |
+> | **P0-f** | ✅ LANDED + VALIDATED (§14.7) | citus `64050e0dd` |
+> | **P0-i** | ✅ LANDED + VALIDATED (§21.12) | citus `67ebc0167` |
+> | **§24** WR-ID contract | ✅ LANDED + VALIDATED (§24.8) | citus `1d379b333` |
+> | **§25 / F7** | ✅ LANDED + VALIDATED (§25.6) | citus `16e4bdf3e` |
+> | **§29a / §29b** | ✅ LANDED | citus `c3e3f3e56` / `e85abe531` |
+>
+> **⇒ P7b IS UNBLOCKED.** P7b.0 *is* P0-b, already landed. P7b.1 is small (§26.6).
+>
+> **STILL OPEN:** P1-f (ready, and FREE — §11.1); P2-i (§9.3); P2-j (accepted, no action); §31 (dead DPU shm
+> rings); §22.10.1 (the `RETIRING` branch is validated by construction, **never by execution**).
+>
+> ### ⚠ THE HAZARD THIS BOX EXISTS TO PREVENT — and it fired, on 2026-07-13
+>
+> This file **appended** its outcomes (§14…§29) and **never updated its header or §4**. A reader — including
+> its own author, after a context compaction — reconstructed the status from the header and §4, because those
+> are the parts that *look* like a summary. The result: a full turn spent proposing P0-b as "the next stage,"
+> a day after it landed, with a confident rationale attached.
+>
+> > **A long-lived document that appends its outcomes instead of updating its header will eventually lie to its
+> > own author.** Status belongs at the TOP and must be edited in place. An append-only log is a history, not a
+> > state. *(Owner + Claude, July 13, 2026.)*
+
+**Status:** **P0 COMPLETE** (see the box). Audit COMPLETE (RDMA + DOCA DMA). Remaining work is P1/P2 — see the box.
 **Opened:** July 12, 2026. **Owner-driven** (the contract below is an owner statement, not a derived rule).
-**Code baseline:** citus `d33f6ded3`, postgres `0021633a44a`.
+**Code baseline (at open):** citus `d33f6ded3`, postgres `0021633a44a`. **Last updated:** July 13, 2026 (citus `a551bcf6e`).
 
 ---
 
@@ -358,6 +392,15 @@ what P7b.1 must avoid.
 ---
 
 ## 4. REMEDIATION PLAN — precise, per issue
+
+> ## ⛔ SUPERSEDED. DO NOT READ THIS SECTION AS STATUS.
+>
+> Every "OPEN" below is **stale**. §4 was the FIRST draft of the plan; it was superseded by §7 (adversarial
+> review), then §9 (the merged protocol of record), then by the per-item implementation specs and outcomes in
+> §14–§29. **The P0 set is COMPLETE — see the status box at the top of this file.**
+>
+> §4 is kept because the *reasoning* is still instructive (three of these items were later refuted or
+> redesigned, and the wrong turn is worth reading). It is a historical record, not a work list.
 
 **Performance rule for every fix below: NO new round-trips, and NO new work on the hot data path.** Every
 mechanism here is either (a) a counter/flag already touched on that path, or (b) a change to *when an existing
@@ -4321,7 +4364,17 @@ every legitimate payload CQE as a recycled slot and resetting the connection. A 
 
 ## §29 — NEW P0-LEVEL FINDING: the SEND QUEUE has no per-LANE admission control
 
-**Found 2026-07-12 while explaining P0-c's partial-post dependency. Not yet fixed. Needs an owner decision.**
+**Found 2026-07-12 while explaining P0-c's partial-post dependency.**
+
+> ### ✅ BOTH PARTS LANDED (2026-07-12) — this section's "needs an owner decision" is HISTORY, not status.
+> - **§29(a)** — the `_Static_assert` pinning the unwritten inequality: citus **`c3e3f3e56`**
+>   ("pin two load-bearing premises that nothing was enforcing").
+> - **§29(b)** — the per-connection outstanding-WR counter + pre-post admission check, via cumulative
+>   `postedSendWrs` / `retiredSendWrs` frontiers: citus **`e85abe531`**.
+>   See `remote_execution_peer_transport_rdma.c:1036`-`:1044` (the frontiers), `:10756` (admission),
+>   `:10815` (post), `:10843` (retire at the signalled checkpoint).
+>
+> The owner question *"is (b) P0, or P7b's first step?"* was answered by doing it: **P0.**
 
 ### 29.1 The mismatch — and it is the SAME one §23 already found, on a different resource
 

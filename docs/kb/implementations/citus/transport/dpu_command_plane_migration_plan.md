@@ -4,6 +4,29 @@
 > data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
 > independently — cite them as "command-plane S1a", etc.
 
+> ## ⚠ CURRENT STATUS (July 13, 2026) — the July-10 paragraph below is HISTORY. Read this box first.
+>
+> **S0–S5 are ✅ DONE. The cross-node DPU gate (`pgbench --homer --homer-dpu-command`) PASSES** and is the
+> project's standing regression gate (CLAUDE.md). **S4+S5 landed** (the "remaining" note below is stale).
+>
+> **The resource-retirement P0 set is COMPLETE** (`resource_retirement_contract_audit.md` — see its status box),
+> so **P7b is unblocked**.
+>
+> ### ⇒ NEXT: **S6**, and it has ONE stated prerequisite, which is NOT done:
+>
+> **"fix B" (per-collector scheduler feedback)** — twelve DPU collectors share one `HomerProgressSourceFeedback`,
+> so a sibling's empty grant drives the discovery collector's backoff *and* refreshes the starvation clock that
+> is supposed to release it. **No S6 number is attributable until this lands.** Plan + verified mechanism:
+> **[`dpu_collector_feedback_aliasing_defect_b.md`](./dpu_collector_feedback_aliasing_defect_b.md)**.
+>
+> ### ⚠ AND S7.1 HAS AN UNSATISFIABLE PRECONDITION — surface it before starting S7
+>
+> S7.1 requires *"the cross-node `--homer` baseline has been captured and SHA-stamped"* **before** the
+> host-service path is gutted. That baseline **cannot be captured**: `pgbench --homer` remote-RDMA is
+> **🔴 BROKEN at HEAD** (fails at session open; CLAUDE.md workload table), and the standing decision is
+> *not to fix it* because host-service Homer is being deleted. **So the precondition must be either waived or
+> re-scoped — an owner decision, not an improvisation.**
+
 **Status (July 10, 2026): IN PROGRESS. S0 ✅, S0b ✅, S1a ✅, S1b ✅, S2 ✅ (citus `008f4f20b`),
 S3.0 ✅ (citus `36a61a5a1`), S3.1 ✅ (citus `c2ec17852`), S3.1b ✅ (citus `84ac374ef`).
 Post-S3.1b comment-only audit `63b0df0a7` records the second invisible demand and sharpens S3.2's

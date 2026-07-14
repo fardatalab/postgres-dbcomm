@@ -8,6 +8,20 @@
 >
 > **Cost models below are ANALYTIC, not measured.** They are loop bounds read out of the source. None of
 > this has been profiled. Do not cite a factor from this doc as a benchmark result.
+>
+> ---
+>
+> ### ⚠ **DEFECT B IS NOW AN ACTIVE WORK ITEM WITH ITS OWN PLAN — AND THIS DOC'S LINE NUMBERS ARE STALE.**
+>
+> Defect B (§0b, *"THE REAL SHAPE OF B"*) is the **S6 prerequisite** and has a verified mechanism + fix plan in
+> **[`dpu_collector_feedback_aliasing_defect_b.md`](../../../implementations/citus/transport/dpu_collector_feedback_aliasing_defect_b.md)**.
+> Go there for status and code pointers.
+>
+> Two corrections to what this doc says about B:
+> 1. **It is TWELVE collectors now, not eleven** — someone added one, past a comment that explicitly said
+>    *"Do not add a twelfth aliasing collector"* (`tuple_sink_service_process.c:3808`).
+> 2. **Every `file:line` in §0b is STALE.** Several thousand lines have been inserted since. The functions
+>    named are still correct; the numbers are not. The new doc re-derives them.
 
 ---
 
