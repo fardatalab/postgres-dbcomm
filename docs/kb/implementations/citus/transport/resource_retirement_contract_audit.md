@@ -5550,3 +5550,115 @@ actually run there before. **And the documented DPU reap recipe matches only `*/
 leftover `homer_dpu_tcp_transport_smoke` holding 9727 is INVISIBLE to it.**
 
 **INFERRED, not verified.** Recorded as the leading hypothesis for a separate investigation, not as a diagnosis.
+
+---
+
+## §35 — P2-k: `TupleSinkServiceResetSession` calls `exit(1)` AND DESTROYS THE ENTIRE TEARDOWN
+
+**Status: PLAN (2026-07-14). Owner-selected as the next item.** Found by P2-i's validation — specifically, by
+being the first person to SIGTERM the DPU service *immediately after a gate run*.
+
+### 35.1 THE MECHANISM — VERIFIED, localized to a line
+
+`tuple_sink_service_process.c:24166-24179`, inside **`TupleSinkServiceResetSession`** (`:24120`):
+
+```c
+if (!TupleSinkServiceClientSqlPeerCommandMailboxMayDeregister(sessionState))
+{
+    fprintf(stderr, "tuple-sink service: refusing to reset peer CLIENT_SQL_SESSION before "
+                    "command-mailbox writers quiesce session=%llu ... peer_close=%u reset_complete=%u\n", ...);
+    exit(1);                                    /* <<<<<< THE BUG */
+}
+```
+
+The guard (`:24526`) returns **false** exactly when:
+
+> the session is a **backend-side `clientSqlPeerReceiver`**, its **peer binding is open**, its **command-mailbox
+> MR exists**, and **NEITHER `peerWritersQuiesced` NOR `connectionResetComplete`** is set.
+
+**⚠ AT SIGTERM THAT IS THE UNIVERSAL STATE FOR ANY STILL-BOUND BACKEND-SIDE SESSION.** The peer never sent a
+close and the connection was never reset — **because we are being KILLED, not closing gracefully.** Observed
+exactly: `peer_close=0 reset_complete=0`.
+
+⇒ **The NORMAL shutdown of the backend-side DPU service dies at `exit(1)`, and `HomerDpuDmaDestroy` — the P2-i
+drain — NEVER RUNS.** No drain, no `doca_ctx_stop`, no release. Confirmed: `RAW EXIT STATUS = 1`,
+`teardown drain lines: 0` on the backend-side DPU; `0` / `1` on the frontend-side one.
+
+**SIGTERM is not an exotic path. It is the ONLY way this service is stopped** (`KeepTupleSinkServiceRunning`,
+`:3861`; handlers at `:23565-23566`).
+
+### 35.2 WHY IT IS BACKWARDS
+
+| | what it costs |
+|---|---|
+| **refusing to deregister the MR** — CORRECT (Scenario C: the remote peer may still write into it) | a **harmless leak at process exit** |
+| **`exit(1)`** | **the DMA engine is never drained** — the actual use-after-free |
+
+> **It trades a harmless leak for a real one.** A defensive guard that makes the system strictly LESS safe —
+> the same shape as the `fatalError` inversion (§34.7), the "I don't know ⇒ IDLE" break (§34.9/R2), and the
+> "gate all submits ⇒ deadlock" (§34.9/R1). **Four times in one stage.**
+
+### 35.3 THE FIX — AND THE TEMPLATE IS TWENTY LINES AWAY
+
+`TupleSinkServiceResetPeerOpenFailureIfSafe` (`:24543`) handles **the same predicate** and states the correct
+policy in its own comment:
+
+> *"Peer OPEN/spawn failure must not destroy a command mailbox while its remote writer can still use the
+> advertised MR. Safe cases retain the historical immediate reset; **unsafe cases fence backend admission,
+> publish a loud state, and leave final reset to peer-close/connection-reset lifecycle ownership.**"*
+
+**It does not exit.** One call path already does the right thing; the reset function itself kills the process.
+
+**THE CHANGE — refuse-and-FENCE, not refuse-and-DIE:**
+
+1. keep the guard and the loud message;
+2. **DELETE the `exit(1)`**;
+3. **fence the session** exactly as `ResetPeerOpenFailureIfSafe` does — `dpuBackendTeardownStarted = true`,
+   `backendLoopActive = false`, `currentCommandState/postCommandState = FAILED`,
+   `backendReuseState = HOMER_BACKEND_REUSE_FORBIDDEN`;
+4. **return WITHOUT resetting.** The session stays `active` and bound, so nothing reuses its slot — which is
+   precisely the documented "leave final reset to peer-close/connection-reset lifecycle ownership".
+
+**At shutdown:** the session's MRs leak (free — the process is exiting), the reset loop moves to the next
+session, and **`HomerDpuDmaDestroy` runs and drains.**
+
+### 35.4 CALLER AUDIT — the fix needs NO call-site changes (VERIFIED)
+
+All 8 callers of `TupleSinkServiceResetSession` are "reset and move on": `:21047`, `:21257` (post-command
+reset), `:24263` (idle-retire scan), `:24437` (idle-retire after peer response), `:24551`
+(`ResetPeerOpenFailureIfSafe` — **already checks the same predicate first, so it can never trigger the guard**),
+`:27420`, `:27433` (freshness reclaim), and **`:48838` (the SHUTDOWN loop)**.
+
+**None checks a return value** (the function is `void`) and **none does anything afterwards that depends on the
+reset having happened.** So refuse-and-fence is safe at every site, with zero call-site edits.
+
+### 35.5 ⚠ THE ONE IMPLEMENTATION TRAP — the refusal message WILL SPAM
+
+`:24263` is a **per-pass idle-retire scan**. Once a session is fenced but still `active`, that scan will call
+`ResetSession` on it **every service pass**, and the refusal `fprintf` has **no rate limit**. On the hot loop
+that is millions of lines — *"a diagnostic that can fill a disk is a bug"*.
+
+**Two things are required, not one:**
+- **latch the message** — log the refusal only on the FIRST refusal per session (`dpuBackendTeardownStarted` is
+  the natural one-shot); and
+- **make `TupleSinkServiceSessionShouldRetireWhenIdle` return FALSE for a fenced session**, so the scan stops
+  re-attempting a reset it can never complete. (Settle this while implementing; it is the difference between a
+  fence and a busy-wait.)
+
+### 35.6 ACCEPTANCE — and it is self-proving
+
+> **SIGTERM the backend-side DPU service immediately after a gate run.**
+> **Today:** `RAW EXIT STATUS = 1`, `teardown drain lines: 0`.
+> **After P2-k:** exit **0**, and a `teardown drain COMPLETE` line — **and we expect `N > 0`**, because the
+> still-bound session's DMA is exactly what is outstanding.
+
+**That single test proves BOTH the fix AND P2-i's drain, on the path that matters most.** Note the ordering was
+load-bearing: **P2-i had to land first.** Without the drain, continuing past the refusal would tear the DOCA
+engine down with tasks in flight — i.e. the "fix" would have turned a loud `exit(1)` into a silent
+use-after-free.
+
+### 35.7 Rule earned (and it is the fourth instance today)
+
+> **A GUARD THAT CANNOT PROVE SAFETY MUST REFUSE THE UNSAFE ACT — NOT ABORT THE SAFE ONES AROUND IT.**
+> `exit(1)` in the middle of a teardown does not prevent the hazard it names; it prevents every *remaining*
+> teardown step, and those steps were the ones actually holding the line.
