@@ -6698,3 +6698,82 @@ and continues drain/cancellation *after* freeing `clientFd`. **Not a bare timeou
 **ACCEPTANCE:** 75-loop → **75/75**; `droppedMachineCount == 0`; **policy-admission drops == 0 on the gate
 path**; gate band ×3; 4-role basebackup; and P2-k Part 1's teardown result (exit 0 / 0 refusals / drain reached)
 must not regress.
+
+---
+
+## §41 — **L0 LANDED AND VALIDATED.** The DPU now states the bug in plain English. (citus: this commit)
+
+**L0 was built to give the silent caps a voice. It did — and it REFUTED MY OWN CHAIN TWICE before confirming
+its root. That is exactly what "instrument before you patch" is for.**
+
+### 41.1 THE MEASUREMENT — 63 dead sessions crowd out the one live one
+
+75-session loop, node B, phase 3 (SEMANTIC — **the phase that actually grants machines**):
+
+```
+PROGRESS MACHINE-CANDIDATE OVERFLOW event=64 phase=3 kept=64/64 dropped_machines=1
+  | KEPT[LOCAL_CONTROL_REQUEST=1 COMMAND_SESSION=63]  kept_in_WAIT_BACKEND=63
+  | first_dropped=COMMAND_SESSION[63] gen=64 state=WAIT_BACKEND
+    ready_actions=0x0000000000000000 waiting_on=0x00000004 blocked=0x00000000
+```
+
+| field | reading |
+|---|---|
+| `kept=64/64` | the machine candidate set is **FULL** |
+| `KEPT[… COMMAND_SESSION=63]` | **63 of the 64 slots are session machines.** ⚠ **ZERO `PAYLOAD_STREAM` machines** |
+| `kept_in_WAIT_BACKEND=63` | **all 63 are waiting for a backend that EXITED LONG AGO** |
+| `first_dropped=COMMAND_SESSION[63] gen=64` | table slot **63**, service session **64** — **THE LIVE SESSION'S OWN MACHINE** |
+| `waiting_on=0x4` | `HOMER_PROGRESS_WAIT_BACKEND_COMPLETION_RING` — it is waiting for its backend's completion |
+
+> ## ⇒ SIXTY-THREE ZOMBIE SESSIONS EVICT THE ONE LIVE SESSION FROM THE SCHEDULER, EVERY PASS, FOREVER.
+> Session 64 lands in table slot 63, is appended **last** (candidates are built in table-index order), and is
+> therefore the one that falls off the end. **That is why the cliff is at exactly 64.** Its command is never
+> planned. 30 s timeout. **(Then D4: its close cannot certify drained, node A's setup listener wedges, and
+> sessions 65-75 cannot even connect — §39.4.)**
+
+**The root (D2 / §37.3) is now MEASURED, not inferred:** stale `backendLoopActive` ⇒
+`CompletionMachineHasWork` true ⇒ a `COMMAND_SESSION` machine in `WAIT_BACKEND` per retained session.
+**`kept_in_WAIT_BACKEND=63` is that claim, printed by the machine itself.**
+
+### 41.2 ⛔ AND IT REFUTED §39.2's LAST LINK — the starved machine is NOT the payload machine
+
+**§39.2/§40.6 said: "payload machines are silently dropped."** **WRONG.** There are **no payload machines in the
+set at all** — the set fills during *session*-machine construction (`:45801`), which runs **before** payload
+construction (`:45806`), so payload machines are **never reached**, not "dropped."
+
+**What is actually starved is the LIVE SESSION'S OWN `COMMAND_SESSION` MACHINE.** The mechanism is more direct
+than I thought, and the fix is unchanged — but *"which machine is being starved"* is exactly the kind of detail
+a fix gets keyed on, and I had it wrong.
+
+### 41.3 ⛔ TWO DEFECTS **IN THE PROBE I WROTE TO ENFORCE MY OWN RULES**
+
+**(a) A SHARED RATE LIMIT ACROSS PHASES IS A FILTER, NOT A LIMIT.** The first cut used ONE global
+first-8-then-powers-of-2 counter. Phase 2 (COLLECTOR) overflows on nearly every pass and **ate the entire
+budget**: phase 3 — *the phase that grants machines* — printed **2 lines out of 25**, and its `first_dropped`
+was the only line that mattered. Fixed: **per-phase counters.** After the fix: 24 phase-2, **12 phase-3**.
+
+> **RULE: A SHARED RATE LIMIT ACROSS DISTINGUISHABLE EVENT CLASSES SILENTLY SELECTS FOR THE NOISIEST CLASS —
+> WHICH IS RARELY THE INTERESTING ONE.**
+
+**(b) "FIRST DROPPED" ANSWERS THE WRONG QUESTION. THE KEPT CENSUS IS THE POINT.** The first cut reported only
+the first *dropped* machine — and in phase 2 that is `PEER_CONNECTION`, which is simply *whatever is built last*
+and says **nothing** about why the set was full. **I predicted `first_dropped=PAYLOAD_STREAM`; it printed
+`PEER_CONNECTION`, and I could not tell whether my model was wrong or my probe was.** Fixed: a **kept-kind
+histogram**, computed *inside* the rate limit (zero hot-path cost).
+
+> **RULE: WHEN A BOUNDED SET OVERFLOWS, THE DIAGNOSTIC QUESTION IS "WHAT IS OCCUPYING IT", NOT "WHAT FELL OFF".
+> The victim is an accident of ordering. The occupants are the bug.**
+
+### 41.4 L0b — the policy budget is NOT the killer (today), but it is contended
+
+`granted collectors=6 (cap 6), DROPPED collectors=2` in phase 2, every pass; **`machines=0 payload=0` dropped,
+and NO phase-3 admission drops at all.** ⇒ **The 12/2 machine/payload budget is not starving anything today.**
+The collector budget (6) *is* saturated — noted, not chased. **The next-cliff hypothesis (§40.4) is NOT
+confirmed; it is now instrumented, which is what L0 was for.**
+
+### 41.5 ▶ NEXT — the plan is UNCHANGED, and now it has a measured target
+
+**L1** (clear `backendLoopActive`/`launchedBackendPid` on a certified terminal `CLIENT_SQL_SESSION_CLOSE`, keyed
+on `commandKind` — never manufactured, §40.2) **directly kills the 63 zombies.**
+**Acceptance is now precise and self-proving:** `kept_in_WAIT_BACKEND` must go to **~0**, the machine-candidate
+overflow must **disappear**, and the 75-loop must reach **75/75**.
