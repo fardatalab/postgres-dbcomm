@@ -384,3 +384,42 @@ the `--debug` `homer_last_abalance` line is the end-to-end decode proof (note `-
 - `farnet_diagnostics_and_baselines.md`: the diagnostic batteries (RDMA link checks, `starve-diag`, stats
   builds) and the historical measurement records these rules were learned from.
 - `../implementations/citus/transport/`: the transport implementation checkpoints these hazards surfaced during.
+
+---
+
+## §9 A "missing" log line that proves NOTHING is missing: `HOMER_SERVICE_LOG` is COMPILED OUT
+
+**Found 2026-07-13, during P2-i validation, by a probe that was itself lying.**
+
+`tuple_sink_service_process.c:546-550`:
+
+```c
+#if HOMER_SERVICE_VERBOSE_LOGGING
+#define HOMER_SERVICE_LOG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define HOMER_SERVICE_LOG(...) ((void) 0)      /* <-- the PERFORMANCE build, i.e. every real run */
+#endif
+```
+
+**In a performance build, every `HOMER_SERVICE_LOG(...)` line is a no-op.** That includes the final line of
+`main()` — `"tuple-sink service: stopped"` (`:48847`).
+
+⇒ **Do NOT anchor any validation proof on a `HOMER_SERVICE_LOG` string.** It cannot pass in the build you
+actually measure with. This is the same shape as the retired gate-proof decoy (a check that could only pass when
+the backend was *broken*): **a proof whose success depends on a configuration nobody runs.**
+
+Note the trap is asymmetric and therefore convincing: the service log DOES contain plenty of
+`tuple-sink service: ...` lines — they come from plain `fprintf(stderr, ...)` calls elsewhere. So the macro looks
+alive, and only the *specific* strings behind it are gone.
+
+### §9.1 And the probe that "found" it was itself a liar
+
+The probe that raised the alarm concluded **"service exited cleanly on SIGTERM"** from the sole fact that
+`/proc/<pid>` had disappeared. **A SIGSEGV does that too.** It could not distinguish a clean exit from a crash,
+which is exactly the question it was written to answer.
+
+The replacement started the service as a **direct child** and read the real `wait()` status: `0` ⇒ `main()`
+returned normally. That settled it in one run.
+
+> **RULE. "The process is gone" is not "the process exited." If you need to know how something died, capture the
+> EXIT STATUS — `/proc` disappearing, a port closing, and a pid vanishing are all consistent with a crash.**
