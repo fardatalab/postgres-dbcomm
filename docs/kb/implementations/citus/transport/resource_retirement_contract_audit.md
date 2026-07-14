@@ -6307,6 +6307,22 @@ Decoded against the enum (`tuple_sink_service_process.c:2577`):
 
 ### 38.4 ⛔ RETRACTION — §36.8's SEVERITY CLAIM IS **WRONG**, and it was mine
 
+> # ⛔⛔ THIS RETRACTION IS **ITSELF RETRACTED** (§40.1). I RETRACTED A CORRECT CLAIM.
+> **§36.8's severity claim was RIGHT IN OUTCOME.** `AllocateSession`'s table-full reclaim requires
+> **`activeSinkCount == 0`** (`:24273`) — and D1's phantom sink pins that at ≥ 1 forever, so **reclaim can
+> never fire and session 65 WOULD get NULL.** The session table *is* a wall.
+>
+> **I never saw `"ran out of free command sessions"` because sessions 65-75 NEVER REACHED node B** — D4's
+> setup-TCP wedge stopped them at node A. **I read the silence as "the allocator coped." It meant "the
+> allocator was never asked."**
+>
+> **⇒ THE RULE I DERIVED IN §38.6 AND THEN IMMEDIATELY MISAPPLIED:**
+> ## A ZERO COUNT PROVES A LINE DID NOT EXECUTE. IT DOES NOT PROVE **WHY**.
+> Absence of a failure message is equally consistent with *"no failure occurred"* and *"the code never got
+> there."* **Before you conclude the former, find a line that WOULD have printed on the path you believe ran.**
+> Here that line was in my own output the whole time: **`DPU backend spawn begin` stopped dead at 64.**
+> Everything below is kept because the reasoning that produced the error is the point.
+
 **§36.8 said:** *"EVERY SELECTED-DPU SESSION LEAKS … hard-capped at 64, after which `AllocateSession`'s
 table-full reclaim finds nothing and returns NULL — **every new session open fails, permanently.**"*
 
@@ -6531,3 +6547,154 @@ cascade, and it is a standing project-wide hazard.
 3. gate band `-c 1 -t 2000` ×3 — no regression.
 4. 4-role basebackup — the only byte-ring wrap exerciser.
 5. SIGTERM teardown still exit 0 / zero refusals / drain reached (P2-k Part 1's result must not regress).
+
+---
+
+## §40 — ROUND 2: the fix plan, attacked. **L1(a) as written would have PERMANENTLY WEDGED the session.**
+
+**Second adversarial round with Codex, on the §39.7 FIX PLAN. Every load-bearing claim below was VERIFIED BY ME
+in the code before acceptance. It refuted L1(a) twice and reshaped L2 and L3. NO CODE WRITTEN YET.**
+
+### 40.1 ⛔ THE UN-RETRACTION — there are **THREE WALLS**, and I only ever hit the first two
+
+`AllocateSession`'s table-full reclaim requires **`active && activeSinkCount == 0 && ShouldRetireWhenIdle`**
+(`:24273`). **VERIFIED.** D1's phantom sink pins `activeSinkCount ≥ 1` forever ⇒ **reclaim can never fire.**
+
+| # | wall | fires at | status |
+|---|---|---|---|
+| **1** | **machine-candidate saturation** (D2/D3) — stale `WAIT_BACKEND` machines fill the 64-cap set; payload machines silently dropped | **session 64** | **OBSERVED** — the 30 s timeout |
+| **2** | **setup-TCP singleton wedge** (D4) — session 64's close never certifies drained; node A's listener never frees `clientFd` | **sessions 65+** | **OBSERVED** — they never reach node B at all |
+| **3** | **session-table exhaustion** (D1) — reclaim provably blocked by the phantom sink | *would* fire at session 65 | **LATENT. VERIFIED IN CODE, NEVER OBSERVED — because wall 2 fired first.** |
+
+**Proof that sessions 65-75 never reached node B (by elimination):** had they entered the peer-open handler they
+would have produced **either** a `DPU backend spawn begin` **or** `"ran out of free command sessions"`. They
+produced **neither**. ⇒ the handler never ran for them.
+
+> ## ⛔ THE RULE, AND I BROKE IT WHILE QUOTING IT
+> **§38.6 says: "a count of zero on a line your theory requires is worth more than any amount of reading."
+> TRUE — AND I THEN MISAPPLIED IT IN THE SAME BREATH.**
+> ### A ZERO COUNT PROVES A LINE DID NOT EXECUTE. IT DOES NOT PROVE **WHY**.
+> I read `0 × "ran out of free command sessions"` as **"the allocator coped."** It meant **"the allocator was
+> never asked."** Absence of a failure message is equally consistent with *"no failure"* and *"never got there."*
+> **Distinguish them by finding a line that WOULD have printed on the path you believe ran.** Mine was sitting
+> in my own output: **`DPU backend spawn begin` stopped dead at 64.**
+
+### 40.2 ⛔ L1(a) AS WRITTEN WOULD HAVE PERMANENTLY WEDGED THE SESSION — the **MANUFACTURED FAILED**
+
+**VERIFIED (`:43873`–`:43887`).** The DPU egress **overwrites a COMPLETED completion's `commandState` to
+FAILED** when the *result relay's* peer-open failed:
+
+```c
+if (sessionState->dpuResultPeerOpenFailed && CommandStateIsTerminal(...) && (resultFlags & ..._EOS) != 0)
+{
+	completionEvent->completion.commandState = CITUS_REMOTE_EXEC_COMMAND_STATE_FAILED;   /* MANUFACTURED */
+	completionEvent->completion.resultFlags  = CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_FAILED;
+	...
+}
+```
+
+**The BACKEND IS ALIVE. Only the RESULT RELAY failed.** This runs *after* the only T1 teardown decision
+(`:43622`–`:43660`), so `dpuBackendTeardownStarted` is still **false**.
+
+⇒ Apply the host predicate to *that* `commandState` and you clear `backendLoopActive` with
+`dpuBackendTeardownStarted == false` ⇒ DPU **landing excludes the session** (`:43363`–`:43367`) ⇒ **the client's
+TX_ABORT / CLOSE can never land** ⇒ **the session can never quiesce.**
+
+> **THAT IS THE EXACT FAILURE SHAPE OF THE §35 "fence-and-return" BUG I ALREADY MADE ONCE.** *Landing disabled,
+> so the CLOSE can never arrive, so the thing can never finish.* **Second time. Same file. Same week.**
+> **⇒ FIFTH proposed fix of mine in this audit that would have been a bug.**
+
+**THE SAFETY PROPERTY THAT SAVES IT (VERIFIED):** the conversion writes `commandState`, `resultFlags`, and
+`detail` — **it does NOT touch `commandKind`.** So keying L1(a) on **`commandKind == CLIENT_SQL_SESSION_CLOSE`**
+is *structurally* immune to the manufactured state. **Key on the field that is never manufactured.**
+
+**AND THE GENUINE-FAILED ARM HAS A SECOND, INDEPENDENT COLLISION (VERIFIED).** Clearing on a *real* backend
+FAILED makes no-backend cleanup eligible (`:24618`–`:24654`) **while** teardown-fenced DPU landing also consumes
+the next mailbox record — *including the CLOSE* (`:43378`–`:43402`). **Two owners for one mailbox record,
+resolved by scheduler order.** ⇒ **DEFER the FAILED arm entirely; it is a separate lifecycle design.**
+
+### 40.3 L2 RESHAPED — the reset branch is the ADJUNCT; the **T4 owner-release is the PRIMARY fix**
+
+**VERIFIED:** node B's selected-DPU result takes its `activeSinkCount` increment at the **eager identity
+reservation** (`:20563`), **before** the synthetic SEND handle is installed (`:39113`). `SERVICE_RESULT_OPEN`
+then *reuses* that already-counted stream (`:38869`–`:38878`), so `:38921` is never reached.
+
+**VERIFIED — the biggest omission in my L2: the NEVER-BOUND `SERVICE_RESULT_OPEN` FAILURE.** If OPEN fails
+before binding, **neither** open-failure cleanup (`:38235`–`:38245`, which only funnels streams *it* created —
+and here `createdStream == false`) **nor** the clean-reset branch (`:29692`–`:29703`, which needs a
+connection-reset callback that may never come) retires the eager count. **⇒ Fixing only `:29702` leaves that
+leak intact.**
+
+**THE SHAPE:**
+- **Do NOT release the synthetic SEND handle at OPEN** — that would let an ordinary semantic close reach the
+  reclaim funnel (`:27863`) **before T4**, reclaiming a stream the DPU mirror may still write into.
+- Add `TupleSinkServiceReleaseServiceOwnedDpuResultSinkAfterBackendTeardown`, called **only after T4** has
+  released the arena, reset selected state, and stamped `teardownCompletedCleanly` (`:44657`–`:44678`):
+  locate `dpuResultServiceSinkId` → validate (active stream, matching parent, `dpuRelayResultStream`, no receive
+  handle) → set `sendHandleOpen = false` **idempotently** → call `TupleSinkServiceMaybeReclaimSinkAndSession` →
+  **make NO further use of `sessionState`, because the funnel may have reset it** (`:27480`–`:27489`).
+- ⚠ **The helper MUST accept `sendHandleOpen == false`** — the count predates the handle.
+- ⚠ **The same release is required on the teardown-CANCELLATION path** (`:44510`–`:44523`), or a failed/unbound
+  OPEN retains the eager count forever.
+- **THEN** `:29702` becomes: clear peer binding → `MaybeReclaimSinkAndSession(...)` → return. **Never decrement
+  or reset directly** — the funnel already guards inactive streams (`:27428`), checks underflow (`:27449`), and
+  decrements exactly once (`:27458`).
+
+### 40.4 L0 RESHAPED — **TWO** reports, and the second one matters more
+
+**VERIFIED — SEVEN silent overflow counters, not six** (`:9484`, `:9536`, `:9554`, `:9573`, `:9592`, `:9612`,
+`:9631`); all seven declared at `:3294`–`:3301`, reset at `:9086`–`:9093`, incremented at the append sites, and
+**never read.**
+
+**VERIFIED — but only the MACHINE array can actually overflow today.** Collectors merge by kind/index and are
+bounded by the enum; critical-recv adds ≤ 1; control mailboxes are capped at 8; reset/liveness at 64; payload
+failures come from a 64-bit bitmap. **So the other six are latent, not live.**
+
+**⇒ VERIFIED — AND THERE IS A SECOND, TIGHTER, ALSO-SILENT BOUNDARY *AFTER* CANDIDATE CONSTRUCTION: POLICY
+ADMISSION.** `:182`–`:195`:
+
+```
+HOMER_SERVICE_MACHINE_BASELINE_MAX_GRANTS          16
+HOMER_SERVICE_MACHINE_BASELINE_MAX_MACHINE_GRANTS  12      <<<< twelve
+HOMER_SERVICE_MACHINE_BASELINE_MAX_PAYLOAD_GRANTS   2      <<<< TWO
+```
+Budget denial only bumps a counter and returns false (`:10600`–`:10625`); those counters are **overwritten per
+phase** (`:3502`) and printed **only at service exit** (`:8400`, `:48941`).
+
+> **⇒ THE NEXT SILENT CLIFF IS ALMOST CERTAINLY THE 12/2 POLICY BUDGET, NOT ANOTHER CANDIDATE COUNTER.** And
+> **the code says so itself**, at `:11913` — a comment written after this exact class of bug already cost a
+> validation cycle:
+> > *"⚠ **ARMING A CANDIDATE IS NOT ENOUGH** … armed on every pass and granted on none … the spawn began, the
+> > peer response deferred, and the DPU then **sat forever without even a timeout** — because the timeout lives
+> > inside the action that never ran. **Nothing warns you** … **the service looks idle.**"*
+>
+> DPU_SPAWN is **not** on the reserved-lifecycle list (`:10507`–`:10510`) and is ordered **late** (`:11748`+).
+
+**L0 must therefore emit BOTH:** (a) machine-candidate overflow — **per PHASE**, since the set is reset per
+phase, not per pass (`:45846`, `:48478`); copy the `HomerProgressMachineFacts` (kind/index/generation + state +
+`readyActionMask`/`waitingOnMask`/`blockedReasonMask`, `:3002`–`:3025`), do not keep a pointer; and (b)
+**per-phase policy-admission drops.** Reuse the existing first-8-then-powers-of-2 rate limit (`:9715`).
+
+### 40.5 L3 RESHAPED — "deadline + EOF escape" is **NOT a safe contract**
+
+**VERIFIED.** `WAITING_CLOSE_DRAIN` proves, *in sequence*, physical DMA drain → semantic lifetime →
+selected-session finalization → host-mmap detach (`homer_service_dpu_setup_tcp.c:646`–`:731`). **EOF proves only
+that the TCP owner vanished — it proves none of those.** And merely closing the socket **loses the continuation
+identity**: `HomerServiceDpuSetupTcpCloseClient` clears bridge/client identity (`:477`–`:499`) while the import
+is already `CLOSING` (`homer_service_dpu_dma.c:10277`).
+
+⇒ **Either fail-stop on the deadline, OR a bounded abandoned-close record** that retains bridge/client identity
+and continues drain/cancellation *after* freeing `clientFd`. **Not a bare timeout.**
+
+### 40.6 ▶ THE PLAN OF RECORD (supersedes §39.7)
+
+| step | what | changed by round 2? |
+|---|---|---|
+| **L0** | **TWO** diagnostics: machine-candidate overflow (**per phase**, copied facts) **+ per-phase policy-admission drops**. Then re-run the 75-loop and SEE both. | **YES** — the policy budget was not in the plan at all |
+| **L1** | Clear `backendLoopActive`/`launchedBackendPid` **ONLY on a certified terminal `CLIENT_SQL_SESSION_CLOSE`**, keyed on **`commandKind`** (never manufactured). **DEFER the FAILED arm.** Snapshot `currentCommandState`/`postCommandState`/**`postCommandStateFlags`**. Finalize completion ownership, and make the index-lookup failure **LOUD**. | **YES** — the FAILED arm would have wedged the session |
+| **L2** | **PRIMARY: the T4 (and teardown-cancellation) owner-release helper.** ADJUNCT: route `:29702` through the funnel. | **YES** — I had the primary and the adjunct backwards |
+| **L3** | Bound the close-drain with **fail-stop or a bounded abandoned-close record** — **not** a bare deadline+EOF. Separate commit. | **YES** |
+
+**ACCEPTANCE:** 75-loop → **75/75**; `droppedMachineCount == 0`; **policy-admission drops == 0 on the gate
+path**; gate band ×3; 4-role basebackup; and P2-k Part 1's teardown result (exit 0 / 0 refusals / drain reached)
+must not regress.
