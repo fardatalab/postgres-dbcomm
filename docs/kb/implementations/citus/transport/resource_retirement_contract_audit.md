@@ -6092,3 +6092,68 @@ defect; the guard is the alarm.
 > consumers: `MayDeregister` (the guard that shouted) **and** `ShouldRetireWhenIdle` (which said nothing, and
 > silently leaked every session on the DPU path). **The loud consumer is rarely the important one.** I chased the
 > `exit(1)` for three review rounds; the retirement leak was sitting on the same flag the whole time.
+
+### 36.9 ROUND 4 — WE AGREE. One hard refutation (S3), one hardening (S4), one wrong rationale (mine).
+
+**Confirmed (VERIFIED):** **S1** P2-k works standing alone — `MayDeregister` reads **none** of §37's stale fields,
+and no later P2.T step clears `peerWritersQuiesced`. **S2** the split is coherent — `backendReuseState`'s only
+behavioural reader (failed-backend cleanup readiness, `:24570`) treats it as *alternative* evidence and does not
+reject disagreement with the stale `postCommandState`; generic reuse reads only `postCommandState`. **P2-k neither
+worsens nor masks P2-L.** **S5** the allocator's `DEFERRED` path is bounded, self-excluding, and all **seven**
+allocation callers already test `NULL`. **S6 — expect ZERO refusal lines on a clean gate.**
+
+#### ⛔ S3 REFUTED — PASSING THE COMPLETION *POINTER* IS A POST-RELEASE READ RACE
+
+My instinct was to pass the whole `CitusRemoteExecCommandCompletion *`. **It felt cleaner. It is a
+use-after-release.**
+
+- **VERIFIED:** on the **host** arm, `completion` points **directly into a mailbox ring slot** (`:21097`).
+- **VERIFIED:** the host copies its contents into session state and then **publishes `consumedEpoch`** (`:21119`,
+  `:21165`) — **BEFORE** the helper call at `:21175`.
+- **VERIFIED:** the backend treats that consumed epoch as **overwrite credit** and **reuses/memsets the slot**
+  (`remote_execution_backend_bridge.c:1831`, `:1850`).
+- **VERIFIED:** failed-backend cleanup has **no completion at all** — it *derives* kind/state/post-state (`:24672`),
+  returns command-ring credit (`:24699`), **then** calls the helper (`:24700`). Its command-record pointer is
+  likewise producer-reusable after credit.
+
+**⇒ THE SIGNATURE MUST BE THREE SCALARS, CAPTURED BEFORE CREDIT IS RETURNED:**
+
+```c
+TupleSinkServiceApplyClientSqlPeerLifetimeCompletion(sessionState, commandKind, commandState, postCommandState)
+```
+
+**VERIFIED: those are the ONLY three facts the helper uses** — no rows, results, flags, sequence, or detail.
+A whole pointer is safe **only** on DPU egress before pop, **not uniformly across callers.**
+
+> **RULE. "PASS THE WHOLE OBJECT" IS AN ABSTRACTION CHOICE, AND ABSTRACTION CHOICES HAVE LIFETIMES.** The cleaner
+> signature was the unsafe one: the object it names is a **producer-owned ring slot** whose credit has already
+> been returned by the time the callee would read it. **Ask what the argument POINTS INTO and who else may write
+> it — before asking what looks tidy.**
+
+#### S4 — hardening: certify the pop
+
+**VERIFIED:** `PUBLISHED` is returned only after final-WIMM acceptance; all non-`PUBLISHED` results return before
+the proposed call site; SIGTERM cannot interleave (the handler only clears the run flag, and teardown starts after
+the current pump returns). **The normal path is safe.**
+
+**But:** `HomerServiceDpuPopSelectedCompletionEvent` can defensively **decline to pop** (count underflow, empty
+head) and **returns no status** (`:42653`). Unreachable under normal invariants — **and the caller cannot certify
+it.** *That is exactly the P0-f disease.* **Make the pop return `bool`, and record the lifetime only after a
+CERTIFIED pop.**
+
+#### ⚠ MY RATIONALE FOR LEAVING THE TEARDOWN-REJECTION BRANCH ALONE WAS WRONG (the decision stands)
+
+I said it fires only when *"the arena backend is already released."* **VERIFIED FALSE:** `dpuBackendTeardownStarted`
+is set at **T1**, immediately after completion acceptance (`:43551`, `:43567`); the arena is released **much later,
+at T4** (`:44527`).
+
+**The decision is still correct, for a different reason:** the normal CLOSE **has already passed LANDING** before
+the completion acceptance sets the flag, so it cannot re-enter the rejection branch. *(Right answer, wrong
+reason — corrected here rather than left to look like it was reasoned.)*
+
+#### Follow-up recorded (not a normal-gate blocker)
+
+Generic retirement has **no explicit P2.T check**; today the normal node-B session is protected only because it
+retains a reserved result handle and a nonzero `activeSinkCount` until T4 (`:20530`, `:27377`). **A direct node-B
+lifecycle close, or a future early result-handle removal, would expose that gap.** Belongs with §37's lifecycle
+work.
