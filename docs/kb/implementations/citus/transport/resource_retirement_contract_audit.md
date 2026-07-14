@@ -4958,3 +4958,55 @@ While specifying I3's enforcement I established, correctly, that:
   workload* executes each set-site. A guard whose latch is never set is not a guard — that is the whole lesson
   of this section.
 - **State explicitly that this changed no behavior.** It is enforcement, not a fix.
+
+### 33.10 ⚠ CORRECTION TO §33.6 — "a verified premise with NOTHING enforcing it" was **WRONG**. It WAS enforced. It just had no VOICE.
+
+**Found while reviewing the implemented diff. My third unchecked claim about this file in one day, and all three are the same species.**
+
+§33.6 said the same-QP premise *"rests on nothing."* **False.**
+`TupleSinkServicePeerMemoryRegionUsableRdma` (`remote_execution_peer_transport_rdma.c:10190`) **already**
+compared `memoryRegionHandle->connectionState == connectionState && ->connectionGeneration ==
+connectionState->generation`, and **both** publishers already call it with **exactly** the (MR, connection)
+pair the new guard checks — `tuple_sink_service_process.c:21747` (I1) and `:19185` (I2).
+
+**So the guard cannot fire where the old path succeeded.** It is a strict factoring-out of an existing
+conjunct. That is also why it is **safe**: no false positive is possible on a path that works today.
+
+#### The REAL justification — and it is stronger than the one I invented
+
+The binding check was one of **six ANDed conjuncts** behind **one** outcome ("path not ready"), and
+`connectionState->generation` is assigned **only at connection creation** (`:6699`, `:7383`) — never bumped in
+place. **Therefore a binding mismatch is PERMANENT.** And the old code's response to it was to take the
+"not ready" branch, bump `remoteCommandPathNotReady++`, **and try again — forever, against a condition that can
+never change.**
+
+> **A silent, permanent, retrying stall. Indistinguishable from a healthy idle service.**
+
+The two rules this project already holds say exactly what to do:
+> *"A guard that ANDs N conditions must report WHICH one failed. One shared message across N conditions is not
+> a diagnostic, it is a decoy."*
+> *"Silence must not be a valid state. If a bound thing is neither progressing nor terminal, it should say so
+> itself."*
+
+**So the guard's value is not new enforcement — it is giving an existing, permanent, silent failure a NAME and
+a terminal outcome.** That is a better reason than the one I gave, and it is the honest one.
+
+#### ⚠ AND STATE THE GUARD'S LIMIT HONESTLY — it is a PROXY
+
+It compares **MR → connection**, not *"this session's connection was never re-pointed."* **If a reconnect
+re-registered the MRs onto the new connection, both would agree and the guard would pass** — while the ordering
+premise across the reconnect is broken. §11.1 verified that cannot happen today (*"failure ENDS the session, it
+does not migrate it"*). **What the guard DOES catch is a session handle re-pointed while its MRs stay bound to
+the old connection — which is precisely the shape P7b (pooling) introduces.** That is the case worth watching,
+and it is why this belongs in the audit rather than in a cleanup commit.
+
+> ### 🔑 THE RULE (and this is the THIRD time today)
+>
+> **"Nothing enforces X" is a NEGATIVE claim. It requires a SEARCH, not an intuition.**
+>
+> Today, in this one file: (1) I claimed defect B suppresses command discovery — refuted by `knownExpectedWork`,
+> three lines from where I was reading. (2) I claimed I3's fence needed hardening — refuted by its path not
+> executing. (3) I claimed the QP premise was unenforced — refuted by a conjunct inside a predicate the caller
+> was already calling. **All three were assertions of ABSENCE, and none of the three cost more than one `grep`
+> to check.** Asserting a presence gets checked by the compiler and by review. **Asserting an absence gets
+> checked by nobody but you.**
