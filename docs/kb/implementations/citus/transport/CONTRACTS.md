@@ -184,6 +184,57 @@ the call site. If it is not on the list, **it has not been checked.**
   the other.* Same as Wall 5 (`descriptor->serviceSessionId`). **This entry's `ENFORCES` list is the thing that
   catches it — nothing else does.**
 
+## `streamEntry->stream.localSenderHeadMirror` — **SCENARIO C. Retire it on EVERY teardown route, or reset FAIL-STOPS.**
+
+- **MEANS:** an 8-byte heap counter **we own**, registered as an RDMA MR so the **remote CONSUMER** can WRITE its
+  consumed-head into it. We publish its `remoteRkey` + address in the peer OPEN request. **We can never see the
+  peer's send CQEs** — so deregistering it needs a *proof* the peer will not write again.
+- **DOES NOT MEAN:** the peer's head mirror.
+  ⚠ **Not to be confused with `peerSenderHeadMirror`**, which is the *sender's* descriptor as held by a
+  **receiver** — not ours to free. A **receiver never registers a `localSenderHeadMirror` at all**: the only
+  registration site is `TupleSinkServiceEnsureLocalSenderHeadMirror()`, reached ONLY from the **outgoing** async
+  open's `STREAM_REGISTER_MIRROR` phase. *(MEASURED: node A, a pure receiver, reports `registered=0` across 75 gate
+  sessions and a 23 GB basebackup.)*
+- **CONTRACT:** **the ownership test is "do I hold a registered handle?" — `memoryRegionHandle != NULL`. It is NOT
+  `peerBindingLocallyInitiated`.** That bit is set at the peer-open **BIND**, which happens strictly **LATER** than
+  the registration it appears to guard, so between those points the mirror is live while every "am I the sender?"
+  bit still reads **false**.
+  **Every route that tears a stream down must retire the mirror BEFORE
+  `HomerServiceResetPayloadStreamEntry()`**, which MEMSETs the descriptor and **fail-stops** on a live handle.
+- **ENFORCES — every teardown route, each with its own NAMED reason and counter:**
+  - `HomerServiceClearPayloadStreamPeerBinding()` (`tuple_sink_service_process.c:~27485`) —
+    `BINDING_CLEAR`. **The only PROOF-BACKED one**: it `exit(1)`s unless `HomerServicePayloadCloseCanClearBinding()`
+    holds (RECLAIMABLE ⇒ the sender *observed* the peer's final head WRITE, and RDMA WRITEs complete **in order on a
+    QP**, so every earlier head-ACK already landed; or reconciled ABORTING ⇒ the QP/CQs are destroyed).
+  - `TupleSinkServiceMaybeReclaimSinkAndSession()` (`tuple_sink_service_process.c:~28068`) — `OPEN_FAILED`.
+    Proof-free, but the mirror was **never bound**, so it was never peer-writable.
+  - the shutdown stream loop in `main()` (`tuple_sink_service_process.c:~49960`) — `SERVICE_EXIT`. Proof-free; safe
+    **only** because the peer transport (and every QP/MR) is destroyed a few statements later, so a poisoned QP has
+    **no next user**.
+  - `HomerServiceResetPayloadStreamEntry()` (`tuple_sink_service_process.c:~26050`) — the **FAIL-STOP TRIPWIRE**.
+  - ⛔ **A NEW TEARDOWN ROUTE BELONGS ON THIS LIST. If the tripwire fires, ADD A RETIREMENT — do not relax it.**
+- **⚠ THE TEMPTING WRONG MOVE — *DEFERRING* the dereg.** A comment used to say: *"a receiver may still have an older
+  consumed-head ACK WR in flight after the sender reclaimed the stream; keep the mirror valid until the peer
+  connection resets, or a late WRITE fails `IBV_WC_REM_ACCESS_ERR` and poisons the QP."* **The hazard was real —
+  someone got a poisoned QP.** But the "deferral" was **never implemented**: the flag was set in one place, read in
+  two (both merely *skipping* the cleanup), cleared **nowhere**, and then `memset` erased the only pointers. **It
+  was not a deferred cleanup, it was an ABANDONED one**, leaking one MR + 8 bytes **per session**. It is excluded
+  today by the `BINDING_CLEAR` proof above.
+- **COST / EVIDENCE:** the tripwire has caught **two** real bugs, and both looked like "no error" beforehand:
+  1. **mid-transfer SIGTERM** — shutdown resets `active` streams *before* destroying the transport, so a stream open
+     at SIGTERM hit reset with a live mirror ⇒ `exit(1)`, **teardown never reached `HomerDpuDmaDestroy`**.
+  2. **the byte-ring-pool refusal at `-c > 8`** — the documented capacity failure. The refused peer-open landed in
+     the reclaim funnel with a registered-but-unbound mirror ⇒ **`-c 10` KILLED the DPU service** instead of
+     partially failing. Before the tripwire this had been a **silent MR leak per refused session**.
+- **HOW TO PROVE IT, don't assume it:** the service prints, at teardown,
+  `head-mirror MR accounting: registered=N released_on_rebind=N retired_on_clear=N retired_at_exit=N
+  retired_on_open_failure=N live=N`. **`live` MUST be 0.**
+  ⚠ **The tripwire's SILENCE is a ZERO COUNT and proves nothing on its own** — it cannot distinguish *"every mirror
+  was retired"* from *"none was ever registered, so the test was vacuous."* Only `registered` vs `retired` can.
+  ⚠ **`registered == retired` is the WRONG invariant**: `TupleSinkServiceEnsureLocalSenderHeadMirror()` can
+  dereg-and-**RE-register** in place when the peer connection changed (`released_on_rebind`). That is a
+  *replacement*, not a retirement; folding it in manufactures a phantom leak on every reconnect.
+
 ## The clean-close payload reclaim — **funnel, then check you were not declined**
 
 - **THE ORDER:** clear the peer binding → `TupleSinkServiceMaybeReclaimSinkAndSession()` → **verify the stream is

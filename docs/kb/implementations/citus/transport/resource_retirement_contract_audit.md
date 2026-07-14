@@ -7227,3 +7227,154 @@ harness. **Real, unbounded in a long-lived service, non-trivial to fix. Recorded
   aborted/timed-out run ⇒ restart both DPU services before the next.** *(If ever taken up: **fail-stop on
   deadline**, and a bare deadline is not enough — `WAITING_CLOSE_DRAIN` ANDs **four** conditions into one bool, so
   a useful ALARM must plumb out **which** one failed.)*
+
+---
+
+## §47 — P2-N: the sender head-mirror MR leak. **FIXED — and the fail-stop I added to keep it honest caught TWO more bugs, one of them a documented, routine crash.**
+
+**Status: LANDED AND VALIDATED** (citus: this commit). Validated on the real 4-machine setup, not argued.
+
+### The leak
+
+`streamEntry->stream.localSenderHeadMirror` is **Scenario C** memory: we own an 8-byte heap counter, register it as
+an RDMA MR, and publish its rkey so the **remote consumer** can WRITE its consumed-head into it. We can never see the
+peer's send CQEs, so deregistering it needs a *proof* the peer will not write again.
+
+There was a `deferSenderHeadMirrorDeregistration` flag that was supposed to supply that. **It never did.** It was set
+in one place, read in two — *both of which merely SKIPPED the cleanup* — and cleared **nowhere**; then the `memset` at
+the end of `HomerServiceResetPayloadStreamEntry()` erased the only pointers.
+
+> **It was not a deferred cleanup. It was an ABANDONED one — one RDMA MR + one heap block leaked PER SESSION.**
+
+**Why deferral is not needed at all.** `HomerServiceClearPayloadStreamPeerBinding()` already `exit(1)`s unless
+`HomerServicePayloadCloseCanClearBinding()` holds, i.e. either
+- `RECLAIMABLE` — the sender has **OBSERVED the peer's FINAL head WRITE**. RDMA WRITEs complete **IN ORDER on a QP**,
+  so observing the final head proves every *earlier* head-ACK WRITE already landed — which is exactly the "older ACK
+  WR still in flight" case the old comment feared; or
+- reconciled `ABORTING` — reset-complete already destroyed the QP/CQs and invalidated every MR.
+
+⇒ **By the time the defer flag was ever set, the peer PROVABLY could not write.** The defer was dead weight guarding an
+already-excluded hazard.
+
+### The fail-stop tripwire — and why it earned its keep twice
+
+Because that argument is load-bearing, `HomerServiceResetPayloadStreamEntry()` now **ALARMs and `exit(1)`s** if it ever
+meets a still-registered mirror. It immediately found **two** bugs that had been invisible:
+
+**(1) MID-TRANSFER SIGTERM.** Shutdown resets every `active` stream (`:~49963`) *before* destroying the peer transport
+(`:~50024`). A stream still OPEN at SIGTERM therefore hit reset with a live mirror and no proof ⇒ `exit(1)`, and the
+service **never reached `HomerDpuDmaDestroy`** — re-breaking the very teardown drain this series exists to restore.
+*Fixed:* the shutdown loop now retires explicitly under a **named** reason, `SERVICE_EXIT`. Proof-free, and safe **only**
+there: the transport (with every QP and MR) dies a few statements later, so a poisoned QP has **no next user**; the
+dereg precedes the heap free; and the only thing that still touches the transport afterwards
+(`TupleSinkServiceResetSession` → `HomerServiceDrainSessionSendCompletions`) is a **BOUNDED** drain that ALARMs and
+cancels its owners on non-convergence rather than blocking.
+
+> ⚠ **A claim I got WRONG and had to correct:** *"nothing uses the QP after the stream reset."* **False** — the session
+> reset loop does. The claim survives only in its stronger form: *everything that touches the QP after that point is
+> bounded and has an explicit non-convergence escape.* Found by checking, not by asserting.
+
+**(2) 🔴 THE `-c > 8` BYTE-RING REFUSAL — A ROUTINE, DOCUMENTED PATH, AND IT KILLED THE SERVICE.**
+Codex (adversarial review) found that the async peer-open registers the mirror at `STREAM_REGISTER_MIRROR` (`:~40062`)
+**BEFORE** `peerBindingLocallyInitiated` / `sendHandleOpen` are set (`:~39839` / `:~39864`, only once the peer's response
+validates). So in that window the mirror is live while **every "am I the sender?" bit reads false**. The retire's guard
+tested exactly that bit — so it **skipped** the window, the reclaim funnel (whose guard is
+`LocalHandleCount != 0 || peerBindingActive`, both false here) proceeded to reset, and the tripwire fired.
+
+I first recorded this as "latent, never observed." **It is not latent.** It is the **documented byte-ring-pool
+exhaustion**: the pool has 8 slots, so at `-c 10` exactly 2 sessions are refused and the peer REJECTS their
+result-relay open. **MEASURED:**
+
+```
+[node B] still alive: *** NO -- IT DIED ***   RAW EXIT STATUS = 1
+[node B] head-mirror TRIPWIRE lines : 1
+ALARM: ... session=9 peerBindingActive=0 peerBindingLocallyInitiated=0 closeState.phase=OPEN
+```
+
+The runbook says `-c 10` *partially fails*. With the tripwire it **crashed the DPU service**; before the tripwire it had
+been **silently leaking an MR per refused session**.
+
+*Fixed:* **the direction discriminator was simply WRONG.** A receiver never registers a `localSenderHeadMirror` at all
+(node A: `registered=0`, measured every run), so the `peerBindingLocallyInitiated` test was **redundant for its stated
+purpose AND set later than the thing it guarded**. Dropped it — **the registered handle IS the ownership proof** — and
+the reclaim funnel now retires under a third named reason, `OPEN_FAILED`.
+
+> **RESIDUAL RISK, stated honestly (open):** if the peer **ACCEPTED** the open and bound our descriptor and only *our*
+> validation of its response then failed, the peer may still write ⇒ `IBV_WC_REM_ACCESS_ERR` ⇒ poisoned QP. That hazard
+> is **pre-existing** (the old reset deregistered there too, just after leaking the heap), and it is **not** what the
+> `-c 10` case does — a *rejected* open means the peer never bound anything. **The clean fix is to reset the peer
+> connection on a post-publication open failure**, which yields proof (b). ⛔ Do **not** "improve" this into a deferral;
+> that is what leaked in the first place.
+
+### The instrument: prove it, don't assume it
+
+The tripwire's **silence is a ZERO COUNT**, and a zero count cannot distinguish *"every mirror was retired"* from
+*"none was ever registered, so the test was vacuous."* So the service now prints, at teardown:
+
+```
+head-mirror MR accounting: registered=N released_on_rebind=N retired_on_clear=N retired_at_exit=N
+                           retired_on_open_failure=N live=N
+```
+
+- **`live` MUST be 0.** It also catches what the tripwire structurally *cannot*: the shutdown loop only visits `active`
+  streams, so an **inactive** entry still holding an MR is invisible to reset — but not to this subtraction.
+- ⚠ **`registered == retired` is the WRONG invariant.** `TupleSinkServiceEnsureLocalSenderHeadMirror()` can
+  dereg-and-**RE-register** in place when the peer connection changed. That is a *replacement*, not a retirement;
+  folding it in would manufacture a phantom leak on every reconnect. Hence `released_on_rebind`.
+- ⚠ **PLACEMENT IS LOAD-BEARING:** the line prints **after** the stream loop but **before** the session loop.
+  `TupleSinkServiceResetSession` carries its **own, unrelated** fail-stop (open peer command-mailbox MR whose writers
+  have not quiesced), which fires on any teardown following an aborted run — and printing after it meant the accounting
+  **silently vanished on exactly the runs that needed it** (measured, on the `-c 10` run itself).
+
+### Validation (final binary, both DPUs redeployed with a landed-proof grep verified ABSENT beforehand)
+
+| workload | result |
+|---|---|
+| 75-session gate loop | **75/75**; node B `registered=75 on_clear=75 at_exit=0 on_open_failure=0 live=0`; ACCEPT both DPUs |
+| gate band `-c 1 -t 2000` ×3 | **303.2 / 302.3 / 301.5** vs band 285.6 / 291.0 / 299.1 — **no regression** |
+| 4-role basebackup | **PASS**, 23,258,416,190 B, `CLOSE_ACK`, ~44k ring laps, `on_clear=1 live=0`, 0 alarms |
+| SIGTERM teardown (clean) | **ACCEPT** both — exit 0, 0 refusals, drain reached |
+| **mid-transfer SIGTERM** | **exit 0**, drain reached, `at_exit=1` *reported* (was: exit 1, no drain) |
+| **`-c 10` byte-ring exhaustion** | **node B SURVIVES** (was: DIED); `registered=10 on_clear=4 at_exit=4 on_open_failure=2 live=0` |
+
+Node A reports `registered=0` on every run — it is the **receiver**; it holds the *peer's* descriptor, not a local
+mirror. **Predicted from code, then confirmed by measurement.**
+
+---
+
+## §48 — 🔴 OPEN: teardown ordering. **A mid-COMMAND SIGTERM cannot exit cleanly, and the shutdown order contradicts the transport's own reset contract.**
+
+**Not caused by §47** — §47 merely stopped masking it. Bring to the user before starting; it is a stage, not a patch.
+
+**The symptom (MEASURED).** SIGTERM node B while the gate is mid-command:
+
+```
+head-mirror tripwire    : 0        <-- §47 is fine
+session-reset fail-stop : 3
+  "refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers quiesce
+   session=1 current_sequence=19904 ... peer_close=0 reset_complete=0"
+RAW EXIT STATUS = 1     teardown drain = 0 lines
+```
+
+The refusal is **honest** — the writers really have not quiesced — and it is **pre-existing** (zero occurrences in the
+§47 diff; identical at citus `29aced926`). But it means **the service cannot be stopped cleanly while a command is in
+flight**, and it fires on **any** teardown that follows an aborted run.
+
+**The deeper inconsistency.** Shutdown does *streams → sessions → transport*. But the transport's **own** reset code
+encodes the **opposite** contract — destroy QP/CQs **first**, *then* invalidate MRs and reconcile owners
+(`remote_execution_peer_transport_rdma.c:~6479-6493`).
+
+⚠ **The naive "destroy the transport first" reorder is ALREADY REFUTED** (see §-earlier, and Codex confirmed):
+`TupleSinkServiceDestroyPeerTransportState()` frees the transport container, but the subsequent session cleanup still
+dereferences stored connection handles ⇒ **use-after-free**.
+
+**Candidate direction (Codex, INFERRED — not yet verified by us):** split transport shutdown into phases —
+(1) fence/reset all connections using the existing QP/CQ-destroy → owner-abort → MR-invalidation → reset-complete
+sequence, but **retain** the transport/connection-slot allocation; (2) cancel shutdown-owned session/FIFO owners, then
+reset streams and sessions while the stored handles still address inactive-but-allocated slots; (3) unmap control state
+and only then free the container.
+
+**Also unresolved and worth folding in:** `TupleSinkServiceDeregisterPeerMemoryRegionRdma()` **ignores `ibv_dereg_mr()`'s
+return value** and frees the handle regardless (`remote_execution_peer_transport_rdma.c:~10225-10246`). So every
+`retired_*` count records an *attempted* retirement, not a *successful* deregistration — and on failure both the
+no-scribble proof **and** the accounting are false.
