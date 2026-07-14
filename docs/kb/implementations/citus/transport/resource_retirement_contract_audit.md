@@ -6046,6 +6046,19 @@ the lifetime and leaves this hazard entirely intact — no half-fix, no inconsis
 
 ### 36.8 ⚠ THE DEFECT IS BIGGER THAN THE `exit(1)`: **SELECTED-DPU SESSIONS NEVER RETIRE**
 
+> # ⛔ PARTIALLY RETRACTED 2026-07-14 BY MEASUREMENT — READ §38 BEFORE YOU BELIEVE THE SEVERITY BOX BELOW.
+> **The FACT is confirmed: selected-DPU sessions are never retired. 63 of them sat `active` in a 75-session run.**
+> **The CONSEQUENCE stated below is WRONG, and it was mine.** This section claims the leak fills the 64-slot
+> session table and then *"every new session open fails, permanently"* via `AllocateSession` returning NULL.
+> **`AllocateSession` NEVER RETURNED NULL.** `"peer service ran out of free command sessions"` = **0**, measured
+> across 75 sequential sessions, on **both** pre-P2-k and P2-k binaries. **The session table is not the wall.**
+>
+> **The real wall is the SCHEDULER READY SET** (`HOMER_PROGRESS_PLAN_MAX_GRANTS` = 64, a *different* resource
+> that happens to have the *same* capacity): each retained session keeps a `COMPLETION_RING` candidate forever,
+> the set saturates at 64, and the **`PAYLOAD_STREAM`** source that would carry the result back is **dropped
+> every pass**. The gate then dies at session **64** with a 30 s timeout — not an honest "out of sessions" error.
+> **Root cause + measurement: §38. Fix: §37 / P2-L.**
+
 **VERIFIED while checking whether P2-k v4 works standing alone. This reframes the severity.**
 
 `TupleSinkServiceSessionShouldRetireWhenIdle` (`:24366`), peer-receiver branch:
@@ -6160,6 +6173,20 @@ work.
 
 ### 36.10 ▶ RESUME POINT — P2-k **Part 1 LANDED (citus `5a57e1cc9`), NOT YET VALIDATED**
 
+> # ✅ SUPERSEDED 2026-07-14 — Part 1 is now BUILT, DEPLOYED, and VALIDATED. **Its acceptance test passed and
+> # THE SYSTEM IS STILL BROKEN.** The live next-step list is **§38.7**. Read §38 first.
+>
+> **Steps 1–4 below are DONE:** both trees built + installed (landed-proof `0 → 1`, proven in both directions),
+> farnet0 synced (md5-identical), **both DPUs redeployed**. The acceptance run passed on **both** DPUs —
+> `RAW EXIT STATUS 1 → 0`, `refusing to reset` `1 → 0`, `teardown drain COMPLETE` `0 → 1 line`. Gate band
+> **299.6 / 296.1 / 296.3** vs `285.6 / 291.0 / 299.1` — **no regression.**
+>
+> **AND IT PROVED NOTHING ABOUT THE ACTUAL BUG.** A 75-session loop (the test this plan did *not* ask for)
+> dies at session **64** — identically on pre-P2-k binaries. **§38.**
+>
+> **Steps 5–6 below are REORDERED:** §37 / P2-L is **promoted** (it is the fix for the measured wall);
+> P2-k Part 2 (the backstop) is **deferred behind it**.
+
 **Stopped here by owner request (2026-07-14). Everything below is the exact next-step list.**
 
 #### ✅ DONE — Part 1 (builds clean, formatted, committed; **no run yet**)
@@ -6197,3 +6224,150 @@ session (`:13014` → `:45277`).** With sessions never retiring, that accumulate
 **Check it against the two standing open performance questions** — the unattributed ~10% (318 → ~285) and the
 ~223 µs DPU discovery latency. **INFERRED, untested — but it is the first mechanism proposed for either that
 predicts a monotonically growing cost.**
+
+---
+
+## §38 — 🔴 **THE 64-SESSION CLIFF: MEASURED.** The gate dies at session 64, and it is NOT the session table.
+
+**Status: ROOT-CAUSED to a verified code chain. PRE-EXISTING (not a P2-k regression — measured on both arms).
+NOT FIXED. This is the real content of §37 / P2-L, and it is a hard functional wall, not a tidy-up.**
+
+**Found 2026-07-14 by the P2-k Part 1 acceptance run — specifically by the test that the plan did NOT ask for.**
+
+### 38.1 THE MEASUREMENT
+
+75 sequential single-client gate sessions (`-c 1 -t 5`) against **one** DPU service instance. Both arms, same
+machine, same hour, clean baseline each time:
+
+| | pre-P2-k (`2b37e8701`) | P2-k Part 1 (`5a57e1cc9`) |
+|---|---|---|
+| sessions 1–63 | ✅ all pass | ✅ all pass |
+| **session 64** | ❌ **FAILS** | ❌ **FAILS** |
+| sessions 65–75 | ❌ all fail | ❌ all fail |
+| failures / 75 | **12** | **12** |
+| `DPU backend spawn begin` / `COMPLETED` | **64 / 64**, then never again | **64 / 64**, then never again |
+| `"ran out of free command sessions"` | **0** | **0** |
+
+```
+pgbench: error: client 0 timed out after 30 s waiting for Homer completion of sql_execute (kind=6 sequence=5)
+pgbench: error: client 0 could not close selected-DPU Homer SQL session: semantic close did not release
+                selected-DPU role-1 slot: session=64 outstanding=5 slot_state=2
+```
+
+> **⇒ IDENTICAL IN BOTH ARMS. P2-k Part 1 IS NOT A REGRESSION, AND PART 1 STAYS.** The before-arm was run for
+> exactly this decision, and it is the only reason the decision is safe to make.
+
+### 38.2 THE DPU NAMES ITS OWN FAILURE — and it is the SCHEDULER, not the session table
+
+```
+tuple-sink service: progress ready-set overflow event=1 kept=64 dropped=1
+    kind_mask=0x00000a00 overflow_kind_mask=0x00000400
+    first_dropped_kind=10 first_dropped_index=0 first_dropped_generation=63
+```
+**First emitted after spawn #63**, then forever (the event counter reaches 16,777,216 — the probe is
+first-N-then-every-Nth, so the output stays bounded; the "always bound the output" rule earning its keep).
+
+Decoded against the enum (`tuple_sink_service_process.c:2577`):
+
+| field | value | meaning |
+|---|---|---|
+| `kept=64` | | `HOMER_PROGRESS_PLAN_MAX_GRANTS` = **64** (`:2551`). The ready set is **FULL**. |
+| `kind_mask=0xa00` | bits 9,11 | KEPT: `COMPLETION_RING` (9) + `CQ_DRAIN` (11) |
+| `first_dropped_kind=10` | | DROPPED: **`PAYLOAD_STREAM`** — *the source that carries the result back* |
+
+> **TWO DIFFERENT CAPACITIES, BOTH 64, AND THE COLLISION IS WHY THIS WAS MISREAD.**
+> the **session table** = `CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SESSIONS` = 64 (`homer_abi_version.h:50`)
+> the **scheduler ready set** = `HOMER_PROGRESS_PLAN_MAX_GRANTS` = 64 (`:2551`)
+> They fill in lockstep because each retained session contributes one scheduler candidate. **The cliff looks
+> like the session table and is not.** `AllocateSession` never once returned NULL.
+
+### 38.3 THE VERIFIED CAUSAL CHAIN (every link read in the code, not inferred)
+
+1. **The selected-DPU arm never clears `backendLoopActive` on terminal completion.** All six writes of
+   `= false` (`:21215`, `:22219`, `:22448`, `:24604`, `:40445`, `:41504`) are on the **host** arm, the
+   **host-peer** arm, or inside `ResetSession`. **None is on the selected-DPU arm.**
+2. **T4 retains the session and does not clear the flag either** (`:44658`–`:44683`). Its comment is explicit:
+   *"Original T4 draft destroyed the service session here: `TupleSinkServiceResetSession(serviceSession);` …
+   Retain the fenced service session until that owner closes it."* — and the backend it just released is **gone**.
+3. → `HomerServiceCompletionMachineHasWork` (`:13018`) returns **true forever**: `backendLoopActive` is one of
+   its disjuncts (`:13026`).
+4. → `HomerServiceFinalizeCompletionPendingBit` (`:13481`) clears the session's ready bit **only** when
+   `HasWork()` is false. It never is. **The bit is never cleared.**
+5. → the ready-set builder (`:13552`–`:13581`) walks `completionRunnableSessions` and appends a
+   `COMPLETION_RING` candidate for every session passing `active && completionMailbox != NULL &&
+   clientSqlPeerReceiver`. **A retained node-B session passes all three, by construction** — "retained" *means*
+   `active`, and the mailbox is the very MR `MayDeregister` guards.
+6. → at **64** retained sessions `HomerProgressReadySetAppend` (`:9682`) returns false and the loop `break`s.
+   **`PAYLOAD_STREAM` sources are never even reached** — COMPLETION_RING is appended first.
+7. → the new session's result never moves. **30 s client timeout. Every session from 64 on.**
+
+> **This is §37.3's FIRST consequence, verbatim** — *"stale `backendLoopActive` … retains completion-machine
+> ownership (`HomerServiceCompletionMachineHasWork`, `:13014`)"*. It was recorded as **INFERRED, untested**.
+> **It is now MEASURED, and it is not a performance footnote — it is a functional wall at 64 sessions.**
+
+### 38.4 ⛔ RETRACTION — §36.8's SEVERITY CLAIM IS **WRONG**, and it was mine
+
+**§36.8 said:** *"EVERY SELECTED-DPU SESSION LEAKS … hard-capped at 64, after which `AllocateSession`'s
+table-full reclaim finds nothing and returns NULL — **every new session open fails, permanently.**"*
+
+**MEASURED: `AllocateSession` NEVER RETURNED NULL.** `"peer service ran out of free command sessions"`
+(`:41127`) = **0**, in **both** arms, across 75 sessions. **The session table was never the wall.**
+The wall is the scheduler ready set (§38.2). *The sessions-never-retire FACT is real; the CONSEQUENCE I
+attached to it was not.* See §36.8's inline retraction.
+
+### 38.5 THE OPEN QUESTION — **WHY is the session retained?** (3 theories, 3 refuted. Do not guess a 4th.)
+
+The chain above explains **the cliff**. It does **not** explain **why no retirement path fires**. Three
+retirement paths exist on paper; the log says **none of them ran**:
+
+| path | what it would do | ran? |
+|---|---|---|
+| `MaybeRetireSessionAfterPeerResponse` (`:24434`) | retire on peer response | **its 5 callers (`:41001`–`:41507`) are ALL on the host-service peer arm.** Not reachable from the DPU arm. |
+| sink-release hook (`:27458`–`:27490`) — `activeSinkCount--` then retire | retire when the last sink drops | ❌ **0 lines.** `"reclaiming sink session="` never printed. **`activeSinkCount` was NEVER decremented.** |
+| connection-reset (`:29738`–`:29774`) — sets `connectionResetComplete`, then retires | retire on peer disconnect | ❌ **0 lines.** `"command mailbox quiesced by connection reset"` never printed. **`connectionResetComplete` was NEVER set.** |
+
+Meanwhile a **fourth** path *did* run, 63×: `"payload stream marked for CLEAN-CLOSE RECLAIM"` →
+`"reclaimed payload stream after a CLEAN CLOSE"`. **It appears to reclaim the stream without decrementing
+`activeSinkCount` and without checking retirement.** Leading suspect for why `:29738` skips the session:
+its filter requires `peerLifetime.peerBindingOpen`, and the log shows 63× `"marked send byte-ring terminal …
+reason=peer-binding-cleared"` — i.e. **the binding may already be cleared by the time the reset callback
+runs**. ⚠ **INFERRED. NOT VERIFIED. This is theory #4 and the previous three were wrong.**
+
+### 38.6 Rules earned — and this section is the expensive one
+
+> **⛔ THE ACCEPTANCE TEST THE PLAN ASKED FOR WAS GREEN ON A SYSTEM THAT STILL HAD THE BUG.**
+> KB §36.10 specified: *SIGTERM the DPU, expect exit 0 and no refusal line.* It passed — exit 0, zero refusals,
+> teardown drain reached. **And the system still dies at 64 sessions.** The shutdown test exercises
+> `MayDeregister`, the consumer that SHOUTED. "Zero refusals" is satisfiable **two** ways: *(a)* sessions now
+> retire, or *(b)* sessions still leak but now deregister cleanly. **It was (b).** The test could not tell them
+> apart — and that was foreseeable *before* running it, from §36.8's own text.
+> **WHEN A BUG HAS A LOUD CONSUMER AND A SILENT ONE, AN ACCEPTANCE TEST BUILT ON THE LOUD ONE PROVES NOTHING.
+> TEST THE SILENT ONE.**
+
+> **A CAP TEST MUST EXCEED THE CAP.** §36.10's criterion D was *"session-table full = 0 ✅"*. Only **4** sessions
+> ran. Of course it was 0. **A ceiling check below the ceiling is decoration**, and it printed a green tick.
+
+> **DIFF THE WHOLE FUNNEL — AND I DID NOT.** §37.5 (written the day before, by me): *"'THE NEW PATH DROPPED A
+> STEP' IS ALMOST NEVER ONE STEP … when you find one invariant a new path skipped, DIFF THE WHOLE FUNNEL."*
+> The selected-DPU arm dropped **four** host-arm steps. Part 1 fixed **one** and I split the other three out as
+> "later". **The KB told me they were there, in a rule I wrote, and I shipped the one anyway.**
+
+> **THREE MECHANISMS, THREE REFUTATIONS, IN ONE HOUR.** (1) "the session table fills and allocation fails
+> permanently" — refuted, `AllocateSession` never returned NULL. (2) "§37.3 named the wrong flag (WAIT_BACKEND,
+> not COMPLETION_RING)" — **refuted; §37.3 named TWO consequences and I read past the first, which was the
+> right one. I 'corrected' a claim that was correct.** (3) "the reclaim path was alive via
+> `connectionResetComplete`" — refuted, that flag was never set. **Each story was coherent, evidence-backed,
+> and wrong. The only thing that stopped each one was going back to the log for a line that would have to
+> exist if the story were true — and finding it absent.**
+> **A COUNT OF ZERO ON A LINE YOUR THEORY REQUIRES IS WORTH MORE THAN ANY AMOUNT OF READING.**
+
+### 38.7 ▶ WHAT THIS CHANGES
+
+1. **P2-k Part 1 STAYS.** Validated for what it claims: exit `1`→`0`, refusals `1`→`0`, teardown now reaches
+   `HomerDpuDmaDestroy`'s drain, gate band **299.6 / 296.1 / 296.3** vs `285.6 / 291.0 / 299.1` (no regression).
+   It is **not** a regression on the cliff (§38.1, measured both arms).
+2. **§37 / P2-L is PROMOTED.** It is not follow-on hygiene; it is the fix for a measured functional wall.
+3. **P2-k Part 2 (the backstop) is DEFERRED behind it** — it hardens an abnormal path, while P2-L unblocks the
+   normal one.
+4. **§38.5 must be settled before any code is written.** Three refuted mechanisms is the signal to stop
+   theorising and have the diagnosis attacked.
