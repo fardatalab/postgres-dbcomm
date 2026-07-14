@@ -6043,3 +6043,52 @@ the lifetime and leaves this hazard entirely intact — no half-fix, no inconsis
 > Beside it, silently: the reuse gate's input, the in-flight predicate's input, and the scheduler's
 > backend-ownership flag. **When you find one invariant a new path skipped, DIFF THE WHOLE FUNNEL — the one you
 > noticed is the one that happened to be load-bearing for the bug you were chasing, not the only one.**
+
+### 36.8 ⚠ THE DEFECT IS BIGGER THAN THE `exit(1)`: **SELECTED-DPU SESSIONS NEVER RETIRE**
+
+**VERIFIED while checking whether P2-k v4 works standing alone. This reframes the severity.**
+
+`TupleSinkServiceSessionShouldRetireWhenIdle` (`:24366`), peer-receiver branch:
+
+```c
+if (sessionState->clientSqlPeerReceiver)
+{
+	return sessionState->peerLifetime.peerWritersQuiesced ||
+	       sessionState->peerLifetime.connectionResetComplete;
+}
+```
+
+…and the comment directly above it states the contract:
+
+> *"Backend-node peer receivers expose their command mailbox as a remote RDMA target. A failed SQL command or
+> backend `DO_NOT_REUSE` state does not prove the peer opener has stopped writing `TX_ABORT` /
+> `CLIENT_SQL_SESSION_CLOSE` through the published descriptor. **Retire only after explicit close has quiesced
+> peer writers, or after connection reset has destroyed the QP.**"*
+
+`TupleSinkServiceMaybeRetireSessionAfterPeerResponse` (`:24420`) calls `ResetSession` **only** when that predicate
+holds.
+
+> ### ⇒ ON THE SELECTED-DPU ARM `peerWritersQuiesced` IS NEVER SET (§36.1) ⇒ `ShouldRetireWhenIdle` ALWAYS RETURNS FALSE ⇒ **THE SESSION IS NEVER RETIRED.**
+> ### **EVERY SELECTED-DPU SESSION LEAKS, PERMANENTLY, FOR THE LIFE OF THE SERVICE.**
+
+**And that is EXACTLY the symptom we observed and did not connect:** the failing shutdown refused on **session 1**
+— the **warmup's** session, `current_sequence=14004` (= 2000 txns × 7 statements) — **still `active` three gate
+runs later.** It was not "lingering". **It could never be retired.**
+
+**⇒ The `exit(1)` at shutdown is a DOWNSTREAM SYMPTOM of a session-retirement leak.** The retirement leak is the
+defect; the guard is the alarm.
+
+#### What this changes
+
+- **P2-k Part 1 is not a teardown fix. It restores SESSION RETIREMENT on the selected-DPU arm.** That is the
+  actual bug and it is a live, permanent resource leak in the command plane — not a shutdown wart.
+- **The acceptance test gets a SECOND, INDEPENDENT observable, and a stronger prediction:**
+  after Part 1, sessions should be retired **as they close**, so at SIGTERM there should be **NO active
+  peer-receiver sessions at all** ⇒ **NO refusal line whatsoever** (not merely a deferred one), exit **0**, and
+  `teardown drain COMPLETE`.
+- **Part 2 is confirmed as a BACKSTOP, not the fix.** Good — that is what a backstop should be.
+
+> **RULE. WHEN A GUARD REFUSES, ASK WHAT ELSE READS ITS PREMISE.** `peerWritersQuiesced` is read by TWO
+> consumers: `MayDeregister` (the guard that shouted) **and** `ShouldRetireWhenIdle` (which said nothing, and
+> silently leaked every session on the DPU path). **The loud consumer is rarely the important one.** I chased the
+> `exit(1)` for three review rounds; the retirement leak was sitting on the same flag the whole time.
