@@ -7,6 +7,17 @@
 > **⛔ IT IS A POINTER AND A WARNING — NEVER A SUBSTITUTE FOR READING THE CODE.** A stale entry misdirects *with
 > authority*: a lying diagnostic costs more than the silence it replaced. **Go read the code. Verify.**
 
+## ⛔ EVERYTHING HERE IS TRUE **NOW**. NO HISTORY, NO CHANGELOG.
+
+That promise is what makes this file safe to read *instead of* searching. **If a contract changes, REWRITE the
+entry** — never add *"used to mean X"*. Two near-identical statements sitting adjacent, one of them wrong, **is
+the exact bug this file exists to prevent** (see the very first entry). History belongs in
+[`resource_retirement_contract_audit.md`](resource_retirement_contract_audit.md) and the commit.
+
+*(A **tempting-wrong-move** warning and a **scoped-out** note are **not** history — they are current facts about
+live traps, and they stay. So is a **COST** line: it is calibration — how hard to respect the rule — and it can
+never be mistaken for a definition.)*
+
 **Line numbers drift; symbol names do not.** Every entry names the **symbol** as its stable key and gives a line
 as a *hint*. Grep the symbol.
 
@@ -98,9 +109,10 @@ the call site. If it is not on the list, **it has not been checked.**
   ⛔ **NEVER clear it on every terminal completion.** The gate runs **~14,000 commands on ONE session**; DPU
   landing rejects a non-teardown session whose `backendLoopActive` is false (`:~43363`) ⇒ **the session would
   stop admitting commands at statement #2.**
-- **⚠ SUPERSEDED / SCOPED:** the selected-DPU **FAILED arm is DELIBERATELY NOT IMPLEMENTED**. A genuine backend
-  `FAILED` collides — no-backend cleanup (`:~24618`) vs teardown-fenced landing (`:~43378`): **two owners for one
-  mailbox record**, resolved by scheduler order. Needs a lifecycle design, not a flag write. Audit §40.2.
+- **⚠ SCOPED OUT — DELIBERATELY NOT DONE (a CURRENT fact, not history):** the selected-DPU **FAILED arm is not
+  implemented.** A genuine backend `FAILED` collides — no-backend cleanup (`:~24618`) vs teardown-fenced landing
+  (`:~43378`): **two owners for one mailbox record**, resolved by scheduler order. **Anyone "completing" this
+  naively re-creates that race.** It needs a lifecycle design, not a flag write. Audit §40.2.
 - **ENFORCES:** L1 in `HomerServiceDpuEgressOneSelectedCompletionEvent()` (CLOSE only); the host arm at `:~21503`.
 - **COST:** 63 zombie `WAIT_BACKEND` machines filled the 64-slot machine candidate set and **evicted the one live
   session's own machine** every pass, forever. Fixed citus `9ef06f224`. Audit §41.
