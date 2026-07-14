@@ -795,6 +795,24 @@ generic race) to find — and the answer was in the DPU log the whole time.** Th
 *symptom* (`DPU result relay peer-open failed for result stream 10`); the **DPU prints the cause**. When a client
 reports a Homer failure, **read the DPU log before touching the source.**
 
+> ## ⚠⚠ AND "THE DPU LOG" MEANS **BOTH DPUs**. THE GATE HAS TWO.
+> **2026-07-14: this cost most of a day.** A 75-session loop failed on node B (farnet1 DPU) — it spawned a
+> backend and then landed *zero* commands. I read node B's log, found nothing there, and built an entire suspect
+> list out of node-B code. **Every suspect was wrong, because the bug was not on node B at all.**
+>
+> **Node A's log (farnet0 DPU) — which nobody had ever opened — was 9.4 MILLION lines, and 9,416,076 of them
+> said `selected-DPU session table is full`.** Node A had leaked every selected session it ever created, so it
+> could not stage the client's commands, so node B never received any.
+>
+> **A failure OBSERVED on one node is routinely CAUSED on the other.** Node A drives the command plane; node B
+> executes it. **Grep both, every time.** Node A's log lives on **farnet0's** DPU — reachable only via
+> `ssh farnet0` → `ssh dpu`, so **ship a script and invoke it by path** (Non-negotiable #5), and **grep it ON the
+> DPU**: a 9.4-million-line `cat` across a double hop simply times out.
+>
+> *(Root cause: `HomerDpuDmaSetupContainsServiceSession` read `descriptor->serviceSessionId` — which is **0 for
+> every ring** of the frontend arena — instead of the runtime binding, violating a rule written in its own file.
+> Fixed citus `f12a96112`. Audit §44–§45.)*
+
 #### ⚠⚠ GREPPING THE SERVICE LOGS FOR `ALARM` IS NOT ENOUGH — THE WORST LINE IS NOT TAGGED
 
 The DMA engine can **die**, and none of the lines it emits when it does contain the string `ALARM`:
