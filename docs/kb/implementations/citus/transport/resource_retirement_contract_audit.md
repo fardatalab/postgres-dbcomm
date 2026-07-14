@@ -7019,3 +7019,124 @@ whether that function is even the right one, **what ELSE on node A leaks per ses
 at 64*), and the unbounded-log fix.
 
 **Still owed regardless:** the gate band (**no perf check has run for L1 or L2**) and the 4-role basebackup.
+
+---
+
+## §45 — ✅ **WALL 5 FIXED. THE 75-SESSION LOOP PASSES 75/75.** It was a ONE-LINE WRONG FIELD READ.
+
+**The 64-session cliff is GONE. Every wall is down. And §44's root-cause claim — mine — was WRONG.**
+
+### 45.1 ⛔ MY §44 CLAIM WAS REFUTED (the sixth of the session, and I asked for it)
+
+**§44 said:** *"Node A has NO release path — both release sites are on the node-B arena-teardown path."*
+**REFUTED (Codex round 3, verified by me).** Node A **does** have a release path, registered with **no node-role
+condition** (`:49403`):
+
+```c
+dpuSetupTcpConfig.closeFinalizeCallback = HomerServiceDpuResetSelectedSessionsForClosingSetup;
+```
+
+**It runs on node A. It just never recognizes a single session.**
+
+### 45.2 THE BUG — a wrong field read, forbidden by a comment in its own file
+
+`HomerDpuDmaSetupContainsServiceSession` (`homer_service_dpu_dma.c:10874`) asked:
+
+```c
+if (import->descriptors[ringIndex].serviceSessionId == serviceSessionId)     /* WRONG FIELD */
+```
+
+**The rule against exactly that is written 10,000 lines above it, on the accessor that exists to replace it**
+(`homer_service_dpu_dma.c:757`):
+
+> *"**THE one way** to ask 'which session does this ring serve?'. **Never read `descriptor->serviceSessionId`**
+> for that question. The descriptor states what the host DECLARED at cold setup; for the frontend agent's
+> shared arena **that is 0 for EVERY ring**, because the arena is exported once at postmaster start and its
+> slots are handed to backends later, one at a time. **`ringRuntime` carries what the DPU has actually BOUND.**"*
+
+⇒ The comparison was `0 == serviceSessionId` — **never true for a real session.** The predicate always answered
+*"not mine"*, so the finalizer (`tuple_sink_service_process.c:42583`) `continue`d past **every** session and
+**never released one**:
+
+```c
+HomerDpuDmaSetupContainsServiceSession(..., &setupOwnsSession, ...);
+if (!setupOwnsSession) { continue; }                    /* <-- ALWAYS taken */
+HomerServiceDpuResetSelectedSessionForClose(...);       /* <-- NEVER reached */
+```
+
+**THE FIX (one line):** `import->descriptors[ringIndex].serviceSessionId`
+→ `HomerDpuDmaRingBoundSessionId(import, ringIndex)`. It repairs **all three** callers (`:42443`, `:42530`,
+`:42583`) — the third being payload setup-drain ownership, broken the same way.
+
+> ⚠ **THE DOC COMMENT NAMED THE WRONG FIELD AS THE CONTRACT** — *"maps a TCP setup-close identity back to
+> **descriptor** service sessions"*. **That phrasing is where the bug came from.** Fixed with the code.
+> **RULE: A DOC COMMENT THAT NAMES THE WRONG FIELD IS NOT A COMMENT, IT IS AN INSTRUCTION TO WRITE THE BUG.**
+
+### 45.3 THE RESULT — 75/75
+
+| | before | after |
+|---|---|---|
+| **75-session loop** | 11 failures, first at 65 | ✅ **ALL SESSIONS OK (75/75)** |
+| node A `reset selected-DPU session on close` | **0** | **75** |
+| node A `selected-DPU session table is full` | **9,416,076** | **0** |
+| node A log lines | **9,422,990** | **7,944** *(1,186× smaller)* |
+| node B spawn begin / COMPLETED | 64 / 64 | **75 / 75** |
+| machine-candidate overflow · ready-set overflow · ALARMs | — | **0 · 0 · 0** |
+
+**GATE BAND (`-c 1 -t 2000` ×3): `295.4 / 296.3 / 296.7`** vs the `2b37e8701` band `285.6 / 291.0 / 299.1`.
+**IN BAND — no regression** across L1 + L2 + Wall 5, and unusually tight (1.3 tps spread).
+**TEARDOWN: ACCEPT on both DPUs** — exit 0, zero refusals, drain reached. P2-k Part 1's result holds.
+
+**4-ROLE BASEBACKUP: PASS** — sender rc=0, consumer rc=0, **`delivered_bytes=23,256,040,341`** (~21.6 GiB,
+**~44,000 byte-ring laps**), `CLOSE_ACK`, **0 ALARMs on both DPUs**. ⚠ **This was NOT optional: L2 changed the
+payload-stream reclaim path, and the gate never wraps the ring.** The wrap is clean.
+
+### 45.4 The unbounded log — bounded, but **the spin is NOT fixed**
+
+That `fprintf` (`tuple_sink_service_process.c:48021`) sat in a scheduler retry loop with **no rate limit** and
+emitted **9,416,076 identical lines**. Now first-8-then-powers-of-2.
+
+⚠ **THIS FIXES THE FLOOD, NOT THE SPIN.** Codex (VERIFIED): that path marks the failed attempt as *progress*
+**without consuming the staged command**, so staged demand re-arms the collector and the service **busy-spins on
+a command it can never place**. The real cure is **bounded overload rejection** — reserve selected-session
+capacity at OPEN and fail the OPEN honestly, rather than accepting a session whose commands can never be staged.
+⚠ **A naive capacity latch DEADLOCKS** (staged selection always returns the first global ring head; an
+unreleased head starves every later ring). **Recorded as open work; do not mistake a quiet log for a healthy
+service.**
+
+### 45.5 Rules earned — and this is the one that cost the most
+
+> ## ⛔ THE GATE HAS **TWO** DPUs. "READ THE DPU LOG" MEANS **BOTH** OF THEM.
+> CLAUDE.md already says *"the DPU prints the cause — read the DPU log before touching the source."* **I read
+> node B's and never opened node A's.** Then I built an entire suspect list out of node-B code (§43.3 — a
+> flag/counter desync, `ActiveSessionScanLimit`, the memsets) and **every one was wrong, because the bug was not
+> on node B at all.** The answer was sitting in 9.4 million lines nobody had ever looked at.
+> **A failure observed on one node is routinely CAUSED on the other.**
+
+> **WHEN EVERY RESOURCE SHARES A MAGIC NUMBER, EACH EXHAUSTION MASKS THE NEXT.** This investigation found
+> **SEVEN 64-sized resources**: node-B session table · machine candidate set · flat ready set ·
+> `MAX_LOCAL_SINKS` payload streams · peer-transport outgoing connections · **selected-DPU session table (both
+> nodes)** · and the ready-set/plan grant cap. Node B's cliff at 64 hid node A's cliff at 64 **perfectly**, for
+> the entire life of this code. Every fix looked like it caused a regression; every "regression" was already
+> there.
+
+> **A ONE-LINE FIX AT THE END OF A SIX-REFUTATION DAY IS NOT LUCK.** It is what instrumenting (L0), fixing what
+> the instrument actually showed (L1, L2), and then reading the *other* log produces. **Each wall had to fall
+> before the next was visible.**
+
+### 45.6 ▶ OPEN
+
+1. **Bounded overload rejection** for the selected-session table (§45.4) — the spin, not the log.
+2. **Codex round 3 found two more leaks I have NOT verified or fixed:**
+   - **selected-session allocation rollback** — a new entry is created before materialization/staged-slot
+     release (`:43444`-`:43510`); either subsequent failure returns **without rolling back** the newly occupied
+     entry. Same shape on the local arm (`:43546`-`:43610`).
+   - **sender-stream heap/MR leak** — `localSenderHeadMirror.counters` allocated (`:18280`); reset **skips both
+     MR deregistration and `free()`** (`:26004`, `:26035`) before erasing the only pointers (`:26054`). Affects
+     node B's result sender.
+3. **A clean-close CLASSIFICATION bug** (Codex, VERIFIED): `sessionState == NULL` takes the **failure-producing
+   orphan branch** (`:30047`) *before* the `peerResetAfterCleanClose` check (`:30097`) — so a clean orphan is
+   reclaimed but **falsely reported as failed**. On the path L2 touched.
+4. **Watch the 1,024-entry import table** — verify every host-detached import gets a matching reclaim, or a
+   growing delta predicts a **1,024-session wall**.
+5. **D4 / L3** — setup-TCP close-drain wedge. Out of scope by owner decision; **fail-stop on deadline** chosen.
