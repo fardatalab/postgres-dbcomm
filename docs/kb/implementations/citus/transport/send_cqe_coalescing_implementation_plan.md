@@ -153,9 +153,13 @@ shifting removal `T:6508`). Under coalescing a checkpoint must retire **across c
   waiters) also advance `F` and also sweep.
 - **WR-ID becomes validation-only:** after the sweep for a typed CQE, the CQE's own named owner MUST be
   inactive; if still live → ALARM (mis-ordering/corruption). The WR-ID keeps its class+index encoding.
-- **KEEP** the lane FIFO arrays and the arbitrary-removal path (`T:6508`) — the latter is the Scenario-E
-  abandonment cancellation, which is orthogonal. **DELETE** `postOrdinal`/`NextClientSqlCommandWritePostOrdinal`
-  (`T:1674`), `FindClientSqlCommandWriteLaneFifoOffset` (`T:6537`) and the peer-client-completion siblings.
+- **The post-ORDER survives; the FIFO ARRAYS do not.** The per-connection per-class ordering the sweep pops
+  is an **intrusive linked list through the owner entries** (`nextIndex` per entry + `{head, tail}` per
+  connection per class — see the sizing note in D-S2.1 for why the array-of-arrays representation dies).
+  **DELETE**: `postOrdinal`/`NextClientSqlCommandWritePostOrdinal` (`T:1674`),
+  `FindClientSqlCommandWriteLaneFifoOffset` (`T:6537`), the array lane-FIFOs and their O(n) shifting
+  mid-queue removal (`T:6508-6531`), and the peer-client-completion siblings. Scenario-E cancellation
+  becomes clear-in-place (`active=false`); the sweep lazily skips inactive entries at pop time.
 - **Control gains a head:** a per-connection post-order FIFO of `{isResponsePublish, slotIndex, generation}`
   (depth `CITUS_REMOTE_EXEC_PEER_CONTROL_OP_SLOTS + ..._RESPONSE_PUBLISH_SLOTS`), swept like the other two;
   entries release via the existing `TupleSinkServiceRetireControlSendCompletion` logic (`R:4301`) refactored to
@@ -224,10 +228,16 @@ shifting removal `T:6508`). Under coalescing a checkpoint must retire **across c
     and the multi-connection drain are all **deleted from the design**. The remaining pressure terms are the
     per-session/per-connection SOURCE-pool ones — every one connection-local, every one with a post-time
     drain trigger at its own gate.
-  - ⚠ Implementation caveat: the lane-FIFO arrays are currently **quadratic** in the table size
-    (`LaneFifos[OUTSTANDING]`, each holding `outstandingIndexes[OUTSTANDING]` — 256×256 today; a naive 4096²
-    is 64 MiB). Decouple the two dimensions: FIFO count = max connections (128), per-FIFO capacity = the
-    per-connection bound (one `CRITICAL_CONTROL` connection can carry all 64 sessions → 4096); ≈2 MiB total.
+  - **The lane-FIFO ARRAYS are deleted with the ordinal machinery (owner correction).** The sweep still
+    needs a per-connection per-class POST-ORDER structure (pop-from-head-while-`mark <= F` is O(retired);
+    with no ordering the sweep would scan the whole 4096-entry table on EVERY CQE — O(table) on the hot
+    path). But the structure is NOT the current array-of-arrays (`LaneFifos[OUTSTANDING]` ×
+    `outstandingIndexes[OUTSTANDING]`, quadratic — a naive 4096² would be 64 MiB): it is an **intrusive
+    linked list threaded through the owner entries** — one `nextIndex` per entry + `{head, tail}` per
+    connection per class. Linear memory, O(1) append at reserve, O(retired) pop at sweep. Scenario-E
+    cancellation simplifies with it: clear the owner in place (`active=false`) and the sweep LAZILY SKIPS
+    inactive entries when it reaches them — the O(n) shifting mid-queue removal (`T:6508-6531`) dies along
+    with the ordinal search.
 
   **On "why would a CQE ever sit undrained?"** — under the de-scheduled design a parked CQE on a
   quiet connection is POSSIBLE by design (the post-clocked poll runs before that CQE arrives; guaranteeing
