@@ -29,7 +29,7 @@
 > | 🔴 **an exit path that reaches `HomerDpuDmaDestroy` NEVER** | ⛔ **OPEN, PRE-EXISTING.** The **backend-side** DPU service **exits(1)** out of the session-reset path (*"refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers quiesce"*) and never tears the DMA engine down **at all**. Fires on SIGTERM shortly after a gate run. **This is the audit's own subject matter: an exit path that releases nothing.** *(Re-observed under P2-N's tripwire; §48 adds the shutdown-ordering analysis. §48 called it "new" — it is not.)* | **§34.12** (bottom) · **§48** |
 > | **P2-j** — grouped-control reads outliving tenancy | ✅ accepted, **no action** | §4/P2-j |
 > | **§31** — dead DPU shm rings | 🧹 planned **cleanup**, not a bug | §31 |
-> | **§22.10.1 / P2-o** — P0-b's `RETIRING` branch + abandonment | ⚠ **unexercised; DECIDED: instrument-and-observe, NOT fatal** | **§49.** `RETIRING` follows *abandonment*, whose two triggers are a **partial-publish transport error** (`:12163`) and a **stale-async slot recycle** (`tuple_sink_service_process.c:41036`) — NOT "owner timed out" (that was imprecise). Both should be **0 in a healthy run**; whether the stale-async race is truly benign is **UNVERIFIED**. Plan: count both abandonment paths + RETIRING entered-vs-exited, report at teardown, nothing fatal; the counters ride along on the next validation (no bespoke run — owner: *"I doubt it'll happen"*). |
+> | **§22.10.1 / P2-o** — P0-b's `RETIRING` branch + abandonment | ✅ **IMPLEMENTED + VALIDATED 2026-07-14 (instrument-and-observe, NOT fatal)** | **§49.** Teardown ledger counts both abandonment triggers — partial-publish (`:12163`) and stale-async recycle (`tuple_sink_service_process.c:41036`) — plus RETIRING entered/released/discarded. ⚠ RETIRING is NOT only abandonment: `:12617` is a **NORMAL** entry (response consumed before our send CQE reaped). VALIDATION: both DPUs printed `abandoned_*=0 live=0`, no ALARM → **abandonment 0/0 confirmed EMPIRICALLY**; `retiring_entered=0` (dead-in-practice, so the RETIRING counters are validated by construction, NOT by execution). Stale-async race benign-ness stays UNVERIFIED but un-triggered. |
 > | 🟡 **The 4-role basebackup stall** | **NOT P2-i** (controlled A/B: 2/2 pass on *both* binaries). Environmental; leading hypothesis is the DPU TCP smoke server binding **9727**, the DPU service's own setup port — and the documented DPU reap recipe **cannot see** the smoke binary. **INFERRED.** | **§34.13** |
 >
 > ⛔ **This box PREVIOUSLY said P2-i's hole was "`fatalError` ⇒ the drain can never converge."** That claim is
@@ -4734,12 +4734,43 @@ What stays here, because it IS retirement-contract business:
 - **§29(b)** — per-connection send-queue admission (`postedSendWrs - retiredSendWrs`). It is the accounting that
   the coalescing plan depends on, and it is a correctness fix in its own right (it replaces a hot-path connection
   reset with a retry).
-- ⚠ **THE UNSIGNALLED-TAIL LEAK** — under investigation as of 2026-07-13. The client-SQL command INLINE fast path
-  (`tuple_sink_service_process.c:21686-21704`) posts TWO UNSIGNALLED WRs and never consults `signalCommandWrite`.
-  At session close they have no signalled successor, so their **send-queue entries** are never reclaimed.
+- ✅ **THE UNSIGNALLED-TAIL LEAK — CLOSED 2026-07-14 by DELETING the inline command fast path** (P2-o batch;
+  validated PASS: gate 297.9/299.9/300.7 tps in the 291–304 band, 4-role basebackup wrap 21.66 GiB CLOSE_ACK,
+  0 ALARMs on both DPUs, both DPUs' teardown ledgers healthy). The client-SQL command INLINE fast path (the former
+  `useInlineCommandPost` branch in `TupleSinkServicePostRemoteClientSqlCommandRecord`,
+  `tuple_sink_service_process.c`) posted TWO UNSIGNALLED WRs and never consulted the always-true
+  `signalCommandWrite`, so their **send-queue WQEs** had no signalled successor of their own.
+
+  ⚠ **It was LATENT on every real workload, not live** (mechanism confirmed by a read-only Codex trace + own
+  byte-math verification, 2026-07-14). The inline branch was taken for any command whose bytes ≤ the negotiated
+  inline grant. ⚠ **The grant is NOT the requested 64.** The QP requests `CITUS_REMOTE_EXEC_PEER_INLINE_WRITE_BYTES`
+  = 64 but the provider grants MORE — **~124 B on this fabric** (per the command-plane migration plan; Codex's
+  read-only trace assumed the *requested* 64 and explicitly flagged the runtime value UNVERIFIED — the migration-plan
+  number is the corrected one, and it does not change the conclusion). So the small commands all fit inline:
+  END/COMMIT/SESSION_CLOSE (`commandBytes == CITUS_REMOTE_EXEC_LOCAL_COMMAND_HEADER_BYTES == 48`), BEGIN (~96 B), and
+  the 8-byte readySeq. The pgbench **UPDATE/SELECT** records EXCEED the grant (~134 B) and take the SIGNALLED
+  non-inline path. On the gate (TPC-B) the inline and signalled commands are INTERSPERSED, so each inline command's
+  unsignalled tail was retired by a later signalled UPDATE — an RC QP completes in order, so one signalled CQE
+  retires the whole unsignalled tail behind it. **That masking is why `-t 2000` never wedged.** The SHARP failure
+  needs a **compact-only command stream** — every command ≤ the grant, so NO signalled successor ever appears:
+  `outstanding` climbs to the §29(b) unsignalled admission ceiling and the two-post inline pair admits the body then
+  FATALLY rejects readySeq (`exit(1)`). No workload produces this.
+
+  **FIX (owner decision, 2026-07-14): DELETE the inline fast path** rather than sign-and-reserve it. VERIFIED the
+  non-inline path is a strict superset: it posts the body unsignalled + the readySeq **SIGNALLED and WR-id-tagged**
+  (so the send CQE retires the tail through the normal reap `TupleSinkServiceRetireClientSqlCommandWriteCompletionEntry`,
+  which advances `retiredEpoch`/`consumedEpoch`), and its posts STILL take `IBV_SEND_INLINE` for small buffers via
+  the shared `TupleSinkServicePostWriteScatterGatherInternal` (`remote_execution_peer_transport_rdma.c:6164`) — so
+  the data-copy benefit is preserved. The only thing lost is a completion-reservation skip on ~one command per
+  transaction (measured: no tps regression). **Leak-closed by construction**: no unsignalled-only command post path
+  remains. ⚠ **The gate CANNOT prove leak-closure** (the leak never manifests there); the gate + basebackup were run
+  as a REGRESSION check only. *(An alternative "keep inline, signal its terminal WR + reserve a completion" was
+  rejected: it converges on exactly what the non-inline path already does, so it is strictly more code for the same
+  result — see §49's fix-option record.)*
+
   ⚠ **P0-i cleaned two lanes and missed this one BECAUSE IT WAS COUNTING THE WRONG RESOURCE.** An INLINE write
   copies its payload into the WQE, so its *source buffer* is free at post time — which is exactly why the path
-  looked safe to an audit hunting leaked *source slots*. **It leaks a WQE instead**, and nothing in this system
+  looked safe to an audit hunting leaked *source slots*. **It leaked a WQE instead**, and nothing in this system
   counted WQEs until §29(b). *The bug did not appear; the instrument did.*
   This is the same shape as every §0 violation: someone proved the contract for ONE resource and missed a SECOND
   riding the same completion.
@@ -7454,3 +7485,38 @@ without a bespoke run. Only if a count comes back nonzero do we open the stale-r
   (stale-async)
 - normal-release counter at `:4383`; reset-discard already counts (`retiringControlOpsDiscarded`, `:5151`)
 - teardown report: alongside the existing service-exit accounting (same site as the head-mirror MR ledger)
+
+### IMPLEMENTED + VALIDATED (2026-07-14, P2-o batch — committed with the §32 inline-path deletion)
+
+Shipped as a file-static lifetime ledger in `remote_execution_peer_transport_rdma.c` (5 counters +
+`TupleSinkServiceReportPeerControlRetirementAccountingRdma`), called from the teardown SAFE WINDOW in
+`tuple_sink_service_process.c` (right after the head-mirror MR ledger, before the session-reset loop and
+`TupleSinkServiceDestroyPeerTransportState` — same placement contract, same reasons: an unrelated fail-stop must not
+silence it, and `live` must still see ops the peer teardown has not yet discarded). NON-FATAL; the `ALARM` token
+(which the acceptance sweep rejects on) is raised ONLY for an accounting underflow or a nonzero abandonment count. A
+nonzero `live` is reported WITHOUT the token — an abrupt/SIGTERM teardown makes it legitimate and there is no clean
+at-exit census to subtract, so ALARMing it would make the sweep lie on every SIGTERM run.
+
+**⚠ CORRECTION to this section's own framing — RETIRING is NOT only an abandonment state.** There are THREE entry
+sites, and only two involve abandonment:
+- `:12617` (`TupleSinkServicePollPeerRequestRdma`) — **NORMAL, no abandonment**: a poll consumed a COMPLETED response
+  before our own request send CQE was reaped. Healthy CQ-drain skew. This is why `retiring_entered` *can* be nonzero
+  on a clean run, and why the accounting invariant is `entered == released_normally + reset_discarded` (a GAP is the
+  leak signal, not a nonzero count).
+- `:8841` (response arrived for an already-abandoned op) and `:12538` (stale-async abandon of a terminal op) — the two
+  abandonment flavors.
+`released_normally` is counted inside `TupleSinkServiceReleasePeerControlOp` guarded on `phase == RETIRING` (the
+unique normal exit — verified `:4390` is its only RETIRING-phase caller; reset-discard memsets directly at `:5153`
+and never routes through the releaser).
+
+**VALIDATION RESULT** (gate `-c 1 -t 2000` + 4-role basebackup): both DPUs printed
+`retiring_entered=0 released_normally=0 reset_discarded=0 live=0 abandoned_partial_publish=0 abandoned_stale_async=0`,
+no ALARM. So:
+- **Abandonment 0/0 is now confirmed EMPIRICALLY** (the code ran and printed 0) on BOTH nodes — the §49 expectation
+  holds. The stale-async race did not fire, so its "is it truly benign?" question stays OPEN but un-triggered (chase
+  only if a future run reports a nonzero `abandoned_stale_async`).
+- **`retiring_entered=0` — RETIRING was never entered on this workload** (each control-op send CQE is reaped before
+  its response is polled), matching the original §22.10.1 observation that it is dead-in-practice. ⚠ **HONEST CAVEAT:**
+  the RETIRING counters are therefore validated **by construction (self-review), not by execution** — the very
+  "validated by construction, never by execution" caveat §22.10.1 records for this same branch. The abandonment
+  counters ARE execution-validated (they ran and printed 0); the RETIRING counters are not (never incremented).

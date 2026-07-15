@@ -835,10 +835,13 @@ simply becomes DPU-local memory nobody else maps. **It likely survives the move 
 > > This entry exists so that an S6 number below the host-service baseline is not mysterious.
 >
 > Two smaller notes: the MR covers the whole 64-slot mailbox, registered once per session (cheap). And
-> for commands ≤ `max_inline_data` (124 bytes on this fabric) the code takes `useInlineCommandPost` and
-> `IBV_SEND_INLINE` (`:19883`-`:19894`), where the HCA copies the payload into the WQE and the MR is
-> nearly vestigial — but a pgbench `UPDATE`/`SELECT` record exceeds 124 bytes, so the normal path is the
-> registered one.
+> for small commands ≤ `max_inline_data` (124 bytes on this fabric) the registered post still takes
+> `IBV_SEND_INLINE` (via `TupleSinkServicePostWriteScatterGatherInternal`), where the HCA copies the payload
+> into the WQE and the MR is nearly vestigial — but a pgbench `UPDATE`/`SELECT` record exceeds 124 bytes, so
+> those take the registered non-inline post regardless.
+> ⚠ **An earlier `useInlineCommandPost` fast path** retired such small commands immediately with BOTH WRs
+> **unsignalled**; it was **REMOVED 2026-07-14** because that leaked send-queue WQEs on a compact-only command
+> stream (audit §32). All commands now take the one registered path, whose terminal readySeq WR is **signalled**.
 
 ### 📌 S4-stage perf item: the command pull moves 67,912 bytes to carry a few hundred
 
