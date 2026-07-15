@@ -1,4 +1,5 @@
 # The resource-retirement contract: audit and remediation plan
+<!-- kb-summary: Ordered Homer transport resource-retirement audit, implementation decisions, evidence, and validation history. -->
 
 > ## ⚠⚠ READ THIS BOX BEFORE ANY OTHER SECTION OF THIS FILE
 >
@@ -4651,10 +4652,11 @@ for the other.**
 
 ---
 
-## §31 — PLANNED: give the negotiated geometry a real home, and stop allocating two DEAD POSIX SHM RINGS per stream on the DPU
+## §31 — IMPLEMENTED + VALIDATED: give the negotiated geometry a real home, and stop allocating two DEAD POSIX SHM RINGS per stream on the DPU
 
-**Not started. Scoped 2026-07-13, out of the §30 post-mortem. Deliberately NOT bundled into §29(b) — it touches
-stream creation and needs its own gate + basebackup validation.**
+**IMPLEMENTED + VALIDATED 2026-07-15 (gate + 4-role basebackup, both — see §31.8). Scoped 2026-07-13, out of the
+§30 post-mortem. Deliberately NOT bundled into §29(b) — it touches stream creation and needs its own gate +
+basebackup validation. Field removal (§31.3 step 4) still deferred to S7.1.**
 
 ### 31.1 The finding: on the DPU, BOTH shm queues are allocated and NEVER USED
 
@@ -4698,9 +4700,9 @@ The exemption was written against the wrong predicate.
    ⚠ This is a ONE-LINE change with no call-site churn — precisely the payoff of §30 having routed all three
    geometry checks through the accessor first.  Do NOT skip step 2's ordering: the accessor is what makes this
    cheap.
-3. **Re-gate BOTH queue mappings on "is this a host-service stream"** rather than `!IsBaseBackup`.  The DPU then
-   stops `shm_open`ing two dead rings per stream, and the basebackup special case disappears because it was never
-   about basebackup.
+3. **Re-gate BOTH queue mappings on "is this a host-service stream"** rather than using `!IsBaseBackup` as the DPU
+   distinction. The DPU then stops `shm_open`ing two dead rings per stream. The independent host-service rule that
+   basebackup has no local receive backend and therefore omits `receiveQueue` remains in place.
 4. When host-service Homer is deleted (see `copy_path_revival_contract.md`), both fields go entirely.
 
 ### 31.4 Validation requirement
@@ -4713,9 +4715,104 @@ broke (§30) — and the gate cannot see it.  §30.6 applies: a green gate says 
 The **rename** (`sendQueue` → `localProducerSourceQueue`, `receiveQueue` → `localConsumerDeliveryQueue`,
 `localReceiveByteRing` → `peerInboundLandingRing`; ~270 sites) is now **cosmetic** — the accessor already removed
 the ambiguity that caused §30.  Do it whenever, but do it AFTER §31 (there will be less left to rename).
+
+### 31.6 IMPLEMENTATION SPEC (2026-07-15 — reader-grep done; owner said do it now; hand to codex-worker)
+
+**Reader-grep result:** `.sendQueue` = **126** refs, `.receiveQueue` = **63** refs, almost all LIVE host-service
+data-path uses guarded by `!= NULL` (publishedTail/consumedHead reads, mapping validation, the
+`receiveQueue → localReceiveByteRing` alias at `tuple_sink_service_process.c:18570`). On a DPU service the rings
+are still `shm_open`ed but the `!= NULL` guards skip them; the ONLY DPU-path need is the **geometry**. So this is a
+**re-gate + geometry hoist, NOT a deletion.** Field removal (§31.3 step 4) stays with S7.1.
+
+**Creation site — `HomerServiceOpenPayloadStream` region, `tuple_sink_service_process.c:26753-26853`:**
+`stream.slotCount` (`:26753`) and `stream.slotCapacityBytes` (`:26754`) are ALREADY stream scalars; geometry is
+computed locally — `producerRecordCapacityBytes` (`:26759`/`:26768`) and `producerRingBytes` (`:26777`) — and today
+lives ONLY inside `sendQueue`/`receiveQueue`.
+
+- **Step 1 — hoist geometry to stream scalars.** Add `stream.byteRingBytes` (u64) + `stream.maxRecordBytes` (u32) to
+  the SAME struct that holds `stream.slotCapacityBytes`/`slotCount`; set them at creation (just after `:26787`,
+  byte-ring branch) from `producerRingBytes` / `producerRecordCapacityBytes`. Do NOT re-add slotCapacity/slotCount.
+- **Step 2 — reroute geometry reads to the scalars.** `HomerServiceStreamNegotiatedByteRingBytes()` (`:4590`) →
+  return `stream.byteRingBytes`; `:18552` (`ringBytes = receiveQueue.byteRingBytes`, sizes the landing ring) → route
+  through the accessor/scalar; plus the "fourth geometry read" §31.2 flags near `:17745`.
+  ⚠ **CRITICAL / make-or-break:** grep EVERY `sendQueue.byteRingBytes` / `receiveQueue.byteRingBytes` /
+  `sendQueue.*maxRecordBytes` / `receiveQueue.*maxRecordBytes` and confirm ALL reads that can run on a **DPU-served**
+  stream are rerouted to the scalar. A single missed one reads an UNMAPPED ring after step 3 → crash.
+- **Step 3 — re-gate the two mappings.** sendQueue map (`:26803` byte-ring / `:26815` slot) is currently UNGATED
+  (every stream); receiveQueue map (`:26830`/`:26843`) is gated `!IsBaseBackup`. Re-gate BOTH on a NEW named helper —
+  e.g. `HomerServiceStreamNeedsLocalShmQueues(streamEntry)` — meaning **"is there a LOCAL BACKEND PROCESS to poll a
+  shm ring"** = **NOT a DPU service** = `!(HomerServiceDpuDmaSchedulerEnabled(dpuDmaState) && dpuDmaState->engine !=
+  NULL)` (dpuDmaState from `HomerServiceDpuDmaSchedulerStateForProgress()`; determinate at creation).
+  ⚠ **Do NOT reuse `HomerServicePayloadStreamUsesDpuMirrorSource()`** — its per-stream TUPLE_VIEW_BATCH gate (`:7351`,
+  false for non-`dpuRelayResultStream` tuple-view streams) would WRONGLY keep mapping on a DPU service. The §31.2
+  predicate is purely service-level. Keep the existing basebackup/tuple-view conditions ANDed in.
+
+**⚠ MUST NOT break the 126/63 host-service refs** — they run on NON-DPU services where the rings stay mapped; the
+re-gate only drops the mapping on DPU services.
+
+**Validation (§31.4): gate AND 4-role basebackup, BOTH** (this is stream-creation surface — the §30/`4382b65d65`
+surface — and a green gate says nothing here). Then commit code + this KB note.
 ⚠ **clangd indexes only the ACTIVE build config**: references inside `#if HOMER_SERVICE_PAYLOAD_STATS` /
 `HOMER_DPU_P2_DIAG` will be **silently skipped**, compile clean, and break only the *diagnostic* build.  Cross-check
 with a textual grep and **build the diagnostic configs to prove it.**
+
+### 31.7 Implementation result (2026-07-15)
+
+Implemented in `citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c`:
+
+- `HomerPayloadStreamState` now owns `byteRingBytes` / `maxRecordBytes`, assigned from the already-validated
+  `producerRingBytes` / `producerRecordCapacityBytes` in `HomerServiceCreatePayloadStreamEntry()`.
+- `HomerServiceStreamNeedsLocalShmQueues()` implements the specified pure service-level predicate. Both byte-ring
+  and fixed-slot send/receive mappings are gated by it; the independent basebackup receive exclusion remains.
+- All DPU-executable negotiated-geometry reads found by the implementation sweep use the stream scalars: the
+  canonical accessor and three strict reopen checks, tuple receive landing sizing, queue-descriptor publication,
+  async peer-open equality validation, and the service-owned result peer-open request. The two remaining literal
+  `sendQueue.byteRingBytes` reads are inside `TupleSinkServiceEnsureSendQueueMemoryRegion()` and deliberately
+  validate an actual host shm mapping rather than discover negotiated geometry.
+- The §31.6 inventory was incomplete in current code. The sweep also found and corrected three load-bearing
+  dependencies on the now-absent DPU mappings: `HomerServiceFillPayloadStreamQueueDescriptor()` now publishes an
+  informational descriptor from stream geometry on a DPU service; `HomerServicePrepareTupleResultStreamForCommand()`
+  requires producer queue control only on the legacy host path; and close deferral logging no longer falls through
+  from an absent byte-ring control to an absent fixed-slot control.
+- Textual cross-config grep found no queue-backed `maxRecordBytes` field reads (that member never existed) and no
+  additional queue-control ring geometry hidden in diagnostic branches. `git clang-format` and `git diff --check`
+  passed. `sudo -n -u dbcomm make -j8 service-bin CPPFLAGS='-D_GNU_SOURCE'` relinked
+  `build/homer/citus_tuple_sink_service` successfully (exit 0); existing warnings remain outside this change.
+
+**Scoped-out mixed mode:** unflagged tuple/COPY streams require a host service without an active DPU DMA engine.
+The §31 service-level decision intentionally does not preserve legacy shm queues inside a DPU-enabled service;
+the source comments and receive-open diagnostic now state that constraint. The required gate/basebackup workloads
+do not exercise this unsupported combination.
+
+### 31.8 Validation (2026-07-15) — PASS (adversarial diff review + gate + 4-role basebackup)
+
+**Diff reviewed adversarially before validation** (the codex-worker diff, against §31.6): predicate correct
+(pure service-level, NOT `UsesDpuMirrorSource`); re-gate short-circuits so a DPU service maps NEITHER queue;
+reopen-check substitution `stream.maxRecordBytes` for `slotCapacityBytes + sizeof(header)` is **provably
+equivalent** (`TupleSinkServiceLocalSendQueueSlotBytes` computes exactly that sum) and now self-consistent with
+the published descriptor; the three "extra" dependency fixes (§31.7) are **required** — unguarded `sendQueue`
+derefs on the DPU path that would SIGSEGV the gate once the ring is unmapped; the other ~75 ring-control derefs
+are all `!= NULL`-guarded and skip on a DPU stream.
+
+**Runtime, on the real hardware** (build + both-DPU deploy; landed-proof: the new
+`"unflagged tuple/COPY streams require a host service"` string present in both DPU binaries):
+- **No crash, no geometry-miss** (the make-or-break): both DPU services survived to end-of-run (ledgers printed on
+  SIGTERM); DPU logs show ZERO `zero stream geometry` / `require a host service` / `no producer byte-ring control` /
+  segfault lines — no DPU-path geometry read hit an unmapped ring.
+- **Gate:** `homer-dpu-command` path confirmed; 0 failed transactions across 3×2000-tx repeats; DPU backend spawn
+  begin→COMPLETED all sessions; anti-fallback clean (no host service).
+- **4-role basebackup (the make-or-break — stream-creation surface a green gate can't see):** completed,
+  `delivered_bytes=23,252,546,830` (~21.65 GiB, ~44k wrap laps), clean CLOSE_ACK both ends. Confirms stream
+  creation + the byte-ring WRAP with the rings unmapped on the DPU.
+- **ALARM sweep:** 0 matches on both DPUs. Ledgers healthy (abandonment 0/0, live=0).
+
+⚠ **Gate tps measured 284.6–287.0** (3 repeats), **2–6% below the 291–304 band** — recorded honestly and
+attributed to **machine load, NOT §31**. §31 is control-path (re-gates allocation at stream *creation*, once per
+stream; the gate runs 2000 tx on one stream), so its per-tx cost is a couple of scalar reads — nanoseconds, not the
+~140 µs/tx a 4% drop implies; the one per-command function it touches it made *faster* on the DPU. The box was
+heavily multi-tenant (934–990 foreign PIDs), and the same session's earlier (A)+(C) run hit 297.9–300.7 in-band on
+this box. **§31 did NOT move the band — do not add a §3.3 band row for it.** (Owner elected to commit on the
+mechanism; a controlled A/B was offered and declined.)
 
 ---
 

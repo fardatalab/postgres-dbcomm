@@ -1,4 +1,5 @@
 # Homer transport — CONTRACTS & INVARIANTS
+<!-- kb-summary: Current high-signal ownership, identity, lifecycle, geometry, and teardown contracts for Homer transport. -->
 
 > **This file is an INDEX, not a narrative.** Everything else in this directory tells a story. This one tells
 > you **what a symbol MEANS, what it does NOT mean, and the rule it carries** — so you find out *before* you
@@ -29,6 +30,37 @@ the call site. If it is not on the list, **it has not been checked.**
 ---
 
 # SYMBOL ENTRIES
+
+## `HomerPayloadStreamState.byteRingBytes` / `maxRecordBytes` — negotiated geometry survives without local shm queues
+
+- **MEANS:** the immutable byte-ring modulus and maximum record footprint negotiated when
+  `HomerServiceCreatePayloadStreamEntry()` creates the stream (`tuple_sink_service_process.c:~26790`).
+- **DOES NOT MEAN:** geometry of `sendQueue`, `receiveQueue`, `localReceiveByteRing`, `dpuMirrorRing`, or the
+  tuple-source ring. Those are distinct storage/transport objects and the two POSIX shm queues are intentionally
+  absent on a DPU service.
+- **CONTRACT:** every control-path geometry check/publication that can execute on a DPU-served stream reads these
+  stream scalars (using `HomerServiceStreamNegotiatedByteRingBytes()` for the modulus), never a queue mapping.
+  Actual host-queue mapping validation may still inspect `TupleSinkServiceQueueMapping.byteRingBytes` because it
+  is validating the mapped object rather than discovering negotiated geometry.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** strict peer/local/async reopen checks; tuple receive landing-ring
+  sizing in `HomerServiceEnsureLocalReceiveByteRing()`; `HomerServiceFillPayloadStreamQueueDescriptor()`;
+  `TupleSinkServiceCompleteStreamOpenAsyncOp()`; and `TupleSinkServiceStartServiceResultPeerOpen()`.
+
+## `HomerServiceStreamNeedsLocalShmQueues()` — service-level local-backend test
+
+- **MEANS:** this service has no active DPU DMA engine and therefore may have a local backend process polling
+  `stream.sendQueue` / `stream.receiveQueue`.
+- **DOES NOT MEAN:** `HomerServicePayloadStreamUsesDpuMirrorSource()`. That predicate also applies a per-stream
+  tuple-view relay discriminator and is not the queue-allocation contract.
+- **CONTRACT:** when `HomerServiceDpuDmaSchedulerEnabled(dpuDmaState) && dpuDmaState->engine != NULL`, neither
+  POSIX shm queue is mapped for any newly created stream. Host services retain both mapping arms; basebackup still
+  independently omits `receiveQueue`. Landing, tuple-source, and DMA-mirror rings are unaffected.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** byte-ring and fixed-slot `sendQueue` mapping arms and byte-ring and
+  fixed-slot `receiveQueue` mapping arms in `HomerServiceCreatePayloadStreamEntry()`; informational descriptor
+  publication in `HomerServiceFillPayloadStreamQueueDescriptor()`.
+- **SCOPED LIMITATION:** unflagged tuple/COPY streams require a host service without an active DPU DMA engine. The
+  §31 service-level decision intentionally does not preserve a mixed legacy-shm/DPU-service mode; runtime validation
+  in §31 covers selected-DPU SQL results and four-role basebackup, not that unsupported combination.
 
 ## `descriptor->serviceSessionId` (`homer_service_dpu_dma.c`) — the host's COLD-SETUP DECLARATION
 
