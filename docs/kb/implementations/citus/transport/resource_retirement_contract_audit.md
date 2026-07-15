@@ -27,7 +27,7 @@
 > | item | state | where |
 > |---|---|---|
 > | **P2-i** — `HomerDpuDmaDestroy` drain on clean exit | ✅ **LANDED + VALIDATED** — citus **`2b37e8701`**. **AND IT IS A REAL BUG FIX:** `entered with 3 outstanding task(s)` when SIGTERM'd **mid-transfer**. | **§34.12** (the measurement) · §34 (spec) · §34.7 (my two self-refutations) · §34.9/§34.10 (3 review rounds, 8 defects, 6 mine) |
-> | 🔴 **an exit path that reaches `HomerDpuDmaDestroy` NEVER** | ⛔ **OPEN, PRE-EXISTING.** The **backend-side** DPU service **exits(1)** out of the session-reset path (*"refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers quiesce"*) and never tears the DMA engine down **at all**. Fires on SIGTERM shortly after a gate run. **This is the audit's own subject matter: an exit path that releases nothing.** *(Re-observed under P2-N's tripwire; §48 adds the shutdown-ordering analysis. §48 called it "new" — it is not.)* | **§34.12** (bottom) · **§48** |
+> | ~~🔴 an exit path that reaches `HomerDpuDmaDestroy` NEVER~~ → ✅ **FIXED + VALIDATED (§48a = §36 PART 2), 2026-07-15** | The **backend-side** DPU service used to **exit(1)** out of the session-reset path (*"refusing to reset peer CLIENT_SQL_SESSION..."*) and never drain the engine. **Now:** guard moved to the top of `TupleSinkServiceResetSession`, `exit(1)` replaced by a pure `DEFERRED` return, so the shutdown sweep reaches `HomerDpuDmaDestroy`. §36 PART 1 (already landed) makes a *graceful* close quiesce the session; this backstop covers the un-graceful SIGTERM-mid-command case that survived PART 1. | **§36.8** (impl) · §34.12 · §48 |
 > | **P2-j** — grouped-control reads outliving tenancy | ✅ accepted, **no action** | §4/P2-j |
 > | **§31** — dead DPU shm rings | 🧹 planned **cleanup**, not a bug | §31 |
 > | **§22.10.1 / P2-o** — P0-b's `RETIRING` branch + abandonment | ✅ **IMPLEMENTED + VALIDATED 2026-07-14 (instrument-and-observe, NOT fatal)** | **§49.** Teardown ledger counts both abandonment triggers — partial-publish (`:12163`) and stale-async recycle (`tuple_sink_service_process.c:41036`) — plus RETIRING entered/released/discarded. ⚠ RETIRING is NOT only abandonment: `:12617` is a **NORMAL** entry (response consumed before our send CQE reaped). VALIDATION: both DPUs printed `abandoned_*=0 live=0`, no ALARM → **abandonment 0/0 confirmed EMPIRICALLY**; `retiring_entered=0` (dead-in-practice, so the RETIRING counters are validated by construction, NOT by execution). Stale-async race benign-ness stays UNVERIFIED but un-triggered. |
@@ -6086,7 +6086,10 @@ helper is one of the places that never got that memo.
   cached session state.** Host path (`:21175`) and failed-backend cleanup (`:24700`) pass their completion; node
   B passes the queued one.
 - **Call it on node B in `HomerServiceDpuEgressOneSelectedCompletionEvent`: AFTER `publishResult == PUBLISHED`
-  (`:43834`) and BEFORE `HomerServiceDpuPopSelectedCompletionEvent` (`:43853`).**
+  (`:43834`) ~~and BEFORE `HomerServiceDpuPopSelectedCompletionEvent` (`:43853`)~~.**
+  > ⓘ **CORRECTED by S4 (below): the call goes AFTER the CERTIFIED pop, not before it** — recording a lifetime
+  > against a completion whose pop was not certified is exactly the "lied in the direction of yes" this audit
+  > ends. The LANDED code (verified 2026-07-15, `tuple_sink_service_process.c:45232`) follows S4, not this bullet.
 - **Do NOT record on `NOT_READY` / `BLOCKED` / `FAILED`** — the event is not popped and stays retry-owned.
 - ⚠ **Do NOT record at ACCEPTANCE time (`:43453`).** VERIFIED unsafe: `TupleSinkServiceCommandStillInFlight`
   (`:22727`) does not know about selected-session `commandInFlight`/`completionEventCount`, so setting
@@ -6110,6 +6113,75 @@ when teardown-landing consumes/rejects the CLOSE, or when completion validation 
   session lingers"* and *"the existing peer-close/lifetime machinery remains the sole owner of actual session
   reclamation."* **Part 2 already covers its only consequence.** Recorded as a known gap; **not a bug to fix.**
   *(Owner pushed back on changing this. Correct call — it removed scope.)*
+
+### 36.8 ✅ PART 2 (the backstop) IMPLEMENTED — 2026-07-15 (this is §48a)
+
+**PART 1 was ALREADY IN THE TREE** — verified before touching anything: the three-scalar
+`TupleSinkServiceApplyClientSqlPeerLifetimeCompletion` (`tuple_sink_service_process.c:25387`) and its node-B
+call in the selected-DPU egress **after certified pop** (`:45232`) are present. So a *graceful* close already
+quiesces the session and the guard passes. This commit is **PART 2 only** — the still-necessary backstop for the
+un-graceful cases §36.7 enumerates (SIGTERM mid-command, skipped/failed CLOSE, blocked egress). **The `exit(1)`
+that §34.12/§48 measured at SIGTERM survived PART 1 and is what this closes.**
+
+**The diff (citus, one file `tuple_sink_service_process.c`), matching §36.7 PART 2 exactly:**
+- `TupleSinkServiceResetSession` is now `TupleSinkServiceSessionResetOutcome {COMPLETED, DEFERRED}` (was `void`).
+- The `MayDeregister` guard **moved to the very top**, before every mutation (the prologue used to disable
+  `dpuPeerCommandLandingActive` *before* the guard — §35.9 defect #5, the wedge). On refusal: log, return
+  `DEFERRED`, **mutate nothing** (PURE DEFER — deliberately does NOT set `dpuBackendTeardownStarted`, which would
+  trigger the Q3 two-owner CLOSE-collision with the synthetic cleanup path `:25461`/`:45270`).
+- `exit(1)` deleted; the in-body guard deleted (it moved up); function returns `COMPLETED` at the end.
+- **NO log-rate latch** (§36 M5). The refusal fprintf is unconditional; it is bounded per-*call*, not per-poll.
+- Allocator (`TupleSinkServiceAllocateSession`) **continues scanning** on a non-`COMPLETED` outcome instead of
+  handing out a still-bound slot (defensive: for a peer receiver `ShouldRetireWhenIdle ⟹ MayDeregister`, so it
+  can't actually defer there — but the contract no longer relies on that cross-function invariant).
+- `TupleSinkServiceHandleCloseSession` **keeps its already-prepared SUCCESS response** on a late `DEFERRED`
+  (`(void)`-ignores the outcome) per §36.2 — does NOT convert to ERROR; `ResetSession` logs the deferral.
+- `main()`'s shutdown sweep ignores the outcome and falls through to `HomerDpuDmaDestroy` — the entire point.
+
+**Two adversarial reviews (codex), both against the PLAN OF RECORD, load-bearing claims re-verified by me:**
+1. **Caller audit** — refuted my CLAIM 2: the fence branch is **structurally reachable in steady state** via
+   `TupleSinkServiceHandleCloseSession` (ungated), though **not by normal in-tree frontend code** (it closes by
+   local, not peer, session id), which is why the gate never crashed. Confirmed all fresh-session open-failure
+   sites are never fence-eligible (`clientSqlPeerReceiver` set only at the peer-open path, `:42392`+), and the
+   allocator/completion reclaim sites are guarded by the same quiescence predicate.
+2. **Diff review** — **R1 (the acceptance) VERIFIED**: no remaining fail-stop on the reset-sweep → destroy-transport
+   → `HomerDpuDmaDestroy` path; the drain is reached. **R6 VERIFIED**: diff matches §36.7 and PART 1 is present.
+   Findings applied: dropped the log latch's "cannot spam" overclaim (a client that RETRIES CLOSE on a deferred
+   session logs at *request* rate — an anomaly worth surfacing, ≪ poll rate, no latch warranted); removed a
+   redundant second deferral log in the close handler; fixed a "fenced" wording (pure defer sets no fence field).
+
+**⚠ Known limitation (diff-review R5, recorded — consistent with §36.3, NOT a regression):** in the abnormal
+`HandleCloseSession`-reaches-`DEFERRED` ordering, that handler has already cleared `backendLoopActive`, so the
+DPU landing path (which needs `dpuBackendTeardownStarted` to serve a `backendLoopActive=false` session) will not
+land the pending CLOSE — reclamation then waits for **connection reset** rather than peer-close. This is
+**bounded** arena-slot/MR retention, only on the violated ordering, and strictly better than the old `exit(1)`
+(whole-service kill). Fixing it needs the shutdown `activeSinkCount` reconciliation §36.3 already scopes out.
+
+**Deviation from §35.9 recorded:** §35.9 prescribed a *dedicated one-shot latch*; §36.2/§36.7 (M5) retired it as
+unnecessary. I implemented the latch first (reading §35.9), then removed it on reaching §36 — the exact
+"re-check earlier sections when the plan evolved" trap §36.5 warns about.
+
+**Also fixed (KB):** §36.7's PART 1 bullet still said *"BEFORE `...PopSelectedCompletionEvent`"* (`:6088`); S4
+(`:6274`) superseded that with *"after certified pop"*, and the landed code follows S4. See the ⓘ note there.
+
+**ACCEPTANCE (§36.4) — ✅ VALIDATED PASS (run-validation, 2026-07-15).** The self-proving test: SIGTERM the
+farnet1 (backend-side) DPU service **mid-gate** (`-c 4 -j 4 -t 2000`, killed ~2 s in). Observed on the farnet1
+DPU log:
+- `homer DPU DMA: teardown drain COMPLETE: entered with 3 outstanding task(s), converged after 1 progress
+  round(s); ... fatal=false` — **N=3, the drain RAN on outstanding tasks** (the exact work the old `exit(1)`
+  skipped);
+- `DEFERRING peer CLIENT_SQL_SESSION reset ... session=1..4` — the backstop fired for **all 4** in-flight sessions;
+- `refusing to reset peer CLIENT_SQL_SESSION` **ABSENT**; `*** P2-i ALARM ***` and the full ALARM grep **empty**;
+  postmaster pid unchanged (no crash-restart).
+- **Graceful control (TEST 1):** `teardown drain COMPLETE: entered with 0 outstanding task(s)` with **neither**
+  `refusing` **nor** `DEFERRING` — confirming §36 PART 1 quiesces a graceful close so the guard passes on its own.
+- **Regression:** 4-role basebackup 23,252,809,978 B (21.66 GiB) clean `CLOSE_ACK`; gate 0 failed / 8000 processed;
+  ALARM grep clean on both DPUs.
+
+⚠ **Process note (re-confirms CLAUDE.md hazard §3.2/§3.3):** the first DPU build returned `exit 0` but left the
+**STALE** binary on both DPUs (old string present, new `DEFERRING` absent). Only the landed-proof `strings` grep
+caught it; the trees were re-rsynced/rebuilt and re-verified (new present, old absent on both) before the tests
+ran. A green `make` is NOT proof of deploy.
 
 ---
 
@@ -7470,7 +7542,13 @@ mirror. **Predicted from code, then confirmed by measurement.**
 
 ---
 
-## §48 — 🔴 OPEN: teardown ordering. **A mid-COMMAND SIGTERM cannot exit cleanly, and the shutdown order contradicts the transport's own reset contract.**
+## §48 — teardown ordering. **A mid-COMMAND SIGTERM cannot exit cleanly, and the shutdown order contradicts the transport's own reset contract.**
+
+> **§48a (the `exit(1)` — "cannot exit cleanly") → ✅ FIXED + VALIDATED as §36 PART 2, see §36.8 (2026-07-15).**
+> §48a is the same item as §35/§36's P2-k backstop; the mid-command SIGTERM now DEFERS the reset instead of
+> `exit(1)`-ing, so `HomerDpuDmaDestroy` runs. **§48b (the shutdown-ORDERING contradiction, below) stays as
+> analysis only** — §36.5/§35.9 established the naive reorder is a use-after-free and the fence/defer makes it
+> unnecessary; the strictly-correct QUIESCE/RELEASE split is deferred to P7b. The rest of this section is §48b.
 
 > ⚠ **§48a IS NOT A NEW BUG — IT IS §34.12's ALREADY-OPEN ITEM, re-observed in P2-N's tripwire context.**
 > The header table's `🔴 exit path that reaches HomerDpuDmaDestroy NEVER` row and §34.12's bottom subsection

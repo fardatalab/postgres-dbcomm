@@ -218,9 +218,20 @@ the call site. If it is not on the list, **it has not been checked.**
   `TupleSinkServiceResetSession(serviceSession)` **at T4**. The peer/session lifetime can legitimately outlive
   its DPU backend; `ResetSession`'s close guards must stay with the lifecycle owner. **Do not re-propose it
   without addressing why it was rejected.**
-- **⚠ `ResetSession` MUTATES BEFORE ITS OWN GUARD** — it disables `dpuPeerCommandLandingActive` *before*
-  checking whether it may deregister. **A guard placed after the mutations it guards is not a guard**; it cannot
-  refuse, only choose how to die. (Audit §36.)
+- **⚠ `ResetSession`'s GUARD IS AT THE TOP — keep it there; add no mutation above it.**
+  `TupleSinkServiceClientSqlPeerCommandMailboxMayDeregister` is the FIRST thing after the NULL check
+  (`tuple_sink_service_process.c:~25040`), *before* the prologue that disables `dpuPeerCommandLandingActive`,
+  retires send completions, and clears scheduler state. On refusal it returns `TUPLE_SINK_SESSION_RESET_DEFERRED`
+  and **mutates nothing** (PURE DEFER — in particular does NOT set `dpuBackendTeardownStarted`); on pass it resets
+  fully and returns `COMPLETED`. It USED to sit *after* those mutations and `exit(1)` on refusal — a guard placed
+  after the mutations it guards is not a guard (it can only choose how to die), and disabling landing first would
+  wedge the session; the `exit(1)` killed the teardown before `HomerDpuDmaDestroy` drained. **Any new mutation
+  added to this function MUST go below the guard.** (Audit §36 PART 2 / §36.8; §48a.)
+- **`TupleSinkServiceResetSession` RETURNS `TupleSinkServiceSessionResetOutcome`, not `void`** — `DEFERRED` means
+  "left active/bound; lifecycle owns the reset." **ENFORCES — a caller that acts on the reset having happened MUST
+  check for `COMPLETED`:** `TupleSinkServiceAllocateSession` (`:~25194`) **continues scanning** on non-`COMPLETED`
+  (never hands out a deferred slot); `TupleSinkServiceHandleCloseSession` (`:~41762`) keeps its SUCCESS response on
+  `DEFERRED` (does NOT convert to ERROR — §36.2); `main()`'s shutdown sweep and every other caller may ignore it.
 
 ## `streamEntry->stream.peerResetAfterCleanClose` — **ONCE CLEAN, ALWAYS CLEAN**
 
