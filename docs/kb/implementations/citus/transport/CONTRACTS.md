@@ -142,23 +142,33 @@ the call site. If it is not on the list, **it has not been checked.**
 
 ---
 
-## `signalCommandWrite` / `TupleSinkServiceClientSqlCommandWriteShouldSignal` — **EVERY command write is SIGNALLED. The command lane does NOT amortize.**
+## `signalCommandWrite` / `TupleSinkServiceClientSqlCommandWriteShouldSignal` — **TODAY signals every command write. That is the PRE-COALESCING state, not an eternal rule.**
 
-- **MEANS:** the terminal WR of every client-SQL command post is `IBV_SEND_SIGNALED` and WR-id-tagged, so its send
-  CQE retires that command's send-queue WQEs and, via the normal reap
-  (`TupleSinkServiceRetireClientSqlCommandWriteCompletionEntry`), advances `retiredEpoch`/`consumedEpoch`.
-  `ShouldSignal` returns `true` **unconditionally** (`tuple_sink_service_process.c:7110`).
-- **DOES NOT MEAN:** a policy knob. It *looks* like one (a former `CLIENT_SQL_SESSION_CLOSE` force-signal + a
-  mailbox-pressure case + an interval), but **every branch returned true** (the interval was 1) — a decoy guard whose
-  arms do not differ. It is also **NOT** the PAYLOAD lane, which genuinely amortizes (many unsignalled body WRs
-  retired by one signalled tail checkpoint). The command lane must NOT be "optimized" to do the same.
-- **CONTRACT / ENFORCES:** ⛔ **A command post must never leave an unsignalled-only WR pair with no signalled
-  successor of its own.** The one surviving path (`TupleSinkServicePostRemoteClientSqlCommandRecord`) posts an
-  unsignalled record body + a **SIGNALLED** readySeq/WIMM tail; the §29(b) admission reserve
-  (`remote_execution_peer_transport_rdma.c:10898`) exists precisely to guarantee that signalled tail is always
-  postable after its unsignalled body. **There is NO inline command fast path** — the former `useInlineCommandPost`
-  branch posted BOTH WRs unsignalled and leaked SQ WQEs on a compact-only stream; it was DELETED 2026-07-14 (audit
-  §32). If you re-introduce a small-command fast path, its terminal WR MUST be signalled.
+- **MEANS (today):** `ShouldSignal` returns `true` **unconditionally** (`tuple_sink_service_process.c:7110`), so the
+  terminal WR of every client-SQL command post is `IBV_SEND_SIGNALED` + WR-id-tagged and its send CQE retires that
+  command's WQEs and (via the reap `TupleSinkServiceRetireClientSqlCommandWriteCompletionEntry`) advances
+  `retiredEpoch`/`consumedEpoch`. It signals every write only because **send-CQE coalescing is not yet applied to
+  this lane** — NOT because the lane is forbidden from amortizing.
+- **THE REAL INVARIANT (this is the violable rule):** ⛔ **no unsignalled command WR may be left without a signalled
+  successor.** Signalling every write satisfies it trivially; **coalescing satisfies it too** — a signalled checkpoint
+  every `≤ ½·SQ` per-QP retires the unsignalled prefix behind it. That IS the send-CQE coalescing project
+  ([`../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md`](../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md)),
+  and the command lane is **explicitly in scope** (it lists command / peer-client-completion / control /
+  peer-command-completion as the four lanes multiplexed onto the shared SQ). Coalescing is SAFE for this lane
+  because its drained pool is the 64-slot command mailbox (`CITUS_REMOTE_EXEC_LOCAL_COMMAND_MAILBOX_SLOTS`), so a
+  ≤32-deep checkpoint interval never starves source credit — **provided** it also carries a **terminal flush**
+  (force-signal the last write at close/quiesce), exactly as the PAYLOAD lane already does.
+- **DOES NOT MEAN:** that the command lane must forever signal every write (it is the coalescing project's explicit
+  target), nor that inlining precludes signalling — `IBV_SEND_INLINE` (source in WQE) and `IBV_SEND_SIGNALED` (CQE)
+  are **orthogonal**; a coalesced lane can inline AND signal-periodically.
+- **THE TRAP (learned the hard way):** the deleted `useInlineCommandPost` fast path made BOTH command WRs
+  **unsignalled with no successor guarantee at all** (no ≤½ checkpoint, no terminal flush), so on a compact-only
+  stream or at quiesce the tail never retired → SQ leak / `exit(1)`. DELETED 2026-07-14 (audit §32); the surviving
+  `TupleSinkServicePostRemoteClientSqlCommandRecord` posts an unsignalled body + a **SIGNALLED** readySeq tail, and
+  the §29(b) admission reserve (`remote_execution_peer_transport_rdma.c:10898`) guarantees that signalled tail is
+  always postable after its unsignalled body. ⚠ **When coalescing lands here it MAY re-introduce unsignalled command
+  writes — but ONLY with the reserve + ≤½-pool checkpoint + terminal flush that guarantee the successor.**
+  Unsignalled-*without*-successor is the bug; unsignalled-*with-guaranteed*-successor is the goal.
 
 ---
 
