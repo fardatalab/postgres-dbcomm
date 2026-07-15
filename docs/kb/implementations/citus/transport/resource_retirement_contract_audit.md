@@ -27,7 +27,7 @@
 > | item | state | where |
 > |---|---|---|
 > | **P2-i** — `HomerDpuDmaDestroy` drain on clean exit | ✅ **LANDED + VALIDATED** — citus **`2b37e8701`**. **AND IT IS A REAL BUG FIX:** `entered with 3 outstanding task(s)` when SIGTERM'd **mid-transfer**. | **§34.12** (the measurement) · §34 (spec) · §34.7 (my two self-refutations) · §34.9/§34.10 (3 review rounds, 8 defects, 6 mine) |
-> | ~~🔴 an exit path that reaches `HomerDpuDmaDestroy` NEVER~~ → ✅ **FIXED + VALIDATED (§48a = §36 PART 2), 2026-07-15** | The **backend-side** DPU service used to **exit(1)** out of the session-reset path (*"refusing to reset peer CLIENT_SQL_SESSION..."*) and never drain the engine. **Now:** guard moved to the top of `TupleSinkServiceResetSession`, `exit(1)` replaced by a pure `DEFERRED` return, so the shutdown sweep reaches `HomerDpuDmaDestroy`. §36 PART 1 (already landed) makes a *graceful* close quiesce the session; this backstop covers the un-graceful SIGTERM-mid-command case that survived PART 1. | **§36.8** (impl) · §34.12 · §48 |
+> | ~~🔴 an exit path that reaches `HomerDpuDmaDestroy` NEVER~~ → ✅ **FIXED + VALIDATED (§48a = §36 PART 2), 2026-07-15** | The **backend-side** DPU service used to **exit(1)** out of the session-reset path (*"refusing to reset peer CLIENT_SQL_SESSION..."*) and never drain the engine. **Now:** guard moved to the top of `TupleSinkServiceResetSession`, `exit(1)` replaced by a pure `DEFERRED` return, so the shutdown sweep reaches `HomerDpuDmaDestroy`. §36 PART 1 (already landed) makes a *graceful* close quiesce the session; this backstop covers the un-graceful SIGTERM-mid-command case that survived PART 1. | **§36.10** (impl) · §34.12 · §48 |
 > | **P2-j** — grouped-control reads outliving tenancy | ✅ accepted, **no action** | §4/P2-j |
 > | **§31** — dead DPU shm rings | 🧹 planned **cleanup**, not a bug | §31 |
 > | **§22.10.1 / P2-o** — P0-b's `RETIRING` branch + abandonment | ✅ **IMPLEMENTED + VALIDATED 2026-07-14 (instrument-and-observe, NOT fatal)** | **§49.** Teardown ledger counts both abandonment triggers — partial-publish (`:12163`) and stale-async recycle (`tuple_sink_service_process.c:41036`) — plus RETIRING entered/released/discarded. ⚠ RETIRING is NOT only abandonment: `:12617` is a **NORMAL** entry (response consumed before our send CQE reaped). VALIDATION: both DPUs printed `abandoned_*=0 live=0`, no ALARM → **abandonment 0/0 confirmed EMPIRICALLY**; `retiring_entered=0` (dead-in-practice, so the RETIRING counters are validated by construction, NOT by execution). Stale-async race benign-ness stays UNVERIFIED but un-triggered. |
@@ -6114,7 +6114,10 @@ when teardown-landing consumes/rejects the CLOSE, or when completion validation 
   reclamation."* **Part 2 already covers its only consequence.** Recorded as a known gap; **not a bug to fix.**
   *(Owner pushed back on changing this. Correct call — it removed scope.)*
 
-### 36.8 ✅ PART 2 (the backstop) IMPLEMENTED — 2026-07-15 (this is §48a)
+### 36.10 ✅ PART 2 (the backstop) IMPLEMENTED — 2026-07-15 (this is §48a)
+
+*(Numbered 36.10, after the existing §36.8/§36.9 analysis below, though placed here — right after §36.7 the
+plan of record — because it records that plan's implementation.)*
 
 **PART 1 was ALREADY IN THE TREE** — verified before touching anything: the three-scalar
 `TupleSinkServiceApplyClientSqlPeerLifetimeCompletion` (`tuple_sink_service_process.c:25387`) and its node-B
@@ -7544,7 +7547,7 @@ mirror. **Predicted from code, then confirmed by measurement.**
 
 ## §48 — teardown ordering. **A mid-COMMAND SIGTERM cannot exit cleanly, and the shutdown order contradicts the transport's own reset contract.**
 
-> **§48a (the `exit(1)` — "cannot exit cleanly") → ✅ FIXED + VALIDATED as §36 PART 2, see §36.8 (2026-07-15).**
+> **§48a (the `exit(1)` — "cannot exit cleanly") → ✅ FIXED + VALIDATED as §36 PART 2, see §36.10 (2026-07-15).**
 > §48a is the same item as §35/§36's P2-k backstop; the mid-command SIGTERM now DEFERS the reset instead of
 > `exit(1)`-ing, so `HomerDpuDmaDestroy` runs. **§48b (the shutdown-ORDERING contradiction, below) stays as
 > analysis only** — §36.5/§35.9 established the naive reorder is a use-after-free and the fence/defer makes it

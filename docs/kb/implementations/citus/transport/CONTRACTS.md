@@ -226,7 +226,7 @@ the call site. If it is not on the list, **it has not been checked.**
   fully and returns `COMPLETED`. It USED to sit *after* those mutations and `exit(1)` on refusal — a guard placed
   after the mutations it guards is not a guard (it can only choose how to die), and disabling landing first would
   wedge the session; the `exit(1)` killed the teardown before `HomerDpuDmaDestroy` drained. **Any new mutation
-  added to this function MUST go below the guard.** (Audit §36 PART 2 / §36.8; §48a.)
+  added to this function MUST go below the guard.** (Audit §36 PART 2 / §36.10; §48a.)
 - **`TupleSinkServiceResetSession` RETURNS `TupleSinkServiceSessionResetOutcome`, not `void`** — `DEFERRED` means
   "left active/bound; lifecycle owns the reset." **ENFORCES — a caller that acts on the reset having happened MUST
   check for `COMPLETED`:** `TupleSinkServiceAllocateSession` (`:~25194`) **continues scanning** on non-`COMPLETED`

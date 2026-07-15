@@ -12,12 +12,20 @@
 > **The resource-retirement P0 set is COMPLETE** (`resource_retirement_contract_audit.md` — see its status box),
 > so **P7b is unblocked**.
 >
-> ### ⇒ NEXT: **S6**, and it has ONE stated prerequisite, which is NOT done:
+> ### ⇒ **S6 IS UNBLOCKED** — both stated prerequisites are now met (2026-07-15):
 >
-> **"fix B" (per-collector scheduler feedback)** — twelve DPU collectors share one `HomerProgressSourceFeedback`,
-> so a sibling's empty grant drives the discovery collector's backoff *and* refreshes the starvation clock that
-> is supposed to release it. **No S6 number is attributable until this lands.** Plan + verified mechanism:
-> **[`dpu_collector_feedback_aliasing_defect_b.md`](./dpu_collector_feedback_aliasing_defect_b.md)**.
+> - **"fix B" (per-collector scheduler feedback) — ✅ DONE + VALIDATED** (FB-1, citus `b9c8e513f`). The DPU-DMA
+>   collector family is now per-collector (`dpuDmaFeedbacks[]`), so the discovery collector is no longer
+>   starved by siblings' grants and an S6 cadence/latency number is attributable and survives re-measurement.
+>   Mechanism + result: **[`dpu_collector_feedback_aliasing_defect_b.md`](./dpu_collector_feedback_aliasing_defect_b.md)**.
+>   *(Residual, NON-blocking: FB-2 — the `peerSendCqFeedback` `+` cluster — folds into the send-CQE coalescing work.)*
+> - **§48a (the teardown `exit(1)` that could contaminate S6's SIGTERM) — ✅ DONE + VALIDATED** (citus `2cf3636c8`;
+>   audit §36.10).
+>
+> **⇒ OWNER DECISION (2026-07-15): finish the send-CQE coalescing FIRST, then S6.** So S6 measures the intended
+> (coalesced) send path rather than a pre-coalescing number coalescing would immediately change — the same
+> "measure the intended system" reasoning that gated the S6 number on fix B. Design + implementation plan:
+> **[`../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md`](../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md)**.
 >
 > ### ✅ S7.1's "capture the cross-node `--homer` baseline first" precondition is WAIVED (owner, July 13, 2026)
 >
