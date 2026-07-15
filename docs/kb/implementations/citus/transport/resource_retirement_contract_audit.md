@@ -29,7 +29,7 @@
 > | 🔴 **an exit path that reaches `HomerDpuDmaDestroy` NEVER** | ⛔ **OPEN, PRE-EXISTING.** The **backend-side** DPU service **exits(1)** out of the session-reset path (*"refusing to reset peer CLIENT_SQL_SESSION before command-mailbox writers quiesce"*) and never tears the DMA engine down **at all**. Fires on SIGTERM shortly after a gate run. **This is the audit's own subject matter: an exit path that releases nothing.** *(Re-observed under P2-N's tripwire; §48 adds the shutdown-ordering analysis. §48 called it "new" — it is not.)* | **§34.12** (bottom) · **§48** |
 > | **P2-j** — grouped-control reads outliving tenancy | ✅ accepted, **no action** | §4/P2-j |
 > | **§31** — dead DPU shm rings | 🧹 planned **cleanup**, not a bug | §31 |
-> | **§22.10.1** — P0-b's `RETIRING` branch | ⚠ **still unexercised — and the test this doc prescribed CANNOT WORK** | **§34.11.** `RETIRING` is gated on `ownerAbandoned`: it is the ZOMBIE path (owner timed out, THEN the response landed). A healthy run never abandons a control op **at any client count**, so `-c N` reports `retiring=0` **by construction**. ~~fold a `-c 4` run into P2-i's validation~~ — **STRUCK.** Needs fault injection. |
+> | **§22.10.1 / P2-o** — P0-b's `RETIRING` branch + abandonment | ⚠ **unexercised; DECIDED: instrument-and-observe, NOT fatal** | **§49.** `RETIRING` follows *abandonment*, whose two triggers are a **partial-publish transport error** (`:12163`) and a **stale-async slot recycle** (`tuple_sink_service_process.c:41036`) — NOT "owner timed out" (that was imprecise). Both should be **0 in a healthy run**; whether the stale-async race is truly benign is **UNVERIFIED**. Plan: count both abandonment paths + RETIRING entered-vs-exited, report at teardown, nothing fatal; the counters ride along on the next validation (no bespoke run — owner: *"I doubt it'll happen"*). |
 > | 🟡 **The 4-role basebackup stall** | **NOT P2-i** (controlled A/B: 2/2 pass on *both* binaries). Environmental; leading hypothesis is the DPU TCP smoke server binding **9727**, the DPU service's own setup port — and the documented DPU reap recipe **cannot see** the smoke binary. **INFERRED.** | **§34.13** |
 >
 > ⛔ **This box PREVIOUSLY said P2-i's hole was "`fatalError` ⇒ the drain can never converge."** That claim is
@@ -7389,3 +7389,68 @@ and only then free the container.
 return value** and frees the handle regardless (`remote_execution_peer_transport_rdma.c:~10225-10246`). So every
 `retired_*` count records an *attempted* retirement, not a *successful* deregistration — and on failure both the
 no-scribble proof **and** the accounting are false.
+
+---
+
+## §49 — P2-o: RETIRING / abandonment — DECIDED (owner, this session): **instrument-and-observe, NOT fatal.** And a CORRECTION to "abandonment is expected."
+
+**Supersedes §22.10.1's "needs fault injection" disposition and its "owner timed out, THEN the response landed"
+characterization — both were imprecise. See the correction below.**
+
+### The corrected understanding (record both sides)
+
+I earlier called abandonment "expected." **That was overstated, and the owner rightly pushed back.** Corrected:
+
+- **In a HEALTHY run, BOTH abandonment paths should fire ZERO times.** "Handled defensively" ≠ "expected in
+  normal operation."
+- **There are exactly TWO abandonment triggers, and neither is the "owner timed out" the header row claimed:**
+  1. **Partial peer-control publish** (`remote_execution_peer_transport_rdma.c:12163`, sets `ownerAbandoned`,
+     ALARMs) — an RDMA multi-WR post that accepted some WRs but not all. A **transport error**. Zero in a
+     healthy run.
+  2. **Stale async op / slot recycled** (`tuple_sink_service_process.c:41036` → `TupleSinkServiceAbandon`
+     `PeerControlOpRdma`, `:12464`, logs *"abandoning peer control op"* at `:12523`; the drop is logged
+     *"dropping stale async local-control op"* at `:41028`) — the SHM slot's `requestSequence`/`state` changed
+     under an in-flight async op.
+- **⚠ UNVERIFIED: whether the stale-async race is genuinely benign.** The code AUTHOR treated it as recoverable
+  (the *invalid* owner/slot cases immediately above it — `:41011`, `:41024` — `abort()`; the STALE case merely
+  drops-and-continues). **But "the author judged it legitimate" is not proof.** Confirming it means tracing the
+  async-op re-entrancy + the full slot lifecycle (FREE→CLIENT_OWNED→REQUEST_READY→SERVICE_OWNED→RESPONSE_READY,
+  `homer_shm_channel_abi.h:32-36`) and who can move a slot out from under the service. **NOT DONE.**
+
+### The two real failure modes (what RETIRING is actually about)
+
+RETIRING = abandoned + response terminal + **send WR not yet retired**. The slot IS the registered RDMA source
+MR (`remote_execution_peer_transport_rdma.c:12140` comment). So:
+
+1. **LEAK** — a RETIRING op that never exits (send CQE never comes AND the connection never resets). Its slot is
+   stuck; finite control-op slots exhaust → new ops cannot allocate. Exits: normal via the send CQE
+   (`:4383` → release), or discarded by connection reset (`:5148`, `retiringControlOpsDiscarded++` `:5151`).
+2. **EARLY RELEASE** (the opposite) — releasing a RETIRING slot before its send retires ⇒ MR reused under a live
+   WR ⇒ corruption. **RETIRING exists precisely to prevent this.**
+
+### THE DECISION (owner)
+
+**(1) Instrument-and-observe. Loud, counted, NOT fatal.**
+
+- ⛔ **NOT fatal on RETIRING entry.** RETIRING is CORRECT cleanup and is legitimately reachable on connection
+  reset, where `exit(1)` makes a bad situation worse (kills every other session on the DPU). **Fatal tripwires
+  are for CODE-INVARIANT violations (e.g. the FB-1 bijection), never for RUNTIME RECOVERY paths.**
+- **Count abandonment on both paths**, tagged distinctly (partial-publish vs stale-async), and **report the
+  counts at service teardown.** A healthy gate/basebackup run WANTS `0/0`. Nonzero ⇒ a real finding (either the
+  stale race is live, or a transport error is happening quietly) ⇒ investigate then.
+- **RETIRING entered-vs-exited accounting** (entered vs released-normally + reset-discarded), reported at
+  teardown; a gap ⇒ a RETIRING op leaked. Same shape as the head-mirror MR ledger (§47).
+- **The reset-discard path stays a LOG, not an ALARM** — it is legitimate when the connection genuinely died.
+
+**(2) NO deliberate validation run for this.** Owner: *"I doubt it's going to happen."* The counters ride along
+on the NEXT validation we do anyway (the (A)+(C) batch, or S6). If abandonment is 0/0 there — as expected — then
+"abandonment never happens in a healthy run" is confirmed EMPIRICALLY and RETIRING is proven dead-in-practice,
+without a bespoke run. Only if a count comes back nonzero do we open the stale-race investigation.
+
+### Implementation surface (file:line)
+
+- entry counters at the 3 RETIRING transitions: `remote_execution_peer_transport_rdma.c:8841, :12538, :12617`
+- abandonment counters at the 2 triggers: `:12163` (partial-publish), `tuple_sink_service_process.c:41036`
+  (stale-async)
+- normal-release counter at `:4383`; reset-discard already counts (`retiringControlOpsDiscarded`, `:5151`)
+- teardown report: alongside the existing service-exit accounting (same site as the head-mirror MR ledger)
