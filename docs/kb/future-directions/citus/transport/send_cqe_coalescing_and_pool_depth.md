@@ -3,6 +3,16 @@
 **Status: DESIGN. Not implemented.** Prerequisite: §29(b) send-queue admission accounting in
 `../../../implementations/citus/transport/resource_retirement_contract_audit.md`.
 
+> ## ⚠⚠ THE IMPLEMENTATION PLAN — with 2026-07-15 corrections — SUPERSEDES PARTS OF THIS DOC
+> **[`../../../implementations/citus/transport/send_cqe_coalescing_implementation_plan.md`](../../../implementations/citus/transport/send_cqe_coalescing_implementation_plan.md)** is the plan of record. A site
+> enumeration found several assumptions below went stale. **Most important: ⛔ C5 IS DEAD.** Its depth-1
+> "~450µs/command blocking fence" target (`TupleSinkServicePublishPeerCommandCompletion`) is dead code pending S7
+> deletion, and every LIVE pool is already deep + non-blocking — **there is no live shallow pool to deepen, and
+> the 235.4µs latency is NOT this fence** (its cause is unattributed, tracked separately). Also: C4's close
+> checkpoint is `CLIENT_SQL_SESSION_CLOSE` / `CLOSE_SINK`, **not** `CLOSE_SESSION` (local control); C4's abort
+> notification is unwired scaffolding (`OBJECT_ERROR` / `ABORT_RESET`), not absent; C2's four classes are **not**
+> uniform (only two have FIFOs). Read the implementation plan's CORRECTIONS section before trusting C1–C5 below.
+
 **Why this doc exists:** this began as §32 of the resource-retirement audit and outgrew it. That audit is about
 **correctness** (a resource may be released only when its outstanding physical operations have retired). This is a
 **performance** generalization that *depends* on that contract but is not part of it. Keeping them together was
