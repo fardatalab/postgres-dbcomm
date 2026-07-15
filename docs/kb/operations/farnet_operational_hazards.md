@@ -423,3 +423,20 @@ returned normally. That settled it in one run.
 
 > **RULE. "The process is gone" is not "the process exited." If you need to know how something died, capture the
 > EXIT STATUS — `/proc` disappearing, a port closing, and a pid vanishing are all consistent with a crash.**
+
+## §10 The md5 tree-verification PASSES over files it cannot read — and "normalize ownership" cuts both ways (2026-07-15, D-S0 validation)
+
+The runbook's mandatory rsync verification — `diff <(md5sum tree on farnet1) <(md5sum tree on farnet0)` —
+**silently DROPS files the checksumming user cannot read**: an unreadable file never enters the list, so it
+cannot differ, and "0 differing files" can be issued over a tree that was never actually checksummed. Found
+when mixed `jasonhu`/`dbcomm` ownership (`.git` objects mode 400/600) hollowed out the comparison. The same
+session re-confirmed that a plain `rsync -n` quick-check (no `--checksum`) reports 0 changes over a genuinely
+stale installed binary — only `--checksum` dry-runs are trustworthy for installed artifacts.
+
+**Rules:** (1) run the md5 comparison as a user that can read EVERY file, and treat `md5sum` stderr as a hard
+error, not noise; (2) normalize ownership BEFORE building or verifying — but **normalize to the runbook's
+SPLIT, not to all-`dbcomm`**: build dirs + `/data/dbcomm/pg-citus` belong to `dbcomm`; the SOURCE trees,
+`docs/`, and `.git` belong to the human user (the 2026-07-15 validation chowned entire trees to `dbcomm`,
+which un-broke its build step and then broke the owner's editing and commits — over-normalization is just
+drift in the other direction); (3) `dbcomm` has NO ssh key auth to farnet0 — source-tree syncs currently need
+`-e 'ssh -l jasonhu'` transport with the receiving-side `--rsync-path='sudo -n -u dbcomm rsync'` intact.

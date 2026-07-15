@@ -329,7 +329,8 @@ abandonment states that need it. The Stage-2 rule is therefore **DEFER-only, spl
    semantics. Until P2-L lands, an abandoned session on a quiet live QP stays deferred — the same bounded
    retention the abandonment leak already has today, now with proof instead of a use-after-free.
 
-### D-S0 Standalone hardening commit — FIRST, before Stage 1 (owner-confirmed 2026-07-15)
+### D-S0 Standalone hardening commit — ✅ IMPLEMENTED + VALIDATED (2026-07-15; audit §50). The clamp was
+### LOAD-BEARING: the provider grants 409/511 against the 256 request (see §50.3).
 
 The two latent HEAD bugs the refutation surfaced are P0-doctrine violations on their own and ship as a
 separate commit ahead of everything else, so the Stage-2a premise ("every CQ consumer can dispatch/sweep

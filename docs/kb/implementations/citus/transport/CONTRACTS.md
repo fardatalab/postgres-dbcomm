@@ -369,6 +369,41 @@ the call site. If it is not on the list, **it has not been checked.**
 
 ---
 
+## `TupleSinkServiceDrainTaggedSendCompletionsInternal(callbacks=...)` — **NO CQ CONSUMER MAY POLL WITHOUT OWNER DISPATCH. The choke point enforces it.**
+
+- **MEANS:** the single funnel through which every nonblocking send-CQ drain runs. Since D-S0 it **REFUSES
+  (`callbacks == NULL` → once-latched ALARM + false) before the first `ibv_poll_cq`** — dequeuing a CQE is
+  destructive (it is the owner's ONLY retirement event, F7/§25), so a blind poll is never a degraded mode,
+  it is a lost resource.
+- **DOES NOT MEAN** a per-caller convention. It used to be one, and two callers passed NULL (the
+  control-response exhaustion drain, the peer-pump SEND_CQ phase) while the blocking waiter EXEMPTED
+  `CRITICAL_CONTROL` — an exemption written before the command-plane migration put typed lanes on that QP.
+  All three are gone; do not reintroduce a caller-side "we know this CQ is empty of typed CQEs" argument —
+  that is exactly the assumption that rotted.
+- **CONTRACT — `HomerServicePersistentSendCompletionCallbacks` is RETIRE-ONLY** (`tuple_sink_service_process.c`,
+  comment at the struct): these callbacks now run from mid-operation transport drains NOT bracketed by
+  `HomerServiceSendCqDrainDepth`. A callback that posts a WR or polls a CQ requires extending that guard to
+  every dispatch site FIRST.
+- **ENFORCES:** the guard in `...DrainTaggedSendCompletionsInternal` (transport); the wrapper
+  `TupleSinkServiceDrainTaggedSendCompletions` and the pump SEND_CQ phase both pass
+  `transportState->sendCompletionCallbacks/-Context`; registration happens once in service init
+  (`TupleSinkServiceRegisterPeerSendCompletionCallbacksRdma`) before any peer connection exists.
+
+## `connectionState->admittedSendWr` — **the CLAMPED admission ceiling. NOT the provider grant.**
+
+- **MEANS:** `min(provider-granted cap.max_send_wr, CITUS_REMOTE_EXEC_PEER_SEND_QUEUE_DEPTH)`, stored at QP
+  creation. Admission (`TupleSinkServiceAdmitSendChainRdma`) bounds outstanding WRs by THIS, which is what
+  keeps the 256-entry `signalledFrontierMark[]` table (sized by the REQUESTED depth) safe from overwrite.
+- **DOES NOT MEAN** what the provider granted. The raw grant may be larger; it is visible in the
+  once-per-connection `peer QP caps` log line (and the payload staging-pool setup check deliberately still
+  tests the RAW grant — stricter, never weaker). The field was **renamed from `grantedSendWr`** precisely so
+  the name cannot re-imply the raw grant; if you need the raw number, read the log, not this field.
+- **ENFORCES:** the clamp at QP creation (`TupleSinkServiceInitConnectionResources`); every admission /
+  diagnostic reader of `admittedSendWr`; mark-table safety follows from this clamp alone (NOT from any
+  CQ-size equality — the granted CQ depth may also exceed the request and is only logged).
+
+---
+
 ## Related
 
 - [`resource_retirement_contract_audit.md`](resource_retirement_contract_audit.md) — the narrative and evidence

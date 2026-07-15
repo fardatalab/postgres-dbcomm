@@ -7698,3 +7698,72 @@ no ALARM. So:
   the RETIRING counters are therefore validated **by construction (self-review), not by execution** — the very
   "validated by construction, never by execution" caveat §22.10.1 records for this same branch. The abandonment
   counters ARE execution-validated (they ran and printed 0); the RETIRING counters are not (never incremented).
+
+## §50 — D-S0: the two latent CQ-dispatch/admission holes, HARDENED. (The coalescing plan's commit 0.)
+
+**Status: IMPLEMENTED; VALIDATION EVIDENCE BELOW.** Found by the send-CQE-coalescing design refutation
+(`send_cqe_coalescing_implementation_plan.md` D-S0), but both are HEAD bugs independent of coalescing — they
+are §0-contract violations of the F7/§25 rule ("a dequeued CQE is the ONLY retirement event its owner gets, so
+every CQ consumer must be able to dispatch every CQE").
+
+### 50.1 Blind send-CQ drains — the rule existed, the enforcement was an alarm, and three shapes violated the premise
+
+- `TupleSinkServiceDrainTaggedSendCompletions` (R:~4950) passed **NULL callbacks**; its one caller is the
+  control-response-slot exhaustion drain (R:~9110). On a QP carrying typed CQEs (CRITICAL_CONTROL, payload
+  connections) a typed CQE dequeued there was DESTROYED — "RETIREMENT EVENT LOST" fired, but the event was
+  still lost. Rare at HEAD only because every WR signals and the scheduled drain keeps CQs short.
+- The peer-pump SEND_CQ phase (R:~13210) polled with NULL callbacks — same shape.
+- The blocking waiter's precondition **EXEMPTED `CRITICAL_CONTROL`** from requiring callbacks — written when
+  control lanes carried no typed CQEs, silently invalidated when the command-plane migration put the
+  command-write and peer-client-completion lanes ON that very QP. A stale exemption aging out under a
+  migration: the exact wrong-neighbor shape CONTRACTS.md exists for.
+
+**Fix (one choke point, not three patches):** `TupleSinkServiceDrainTaggedSendCompletionsInternal` now
+REFUSES (`callbacks == NULL` → once-latched ALARM + false) before the first poll — no caller can blind-poll,
+current or future. The wrapper and the pump pass the persistent registered dispatch
+(`HomerServicePersistentSendCompletionCallbacks`, registered at service init before any connection exists);
+the CRITICAL_CONTROL exemption is deleted. ⚠ The persistent callbacks acquired a **RETIRE-ONLY contract**
+(comment at the struct, `T:~16190`): since D-S0 they also run from mid-operation transport drains that the
+`HomerServiceSendCqDrainDepth` recursion guard does NOT bracket — a future callback that posts or polls must
+first extend that guard. (Adversarial review confirmed all three current callbacks are retire-only, and that
+the exhaustion drain runs BEFORE any response slot is held, so no in-flight publish state is exposed.)
+
+### 50.2 The admission ceiling was the RAW provider grant; the mark table is sized by the REQUEST
+
+`signalledFrontierMark[]` has `CITUS_REMOTE_EXEC_PEER_SEND_QUEUE_DEPTH` (256) entries, but admission used the
+provider-granted `cap.max_send_wr` verbatim — a grant > 256 plus > 256 outstanding signalled WRs would
+overwrite unconsumed marks (mark overwrite PROVEN from code; CQ overrun plausible but unproven — the granted
+CQ depth was never inspected). The setup-time capacity check guarded the payload staging pools against the
+raw grant and nothing guarded the mark table: the capacity proof counted one thing again.
+
+**Fix:** the stored ceiling is clamped to `min(granted, 256)` and the field is **RENAMED
+`grantedSendWr` → `admittedSendWr`** so the name cannot re-imply the raw grant (the old field comment had
+become a lie the moment the clamp landed). One new cold-path log line per connection —
+`peer QP caps host=... requested_send_wr/granted_send_wr/admitted_send_wr/granted_send_cq_entries` — because
+until now the grant was visible ONLY inside error messages. (Incoming connections print
+`(incoming, pre-established)` for the host: the peer address is resolved only at ESTABLISHED, and an empty
+string would read as a lookup failure.) Review also caught: widened `uint64_t` arithmetic in the staging
+check, and the correction that mark safety follows from the SQ clamp alone, not from any CQ-size equality.
+
+### 50.3 Validation — PASS, and the §50.2 hazard was LIVE ON THIS HARDWARE, not theoretical
+
+Full battery (2026-07-15): all seven targets built; farnet0 sync verified 0-diff by md5; both DPUs rebuilt
+with the exit-1-on-miss landed-proof (`admitted_send_wr=` present in all three deployed binaries); clean
+baseline; gate `-t 5 --debug` smoke with ALL FOUR proofs; 3 warmed `-c 1 -t 2000` repeats =
+**290.97 / 297.16 / 298.98 tps** vs the 291–304 band (run 1 sits 0.03 below the floor, runs 2–3 in-band — no
+directional shift; behavior-neutral as designed); 4-role basebackup **21.66 GiB** (`delivered_bytes=
+23253269858`), clean CLOSE_ACK, sender exit 0 in 15.97 s. Alarm battery, `RETIREMENT EVENT LOST`, and the new
+`send-CQ drain refused` grep: **all EMPTY on both DPUs**.
+
+**THE HEADLINE — the new `peer QP caps` line, identical on every connection, both DPUs:**
+```
+requested_send_wr=256 granted_send_wr=409 admitted_send_wr=256 granted_send_cq_entries=511
+```
+The provider grants **409 send WRs and 511 CQ entries against the 256 request** — so pre-clamp, admission
+would have allowed up to 409 outstanding WRs against a 256-entry mark table. §50.2 was a LIVE hazard on this
+hardware for any all-signalled workload exceeding 256 outstanding; the clamp is load-bearing, not defensive.
+
+Caveats recorded honestly: the run was on a REPAIRED machine (ownership drift + a broken md5-verification
+mode found and fixed — see `farnet_operational_hazards.md` §10); a pre-existing aarch64-only compiler warning
+at `remote_execution_peer_transport_rdma.c:4113` (untouched by this change) was noted; multi-client gate and
+the two broken-at-HEAD host workloads were not exercised.
