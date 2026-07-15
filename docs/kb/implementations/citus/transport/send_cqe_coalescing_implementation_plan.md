@@ -115,14 +115,14 @@ now.
 
 ---
 
-## CONCRETE DESIGN (2026-07-15) — settled through TWO adversarial refutation rounds; ⚠ pending owner
-## ratification of ONE choice (the owner-table strategy, option A vs B in D-S2.1) before implementation.
+## CONCRETE DESIGN (2026-07-15) — SETTLED. Two adversarial refutation rounds + owner review.
 
 Round 1 found 7 objections (all verified, all folded — the "(refutation round 1)" blocks); round 2 attacked
 the corrections and found 4 more defects (the synthetic-close backstop died — see D-S2.4; the sweep
-validation gained a cross-connection arm; FAILED needs a distinct result; the global-table watermark needed
-the option-A redesign). The stage list above says *what*; this section says *how*, with the mechanism nailed
-to code. `T` = `tuple_sink_service_process.c`, `R` = `remote_execution_peer_transport_rdma.c`.
+validation gained a cross-connection arm; FAILED needs a distinct result); owner review then replaced the
+round-2 owner-table machinery with the **size-out** (D-S2.1 — the P0-c move, simpler and structural). The
+stage list above says *what*; this section says *how*, with the mechanism nailed to code. `T` =
+`tuple_sink_service_process.c`, `R` = `remote_execution_peer_transport_rdma.c`.
 
 ### D-S2.0 The retirement REDESIGN (why this is not "re-arm what exists")
 
@@ -202,17 +202,41 @@ shifting removal `T:6508`). Under coalescing a checkpoint must retire **across c
   GLOBAL ActiveCount watermark forces signals only on connections that POST, whose connection-local sweeps
   **cannot retire owners belonging to QUIET connections** — the table can fill with quiet-QP owners and
   drain-retry on the posting connection frees nothing (today's scheduled collector avoids this by scanning
-  EVERY owner-bearing FIFO, `T:16309`/`T:16333` — exactly what D-S3 de-schedules). **DECIDED fix (option A;
-  ratify at review):** (i) per-connection active-owner counts, with the forced-signal term keyed on the
-  CONNECTION's share (`capacity / (2 × live connections)`, recomputed on connect/disconnect — cold path);
-  (ii) a small checkpoint-only RESERVE of table entries (mirror of the WQE reserve `R:10905`: a forced
-  signalled post must always be able to reserve its owner entry, or the checkpoint that frees the table
-  cannot be posted — the same deadlock one level up); (iii) the table-watermark / reservation-failure handler
-  drains EVERY distinct owner-bearing connection (pull-style port of the collector's scan), not just the
-  poster's. Owner-table reservation failure (today `PUBLISH_FAILED`, `T:20349-20365`, not retryable) becomes
-  drain-then-retry-once. *Recorded fallback (option B): partition the owner tables per connection — the
-  structurally cleanest answer (the global tables are an all-signalled-era sizing assumption) but a larger
-  refactor; adopt if (i)-(iii) prove fiddly in implementation.*
+  EVERY owner-bearing FIFO, `T:16309`/`T:16333` — exactly what D-S3 de-schedules).
+
+  **DECIDED (owner, 2026-07-15): SIZE THE TABLES OUT OF THE PROBLEM — the P0-c move.** Two earlier fix shapes
+  are RETIRED, and the reasoning is worth keeping: round 1's global-watermark term died in round 2
+  (connection-local sweeps cannot free quiet connections' entries), and round 2's replacement ("option A":
+  per-connection share terms + a checkpoint-only table reserve + a drain-all-owner-bearing-connections
+  handler) was over-engineering born of treating the 256 capacity as fixed. The owner challenged that with
+  P0-c's own precedent (*"sizing the pool out of the problem deleted the frontier, the WR-ID field, the
+  backpressure plumbing, and that bug class"*, `R:1020-1026`) — and the bound is airtight:
+  - An owner entry exists ONLY while its command/completion holds a per-session SOURCE slot: each table has
+    **exactly one reserve caller** (`T:22711` after the credit gate `T:22637`; `T:20349` after the 16-ring
+    reservation), and retirement releases the source credit in the same step. Lockstep, 1:1.
+  - Ceiling: `64 sessions × 62` = **3968** command owners; `64 × 16` = **1024** completion owners. The WR-ID
+    INDEX fields are **16 bits** (`R:300-301`, masks `0xffff`), so sizing command→4096, completion→1024 sits
+    an order of magnitude under the encoding ceiling (existing asserts `R:345-350` continue to hold).
+  - **Enforce the bound at compile time** (the P0-c pattern):
+    `_Static_assert(COMMAND_OUTSTANDING_WRITES >= MAX_LOCAL_SESSIONS × (LOCAL_COMMAND_MAILBOX_SLOTS − 1))`
+    and the completion analogue — so raising sessions or pool depths cannot silently reopen the hole.
+  - Consequences: **reservation becomes INFALLIBLE** (P0-c language); the watermark term, the table reserve,
+    and the multi-connection drain are all **deleted from the design**. The remaining pressure terms are the
+    per-session/per-connection SOURCE-pool ones — every one connection-local, every one with a post-time
+    drain trigger at its own gate.
+  - ⚠ Implementation caveat: the lane-FIFO arrays are currently **quadratic** in the table size
+    (`LaneFifos[OUTSTANDING]`, each holding `outstandingIndexes[OUTSTANDING]` — 256×256 today; a naive 4096²
+    is 64 MiB). Decouple the two dimensions: FIFO count = max connections (128), per-FIFO capacity = the
+    per-connection bound (one `CRITICAL_CONTROL` connection can carry all 64 sessions → 4096); ≈2 MiB total.
+
+  **On "why would a CQE ever sit undrained?"** — under the de-scheduled design a parked CQE on a
+  quiet connection is POSSIBLE by design (the post-clocked poll runs before that CQE arrives; guaranteeing
+  prompt drains everywhere would just re-create the scheduled collector being deleted). The invariant is not
+  "no parked CQEs"; it is **"everything a parked CQE defers is bounded and connection/session-local, with a
+  drain trigger at the point of need"**: owner entries (sized out, above), the session's source credits (its
+  own next publish hits the credit gate → connection-local drain → self-heals), the connection's WQE
+  admission (next post WOULD_BLOCK → drain, exists), CQ capacity (outstanding ≤ admission ≤ SQ ≤ CQ). After
+  the size-out, no cross-connection coupling remains.
 - Control op vs response-source slots retire differently (request CQE only sets `sendCompletionRetired`
   while the op stays `WAIT_RESPONSE`, `R:4383`; response slots free directly on CQE, `R:4357`) — the control
   pressure term counts them separately.
