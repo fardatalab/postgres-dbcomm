@@ -1,5 +1,7 @@
 # Homer base backup target checkpoint
 
+<!-- kb-summary: Current PostgreSQL and Homer implementation, lifecycle, validation, and limitations for the TARGET homer basebackup path. -->
+
 ## Scope
 
 - **What this doc explains**: the current implementation checkpoint for the `TARGET 'homer'` base-backup prototype, including the PostgreSQL `bbsink`, Homer client API, service-side typed object handling, local blackhole smoke mode, two-service RDMA blackhole mode, and verification/performance results.
@@ -23,14 +25,17 @@ The implementation keeps the chosen semantic split:
 
 For Homer targets, [`SendBaseBackup()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup.c:1033) rejects compression, throttling, and WAL inclusion at [`basebackup.c:1034`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup.c:1034), skips throttle/compression wrappers at [`basebackup.c:1046`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup.c:1046), and skips the generic progress wrapper at [`basebackup.c:1058`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup.c:1058).
 
-[`bbsink_homer_begin_backup()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_homer.c:191) still calls `bbsink_begin_backup()` on `bbs_next` so the ordinary replication protocol result sets and `COPY OUT` lifecycle remain visible to `pg_basebackup`. It then opens Homer control and the basebackup stream, reserves a queue slot, publishes `CITUS_REMOTE_BASEBACKUP_OBJECT_BEGIN`, and exposes the next reserved payload slot as `sink->bbs_buffer`.
+[`bbsink_homer_begin_backup()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:337) still calls `bbsink_begin_backup()` on `bbs_next` so the ordinary replication protocol result sets and `COPY OUT` lifecycle remain visible to `pg_basebackup`. It opens Homer control and the basebackup stream, allocates a producer scratch buffer, and publishes `CITUS_REMOTE_BASEBACKUP_OBJECT_BEGIN`.
 
-The hot payload callbacks do not copy into a second staging buffer:
+The current generic `bbsink` callback path performs one compatibility copy so the Homer record advertises the callback's exact payload length:
 
-- [`bbsink_homer_archive_contents()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_homer.c:253) updates `bbs_state->bytes_done`, publishes `CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_CHUNK`, and reserves the next slot.
-- [`bbsink_homer_end_archive()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_homer.c:272) publishes `ARCHIVE_END` and increments `bbs_state->tablespace_num`.
-- [`bbsink_homer_begin_manifest()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_homer.c:290), `manifest_contents`, and `end_manifest` publish manifest objects in the same stream family.
-- [`bbsink_homer_end_backup()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/backend/backup/basebackup_homer.c:341) publishes `CITUS_REMOTE_BASEBACKUP_OBJECT_END`, closes the Homer stream/control handles, and then forwards backup end to the copy-stream sink.
+- [`bbsink_homer_write_record()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:325) reserves an exact-sized Homer record, copies the callback's `len` bytes from the scratch buffer, and submits that same length.
+- [`bbsink_homer_archive_contents()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:402) updates `bbs_state->bytes_done` and publishes `CITUS_REMOTE_BASEBACKUP_OBJECT_ARCHIVE_CHUNK` through that helper.
+- [`bbsink_homer_end_archive()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:415) publishes `ARCHIVE_END` and increments `bbs_state->tablespace_num`.
+- [`bbsink_homer_begin_manifest()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:427), `manifest_contents`, and `end_manifest` publish manifest objects in the same stream family.
+- [`bbsink_homer_end_backup()`](/data/dbcomm/postgres-citus/src/backend/backup/basebackup_homer.c:459) publishes `CITUS_REMOTE_BASEBACKUP_OBJECT_END`, closes the Homer stream/control handles, and then forwards backup end to the copy-stream sink.
+
+The extra copy is current compatibility scaffolding, not the target zero-copy producer shape. A future producer-loop integration may reserve directly from Homer before filling bytes, but it must preserve truthful exact record lengths.
 
 The important progress decision is now implemented: the prototype does not emit a separate progress data-plane object, but it preserves the local `bbsink_state` updates needed by [`bbsink_end_backup()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/include/backup/basebackup_sink.h:255).
 
@@ -239,9 +244,10 @@ service-backed basebackup workload:
   sending typed `BaseBackupArchiveStream` objects through Homer.
 - The prototype intentionally supports the common tar/no-WAL/no-compression path
   and rejects unsupported wrappers before the hot path.
-- The backend writes basebackup payload bytes directly into Homer queue slots;
-  the service adds the transport header in the same registered slot before RDMA
-  publication.
+- The generic `bbsink` producer currently writes into a private scratch buffer;
+  the compatibility callback then copies the actual `len` bytes into an
+  exact-sized Homer record before publication. Direct producer fill remains a
+  future optimization, not current behavior.
 - The remote two-service blackhole path validates and counts basebackup semantic
   objects through the shared RDMA substrate.
 - The shared RDMA substrate now uses posted/completed frontiers, a larger

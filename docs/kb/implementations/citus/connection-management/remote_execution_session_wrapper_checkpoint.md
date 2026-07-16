@@ -1,5 +1,7 @@
 # RemoteExecutionSession wrapper checkpoint
 
+<!-- kb-summary: Earlier wrapper checkpoint for the backend-visible RemoteExecutionSession over the tuple-sink substrate. -->
+
 ## Scope
 
 - **What this doc explains**: the earlier wrapper-layer checkpoint that introduced the backend-facing `RemoteExecutionSession` API, its session/batch semantics, and the first route-to-session convergence step.

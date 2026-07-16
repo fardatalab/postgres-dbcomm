@@ -1,5 +1,7 @@
 # Per-session DPU byte-ring resource pool + lifetime protocol (plan + design)
 
+<!-- kb-summary: Design and staged plan for per-session DPU byte-ring resources and their lifetime protocol. -->
+
 ## Scope
 
 - **What this doc is:** the design + staged implementation plan for making every

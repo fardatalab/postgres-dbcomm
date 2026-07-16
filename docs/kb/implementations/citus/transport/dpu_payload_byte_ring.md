@@ -1,5 +1,7 @@
 # DPU Payload Byte-Ring: Wrap Protocol, Mirror, and Invariants
 
+<!-- kb-summary: Current DPU payload byte-ring wrap protocol, mirror geometry, egress parsing, and invariants. -->
+
 ## Scope
 
 - **What this doc explains**: how the Homer payload byte-ring works on the

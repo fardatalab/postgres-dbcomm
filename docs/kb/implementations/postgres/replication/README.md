@@ -1,5 +1,7 @@
 # PostgreSQL Replication Implementations
 
+<!-- kb-summary: Current Homer replication and basebackup implementation checkpoints and lifecycle contracts. -->
+
 ## Purpose
 
 Track implementation-progress notes for PostgreSQL replication-facing prototype work, especially service-backed physical backup and replication transport experiments.
@@ -13,7 +15,8 @@ Track implementation-progress notes for PostgreSQL replication-facing prototype 
 ## Documents
 
 <!-- kb-docs:start -->
-- [homer_base_backup_target_checkpoint.md](homer_base_backup_target_checkpoint.md) - Current checkpoint for the `TARGET 'homer'` base-backup prototype: server-side `bbsink`, typed basebackup objects, shared queue/RDMA service integration, local blackhole smoke mode, and remaining remote-RDMA caveats.
+- [CONTRACTS.md](CONTRACTS.md) - **READ BEFORE CHANGING THIS IMPLEMENTATION AREA.** Current graceful/abort close and exact-record sizing contracts for the Homer basebackup sink.
+- [homer_base_backup_target_checkpoint.md](homer_base_backup_target_checkpoint.md) - Current PostgreSQL and Homer implementation, lifecycle, validation, and limitations for the TARGET homer basebackup path.
 <!-- kb-docs:end -->
 
 ## Related

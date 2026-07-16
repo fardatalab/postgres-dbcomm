@@ -1,5 +1,7 @@
 # Byte-Ring Payload Stream Checkpoint
 
+<!-- kb-summary: Current checkpoint for the service-to-service byte-ring RDMA substrate used by Homer basebackup streams. -->
+
 ## Summary
 
 The current implementation has a common byte-ring Homer payload substrate for

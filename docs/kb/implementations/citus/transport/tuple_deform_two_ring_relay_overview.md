@@ -1,5 +1,7 @@
 # Homer tuple DEFORM and the two-ring result relay
 
+<!-- kb-summary: End-to-end overview of tuple deformation and the two-ring selected-DPU SQL-result relay. -->
+
 This note follows one SQL result from a socketless PostgreSQL backend to a Homer client. The short
 version is: the backend writes PostgreSQL-aware **tuple-view** batches, the services move those bytes
 between hosts, the receiving DPU deforms each packed row into an O(1)-addressable decoded image, and

@@ -1,5 +1,7 @@
 # Experimental tuple-route substrate under the service-owned control checkpoint
 
+<!-- kb-summary: Historical tuple-route checkpoint for shared-memory batching beneath the later service-owned control path. -->
+
 ## Scope
 
 - **What this doc explains**: the current tuple-route queue/batch substrate that sits underneath the newer `RemoteExecutionSession` control path: tuple-view layout, queue ownership, batch lifecycle, and loopback forwarding behavior.

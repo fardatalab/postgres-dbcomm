@@ -1,5 +1,7 @@
 # Cross-Node DPU-Offload Migration — Implementation Checkpoint
 
+<!-- kb-summary: Implementation checkpoint for migrating Homer command, completion, and payload paths across the two-host DPU topology. -->
+
 ## Scope
 
 Tracks the cross-node DPU-offload migration for the two Homer workloads

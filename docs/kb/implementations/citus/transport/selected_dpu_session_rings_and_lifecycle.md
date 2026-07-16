@@ -1,5 +1,7 @@
 # Selected-DPU sessions: identities, rings, exports, and lifecycle
 
+<!-- kb-summary: Architecture of record for selected-DPU session identities, ring roles, exports, and lifecycle. -->
+
 ## Scope
 
 - **What this doc explains**: the CURRENT architecture of record for the selected-DPU path — what a

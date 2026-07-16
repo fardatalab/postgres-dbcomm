@@ -1,5 +1,7 @@
 # Connection Management
 
+<!-- kb-summary: Current implementation checkpoints and contracts for Homer session, compatibility, and connection management. -->
+
 ## Purpose
 
 Capture the current implementation state of Citus-side control-plane prototype work. Use this directory when the question is "what control-plane/session abstraction have we actually landed in code so far?" rather than "how does current Citus work?" or "what is the final service design?"
@@ -13,9 +15,10 @@ Capture the current implementation state of Citus-side control-plane prototype w
 ## Documents
 
 <!-- kb-docs:start -->
-- [cross_node_tuple_sink_peer_control_checkpoint.md](cross_node_tuple_sink_peer_control_checkpoint.md) - Current canonical checkpoint: full tuple-view contract exchange, peer-provisioned exact sinks, service-side semantic receive decode, batching/backpressure, typed command dispatch, and worker-side borrow/use/release for the tuple-sink prototype.
-- [local_service_owned_tuple_sink_control_checkpoint.md](local_service_owned_tuple_sink_control_checkpoint.md) - Earlier checkpoint: the standalone local service owns SHM control IPC, resolves compatibility sessions, and manages tuple sinks underneath `RemoteExecutionSession`.
-- [remote_execution_session_wrapper_checkpoint.md](remote_execution_session_wrapper_checkpoint.md) - Earlier wrapper checkpoint: backend-visible `RemoteExecutionSession` over the tuple-route substrate before the later cross-node, semantic-decode, and borrow/use/release milestones landed.
+- [CONTRACTS.md](CONTRACTS.md) - **READ BEFORE CHANGING THIS IMPLEMENTATION AREA.** Current compatibility-intent, exact-operation, and data-plane/session-close contracts for Homer connection management.
+- [cross_node_tuple_sink_peer_control_checkpoint.md](cross_node_tuple_sink_peer_control_checkpoint.md) - Current cross-node tuple-sink control, semantic decode, batching, terminal signaling, and worker borrow/use/release checkpoint.
+- [local_service_owned_tuple_sink_control_checkpoint.md](local_service_owned_tuple_sink_control_checkpoint.md) - Earlier local checkpoint for service-owned SHM control, compatibility sessions, and exact tuple sinks.
+- [remote_execution_session_wrapper_checkpoint.md](remote_execution_session_wrapper_checkpoint.md) - Earlier wrapper checkpoint for the backend-visible RemoteExecutionSession over the tuple-sink substrate.
 <!-- kb-docs:end -->
 
 ## Related

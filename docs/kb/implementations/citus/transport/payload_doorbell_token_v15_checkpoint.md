@@ -1,5 +1,7 @@
 # Payload Doorbell Token v15 Checkpoint
 
+<!-- kb-summary: Landed checkpoint for payload doorbell tokens and fixed service-owned payload-ready queues. -->
+
 ## Scope
 
 - **What this doc explains**: the landed Slice 2E-A and Slice 2E-B checkpoints

@@ -10,8 +10,9 @@
 
 ## ⛔ EVERYTHING HERE IS TRUE **NOW**. NO HISTORY, NO CHANGELOG.
 
-That promise is what makes this file safe to read *instead of* searching. **If a contract changes, REWRITE the
-entry** — never add *"used to mean X"*. Two near-identical statements sitting adjacent, one of them wrong, **is
+That promise makes this file a focused **starting map for source search**, never a replacement for it. **If a
+contract changes, REWRITE the entry** — never add *"used to mean X"*. Two near-identical statements sitting
+adjacent, one of them wrong, **is
 the exact bug this file exists to prevent** (see the very first entry). History belongs in
 [`resource_retirement_contract_audit.md`](resource_retirement_contract_audit.md) and the commit.
 
@@ -401,6 +402,93 @@ the call site. If it is not on the list, **it has not been checked.**
 - **ENFORCES:** the clamp at QP creation (`TupleSinkServiceInitConnectionResources`); every admission /
   diagnostic reader of `admittedSendWr`; mark-table safety follows from this clamp alone (NOT from any
   CQ-size equality — the granted CQ depth may also exceed the request and is only logged).
+
+## `entry->frontierMark` (command-write / completion-publish owners) — **QP-wide retirement coordinate. Class-local ordinals are GONE.**
+
+- **MEANS:** the connection's cumulative `postedSendWrs` as of the owner's unit's LAST (signalled) post,
+  stamped at the post site immediately after the unit's final post succeeds
+  (`TupleSinkServicePeerConnectionPostedSendWrsRdma`). A later successful CQE whose retired frontier `F`
+  reaches the mark proves this WR — and everything posted before it on the same QP — completed; the sweep
+  pops per-connection post-order lanes while `mark <= F`, so retirement is CROSS-CLASS (a payload or
+  control CQE retires command/completion owners on that QP for free).
+- **DOES NOT MEAN** a per-class sequence number (`postOrdinal` and the array lane FIFOs are deleted), and
+  `0` is NOT a mark: it flags "reserved, unit not yet posted" — the validators' orphan discriminator.
+- **ENFORCES:** stamp+link ONLY after the unit's posts all succeed (command post fn, completion publish fn
+  in `tuple_sink_service_process.c`); `TupleSinkServiceAccountPostedSendChainRdma` increments
+  `postedSendWrs` BEFORE stamping the mark table, which is what makes the service-side stamp equal the
+  signalled WR's own mark; comparisons assume the u64 frontier never wraps.
+
+## `entry->linked` vs `entry->active` — **a wrong-neighbor pair. List membership vs accounting liveness.**
+
+- **`linked` MEANS:** threaded on its connection's post-order sweep lane (`nextIndex` is LIVE list state).
+  Reserve MUST skip `active || linked` slots — re-reserving a linked slot threads one table slot into a
+  lane twice and corrupts the intrusive list. Only the sweep pop (or a stale-generation purge) unlinks.
+- **`active` MEANS:** the entry holds owner accounting. Scenario-E abandonment clears `active` IN PLACE and
+  KEEPS `linked` (+ the signalled demand, next entry): the WR's CQE is still in flight and the sweep lazily
+  discards the entry when it arrives. `active && !linked && frontierMark != 0` = a posted-but-never-linked
+  ORPHAN (link failure), released directly by the CQE validator.
+- **ENFORCES:** both reserve probe loops; `Clear...Index` (linked guard: deactivate-in-place + ALARM, never
+  memset); `Abandon...OwnerIndex`; the sweep pop unlink-before-retire order (the retire memsets).
+
+## The signalled-demand counts (`...SignaledCompletionActiveCount`) — **released at CQE CONSUMPTION, never at abandonment.**
+
+- **MEANS:** "signalled send CQEs not yet consumed on some lane" — the CQ-drain scheduler's demand gates
+  (`...SendCqShouldDrain`, the demand scan, scheduler feedback) key off these.
+- **DOES NOT MEAN** "active signalled owners": an abandoned (Scenario-E) owner is inactive but its CQE is
+  still in flight and still needs draining — that drain is the ONLY thing that frees the linked slot, so
+  releasing the demand at abandonment starves the very consumption that reclaims capacity (codex round 2).
+  The per-lane `...SweepLaneHasSignaledOwner` predicates are deliberately NOT gated on `active`.
+- **ENFORCES:** release points are exactly: `Clear...Index` UNLINKED path (post-failure, or retire after a
+  sweep pop of an ACTIVE entry), the command retire's inline decrement, the sweep-pop/purge INACTIVE arms
+  (via `TupleSinkServiceRelease...SignaledDemand`), and unlinked Abandon. The Abandon/Clear LINKED arms
+  deliberately do not touch it.
+
+## The sweep lanes' `connectionGeneration` — **dead-QP reclamation has THREE triggers, and purge RETIRES.**
+
+- **MEANS:** the connection generation the lane's owners were posted under. A lookup that finds the
+  handle's CURRENT generation differs proves the QP+CQs were destroyed (reset memsets the connection AFTER
+  destroying them; re-establish assigns a fresh monotone generation) — no CQE for these owners can ever
+  arrive, so the lane is purged.
+- **Purge RETIRES active entries** (per-entry retire: session credits/epochs/outstanding counts advance) —
+  QP destruction is the P0 proof no WR still reads their sources, and a blind memset would strand a
+  sender session's bookkeeping when it outlives the shared CRITICAL_CONTROL connection (reset-complete
+  marks only `clientSqlPeerReceiver` sessions). Abandoned entries release their retained demand and free.
+- **ENFORCES — all three trigger sites, or a full table blocks the purge that would empty it:** the
+  generation check in `Find...SweepLane`; `PurgeStale...SweepLanes()` on reservation table-full (one
+  retry); the demand scan's per-lane generation check (purge instead of draining a dead/reused
+  connection's CQ).
+
+## `sendCheckpointSweep` / `TupleSinkServiceHandleTaggedSendCompletion` — **every successful CQE on an accounted QP retires and sweeps. NO raw consumers.**
+
+- **MEANS:** the scalar retire → control-FIFO sweep → `sendCheckpointSweep` sequence runs inside the
+  dispatch's SUCCESS block for EVERY class including UNTAGGED; the class-typed callbacks afterwards are
+  VALIDATORS (their contract comment in `remote_execution_peer_transport_rdma.h`), releasing only the
+  orphan/skew anomalies, best-effort.
+- **DOES NOT MEAN** the bootstrap poll is exempt: `TupleSinkServicePollBootstrapSendCompletion` consumes an
+  accounted-signalled CQE and therefore RETIRES (validated against the stashed
+  `bootstrapSendWorkRequestId`). Before that fix the mark pairing was shifted by one for the QP's life and
+  the sweep would strand the LAST owner of every burst — `SESSION_CLOSE`'s included (D-S2.3; the reason the
+  bootstrap fix moved from 2b into 2a).
+- **ENFORCES:** the success block in `HandleTaggedSendCompletion`; both drain paths reject errored CQEs
+  before dispatch; the D-S0 choke point guarantees no NULL-callback consumer; the send-CQ poll inventory is
+  exactly three (bootstrap poll, blocking waiter, drain loop) — a NEW `ibv_poll_cq` on a send CQ must
+  either dispatch through `HandleTaggedSendCompletion` or retire explicitly, else owners leak and the
+  validators ALARM.
+
+## `connectionState->controlSendOwners[]` — **the control class's post-order sweep FIFO. Appended ONLY by `TupleSinkServicePublishControlMessage`.**
+
+- **MEANS:** transport-internal ring of in-flight signalled CONTROL sends `{responsePublish, slotIndex,
+  slotGeneration(0 for responses), frontierMark}`, swept by `TupleSinkServiceSweepControlSendOwners` on
+  every successful CQE; release runs the decode-free core `TupleSinkServiceReleaseControlSendOwner`
+  (old per-CQE retire semantics preserved: response slot `inUse=false`; request `sendCompletionRetired` +
+  conditional op release).
+- **DOES NOT MEAN** a service-visible structure, and the CONTROL dispatch arm does NOT release: it
+  validates (entry gone after its own CQE's sweep) with a slot-state fallback whose no-double-release proof
+  is TEMPORAL (sweep-before-validator within one dispatch), not identity-based — response WR-IDs all carry
+  generation 0.
+- **ENFORCES:** the append after the post in `PublishControlMessage` (all three control encode sites funnel
+  there); the connection-reset memset zeroes it with the accounting; depth = op+response slot counts, so
+  overflow is structurally impossible (ALARM + validator fallback if it ever fires).
 
 ---
 

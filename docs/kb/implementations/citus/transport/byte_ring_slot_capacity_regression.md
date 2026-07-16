@@ -1,5 +1,7 @@
 # Byte-ring `slotCapacityBytes` has two meanings — and b2b COPY is broken at HEAD
 
+<!-- kb-summary: Regression analysis separating synthetic byte-ring geometry from negotiated record capacity and the unrelated broken COPY path. -->
+
 **Status (July 9, 2026):** two distinct, independently-confirmed problems, found while bringing up
 `pgbench --homer-dpu`. Neither is fixed. They are recorded together because investigating one
 surfaced the other, but **they are not the same bug and probably do not share a cause.**

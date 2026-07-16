@@ -1,5 +1,7 @@
 # Tuple Route
 
+<!-- kb-summary: Historical tuple-route checkpoints and current tuple-view queue lifetime contracts. -->
+
 ## Purpose
 
 Capture the actual code and behavior of the experimental tuple-route prototype as it is implemented step by step. Use this directory when the question is “what does our current tuple-route code do now?” rather than “how does existing Citus work?” or “what is the target RDMA/service design?”
@@ -18,7 +20,8 @@ Historical naming note:
 ## Documents
 
 <!-- kb-docs:start -->
-- [local_batch_materialization_checkpoint.md](local_batch_materialization_checkpoint.md) - Current tuple-route checkpoint: shared-memory external-service loopback plus the first session-centric backend wrapper layer over the tuple-sink prototype.
+- [CONTRACTS.md](CONTRACTS.md) - **READ BEFORE CHANGING THIS IMPLEMENTATION AREA.** Current borrowed-tuple and receive-record lifetime contracts for the tuple-view queue substrate.
+- [local_batch_materialization_checkpoint.md](local_batch_materialization_checkpoint.md) - Historical tuple-route checkpoint for shared-memory batching beneath the later service-owned control path.
 <!-- kb-docs:end -->
 
 ## Related

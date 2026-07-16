@@ -1,5 +1,7 @@
 # Cross-node selected-DPU command/completion bridges — design + implementation steps
 
+<!-- kb-summary: Design and implementation steps for selected-DPU cross-node command and completion bridges. -->
+
 > **Status:** DESIGN AGREED (July 10, 2026), ready to implement. Feeds the merged **S4+S5** portion of
 > [dpu_command_plane_migration_plan.md](./dpu_command_plane_migration_plan.md).
 >

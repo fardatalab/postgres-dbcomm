@@ -1,5 +1,7 @@
 # The post-gate basebackup open stall (P0)
 
+<!-- kb-summary: Diagnosis and resolution record for the basebackup open stall discovered after the DPU gate. -->
+
 **Status: FIXED AND VALIDATED (2026-07-13).** Root-caused statically, every link verified in code; fix implemented,
 deployed to both DPUs, and validated on the shape that had failed **100% of the time**.
 **Reproduced at `HEAD` (citus `ffe2c4ac9`). ⚠ Misfiled as "DOCA cold-start flakiness" for weeks — that excuse is

@@ -1,5 +1,7 @@
 # Client SQL Session Implementations
 
+<!-- kb-summary: Current Homer client-SQL session implementation checkpoints and result/completion contracts. -->
+
 ## Purpose
 
 Track the implemented client SQL session prototype that runs a pgbench-like foreground transaction workload through Homer typed commands instead of libpq workload traffic.
@@ -13,7 +15,8 @@ Track the implemented client SQL session prototype that runs a pgbench-like fore
 ## Documents
 
 <!-- kb-docs:start -->
-- [client_sql_session_pgbench_checkpoint.md](client_sql_session_pgbench_checkpoint.md) - TODO
+- [CONTRACTS.md](CONTRACTS.md) - **READ BEFORE CHANGING THIS IMPLEMENTATION AREA.** Current result-sink ownership and ordered completion-mailbox contracts for Homer client SQL sessions.
+- [client_sql_session_pgbench_checkpoint.md](client_sql_session_pgbench_checkpoint.md) - Current implementation state, validation evidence, and milestone history for integrated pgbench Homer client-SQL sessions.
 <!-- kb-docs:end -->
 
 ## Related

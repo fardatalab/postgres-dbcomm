@@ -1,5 +1,7 @@
 # Citus Implementations
 
+<!-- kb-summary: Current implementation checkpoints and cross-component contracts for Citus-side Homer prototypes. -->
+
 ## Purpose
 
 Track the current state of Citus-side prototype code that we are actively landing. These notes should describe the actual behavior, feature gates, shortcuts, and caveats of our implementation work, not just the intended design.
@@ -7,15 +9,15 @@ Track the current state of Citus-side prototype code that we are actively landin
 ## Subdirectories
 
 <!-- kb-subdirs:start -->
-- `connection-management/`: Ongoing implementation progress for the new session-centric control-plane wrapper layer, service-owned SHM control path, and service-side compatibility session work in Citus.
-- `transport/`: Implementation checkpoints for the landed Homer stack, including the current frontend/service boundary, shared ABI split, RDMA substrate, tuple COPY, pgbench, and basebackup paths.
-- `tuple-route/`: Ongoing implementation progress for the experimental tuple-route service path in Citus.
+- `connection-management/`: Current implementation checkpoints and contracts for Homer session, compatibility, and connection management.
+- `transport/`: Current implementation checkpoints, plans, and high-signal contracts for the Homer transport stack.
+- `tuple-route/`: Historical tuple-route checkpoints and current tuple-view queue lifetime contracts.
 <!-- kb-subdirs:end -->
 
 ## Documents
 
 <!-- kb-docs:start -->
-- (none)
+- [CONTRACTS.md](CONTRACTS.md) - **READ BEFORE CHANGING THIS IMPLEMENTATION AREA.** Cross-component semantic-operation and stream/session identity contracts for Citus-side Homer implementations.
 <!-- kb-docs:end -->
 
 ## Related

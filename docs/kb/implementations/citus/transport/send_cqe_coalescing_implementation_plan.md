@@ -354,9 +354,152 @@ basebackup unchanged (behavior-neutral except where today's behavior is the RETI
 
 (a) stamping + sweep with signalling still always-on — a pure refactor whose sweep degenerates to per-CQE
 pops (its "every consumer can sweep" prerequisite is already true after D-S0); gate + 4-role basebackup must
-be unchanged. (b) bootstrap retire fix + unit reservation + the D-S2.4 surviving-QP reset backstop. (c) flip
-the decision function, including the global-owner-table pressure terms (tripwires `T:423`/`T:442` replaced in
-the same commit; Stage 1 must already be landed).
+be unchanged. **⚠ AMENDED at 2a implementation (2026-07-16): the D-S2.3 bootstrap-retire fix MOVES FROM (b)
+INTO (a).** It is not an optimization there — it is a *correctness precondition* for the sweep itself: the
+bootstrap skew makes every subsequent scalar retire yield the PREVIOUS checkpoint's mark, so under
+sweep-only release the LAST owner of every burst has `mark > F` and is never popped. The last command of a
+session is `SESSION_CLOSE` itself ⇒ its owner survives ⇒ `TupleSinkServiceRetireSessionSendCompletions`
+polls an already-empty CQ for 2 s, then Scenario-E ALARMs — **on every session close**. "(a) is
+behavior-identical" is therefore only satisfiable with the bootstrap retire in the same commit (full
+argument + defense-in-depth in the D-S2a map below). (b) unit reservation + the D-S2.4 surviving-QP reset
+backstop (bootstrap fix moved out, see above). (c) flip the decision function, including the
+global-owner-table pressure terms (tripwires `T:423`/`T:442` replaced in the same commit; Stage 1 must
+already be landed).
+
+### D-S2a IMPLEMENTATION MAP (2026-07-16, anchors re-derived at HEAD = citus 4a5d18930; T shifted ~+600 vs the pre-Stage-1 anchors above)
+
+Re-derived anchors: ordinal/FIFO structs+globals `T:1623-1685`; completion-lane FIFO machinery
+`T:6011-6420`; command-lane `T:6462-6975` (reserve `T:6635`, per-entry retire `T:6719`, range-retire
+`T:6834`, clear `T:6927`); Scenario-E cancel inside `TupleSinkServiceRetireSessionSendCompletions`
+`T:7100-7153`; drain callbacks `T:15922`/`T:15946`; persistent callback table `T:16255`; demand scan
+`T:16373-16410`; command post site `T:22772-22864`; completion post site `T:20406-20497`; dispatch funnel
+`R:4424` (scalar retire `R:4448-4451`, class arms `R:4534`/`R:4570`/`R:4596`); control retire `R:4311`;
+drain loop `R:4808+` (errored CQEs rejected BEFORE dispatch, `R:4925`); accounting `R:11017-11052`;
+control post funnel: encode sites `R:9263`/`R:9337` (response, generation ALWAYS 0)/`R:12330` (request) →
+`TupleSinkServicePublishControlMessage` `R:8657` → sole post `R:11122` (Account at `R:11181`); connection
+reset = full memset `R:6675`, generation reassigned fresh at (re)establish `R:6881`/`R:7565`; accessor
+`TupleSinkServicePeerConnectionGenerationRdma` already exported (`rdma.h:920`).
+
+Micro-decisions SETTLED at implementation (each is a deviation-from-letter or a gap the plan text did not
+cover; attack these first in review):
+
+1. **The bootstrap-retire fix ships IN 2a** (see the D-S2.5 amendment above for the forcing trace). Per
+   D-S2.3's own spec: both special-poll sites get `connectionState`, the poll validates the CQE's WR-ID is
+   the bootstrap buffer's before retiring, a non-bootstrap CQE there is ALARM. The lying comment
+   `R:6064-6072` is rewritten with the code.
+2. **Defense-in-depth for any REMAINING raw consumer (the D-S2.3 "inventory pending" risk): the named-CQE
+   validator self-heals.** A typed CQE whose own owner survives the sweep with `mark > F` on the SAME
+   connection means the mark pairing has skewed (impossible after fix 1 — RC ordering pairs the k-th
+   signalled CQE with the k-th mark, so for the CQE's own entry `mark == F`). The validator then ALARMs
+   **and force-sweeps through the named entry's own mark** (its WR completed, so its mark IS a proven
+   frontier) instead of leaking the owner. Turns an unknown raw consumer into a diagnostic instead of a
+   slow leak. Same rule transport-side for a CONTROL CQE still in the control FIFO after its sweep.
+3. **List append moves to POST-SUCCESS time (today: lane-FIFO enqueue at RESERVE time, `T:6695`/`T:6237`).**
+   The mark is only known after the post; appending after the unit's final post keeps the per-connection
+   list mark-sorted for free (single-threaded service; no CQ drain between reserve and post on this path).
+   Post-failure paths (`T:22784`/`T:22805`/`T:22819`, `T:20421`/`T:20439`/`T:20471`) then clear an entry
+   that was NEVER linked — plain memset, and the O(n) mid-queue lane-FIFO removal dies entirely (nothing
+   unposted is ever in a list; nothing posted is ever removed except by sweep pop or purge).
+4. **Owner entries gain `linked` + `connectionGeneration`; reserve skips `active || linked`.** A
+   Scenario-E-cancelled entry stays LINKED (inactive) until swept — its table slot must not be re-reserved
+   or the intrusive list corrupts.
+5. **Generation-checked lane PURGE — a lifecycle hole the plan's lazy-skip did not cover.** At HEAD there
+   is NO connection-level owner cleanup: Scenario-E *physically removes* entries from the lane FIFO, so a
+   dead connection's owners vanish with their sessions. Lazy clear-in-place breaks that: entries on a QP
+   that died get NO CQEs, are never swept, and their slots leak. Fix: each lane records
+   `{connectionHandle, connectionGeneration}`; any lookup (reserve-append, sweep, Scenario-E) that finds
+   the handle's CURRENT generation ≠ the lane's stored one purges the whole list before rebinding. Sound
+   because reset destroys QP+CQs before the memset (`R:6675`) and a reused slot gets a FRESH generation
+   (`R:6881`/`R:7565`) — once the generation differs, no CQE from the old QP can ever arrive.
+   **AMENDED (codex round 1, D1): the purge RETIRES active entries** (per-entry retire, session
+   credits/epochs/outstanding counts advanced) **instead of blind-memsetting them.** A blind memset
+   stranded the OWNING SESSION's bookkeeping when a sender session outlives the shared CRITICAL_CONTROL
+   connection (control connections are ownership-exempt and shared; reset-complete marks only
+   `clientSqlPeerReceiver` sessions) — the credit gate could then block that session permanently. QP
+   destruction is the transport proof that retiring is P0-clean, and the OLD array-FIFO code produced the
+   same effect by accident: the reused lane's first new CQE range-retired the stale prefix. Abandoned
+   entries just free (their accounting was released at abandon).
+6. **Validator verdicts follow the `R:4359-4366` precedent: ALARM-and-keep-draining**, not
+   dispatch-failure (which would reset the connection and turn an accounting diagnostic into a run-killer).
+7. **Sweep callback shape:** ONE new member `sendCheckpointSweep(context, connectionHandle, retiredFrontier,
+   err, errBytes)` on `TupleSinkServicePeerSendCompletionCallbacks` (`rdma.h:395`), invoked in
+   `HandleTaggedSendCompletion` inside the SUCCESS block right after the scalar retire — i.e. for EVERY
+   successful CQE of EVERY class including UNTAGGED (the arm at `R:4467` returns before dispatch but after
+   retire+sweep) — after the transport-internal control-FIFO sweep. The existing `commandCompletion` /
+   `peerClientCompletionPublishCompletion` callbacks change signature to `(context, connectionHandle,
+   retiredFrontier, outstandingIndex, ...)` and become the 3-arm VALIDATORS. Payload callbacks unchanged.
+   RETIRE-ONLY contract (`T:16244`) holds: the sweep releases owners and merges deltas, never posts/polls.
+8. **Control FIFO is transport-internal**, embedded in `connectionState` (zeroed by the reset memset for
+   free): entries `{responsePublish, slotIndex, slotGeneration, frontierMark}`, ring of depth
+   `OP_SLOTS + RESPONSE_PUBLISH_SLOTS` = 128, appended inside `TupleSinkServicePublishControlMessage` after
+   its post succeeds (it decodes its own WR-ID — the transport owns the layout; all three encode sites
+   funnel there). `TupleSinkServiceRetireControlSendCompletion` (`R:4311`) splits: decode-free core
+   `...ReleaseControlSendOwner(connectionState, responsePublish, slotIndex, generation)` called by the
+   sweep pop; the CONTROL arm of the dispatch becomes validation (+ rule 2's force-sweep).
+9. **New accessor** `TupleSinkServicePeerConnectionPostedSendWrsRdma(handle)` for the service-side stamp
+   (mark = value AFTER the unit's last post; both command branches and the completion publish stamp at
+   their existing `*commandWrCount`-known points).
+10. **`qpPostOrdinal` is WRITE-ONLY at HEAD** (field `T:1267`; writers `T:5894` from the ring's own
+    counter and `T:6244` from the owner entry's `postOrdinal`; zero readers). The `T:6244` write dies with
+    `postOrdinal`; the field itself + `T:5894` stay (out of 2a scope, flagged for later deletion).
+11. **Demand-scan predicates** (`T:16382-16394` + completion sibling; per-lane `HasSignaledOwner`
+    `T:6607`/`T:6137`) re-implement as intrusive-list walks over the new lane table — the PEER_SEND_CQ
+    collector itself is untouched until D-S3.
+12. **Deleted outright:** `postOrdinal` fields, `NextClientSqlCommandWritePostOrdinal` (`T:1674`) +
+    `NextPeerClientCompletionPublishPostOrdinal` (`T:1683`), both LaneFifo structs + global arrays
+    (`T:1635-1642`, `T:1657-1664`, `T:1675-1685`), Reset/Find/Enqueue/Remove/FindOffset lane helpers,
+    both range-retire functions (`T:6834`, `T:6364`) and the `allowAlreadyRetiredCheckpoint` concept
+    (`T:6827`), the completion-entry inactive-tolerance arm (`T:6325-6333` — the sweep pops each entry
+    exactly once; the named-CQE-already-swept case is what the validator now expresses).
+
+Codex adversarial review outcomes folded in (round 1: 4 defects, 3 concerns, 2 nits; round 2 verified every
+round-1 correction and found 2 NEW defects — items 19–20 below; round 3 verified those):
+
+13. **D1 → purge retires (see the rule-5 amendment).**
+14. **D4 → the recovery ALARMs are now TRUE:** the service validators' `!linked` arm releases a
+    posted-but-unlinked ORPHAN directly (`active && same connection && frontierMark != 0 && mark <= F` —
+    `frontierMark == 0` discriminates the reserved-not-yet-posted window), and the CONTROL arm falls back
+    on SLOT STATE (response: `inUse`; request: generation match ∧ `phase != UNUSED` ∧
+    `!sendCompletionRetired`) when the FIFO does not contain the CQE's entry — a live entry with that
+    identity would have been FOUND, so no double release.
+15. **D3 → self-heal widened but deliberately NOT fully QP-wide at 2a:** service validators heal BOTH
+    service classes through the proven mark; the CONTROL arm's heal also invokes `sendCheckpointSweep`.
+    TWO residual gaps, both **2c items** (the skew ALARM is unreachable at 2a — always-on signalling + the
+    bootstrap retire make the pairing exact): (a) a service-side heal cannot sweep the transport control
+    FIFO; (b) NO heal repairs the scalar accounting itself (`retiredSendWrs` /
+    `signalledRetiredOrdinal` are only advanced by the scalar retire), so a real skew would re-ALARM on
+    every later CQE and leave SQ admission seeing phantom outstanding WRs — the heal releases owners, it
+    does not re-pair the frontier. Also the heal is BEST-EFFORT: sweeping through a mark cannot pop past a
+    larger-marked lane head (safe retention until a covering checkpoint), which the ALARM text now states.
+16. **D2 adjudicated ACCEPTED-AS-DOCUMENTED:** abandoning owners drops the lane's CQ-drain demand on a
+    quiet QP, but the OLD Scenario-E dropped it identically (Clear decremented the same signalled counts)
+    *and* turned the parked CQE's eventual consumption into a "stale checkpoint" drain failure; the sweep
+    consumes it cleanly. D-S3's pressure-drain triggers own the quiet-QP window. Not a 2a regression.
+17. **Monotonicity-violation policy adjudicated ALARM-and-append (not reset):** a smaller mark appended
+    behind a larger one can only be popped LATE (the sweep stops at the larger head first), never early —
+    delayed release is safe, so failing/resetting would trade an accounting anomaly for a leak/run-killer.
+18. **Round-1 nits fixed:** completion Abandon decrements the stats gauge; the stale `rdma.h`
+    "callback-absent drains are control-only" comment rewritten to the D-S0 refusal rule; control
+    pop-before-release documented as terminal-for-drain (matches the old dispatch-driven retire).
+19. **Round-2 defect A → THREE purge triggers, not one.** The generation check originally ran only from
+    same-handle lookups (link/sweep/Scenario-E) — so a table FILLED by owners stranded on dead connections
+    blocked the very reservations whose lookups would have purged them. Added:
+    `TupleSinkServicePurgeStale{ClientSqlCommandWrite,PeerClientCompletionPublish}SweepLanes()` invoked (a)
+    on reservation table-full, with ONE retry if anything was reclaimed, and (b) from the demand scan,
+    which generation-checks each CANDIDATE lane (one that passed `HasSignaledOwner`) and purges instead of
+    handing a dead/reused connection's CQ to the drain. ⚠ Round-3 scope note: at 2a every owner is
+    signalled, so every nonempty stale lane IS a candidate and gets purged there; under 2c's selective
+    signalling an all-unsignalled stale lane would only be reclaimed by the table-full trigger — **2c must
+    either move the generation check ahead of the demand predicate or accept the table-full trigger as the
+    backstop.**
+20. **Round-2 defect B → the signalled-demand LIFECYCLE moved to consumption.** Abandoning an owner used to
+    decrement the signalled counts — dropping the only CQ-drain demand that would ever consume the parked
+    CQE and free the linked slot (the owner-table capacity bound stopped being 1:1). Now: the signalled
+    count is released at CQE CONSUMPTION (sweep pop, purge) or when the WR provably never existed
+    (unlinked clear) — NEVER at abandonment; the per-lane demand predicates drop their `active` gate so
+    abandoned owners keep their lane hot; helpers
+    `TupleSinkServiceRelease{ClientSqlCommandWrite,PeerClientCompletionPublish}SignaledDemand` carry the
+    rule. This also strictly supersedes round-1's D2 adjudication: demand is no longer dropped at all.
 
 ### D-S3 Drain de-schedule: the pull points that replace the PEER_SEND_CQ collector
 

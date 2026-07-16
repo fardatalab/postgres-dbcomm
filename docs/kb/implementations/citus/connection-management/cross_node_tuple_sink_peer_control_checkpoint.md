@@ -1,5 +1,7 @@
 # Cross-node tuple-sink peer-control checkpoint
 
+<!-- kb-summary: Current cross-node tuple-sink control, semantic decode, batching, terminal signaling, and worker borrow/use/release checkpoint. -->
+
 ## Scope
 
 - **What this doc explains**: the current implementation checkpoint for the tuple-sink prototype: full tuple-view contract exchange, peer-provisioned exact sinks, service-side semantic receive decode, typed command/completion dispatch, batching/backpressure, and the worker-side borrow/use/release insert path.
@@ -187,11 +189,11 @@ Two defensive rules landed with that:
 
 This batch-scoped lifetime is also why the worker release must stay after [`ExecSimpleRelationInsert()`](/data/dbcomm/postgres-citus/src/backend/executor/execReplication.c:490), not merely after [`ExecStoreVirtualTuple()`](/data/dbcomm/postgres-citus/src/backend/executor/execTuples.c:1641). Triggers, generated columns, and constraints still execute inside the insert path.
 
-### 8. Current terminal signaling is still asymmetric
+### 8. The low-level receive API distinguishes failure, but the tuple-session wrapper does not yet propagate it
 
-The backend-visible receive EOS bit is still only [`CITUS_TUPLE_SINK_QUEUE_FLAG_PEER_CLOSED`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/tuple_sink_protocol.h:29), surfaced through [`CitusTupleSinkReceivePeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service.c:1499) and [`RemoteExecutionSessionReceivePeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_session.c:3178).
+The current byte-ring frontend keeps graceful peer close and terminal failure as different states. [`CitusTupleSinkReceivePeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_tuple_queue_frontend.c:2295) exposes the successful peer-close flag. [`CitusTupleSinkReceivePeerFailed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_tuple_queue_frontend.c:2314) checks for `CITUS_TUPLE_SINK_TERMINAL_FAILED` and returns its failure code, while [`CitusTupleSinkReceiveTerminalState()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_tuple_queue_frontend.c:2343) exposes the raw terminal state to callers that must distinguish failure from graceful quiescence.
 
-The send side now also has sender-visible terminal publication through [`TupleSinkServiceMarkSendQueueTerminal()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:3625), so blocked senders do not wait forever after peer-binding teardown or transport failure. But receive-side transport failure is still not exposed to the worker as a distinct terminal bit. That remains a real follow-up gap.
+The substrate contract is therefore no longer “failure and EOF are the same bit”: peer-closed is successful EOF, while `FAILED` is an error and carries a failure code. However, this distinction is **not yet end-to-end on the tuple-worker path**. [`RemoteExecutionSessionReceivePeerClosed()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend.c:1448) still exposes only the graceful-close predicate, and the worker loop checks only that wrapper in [`ExecuteWorkerTupleSinkInsert()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/worker/homer/worker_tuple_sink_insert.c:350). Propagating the low-level failed state through the session wrapper and worker remains a current gap.
 
 ## Validation state
 

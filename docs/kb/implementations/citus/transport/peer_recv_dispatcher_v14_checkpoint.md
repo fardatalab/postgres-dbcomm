@@ -1,5 +1,7 @@
 # Peer Recv Dispatcher v14 Checkpoint
 
+<!-- kb-summary: Landed checkpoint for peer protocol v14 immediate-data ABI and permanent receive-CQ dispatch. -->
+
 ## Scope
 
 - **What this doc explains**: the landed Slice 2A checkpoint for the peer

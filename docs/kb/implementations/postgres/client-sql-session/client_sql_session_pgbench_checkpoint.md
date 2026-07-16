@@ -1,5 +1,7 @@
 # Client SQL Session Pgbench Checkpoint
 
+<!-- kb-summary: Current implementation state, validation evidence, and milestone history for integrated pgbench Homer client-SQL sessions. -->
+
 ## Scope
 
 - **What this doc explains**: the current implementation state for the simple-mode pgbench transaction workload that uses Homer typed client SQL sessions instead of libpq workload traffic.
@@ -378,14 +380,14 @@ backend-created POSIX shared-memory shortcut:
 - [`TupleSinkServiceHandleOpenSession()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/tuple_sink_service_process.c:9920) recognizes this client-SQL result-open shape through `parentServiceSessionId` and returns a byte-ring descriptor for the exact service-owned stream.
 - [`RemoteExecSqlDestStartup()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:972) receives the executor `TupleDesc`, builds a tuple-view contract, opens the service-owned send-side tuple sink, and publishes a `STARTED` completion so the frontend can open the sink while the command is still active.
 - [`RemoteExecSqlDestReceiveSlot()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:585) copies executor tuples into a receiver-owned virtual slot, appends them to tuple-sink batches, and flushes/reserves batches on normal batch-full backpressure.
-- [`RemoteExecSqlDestShutdown()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:640) flushes the final batch, marks peer-closed/EOS, and closes the backend-local sink handle before the executor context can be reset.
-- [`RemoteExecSqlDestDestroy()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1214) drops only receiver-local state; service-owned sink teardown is handled through [`RemoteExecCloseServiceOwnedResultSink()`](/data/dbcomm/citus-dbcomm-separate-comm-stack/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:558).
+- [`RemoteExecSqlDestShutdown()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1635) flushes the final batch and marks peer-closed/EOS, then drops only the receiver's borrowed handle pointer. The persistent backend session retains the actual handle and mapping for compatible later commands.
+- [`RemoteExecSqlDestDestroy()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1660) drops receiver-local references only. [`RemoteExecCleanupSessionResultQueue()`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/remote_execution_backend_bridge.c:1186) closes the handle/mapping, service-owned sink, copy slot, and copied descriptor when the socketless backend session ends.
 - [`HomerRunCommandAndWait()`](/data/dbcomm/postgres-citus-separate-comm-stack/src/bin/pgbench/pgbench.c:3249) opens and drains the result sink on `STARTED` or `COMPLETED` command completions, then closes/unlinks the frontend mapping.
 
 Two lifetime corrections are important:
 
 - The receiver-owned copy slot uses a copied `TupleDesc` in `TopMemoryContext`. Keeping the executor-provided `TupleDesc` inside a longer-lived slot after `PortalDrop()` produced stale executor slot metadata on the next command.
-- The send-side tuple sink handle must be closed in `rShutdown`, not in the later manual destroy path. `OpenCitusTupleSink()` currently allocates the handle in the executor context active during `rStartup`; closing it after `PortalDrop()` touched freed context memory and caused the next post-`SELECT` DML command to fail with `trying to store an on-disk heap tuple into wrong type of slot`.
+- The send-side tuple sink handle is session-owned and deliberately survives `rShutdown`/`rDestroy`. Those callbacks own one command's receiver state, while `RemoteExecBackendSessionState` owns the reusable mapping, copy slot, and copied descriptor until session cleanup. The earlier command-local close avoided one stale-context failure but also prevented the current cross-command reuse; it is historical rationale, not the current ownership rule.
 
 The current implementation deliberately keeps a local shared-memory mapping for
 the local-host prototype, but ownership and binding are now service-driven. That

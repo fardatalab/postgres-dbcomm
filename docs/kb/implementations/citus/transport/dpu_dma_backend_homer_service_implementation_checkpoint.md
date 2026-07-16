@@ -1,5 +1,7 @@
 # DPU DMA Backend Homer Service Implementation Checkpoint
 
+<!-- kb-summary: Stage-by-stage implementation checkpoint for the DPU-pull Homer service migration. -->
+
 ## Current Status
 
 This note tracks landed implementation stages for the DPU-pull Homer migration.

@@ -1,5 +1,7 @@
 # Local service-owned session and tuple-sink control checkpoint
 
+<!-- kb-summary: Earlier local checkpoint for service-owned SHM control, compatibility sessions, and exact tuple sinks. -->
+
 ## Scope
 
 - **What this doc explains**: the current implementation checkpoint where the standalone homer service owns the local shared-memory control path, resolves compatibility at a service-session layer, and then manages one or more tuple sinks under that session for the experimental [`RemoteExecutionSession`](/data/dbcomm/citus-dbcomm/src/include/distributed/homer/remote_execution_session.h).

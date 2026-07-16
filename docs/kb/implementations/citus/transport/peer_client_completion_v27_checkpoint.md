@@ -1,5 +1,7 @@
 # Peer-Client Completion v27 Checkpoint
 
+<!-- kb-summary: Landed checkpoint for peer-client completion mailbox v27 and full-slot publication. -->
+
 ## Scope
 
 - **What this doc explains**: the landed Slice 1 implementation for the

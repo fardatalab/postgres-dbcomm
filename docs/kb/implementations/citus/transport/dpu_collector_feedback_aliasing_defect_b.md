@@ -1,5 +1,7 @@
 # Defect B — twelve DPU collectors share one feedback struct, and it defeats the starvation escape hatch
 
+<!-- kb-summary: Active diagnosis and remediation plan for DPU collector feedback aliasing and starvation suppression. -->
+
 **Status:** PLAN, not yet implemented. **FB-0 (instrumentation) DONE and MEASURED — see the banner: it refuted BOTH the prior review's mechanism AND my liveness escalation.**
 **Justification now rests on MEASURABILITY (S6 blocker) + a genuinely INVERTED feedback signal — not on latency, and not on liveness today.** **Blocks:** command-plane **S6** (the plan states this explicitly:
 *"⚠ PREREQUISITE: fix B (per-collector feedback) BEFORE recording any S6 number"*).

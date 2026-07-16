@@ -1,5 +1,7 @@
 # DPU gate concurrency limits — the byte-ring pool caps the gate at 8 clients
 
+<!-- kb-summary: Current DPU gate concurrency limits imposed by the byte-ring pool and related fixed-capacity resources. -->
+
 **Status: UNDERSTOOD and BOUNDED (2026-07-13). Not a regression; a pre-existing capacity limit, found the first
 time the DPU gate was ever run above one client.** Decision: **cap the gate at 8 clients**, raise the knob if we
 need more. The engine-fatal that appears above the cap is **gated behind the cap** and is deliberately parked.

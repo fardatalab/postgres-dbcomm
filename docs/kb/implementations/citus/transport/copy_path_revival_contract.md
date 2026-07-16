@@ -1,5 +1,7 @@
 # The COPY revival contract — what to uphold when you come back to backend-to-backend COPY
 
+<!-- kb-summary: Coverage, invariants, refuted suspects, and prerequisites for eventually reviving backend-to-backend COPY. -->
+
 > ## ⚠ READ THIS BOX FIRST — IT CHANGES WHAT THIS DOCUMENT IS FOR (2026-07-12, owner's direction)
 >
 > **HOST-SERVICE HOMER IS BEING REMOVED.** Once the DPU command plane lands, the host-service arm goes away.

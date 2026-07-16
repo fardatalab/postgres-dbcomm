@@ -1,5 +1,7 @@
 # DPU command-plane migration — detailed plan
 
+<!-- kb-summary: Detailed staged plan and decisions for moving the Homer SQL command plane onto the DPUs. -->
+
 > **Naming.** A SEPARATE workstream from the byte-ring pool plan, not its "Stage 3". The pool plan owns
 > data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
 > independently — cite them as "command-plane S1a", etc.

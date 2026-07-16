@@ -1,5 +1,7 @@
 # Homer current implementation checkpoint
 
+<!-- kb-summary: Historical Homer implementation checkpoint predating the selected-DPU command-plane migration. -->
+
 > ## ⚠ STALE — MILESTONE HISTORY ONLY (banner added July 12, 2026)
 >
 > This doc was last true on **July 3, 2026**. It predates the **command-plane migration (S1-S4)**, which
