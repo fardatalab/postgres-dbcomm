@@ -2,7 +2,12 @@
 
 <!-- kb-summary: Ordered stage plan for re-arming send-CQE coalescing on the peer RDMA transport, with the 2026-07-15 site-enumeration corrections to the design. -->
 
-**Status: PLANNING (2026-07-15). No code yet.** Graduated from the design
+**Status: IMPLEMENTATION IN PROGRESS (2026-07-16).** Stage 1 is landed and validated (§51 in the retirement
+audit). **Stage 2a is LANDED + VALIDATED** as Citus `bdcb7eb70`: the gate and 4-role basebackup passed
+on the corrected final binary, with no Stage-2a/global alarms and no directional gate regression (D-S2a
+acceptance below; audit §52). A post-implementation review replaced unsafe orphan/drop recovery on structurally
+impossible ownership-insertion failures with the scoped fail-stop policy in D-S2a item 14. **Next: Stage 2b.**
+Graduated from the design
 [`../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md`](../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md)
 (C1–C5). Prerequisite **§29(b) send-queue accounting is LANDED** (`postedSendWrs` / `retiredSendWrs` /
 `signalledFrontierMark[]`, `remote_execution_peer_transport_rdma.c:~1043`).
@@ -433,7 +438,10 @@ cover; attack these first in review):
    free): entries `{responsePublish, slotIndex, slotGeneration, frontierMark}`, ring of depth
    `OP_SLOTS + RESPONSE_PUBLISH_SLOTS` = 128, appended inside `TupleSinkServicePublishControlMessage` after
    its post succeeds (it decodes its own WR-ID — the transport owns the layout; all three encode sites
-   funnel there). `TupleSinkServiceRetireControlSendCompletion` (`R:4311`) splits: decode-free core
+   funnel there). FIFO overflow or failure to decode that just-encoded CONTROL ID is structurally impossible
+   and **fail-stops** after the ALARM; continuing would leave a posted source untracked. Process exit destroys
+   the QP and is the deliberately simple research-prototype failure fence. `TupleSinkServiceRetireControlSendCompletion`
+   (`R:4311`) splits: decode-free core
    `...ReleaseControlSendOwner(connectionState, responsePublish, slotIndex, generation)` called by the
    sweep pop; the CONTROL arm of the dispatch becomes validation (+ rule 2's force-sweep).
 9. **New accessor** `TupleSinkServicePeerConnectionPostedSendWrsRdma(handle)` for the service-side stamp
@@ -456,12 +464,14 @@ Codex adversarial review outcomes folded in (round 1: 4 defects, 3 concerns, 2 n
 round-1 correction and found 2 NEW defects — items 19–20 below; round 3 verified those):
 
 13. **D1 → purge retires (see the rule-5 amendment).**
-14. **D4 → the recovery ALARMs are now TRUE:** the service validators' `!linked` arm releases a
-    posted-but-unlinked ORPHAN directly (`active && same connection && frontierMark != 0 && mark <= F` —
-    `frontierMark == 0` discriminates the reserved-not-yet-posted window), and the CONTROL arm falls back
-    on SLOT STATE (response: `inUse`; request: generation match ∧ `phase != UNUSED` ∧
-    `!sendCompletionRetired`) when the FIFO does not contain the CQE's entry — a live entry with that
-    identity would have been FOUND, so no double release.
+14. **D4 → SUPERSEDED by round 4 after owner review.** The proposed posted-but-unlinked recovery was unsafe:
+    Scenario-E treated every unlinked entry as unposted and could reuse its index before the old CQE arrived;
+    merely retaining the orphan was also incomplete because CQ-demand execution enumerates sweep lanes, so an
+    unlinked owner does not identify a QP to drain. The owner explicitly chose the research-prototype policy:
+    lane allocation is structurally infallible (lanes are owner-table-sized), and violation is **ALARM +
+    `exit(1)` immediately after post success**. The same fail-stop rule replaces the CONTROL dropped-entry
+    fallback for impossible FIFO overflow / local WR-ID decode failure. Normal execution therefore has no
+    posted-but-unlinked or dropped-control owner; validators handle only sweep/skew diagnostics.
 15. **D3 → self-heal widened but deliberately NOT fully QP-wide at 2a:** service validators heal BOTH
     service classes through the proven mark; the CONTROL arm's heal also invokes `sendCheckpointSweep`.
     TWO residual gaps, both **2c items** (the skew ALARM is unreachable at 2a — always-on signalling + the
@@ -500,6 +510,36 @@ round-1 correction and found 2 NEW defects — items 19–20 below; round 3 veri
     abandoned owners keep their lane hot; helpers
     `TupleSinkServiceRelease{ClientSqlCommandWrite,PeerClientCompletionPublish}SignaledDemand` carry the
     rule. This also strictly supersedes round-1's D2 adjudication: demand is no longer dropped at all.
+
+### D-S2a acceptance — PASS (2026-07-16, corrected final binary; Citus `bdcb7eb70`)
+
+Post-implementation review found one HIGH exceptional-path defect in the first implementation: the validator
+claimed it could recover a posted-but-unlinked owner, but Scenario-E treated every unlinked entry as unposted and
+could reuse the index before the old CQE arrived. Retaining the orphan was also incomplete because CQ-demand
+execution enumerates sweep lanes, so the orphan did not identify a QP to drain. The owner explicitly chose the
+research-prototype resolution in item 14: structurally impossible service-lane allocation and control-owner
+insertion/decode failures ALARM and fail-stop; process exit/QP teardown is the failure fence. A fresh adversarial
+pass verified that correction and found no remaining ownership or normal-path defect.
+
+Final full acceptance rebuilt/installed both trees, checksum-synced farnet0, rebuilt both DPU services, proved the
+new fail-stop literal in all deployed binaries, and ran from a hard clean baseline with host services absent:
+
+- debug gate: correct `homer-dpu-command` path, five distinct decoded `abalance` values, 5/5 processed, DPU backend
+  spawn `COMPLETED`;
+- warmed gate `-c 1 -j 1 -t 2000`: **303.395 / 298.298 / 295.362 TPS**, 2000/2000 and zero failures each — inside
+  the accepted current/Stage-1 neighborhood, no directional regression;
+- measured 4-role basebackup: sender/consumer exit 0, **23,254,330,999 bytes (21.6573 GiB)** in 7.96 s, clean
+  `stream complete` + `CLOSE_ACK`; 512-KiB geometry forces **44,354 full ring laps plus 61,047 bytes**;
+- both DPUs: global alarms = 0; Stage-2a sweep/skew/orphan/self-heal/purge/Scenario-E diagnostics = 0; supervised
+  exit status 0; peer-control `live=0`, abandonment 0/0; head-mirror `live=0`; DMA drain 0 tasks,
+  `free_slots=3072/3072`, `fatal=false`.
+
+**Honest evidence boundary:** the implementation does not print final per-connection `postedSendWrs` and
+`retiredSendWrs`, so exact numerical equality was not directly observed. Acceptance instead proves clean semantic
+closure, no named-CQE/sweep recovery diagnostics, zero live retirement ledgers, zero DMA tasks, and clean service
+exits. Node A also retained the pre-existing clean gate result-relay teardown shape (host-consumer detach → reason-4
+connection reset → clean orphan reclaim, with `response_slots=1` and all control-op state counts zero); it carried no
+Stage-2a alarm/recovery diagnostic and is not reclassified as a Stage-2a fallback.
 
 ### D-S3 Drain de-schedule: the pull points that replace the PEER_SEND_CQ collector
 

@@ -10,7 +10,7 @@ Index forward-looking Citus design notes. Canonical grounded behavior should sta
 - `connection-management/`: Chosen remote-execution-session control-plane direction for external-service ownership of Citus communication semantics.
 - `data-movement/`: Concrete prototype plans for replacing Citus data-movement byte paths with tuple-service designs.
 - `intermediate-results/`: Non-file storage and API design space for intermediate results.
-- `transport/`: RDMA and service-oriented transport/control-plane abstraction ideas grounded in current Citus connection management.
+- `transport/`: Index of forward-looking Citus transport, RDMA, DPU, and Homer control-plane designs.
 <!-- kb-subdirs:end -->
 
 ## Documents

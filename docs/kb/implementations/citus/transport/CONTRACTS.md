@@ -412,7 +412,7 @@ the call site. If it is not on the list, **it has not been checked.**
   pops per-connection post-order lanes while `mark <= F`, so retirement is CROSS-CLASS (a payload or
   control CQE retires command/completion owners on that QP for free).
 - **DOES NOT MEAN** a per-class sequence number (`postOrdinal` and the array lane FIFOs are deleted), and
-  `0` is NOT a mark: it flags "reserved, unit not yet posted" — the validators' orphan discriminator.
+  `0` is NOT a posted mark: it flags "reserved, unit not yet posted."
 - **ENFORCES:** stamp+link ONLY after the unit's posts all succeed (command post fn, completion publish fn
   in `tuple_sink_service_process.c`); `TupleSinkServiceAccountPostedSendChainRdma` increments
   `postedSendWrs` BEFORE stamping the mark table, which is what makes the service-side stamp equal the
@@ -425,8 +425,9 @@ the call site. If it is not on the list, **it has not been checked.**
   lane twice and corrupts the intrusive list. Only the sweep pop (or a stale-generation purge) unlinks.
 - **`active` MEANS:** the entry holds owner accounting. Scenario-E abandonment clears `active` IN PLACE and
   KEEPS `linked` (+ the signalled demand, next entry): the WR's CQE is still in flight and the sweep lazily
-  discards the entry when it arrives. `active && !linked && frontierMark != 0` = a posted-but-never-linked
-  ORPHAN (link failure), released directly by the CQE validator.
+  discards the entry when it arrives. A posted-but-unlinked entry is forbidden: lane capacity is structurally
+  at least owner capacity, and a post-success link failure ALARMs and fail-stops so process teardown fences
+  the QP. This deliberately simple research-prototype failure policy avoids a second orphan scheduler.
 - **ENFORCES:** both reserve probe loops; `Clear...Index` (linked guard: deactivate-in-place + ALARM, never
   memset); `Abandon...OwnerIndex`; the sweep pop unlink-before-retire order (the retire memsets).
 
@@ -462,8 +463,8 @@ the call site. If it is not on the list, **it has not been checked.**
 
 - **MEANS:** the scalar retire → control-FIFO sweep → `sendCheckpointSweep` sequence runs inside the
   dispatch's SUCCESS block for EVERY class including UNTAGGED; the class-typed callbacks afterwards are
-  VALIDATORS (their contract comment in `remote_execution_peer_transport_rdma.h`), releasing only the
-  orphan/skew anomalies, best-effort.
+  VALIDATORS (their contract comment in `remote_execution_peer_transport_rdma.h`), best-effort healing only
+  a surviving linked owner / frontier-skew anomaly. Post-success ownership insertion failures fail-stop.
 - **DOES NOT MEAN** the bootstrap poll is exempt: `TupleSinkServicePollBootstrapSendCompletion` consumes an
   accounted-signalled CQE and therefore RETIRES (validated against the stashed
   `bootstrapSendWorkRequestId`). Before that fix the mark pairing was shifted by one for the QP's life and
@@ -482,13 +483,13 @@ the call site. If it is not on the list, **it has not been checked.**
   every successful CQE; release runs the decode-free core `TupleSinkServiceReleaseControlSendOwner`
   (old per-CQE retire semantics preserved: response slot `inUse=false`; request `sendCompletionRetired` +
   conditional op release).
-- **DOES NOT MEAN** a service-visible structure, and the CONTROL dispatch arm does NOT release: it
-  validates (entry gone after its own CQE's sweep) with a slot-state fallback whose no-double-release proof
-  is TEMPORAL (sweep-before-validator within one dispatch), not identity-based — response WR-IDs all carry
-  generation 0.
+- **DOES NOT MEAN** a service-visible structure, and the CONTROL dispatch arm does NOT normally release: it
+  validates that the entry is gone after its own CQE's sweep and best-effort sweeps a surviving linked entry.
+  There is no dropped-entry slot-state fallback.
 - **ENFORCES:** the append after the post in `PublishControlMessage` (all three control encode sites funnel
   there); the connection-reset memset zeroes it with the accounting; depth = op+response slot counts, so
-  overflow is structurally impossible (ALARM + validator fallback if it ever fires).
+  overflow is structurally impossible. Overflow or failure to decode the locally encoded CONTROL WR-ID
+  ALARMS and fail-stops; process exit destroys the QP rather than continuing with an untracked live source.
 
 ---
 

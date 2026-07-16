@@ -1,6 +1,11 @@
 # Send-CQE coalescing and pool depth
+<!-- kb-summary: Historical send-CQE coalescing design, corrected by and linked to the active staged implementation plan. -->
 
-**Status: DESIGN. Not implemented.** Prerequisite: §29(b) send-queue admission accounting in
+**Status: IMPLEMENTATION IN PROGRESS.** The corrected design is being implemented through
+[`send_cqe_coalescing_implementation_plan.md`](../../../implementations/citus/transport/send_cqe_coalescing_implementation_plan.md):
+Stage 1 is landed/validated and Stage 2a is implemented/validated; Stage 2b is next.
+This document remains the historical design and contains superseded assumptions; the implementation plan is
+the source of truth. Prerequisite §29(b) send-queue admission accounting is in
 `../../../implementations/citus/transport/resource_retirement_contract_audit.md`.
 
 > ## ⚠⚠ THE IMPLEMENTATION PLAN — with 2026-07-15 corrections — SUPERSEDES PARTS OF THIS DOC

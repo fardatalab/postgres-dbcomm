@@ -1,4 +1,5 @@
 # Transport
+<!-- kb-summary: Index of forward-looking Citus transport, RDMA, DPU, and Homer control-plane designs. -->
 
 ## Purpose
 
@@ -31,6 +32,7 @@ Index forward-looking transport and control-plane designs for Citus, especially 
 - [peer_service_push_completion_implementation_plan.md](peer_service_push_completion_implementation_plan.md) - Implementation status and cleanup plan for replacing normal service-to-service peer completion polling with a requester-owned peer command completion ring.
 - [rdma_publication_visibility_and_doorbells.md](rdma_publication_visibility_and_doorbells.md) - RDMA publication/visibility rules, including why the tuple-sink prototype now uses WRITE_WITH_IMM doorbells rather than trusting memory polling alone as the responder-visible publish event.
 - [rdma_transport_control_plane_abstraction.md](rdma_transport_control_plane_abstraction.md) - TODO
+- [send_cqe_coalescing_and_pool_depth.md](send_cqe_coalescing_and_pool_depth.md) - Historical send-CQE coalescing design, corrected by and linked to the active staged implementation plan.
 - [service_progress_control_data_plane_scheduler.md](service_progress_control_data_plane_scheduler.md) - Current state-machine service-progress scheduler design, default `machine-baseline` policy, validation gate, known caveats, and future adaptive-policy directions.
 - [session_identity_and_pairing.md](session_identity_and_pairing.md) - Cross-node session identity model (sessionKey vs node-local serviceSessionId vs cross-node sessionUID), the basebackup throwaway-session/registry warts, the DPU-instance spike that killed the handshake plan, and the adopted receiver-session base-compat+tag scan (no handshake).
 <!-- kb-docs:end -->

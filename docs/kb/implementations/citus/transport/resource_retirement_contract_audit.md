@@ -19,6 +19,7 @@
 > | **§25 / F7** | ✅ LANDED + VALIDATED (§25.6) | citus `16e4bdf3e` |
 > | **§29a / §29b** | ✅ LANDED | citus `c3e3f3e56` / `e85abe531` |
 > | **P1-f** | ✅ LANDED + VALIDATED (§33.11) | citus `91482c840` |
+> | **send-CQE Stage 2a** | ✅ **LANDED + VALIDATED** | citus `bdcb7eb70` · **§52** |
 >
 > **⇒ P7b IS UNBLOCKED.** P7b.0 *is* P0-b, already landed. P7b.1 is small (§26.6).
 >
@@ -52,7 +53,8 @@
 
 **Status:** **P0 COMPLETE** (see the box). Audit COMPLETE (RDMA + DOCA DMA). Remaining work is P1/P2 — see the box.
 **Opened:** July 12, 2026. **Owner-driven** (the contract below is an owner statement, not a derived rule).
-**Code baseline (at open):** citus `d33f6ded3`, postgres `0021633a44a`. **Last updated:** July 13, 2026 (citus `a551bcf6e`).
+**Code baseline (at open):** citus `d33f6ded3`, postgres `0021633a44a`. **Last updated:** July 16, 2026 (Stage 2a
+landed as citus `bdcb7eb70`).
 
 ---
 
@@ -7909,3 +7911,51 @@ an aborted sender NEVER yielded consumer success).** Caveats: probe-C detail str
 zero-frontier FAILED path code-reviewed-only; validator round-3 deviations (self-inflicted postmaster
 restarts during probe-timing calibration; `pg_stat_progress_basebackup` never populates for the Homer
 sink — unexplained, diagnostic-only).
+
+## §52 — send-CQE coalescing Stage 2a: QP-wide owner-frontier sweep with signalling still always-on. LANDED + VALIDATED 2026-07-16 (citus `bdcb7eb70`).
+
+Plan of record and full implementation map:
+`send_cqe_coalescing_implementation_plan.md` D-S2.0 through D-S2a. Stage 2a replaces the class-local ordinal /
+array-FIFO retirement of command-write and peer-client-completion owners with per-connection intrusive post-order
+lanes stamped by the QP-wide `postedSendWrs` frontier. Every successful accounted send CQE advances the scalar
+retirement frontier, sweeps the transport-owned control FIFO, then sweeps both service owner classes; the typed
+command/completion/control CQE arms validate that their own named owner is already gone. The bootstrap special poll
+now validates and retires its accounted CQE, eliminating the permanent one-checkpoint mark skew. Signalling policy is
+unchanged in this stage: command, completion, and control sends remain always-signalled.
+
+### 52.1 Post-implementation review correction — edge recovery was more dangerous than fail-stop
+
+The first implementation attempted to recover a posted-but-unlinked service owner from its typed CQE. Adversarial
+review refuted that recovery: Scenario-E treated every unlinked entry as unposted and could reuse the index before
+the old CQE arrived; retaining the orphan was still incomplete because the send-CQ demand executor enumerates sweep
+lanes, so an unlinked owner did not identify a QP to drain. A later old CQE could therefore inspect a same-connection
+replacement owner and force-sweep through a mark it did not prove.
+
+Owner decision: this is a research prototype and these insertion failures are structurally impossible (each lane
+table is owner-table-sized; control FIFO depth is exactly op slots + response slots). Do not build a second orphan
+scheduler. Service-lane allocation failure, control FIFO overflow, and failure to decode the locally encoded CONTROL
+WR-ID now **ALARM + `exit(1)` immediately after post success**. Process exit destroys the QP and is the failure fence.
+The unsafe orphan/drop fallback code and promises were removed. A fresh adversarial pass verified the corrected
+normal and fail-stop paths and found no remaining ownership defect.
+
+### 52.2 Validation — PASS on the corrected final binary
+
+Full rebuild/install, farnet0 checksum sync, both-DPU rebuild/deploy/landed proof, hard clean baseline, and fresh
+service-identity proof all passed. Acceptance evidence:
+
+- debug gate proved `homer-dpu-command`, five distinct decoded results, 5/5 processed, and DPU backend spawn
+  `COMPLETED`;
+- warmed gate `-c 1 -j 1 -t 2000`: **303.395 / 298.298 / 295.362 TPS**, each 2000/2000 with zero failures — no
+  directional regression versus the accepted current/Stage-1 neighborhood;
+- measured 4-role basebackup: sender/consumer exit 0, **23,254,330,999 bytes (21.6573 GiB)** in 7.96 s, clean
+  `stream complete` and `CLOSE_ACK`; the 512-KiB ring traversed **44,354 full capacities plus 61,047 bytes**;
+- both DPUs: global alarms = 0; Stage-2a sweep/skew/orphan/self-heal/purge/Scenario-E diagnostics = 0; supervised
+  service exit status 0; peer-control `live=0`, abandonment 0/0; head-mirror `live=0`; DMA drain 0 tasks,
+  `free_slots=3072/3072`, `fatal=false`.
+
+**Evidence boundary:** no teardown log prints final per-connection `postedSendWrs` and `retiredSendWrs`, so their
+exact numerical equality remains directly unobserved. The acceptance substitute is clean semantic closure, no
+named-CQE/sweep recovery diagnostics, zero live retirement ledgers, zero DMA tasks, and clean service exits. Node A
+also retained the pre-existing clean gate result-relay teardown shape (host-consumer detach → reason-4 reset → clean
+orphan reclaim, `response_slots=1`, all control-op state counts zero); it carried no Stage-2a alarm or recovery and is
+not evidence that the Stage-2a fallback ran.
