@@ -1,5 +1,7 @@
 # Farnet diagnostics and measurement history
 
+<!-- kb-summary: Diagnostic builds and network batteries, SHA-stamped measurement history, and intentionally non-runnable broken command shapes for the farnet Homer rig. -->
+
 ## Purpose
 
 Two things that do **not** belong in the runbook but must not be lost:
@@ -11,8 +13,8 @@ Two things that do **not** belong in the runbook but must not be lost:
    **timestamped observation, not a standing fact**, and several are now known stale. They are kept because a
    number you cannot date is a number you cannot retire.
 
-The always-on guards that must *never* be skipped live in `CLAUDE.md`: the process preflight, the correctness
-anchors, and intended-path confirmation.
+The always-on guards live in repository `AGENTS.md`; exact current preflight, correctness anchors, and intended-path
+procedure live in `farnet_operator_runbook.md`.
 
 ## Status
 
@@ -98,8 +100,8 @@ FATAL-on-failure *before* the command loop.
 ## 2. Network / RDMA diagnostic battery
 
 **Run these only** after a reboot or renumber, when a run actually fails, or before a fresh absolute
-(e.g. line-rate) performance claim. In steady state the addresses in `CLAUDE.md` are the source of truth —
-go straight to the preflight and the workload.
+(e.g. line-rate) performance claim. In steady state the operator runbook is the source of truth — go straight to
+the preflight and workload.
 
 ### 2.1 Addressing and link state
 
@@ -293,7 +295,7 @@ separate performance question.**
 
 ⚠ **The "≈450 µs/command" here is ARITHMETIC and it is 2× WRONG** (3.14 ms ÷ ~7 statements). The **measured**
 per-command control wait is **235.4 µs** — see
-[`remove_synchronous_start_round_trip.md`](../../future-directions/citus/transport/remove_synchronous_start_round_trip.md).
+[`remove_synchronous_start_round_trip.md`](../future-directions/citus/transport/remove_synchronous_start_round_trip.md).
 
 Two methodological notes worth keeping:
 
@@ -381,7 +383,7 @@ pool refactor; it dates to whenever basebackup became mandatorily selected-DPU. 
 `../implementations/citus/transport/byte_ring_slot_capacity_regression.md`, where the fix shape is recorded
 (teach the host service the shared rule) but **not yet implemented**.
 
-**Use the 4-role DPU-relay topology** (`host=10.10.1.200`, the farnet0 **DPU**) in `CLAUDE.md`.
+**Use the 4-role DPU-relay topology** (`host=10.10.1.200`, the farnet0 **DPU**) in the operator runbook.
 
 ### 4.2 `bytes=8388608` — cannot work
 
@@ -414,7 +416,8 @@ different axis entirely.
 ## Related
 
 - `farnet_operational_hazards.md`: the traps — checks whose failure mode is silent.
-- `../../../CLAUDE.md` (→ `AGENTS.md`): machine setup and the canonical runbook.
+- `../../../AGENTS.md`: concise policy, triggers, and workload-selection rules.
+- `farnet_operator_runbook.md`: canonical machine setup and operator workflow.
 - `../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md`: the scheduler arm/execute
   mismatch that `starve-diag` instruments.
 - `../implementations/citus/transport/byte_ring_slot_capacity_regression.md`: the open regressions behind the

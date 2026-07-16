@@ -62,6 +62,7 @@ class PhasePlanner:
             helpers = tuple(path.name for path in sorted(HELPER_ROOT.glob("*.sh")))
             specs += upload_specs("dpu", c.run_id, helpers, pg)
             specs += upload_specs("farnet0", c.run_id, helpers, pg)
+            specs += [invoke_spec("farnet0", c.run_id, "dpu_dispatch.sh", ("prepare",), pg, 60, True)]
             specs += [invoke_spec("farnet0", c.run_id, "dpu_dispatch.sh", ("install", name), pg, 60, True)
                       for name in helpers]
             return specs
@@ -133,7 +134,8 @@ class PhasePlanner:
         if phase == "clean":
             return [CommandSpec("postgres-stop", ("bash", str(HELPER_ROOT / "postgres_stop.sh"), prefix),
                                 pg, timeout_s=60, mutates=True),
-                    invoke_spec("farnet0", c.run_id, "postgres_stop.sh", (prefix,), pg, 60, True),
+                    invoke_spec("farnet0", c.run_id, "postgres_stop.sh",
+                                (prefix, "--allow-missing-data"), pg, 60, True),
                     CommandSpec("local-host-process-cleanup",
                                 ("bash", str(HELPER_ROOT / "host_process_cleanup.sh"), prefix),
                                 pg, timeout_s=60, mutates=True),

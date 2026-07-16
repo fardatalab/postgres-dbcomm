@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Checked-in farnet0 helper for file-based second-hop DPU operations.
 set -euo pipefail
-action=${1:?install or helper name required}
+action=${1:?prepare, install, install-data, or helper name required}
 run_id_from_path=$(basename "$(dirname "$(dirname "$0")")")
 remote="/tmp/$run_id_from_path/helpers"
+if [[ "$action" == prepare ]]; then
+    exec ssh dpu install -d -m 0700 "$remote"
+fi
 if [[ "$action" == install ]]; then
     name=${2:?helper name required}
     scp "$(dirname "$0")/$name" "dpu:$remote/.$name.upload"

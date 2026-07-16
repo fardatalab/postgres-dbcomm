@@ -6,7 +6,8 @@
 
 **IMPLEMENTATION IN PROGRESS, LIVE EXECUTION FAIL-CLOSED (2026-07-16).** The profile/phase/evidence/parser skeleton
 and the forward structured-event API now exist, but `validate.py run --execute` deliberately rejects the invocation.
-The current runbook remains authoritative until receipt minting, remote takeover/identity proof, lifecycle cleanup,
+The current [`farnet_operator_runbook.md`](farnet_operator_runbook.md) remains authoritative until receipt minting,
+remote takeover/identity proof, lifecycle cleanup,
 negative tests, another adversarial pass, and one known-green live acceptance are complete.
 
 “The runbook remains authoritative” does not mean the runner scripts should sit unused. Every applicable checked-in
@@ -35,20 +36,21 @@ the symptom into a generic timeout or blindly cleaning away the evidence.
 
 ## Grounding and non-negotiable contracts
 
-- `AGENTS.md:173-191`: every validation build names all seven smoke targets.
-- `AGENTS.md:243-268`: peer sync is dry-run first, rejects any nonzero status, preserves `dbcomm` receiving-side
-  ownership, and proves parity.
-- `AGENTS.md:270-343`: cleanup identifies processes by `/proc/<pid>/exe`, includes both DPUs, and removes only the
-  project's shared-memory objects.
-- `AGENTS.md:345-376`: every measured run starts from a process/database identity preflight; port 5433 and the exact
-  data directory are load-bearing.
-- `AGENTS.md:617-750`: the DPU gate requires both host services absent, the correct DPU peer address, a fresh
-  frontend-doorbell attachment, decoded result proof, and DPU backend-spawn begin/completed proof. Any failed gate
-  invalidates later runs until both DPU services restart.
-- `AGENTS.md:866-907`: four-role basebackup starts the consumer first, uses matching 4 x 524,288-byte geometry, and
-  requires both roles to complete.
-- `AGENTS.md:980-1011`: transport changes run the gate and four-role basebackup; DPU DMA/byte-ring/bridge changes add
-  the DPU TCP smoke.
+- [`Build, install, and artifact proof`](farnet_operator_runbook.md#build-install-and-artifact-proof) names the full
+  target set and preserves the Citus-install→PostgreSQL-relink/install order.
+- [`Peer-host artifact deployment`](farnet_operator_runbook.md#peer-host-artifact-deployment) rejects broad source
+  sync, uses run-scoped DPU snapshots, and requires receipt/checksum proof.
+- [`Clean baseline`](farnet_operator_runbook.md#clean-baseline) uses canonical `/proc/PID/exe` identity, includes both
+  DPUs, and removes only project-owned shared memory.
+- [`Start roles and prepare workload`](farnet_operator_runbook.md#start-roles-and-prepare-workload) proves port 5433,
+  the exact data directory, service identity, listener ownership, and clean candidate state.
+- [`Selected-DPU command gate`](farnet_operator_runbook.md#selected-dpu-command-gate) requires both host services
+  absent, correct local/remote DPU identities, four path proofs, both-DPU evidence, and a both-service restart after
+  failure.
+- [`Four-role basebackup`](farnet_operator_runbook.md#four-role-basebackup) starts the consumer first, uses matching
+  4 x 524,288-byte geometry, and requires both role statuses plus wrap evidence.
+- [`Regression sweep`](farnet_operator_runbook.md#regression-sweep) requires gate plus basebackup and adds the DPU TCP
+  smoke for DPU DMA, byte-ring, or bridge changes.
 - `docs/kb/operations/farnet_operational_hazards.md`: a scripted check must fail loudly when it cannot establish
   identity; unreadable `/proc`, stale DPU services, rsync 23, and pipeline-masked build failure cannot become PASS.
 
@@ -91,6 +93,13 @@ duplicative while retaining every silent-wrong-result guard.
 
 The runner writes only under an explicit evidence directory (default `/tmp/farnet-validation-<run-id>`) plus
 documented runtime/build/install destinations selected by the profile.
+
+The configured host prefix is a **logical cross-host path**, currently `/data/dbcomm/pg-citus`. Farnet0 resolves
+`/data/dbcomm` through `/home/dbcomm/data-dbcomm`, while farnet1 stores it on the `/data` filesystem. Runtime process
+identity therefore canonicalizes both the configured prefix and `/proc/PID/exe` before comparison while retaining
+both forms in evidence. The runner does not require equal physical paths. Missing PostgreSQL data is a role-specific
+condition: allowed for the current farnet0 peer role only when the helper invocation says so; never silently accepted
+for farnet1's intended database role.
 
 ### Profiles
 
@@ -317,8 +326,8 @@ any mismatch is invalid invocation or `INCONCLUSIVE`, never a comparison PASS.
 
 1. **Framework:** profiles, phase engine, atomic evidence manifest, command runner, timeouts, dry-run, resume
    invalidation, verdict codes.
-2. **Safe operational helpers:** `/proc/exe` identity/preflight, cleanup, DPU lifecycle, PostgreSQL identity/start,
-   SSH multiplexing and script upload/invoke.
+2. **Safe operational helpers:** canonicalized logical-prefix versus `/proc/exe` identity/preflight, role-explicit
+   absent-data handling, cleanup, DPU lifecycle, PostgreSQL identity/start, SSH multiplexing and script upload/invoke.
 3. **Artifact phases:** complete source identity, run-scoped Citus source snapshot, ownership preflight,
    all-target build/install order, source->build->install->peer/DPU receipt chain, both-DPU configure/forced-build/
    landed proof.
@@ -342,6 +351,9 @@ any mismatch is invalid invocation or `INCONCLUSIVE`, never a comparison PASS.
   DPU peer, unexpected host service, rsync/checksum failure, pipeline-masked build failure, missing/duplicated path
   anchors, truncated/rotated logs, missing teardown ledger, mismatched basebackup geometry/roles, unexplained
   frontier delta, and nonzero/vacuous teardown accounting.
+- Path-layout fixtures prove that a logical prefix through a parent symlink matches the canonical `/proc/PID/exe`
+  path, a mismatched canonical prefix does not match, missing farnet0 data is accepted only under the explicit peer
+  mode, and missing farnet1 data fails closed.
 - Hang/takeover tests prove the runner captures before cleanup, never advances an unexpected attempt, accepts only
   allowlisted read-only capture or cleanup controls, times out the hold boundedly, and requires a clean restart for
   retry. Unknown event versions/required fields and contradictory structured-versus-legacy evidence are
@@ -362,7 +374,9 @@ any mismatch is invalid invocation or `INCONCLUSIVE`, never a comparison PASS.
 
 ## Current next step
 
-Complete the provenance receipt writer and runtime identity/preflight/cleanup/takeover implementation while keeping
+Canonical-prefix matching and role-explicit absent-data handling discovered by the farnet0 home-backed layout audit
+are now fixed and covered by process-local alias, sibling-tree, identity-drift, and capability tests. Next complete
+the provenance receipt writer and runtime identity/preflight/cleanup/takeover implementation while keeping
 `LIVE_EXECUTION_READY = False`. Expand role-separated negative fixtures and process-local supervisor tests, then run
 another independent diff review. Only after every live false-PASS/contamination path is closed should the main agent
 ask for the one known-green `transport-acceptance` run and consider enabling `--execute`.
@@ -390,3 +404,11 @@ ask for the one known-green `transport-acceptance` run and consider enabling `--
   plan/dry-run surfaces for inspection and parser/checker functions as evidence compressors over manually bracketed
   candidate logs while this note says fail-closed; keep live orchestration on the manual runbook, and eventually split
   deterministic known-path automation from agent-owned unexpected-state takeover.
+- A path-layout audit found farnet0's logical `/data/dbcomm` resolves into `/home/dbcomm/data-dbcomm`. The initial
+  helpers compared canonical `/proc/PID/exe` values against the logical prefix and asked the peer to stop a data
+  directory it intentionally lacks. The helpers now canonicalize and pin the prefix through final cleanup proof,
+  reject sibling-tree identity, and require an explicit peer capability for absent data. The full runner suite has
+  52 passing process-local tests. Live execution remains closed for the other incomplete receipt/lifecycle surfaces.
+- The operator-runbook audit also exposed that fresh second-hop helper installation assumed the farnet0-DPU helper
+  directory already existed. `dpu_dispatch.sh prepare` now creates it by file-based second hop, and planner tests
+  require prepare to precede every helper install.

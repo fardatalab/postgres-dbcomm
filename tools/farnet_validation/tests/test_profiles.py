@@ -1,7 +1,7 @@
 from pathlib import Path
 import unittest
 
-from tools.farnet_validation.phases import RunConfig, render_plan
+from tools.farnet_validation.phases import PhasePlanner, RunConfig, render_plan
 from tools.farnet_validation.profiles import PROFILES, expand_profile
 from tools.farnet_validation.remote_helpers import HELPER_ROOT
 
@@ -44,6 +44,28 @@ class ProfileTests(unittest.TestCase):
         self.assertIn("--homer-peer-host 10.10.1.201", (HELPER_ROOT / "gate.sh").read_text())
         sender = next(c for c in commands if c["name"] == "basebackup-sender")
         self.assertTrue(any("host=10.10.1.200" in arg for arg in sender["argv"]))
+
+    def test_only_peer_postgres_stop_allows_missing_data(self):
+        config = RunConfig("test", "transport-acceptance", "current-source", "dpus",
+                           "/pg", "/citus", "/data/dbcomm/pg-citus", "/tmp/evidence")
+        specs = PhasePlanner(config).specs("clean")
+        local_stop = next(spec for spec in specs if spec.name == "postgres-stop")
+        peer_stop = next(spec for spec in specs if "postgres_stop" in spec.argv[2])
+
+        self.assertNotIn("--allow-missing-data", local_stop.argv)
+        self.assertEqual(peer_stop.argv[-2:], ("/data/dbcomm/pg-citus", "--allow-missing-data"))
+
+    def test_peer_dpu_helper_directory_is_prepared_before_install(self):
+        config = RunConfig("test", "transport-acceptance", "current-source", "dpus",
+                           "/pg", "/citus", "/data/dbcomm/pg-citus", "/tmp/evidence")
+        specs = PhasePlanner(config).specs("orient")
+        prepare = next(i for i, spec in enumerate(specs)
+                       if spec.name == "farnet0-dpu_dispatch-prepare")
+        installs = [i for i, spec in enumerate(specs)
+                    if spec.name == "farnet0-dpu_dispatch-install"]
+
+        self.assertTrue(installs)
+        self.assertTrue(all(prepare < install for install in installs))
 
 
 if __name__ == "__main__":

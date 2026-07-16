@@ -1,1108 +1,185 @@
-# Homer / farnet project guide
+# Homer / farnet project policy
 
-This file is the **machine setup and the runbook**. It answers "what are the facts" and "what do I run".
+This file is the always-loaded policy for the two-host, two-DPU Homer research rig. Exact topology, build,
+deployment, workload, evidence, and teardown commands live in
+[`docs/kb/operations/farnet_operator_runbook.md`](docs/kb/operations/farnet_operator_runbook.md).
 
-It deliberately does **not** carry the incident narratives, the diagnostic batteries, or the historical
-numbers. Those live in the KB, because a runbook you have to skim past is a runbook people stop reading:
+The runbook is authoritative for the current manual workflow. Incident rationale lives in
+[`farnet_operational_hazards.md`](docs/kb/operations/farnet_operational_hazards.md), diagnostic instruments and
+timestamped measurements in
+[`farnet_diagnostics_and_baselines.md`](docs/kb/operations/farnet_diagnostics_and_baselines.md), and deterministic
+runner readiness in [`farnet_validation_runner_plan.md`](docs/kb/operations/farnet_validation_runner_plan.md).
 
-- **`docs/kb/operations/farnet_operational_hazards.md`** — every check in this project that lies, and the
-  incident that proved it. **Read this once, in full.** Every ⚠ rule below is a one-line summary of an entry
-  there.
-- **`docs/kb/operations/farnet_diagnostics_and_baselines.md`** — the diagnostic builds (`starve-diag`, stats
-  macros), the RDMA/RoCE link battery, the measurement history, and the broken command shapes kept only so
-  they stay recognisable.
+## Task trigger matrix
 
-## Project setup background
+| task | mandatory reading before acting |
+|---|---|
+| Explain/review Homer code | The narrowest `docs/kb/implementations/**/CONTRACTS.md`, then cited current code |
+| Build, install, sync, deploy, start/stop a role, or run a workload | The applicable operator-runbook sections and linked hazard rules |
+| Live farnet validation or benchmark | This file, the **entire** operator runbook, hazards, runner-plan **Status** and **Current next step**, plus the task's implementation plan |
+| Diagnose a broken run | Hazards first, then the applicable diagnostics and implementation contract; localize the first failing frontier before patching |
+| Change a validation-bearing lifecycle, identity, or teardown site | Stable-event policy below and the owning implementation `CONTRACTS.md` |
 
-Two source trees:
+This matrix applies to main agents and implementation workers, not only dedicated validation agents. The operator
+runbook must be reread when mutable topology, paths, or runner readiness may have changed.
 
-- PostgreSQL fork: `/data/dbcomm/postgres-citus`
-- Citus/Homer fork: `/data/dbcomm/citus-dbcomm`
+## Project boundaries
 
-Installed runtime prefix `/data/dbcomm/pg-citus`; runtime user `dbcomm`. Build dirs, installed
-executables/libraries/headers, and workload-created runtime files are all owned by `dbcomm`. Run build,
-install, service, and workload commands **as `dbcomm`** (`sudo -n -u dbcomm ...` if your shell is another
-user) — never produce root-owned build or install artifacts. If ownership drifts, normalize it explicitly
-before continuing rather than mixing privilege styles:
+- PostgreSQL fork: `/data/dbcomm/postgres-citus`.
+- Citus/Homer fork: `/data/dbcomm/citus-dbcomm`.
+- Stable logical install prefix on both hosts: `/data/dbcomm/pg-citus`; runtime user: `dbcomm`.
+- Farnet0's logical `/data/dbcomm` resolves through `/home/dbcomm/data-dbcomm`; farnet1 stores it on the real `/data`
+  filesystem. Compare canonical process identities, but keep configuration and commands on the logical path.
+- Some branch families use suffixed sibling worktrees. Confirm the active worktrees before using an example path.
+- Build/install/runtime artifacts belong to `dbcomm`; source, docs, and Git metadata belong to the human developer.
+  Citus in-tree `.deps` and `build-cdc-*` directories are generated artifacts and belong to `dbcomm`.
 
-```sh
-sudo -n chown -R dbcomm:dbcomm \
-  /data/dbcomm/postgres-citus*/build /data/dbcomm/citus-dbcomm*/build /data/dbcomm/pg-citus
-```
+## Non-negotiable safety rules
 
-Some branches use `-separate-comm-stack` suffixed trees. **Confirm the active tree for the current task**;
-do not assume a path from an example.
+1. **Our PostgreSQL is port 5433 and data directory `/data/dbcomm/pg-citus/data`.** Farnet1 also runs another
+   project's PostgreSQL on 5432 under the same Unix user. Never stop, query, or initialize against it. Every
+   `psql`, `pgbench`, and `pg_basebackup` command must name `-p 5433` and validation must prove the data directory.
+2. **Never use `pkill -f`, `pgrep -f`, or `ps | grep` as process identity.** Resolve `/proc/PID/exe`, including the
+   `sudo -n readlink` fallback and deleted-executable suffix; unreadable user identity is `INCONCLUSIVE`, not clean.
+3. **Never `kill -9` a live `postgres: remote exec backend`.** Stop the intended postmaster first, then reap the
+   socketless backend by verified executable identity during teardown.
+4. **Write multi-line and second-hop operations to files and invoke them by path.** Do not put a heredoc body inside
+   `bash -c`, and never inline `ssh farnet0 ssh dpu ...`.
+5. **Never run a write-capable subagent concurrently with another writer in the same tree.** Use an isolated worktree
+   or exclusive ownership.
+6. **A diagnostic `make -B` build is sticky.** Exit with another forced performance build and prove diagnostic strings
+   are absent.
+7. **Stamp every recorded performance result with both commit SHA and workload shape.** Client count, transaction
+   count, logging state, and warmup state are part of the result.
+8. **Use a commit-message file.** Backticks inside `git commit -m "..."` execute shell substitution.
+9. **Each host frontend talks to its own local DPU.** Only the DPU-to-DPU leg uses the remote DPU address.
+10. **Any bridge/ABI change requires rebuilding and deploying both DPUs.** Source the current protocol version from
+    the header; never trust a copied number in prose.
+11. **Do not broadly rsync source trees with `--delete`, and do not accept unreadable checksum omissions as parity.**
+    Peer deployment is installed-prefix receipt/checksum proof; DPU deployment is a run-scoped source snapshot.
+12. **A failed, timed-out, interrupted, or manually cleaned candidate is diagnostic-only.** Restart from a clean
+    baseline; after a failed gate, restart both DPU services before any retry.
 
-The project is a database systems research prototype for communication-stack efficiency and offload. New
-Homer code lives under a `homer/` subdirectory in the Postgres or Citus tree.
+The incident evidence behind these rules is in `farnet_operational_hazards.md`. Do not simplify a rule without first
+reading its incident.
 
----
+## Build and artifact invariants
 
-## ⚠ Non-negotiables
+- When source changes are in scope, assume both trees must be rebuilt and reinstalled.
+- Install Citus first so the new `libhomer_client.a`, headers, and `citus.so` exist; then relink PostgreSQL against
+  that archive; only then install PostgreSQL and start it. A new `citus.so` with an old `postgres` fails symbol
+  resolution in every backend.
+- Build every validation target, not only `service-bin`. A target that was not compiled cannot be covered by a green
+  workload.
+- Performance candidates use forced non-diagnostic objects and prove stats/trace instrumentation absent.
+- Artifact parity means a complete source→build→install→peer→both-DPU receipt chain. Equal stale binaries are not
+  provenance.
+- Source synchronization and builds must fail loudly on nonzero status. Pipeline output and an empty rsync log are not
+  evidence.
 
-Each of these has already cost at least one debugging cycle, and several cost days. The reason is one click
-away — follow the link before you "simplify" a rule.
-(→ `docs/kb/operations/farnet_operational_hazards.md`)
+## Validation and workload policy
 
-1. **farnet1 runs TWO PostgreSQL instances under the same `dbcomm` user. Ours is on port `5433`.**
-   `/home/dbcomm/pg` (port `5432`) belongs to a *different* Postgres project — **never stop, kill, or query
-   it.** Both defaulted to 5432 + `/tmp`, so they used to race for the same socket; ours is now pinned to
-   `5433` in `postgresql.conf` on **both** hosts. Every `psql`/`pgbench`/`pg_basebackup` needs **`-p 5433`**,
-   or OID lookups silently hit the foreign catalog and `pgbench -i` **recreates tables in their database**.
-   (§2)
-2. **Never `pkill -f` / `pgrep -f` from an `ssh` one-liner or `bash -c`** — the pattern sits in the caller's
-   own argv, so it matches itself. It has killed the ssh session, and it has silently *not* killed the
-   target. `pkill -x` does not save you (`comm` truncates to 15 chars). Resolve identity from
-   `/proc/<pid>/exe`, with a `sudo -n readlink` fallback and a **trailing `*`** in the pattern (for
-   `(deleted)` exes). (§1)
-3. **Never `kill -9` a LIVE `postgres: remote exec backend` mid-run** — it triggers a full postmaster
-   crash-restart. Reap only at end-of-run, after stopping PostgreSQL. Since S3.3b these backends **survive
-   `pg_ctl stop -m fast`** and must be reaped by `/proc/<pid>/exe`. (§1.5)
-4. **Write multi-line scripts to a FILE and invoke by path.** A heredoc inside `bash -c` leaks its body into
-   the caller's argv, which re-arms trap #2. (§1.1, §6.2)
-5. **Never inline a double-hop ssh command** (`ssh farnet0 ssh dpu "cd ~/..."`) — farnet0's shell expands `~`
-   to *farnet0's* home. Ship a script; invoke it by path. (§6.3)
-6. **Never run a write-capable subagent concurrently with your own edits in the same tree.** One silently
-   *reverted* ~30 hand-applied edits. Use `isolation: "worktree"`, or hold your edits until it reports. (§6.1)
-7. **A `make -B` diagnostic build is sticky.** A plain `make` will relink the instrumented objects. Exit a
-   diagnostic build with another `make -B`, and **prove** it. (§3.1)
-8. **Stamp every recorded baseline with a commit SHA, not just a date.** A dated baseline reads like a
-   standing fact; it is a timestamped observation. (§8.2)
-9. **Backticks inside `git commit -m "..."` trigger command substitution.** Use `-F <file>`. (§6.4)
-
----
-
-## Farnet topology
-
-`farnet1` is the primary development and benchmark driver host; `farnet0` is the peer. Both have the same
-`/data/dbcomm` layout and the same `dbcomm` user. Reach the peer with `ssh farnet0`; reach each host's DPU
-with `ssh dpu` **from that host**.
-
-`/data` is local ext4 on both hosts. **Do not rely on NFS** — farnet1 may still advertise an old `/data`
-export; use explicit `rsync`. Never sync a live database data directory unless PostgreSQL is stopped and
-replacing it is the explicit goal.
-
-### Addresses (verified June 17 / June 28, 2026)
-
-| role | fast-link lane 0 | lane 1 | notes |
-|---|---|---|---|
-| farnet0 host | `10.10.1.100` | `10.10.2.100` | `enp33s0f0np0` / `enp33s0f1np1` |
-| farnet1 host | `10.10.1.101` | `10.10.2.101` | `enp33s0f0np0` / `enp33s0f1np1` |
-| farnet0 DPU | `10.10.1.200` | — | `enp3s0f0s0` |
-| farnet1 DPU | `10.10.1.201` | — | `enp3s0f0s0` |
-
-`mlx5_0` → `enp33s0f0np0`; `mlx5_1` → `enp33s0f1np1`; IPv4 RoCE v2 uses **GID index 3**. Both host and both
-DPU fast-link ports report 400 Gb/s, 4 lanes, full duplex.
-
-**Cross-lane RDMA does NOT work** (lane 0 ↔ lane 1 fails with `transport retry counter exceeded`). This is a
-switch-side L2-domain problem, not a Homer bug, and it is unresolved. Do not treat this as a verified
-four-port full mesh.
-(→ `docs/kb/operations/farnet_diagnostics_and_baselines.md` §2.3)
-
-### Ports and devices
-
-| thing | value | override |
+| workload | status | acceptance meaning |
 |---|---|---|
-| **our PostgreSQL** | **`5433`** (both hosts) | in `postgresql.conf` |
-| foreign PostgreSQL — do not touch | `5432` (farnet1 only) | — |
-| Homer service peer RDMA | `9717` | `HOMER_SERVICE_PEER_PORT` |
-| DPU service TCP **setup** listener | `9727` (bind `0.0.0.0`) | `HOMER_SERVICE_DPU_SETUP_{BIND_HOST,PORT}` |
-| DPU service spawn **doorbell** | `9728` | `HOMER_SERVICE_DPU_DOORBELL_PORT` |
-| DPU DOCA DMA device | `0000:03:00.0` | `HOMER_SERVICE_DOCA_DEV_PCI` |
-| Host DOCA mmap-export device | `0000:21:00.0` | `HOMER_FRONTEND_DOCA_DEV_PCI` |
-| Host frontend → DPU setup target | its **own local** DPU | `HOMER_FRONTEND_DPU_SETUP_{HOST,PORT}`, `..._TIMEOUT_MS` |
-
-⚠ **Each host's frontend must point at its OWN local DPU** — farnet1 → `10.10.1.201`, farnet0 →
-`10.10.1.200`. Pointing a farnet0-resident client at `10.10.1.201` fails with
-`DPU setup rejected frontend export status=5`. The DOCA PCI id is the same on both hosts (symmetric
-hardware).
-
-### Host ↔ DPU setup uses TCP, not DOCA COMCH
-
-DOCA COMCH repeatedly failed below Homer after firmware/driver resets, while DOCA DMA still validated. The
-TCP setup socket carries the same cold-path bytes (host PCI mmap export descriptor, bridge header, ring
-descriptors, setup ack). **Hot command/completion/payload movement remains DOCA DMA.** DMA does not take a
-representor.
-
-`HOMER_DPU_BRIDGE_PROTOCOL_VERSION` is currently **`3`** (role 8, `BACKEND_SPAWN_REGION`). **A bridge/COMCH
-ABI bump means BOTH DPUs must be resynced and rebuilt**, or the setup handshake fails with `BAD_PROTOCOL`.
-The **frontend arena** ABI (`citus_homer_frontend_arena_v3`) is **host-only** and needs no DPU redeploy.
-
----
-
-## Build and install
-
-When source changes are involved, assume **both** trees must be rebuilt and reinstalled before validation.
-
-### ⚠ Install order is load-bearing (since command-plane S2)
-
-`citus.so` is built `-fvisibility=hidden` and leaves `HomerDpuFrontend*` **undefined**; those symbols resolve
-at `dlopen` time out of the **`postgres` executable**, which statically links `libhomer_client.a`. Installing
-a new `citus.so` against an old `postgres` fails **every** backend with
-`undefined symbol: HomerDpuFrontendOpenDevice`.
-
-```sh
-# 1. citus first -- installs the new libhomer_client.a AND citus.so
-cd /data/dbcomm/citus-dbcomm
-sudo -n -u dbcomm make -j8
-sudo -n -u dbcomm make install-headers install-service-bin install
-
-# 2. postgres -- this RELINKS `postgres` against that archive
-cd /data/dbcomm/postgres-citus
-sudo -n -u dbcomm env CCACHE_DISABLE=1 ninja -C build
-
-# 3. install
-sudo -n -u dbcomm meson install -C build --no-rebuild
-
-# 4. only now start
-nm -D /data/dbcomm/pg-citus/bin/postgres | grep HomerDpuFrontend   # sanity
-```
-
-For a performance build, force the service/client binaries with no stats macros:
-
-```sh
-cd /data/dbcomm/citus-dbcomm
-sudo -n -u dbcomm make -B -j8 service-bin client-bin CPPFLAGS='-D_GNU_SOURCE'
-sudo -n -u dbcomm make install-headers install-service-bin install
-```
-
-Diagnostic builds (stats macros, `starve-diag`, `HOMER_REMOTE_EXEC_TRACE`) are in
-`docs/kb/operations/farnet_diagnostics_and_baselines.md` §1. **They are sticky — exit with `make -B` and
-prove the instrumentation is gone** (Non-negotiable #7).
-
-### Build every target (there are seven smoke targets)
-
-The DPU TCP transport smoke silently failed to compile for three days because the standing recipe named one
-target. Copy this verbatim:
-
-```sh
-sudo -n -u dbcomm make -j8 all service-bin client-bin \
-  dpu-comch-transport-smoke-bin dpu-tcp-transport-smoke-bin \
-  frontend-dma-smoke service-dpu-dma-smoke tuple-deform-smoke \
-  service-dpu-dma-doca-smoke service-dpu-comch-smoke-bin \
-  CPPFLAGS='-D_GNU_SOURCE'
-```
-
-`service-dpu-dma-smoke` is the **only** caller of `HomerDpuDmaClaimNextMirroredByteRange` — an engine API
-that looks dead if you grep only the service sources.
-
-### DPU trees
-
-The current DPU ARM tree is `~/dbcomm/citus-dbcomm` on **both** DPUs (a plain non-git rsync dir). After
-rsyncing sources you **must re-run configure** — the copied `Makefile.global` pins `/data/dbcomm` paths that
-do not exist there:
-
-```sh
-ssh dpu "cd ~/dbcomm/citus-dbcomm && PG_CONFIG=/usr/bin/pg_config ./configure --without-libcurl \
-  && make -j8 service-bin CPPFLAGS='-D_GNU_SOURCE'"
-```
-
-⚠ `rsync -a` preserves mtime, so `make` will skip the file you just edited — `touch` it, or use `make -B`.
-And **prove the deploy landed** by grepping the binary for a string literal only the new code emits; grepping
-for a macro *name* proves nothing in either direction (hazards §3.2, §3.3).
-
-⚠ **A DPU build script that pipes `make` into `tail`/`grep` reports SUCCESS after a FAILED build** — the
-pipeline's status is the *last* command's. Use `set -e -o pipefail`, or redirect `make` to a log and test its
-status explicitly. On July 12 a script printed `DPU BUILD OK` over `make: *** Error 1`, and the only thing that
-caught it was the landed-proof grep returning 0. **Make the landed-proof grep `exit 1` on a miss** — otherwise
-it, too, is decoration.
-
-### Installed artifacts
-
-`/data/dbcomm/pg-citus/bin/{postgres,pgbench,pg_basebackup,citus_tuple_sink_service}` and
-`/data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so`.
-
-After changing shared Homer protocol headers or control-region names, verify the installed binaries agree —
-a stale `pgbench` or `libhomer_client.a` silently maps the **old** shared-memory name:
-
-```sh
-strings /data/dbcomm/pg-citus/bin/pgbench                  | grep citus_remote_execution_control
-strings /data/dbcomm/pg-citus/bin/citus_tuple_sink_service | grep citus_remote_execution_control
-```
-
-### clangd / `compile_commands.json`
-
-- **postgres-citus (Meson)** regenerates `build/compile_commands.json` on every build. Symlink it once:
-  `ln -sfn build/compile_commands.json /data/dbcomm/postgres-citus/compile_commands.json`
-  (keep the symlink out of git via `.git/info/exclude`).
-- **citus-dbcomm (autotools)** needs `bear`. Regenerate only when the build graph or flags change:
-  ```sh
-  cd /data/dbcomm/citus-dbcomm
-  sudo -n -u dbcomm bash -c 'CCACHE_DISABLE=1 bear --output compile_commands.json -- make -B -j8 all'
-  ```
-  `-B` is required (bear only records commands that actually run — a no-op build yields an **empty** DB);
-  `CCACHE_DISABLE=1` keeps entries as plain `gcc ...` (bear may skip `ccache`-wrapped commands, which clangd
-  then cannot parse). To add a few targets to an existing DB without rebuilding everything:
-  `bear --append -- make -B <targets>`.
-
-⚠ clangd indexes only the **active build configuration** — code behind inactive `#ifdef`s (non-DOCA, stats
-builds) is **not** indexed and `findReferences` will silently miss it. Cross-check with textual search.
-
----
-
-## Sync farnet1 → farnet0
-
-Dry-run first (`-n`), then remove it. Exclude local logs — they are not needed for validation and can make
-rsync return `23` even after the important artifacts copied.
-
-⚠ **The source-tree rsync MUST run as `dbcomm` on the receiving side** (`--rsync-path='sudo -n -u dbcomm rsync'`),
-exactly like the `pg-citus` one below. farnet0's trees are owned by `dbcomm`; if your shell user is anyone else,
-rsync fails `chgrp` on **every file**, returns **code 23**, and — this is the trap — **leaves files untransferred
-without saying which**. On July 12 this left farnet0's `homer_queue_abi.h` **three days stale**, which was invisible
-until a *DPU* build failed on undeclared macros from a stage that had long since landed. **Code 23 is not benign
-here.** Always verify afterwards:
-`diff <(md5sum-of-tree-on-farnet1) <(md5sum-of-tree-on-farnet0)` → must be **0 differing files**.
-
-```sh
-rsync -azn --delete --itemize-changes --rsync-path='sudo -n -u dbcomm rsync' \
-  /data/dbcomm/postgres-citus/ farnet0:/data/dbcomm/postgres-citus/
-rsync -azn --delete --itemize-changes --rsync-path='sudo -n -u dbcomm rsync' \
-  /data/dbcomm/citus-dbcomm/   farnet0:/data/dbcomm/citus-dbcomm/
-
-rsync -az --delete \
-  --exclude data/ --exclude '*.log' --exclude logfile --exclude stage_tmp/ \
-  --rsync-path='sudo -n -u dbcomm rsync' \
-  /data/dbcomm/pg-citus/ farnet0:/data/dbcomm/pg-citus/
-```
-
----
-
-## Clean runtime baseline
-
-Unless the goal is specifically to study warm reuse, start every validation from a clean baseline **on both
-hosts**.
-
-1. **Stop PostgreSQL by data dir** (never by port — that is how you hit the foreign instance):
-
-   ```sh
-   sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_ctl -D /data/dbcomm/pg-citus/data stop -m fast || true
-   ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_ctl -D /data/dbcomm/pg-citus/data stop -m fast || true"
-   ```
-
-2. **Reap Homer processes by `/proc/<pid>/exe`** — never `pkill -f` (Non-negotiable #2). Write this to a
-   script file and invoke it by path:
-
-   ```sh
-   for d in /proc/[0-9]*; do
-     exe=$(readlink -f "$d/exe" 2>/dev/null) || exe=$(sudo -n readlink -f "$d/exe" 2>/dev/null)
-     case "$exe" in
-       */pg-citus/bin/citus_tuple_sink_service*) sudo -n kill -9 "${d#/proc/}" ;;
-       */pg-citus/bin/postgres*)  # only socketless backends; the postmaster is already stopped
-         args=$(sudo -n tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
-         case "$args" in *"remote exec backend"*) sudo -n kill -9 "${d#/proc/}" ;; esac ;;
-     esac
-   done
-   ```
-
-   **Count the pids you could not identify and say so** — an unreadable `/proc` must not masquerade as an
-   empty one.
-
-   ⚠ **THIS RECIPE DOES NOT REAP THE DPU SERVICE, AND A STALE ONE WILL FAKE A PASS.** The pattern above only
-   matches `*/pg-citus/bin/*` — the **host** install prefix. The DPU-native service lives at
-   `~/dbcomm/citus-dbcomm/build/homer/citus_tuple_sink_service` and is invisible to it. On 2026-07-13 a stale
-   DPU service from a previous session was still bound to `9727`/`9728`; the **fresh** service therefore died
-   at startup with `could not initialize DPU TCP setup server: Address already in use` — **and the stale one
-   went on answering the port**, so the workload connected, ran, and looked healthy **against binaries that
-   did not contain the change under test.** That is a false pass, and only an elapsed-time check on `ps`
-   caught it. **Reap on each DPU too, by its own path**, and prove the service you are talking to is the one
-   you just started (check its start time, not just that the port answers):
-
-   ```sh
-   # ON EACH DPU (invoke from a script by path; never a double-hop ssh one-liner)
-   for d in /proc/[0-9]*; do
-     exe=$(readlink -f "$d/exe" 2>/dev/null) || exe=$(sudo -n readlink -f "$d/exe" 2>/dev/null)
-     case "$exe" in */citus-dbcomm/build/homer/citus_tuple_sink_service*) kill -9 "${d#/proc/}" ;; esac
-   done
-   ```
-
-3. **Remove only OUR shared memory**, by glob:
-
-   ```sh
-   ls -lh /dev/shm | grep -E 'citus|homer|remote_exec'
-   ```
-
-   | object | created by |
-   |---|---|
-   | `citus_remote_execution_control_*` | `citus_tuple_sink_service` |
-   | `citus_remote_exec_{cmd,cpl,client_cpl}_*` | per-client/per-session command + completion rings |
-   | `citus_remote_exec_backend_spawn_v*` | the PostgreSQL backend bridge, at postmaster start |
-   | `citus_homer_frontend_arena_*` | the postmaster, **only** with `citus.enable_homer_dpu_frontend_agent=on` |
-   | `citus_res_*` | payload/result queues of active or recent sessions |
-
-   ⚠ **The arena's version is in its NAME** (`_v3` today). Delete it **by glob**, and confirm the current
-   version from the header, not from any doc — this note said `_v2` for a month while the code was on `_v3`,
-   so the documented cleanup was deleting a nonexistent object and leaving the real arena in place
-   (hazards §4):
-   `grep HOMER_FRONTEND_ARENA_SHM_NAME /data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_agent.h`
-
-   If you remove `citus_remote_exec_backend_spawn_v*` **after** PostgreSQL has started, **restart
-   PostgreSQL** — otherwise clients fail to open the backend-spawn region.
-
-   **Do not remove shared memory belonging to other users' experiments.**
-
----
-
-## Process preflight (before EVERY measured run)
-
-Do this even after a successful restart. Aborted pgbench/basebackup runs and timed-out peer experiments leave
-client and socketless-backend processes behind, and **any result collected on top of that state is
-contaminated**.
-
-⚠ `ps -eo args | grep -E ...` matches the calling shell and its own grep, so a clean machine reports
-"leftovers". Resolve identity from `/proc/<pid>/exe` (Non-negotiable #2). A quick eyeball version, understood
-as approximate:
-
-```sh
-ps -eo pid,ppid,psr,comm,args | \
-  grep -E 'citus_tuple_sink_service|postgres -D|remote exec|pgbench|pg_basebackup|walsender' | grep -v grep
-```
-
-A clean start has exactly: the intended `citus_tuple_sink_service` on each host, plus the PostgreSQL
-postmaster/background processes on hosts where PostgreSQL is intentionally running. **Nothing else.** If an
-old `pgbench`, `pg_basebackup`, `walsender`, or `postgres: remote exec backend` is present, clean first,
-rerun the preflight, and record that it was clean.
-
-**Confirm you are talking to OUR PostgreSQL** — this query names the data dir, so it cannot lie:
-
-```sh
-sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql -h /tmp -p 5433 -U dbcomm -AtX postgres \
-  -c "select current_setting('data_directory')"
-# want: /data/dbcomm/pg-citus/data
-```
-
-**If a candidate run times out, is interrupted, or needs manual cleanup, it is diagnostic-only.** Do not use
-it for an acceptance or rejection claim.
-
----
-
-## Start PostgreSQL
-
-```sh
-sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_ctl \
-  -D /data/dbcomm/pg-citus/data \
-  -l /data/dbcomm/pg-citus/data/postgres.log start -w
-```
-
-Port `5433` comes from `postgresql.conf`; no `-o` needed. PostgreSQL is required on farnet1 for pgbench and
-the basebackup sender. `farnet0` needs PostgreSQL only when the experiment needs a database instance there
-(backend-to-backend COPY does; the 4-role basebackup does not).
-
-**With the DPU frontend agent** (required for at least one workload in the regression sweep — see below), the
-frontend DPU env must be in the **postmaster's** environment, not just the client's:
-
-```sh
-sudo -n -u dbcomm env \
-  HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.201 HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
-  HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
-  /data/dbcomm/pg-citus/bin/pg_ctl -D /data/dbcomm/pg-citus/data \
-  -l /data/dbcomm/pg-citus/data/postgres.log \
-  -o "-c citus.enable_homer_dpu_frontend_agent=on" start -w
-```
-
----
-
-## Start Homer services
-
-Use **code-level pinning**, not `taskset`. Keep CPU sets **disjoint** across the standalone service, the
-socketless backends it spawns, and the pgbench worker threads.
-
-```sh
-# farnet1
-sudo -n -u dbcomm sh -c 'env \
-  HOMER_SERVICE_CPU=2 HOMER_REMOTE_EXEC_BACKEND_CPUS=4,5,6,7 \
-  HOMER_SERVICE_PEER_BIND_HOST=10.10.1.101 HOMER_SERVICE_PEER_PORT=9717 \
-  /data/dbcomm/pg-citus/bin/citus_tuple_sink_service \
-  > /data/dbcomm/pg-citus/data/homer_service_farnet1.log 2>&1 &'
-
-# farnet0 (same, with its own bind host)
-ssh farnet0 "sudo -n -u dbcomm sh -c 'env \
-  HOMER_SERVICE_CPU=2 HOMER_REMOTE_EXEC_BACKEND_CPUS=4,5,6,7 \
-  HOMER_SERVICE_PEER_BIND_HOST=10.10.1.100 HOMER_SERVICE_PEER_PORT=9717 \
-  /data/dbcomm/pg-citus/bin/citus_tuple_sink_service \
-  > /data/dbcomm/pg-citus/data/homer_service_farnet0.log 2>&1 &'"
-```
-
-Both hosts may listen on `9717`. Two services on the *same* host need distinct `HOMER_SERVICE_PEER_PORT`,
-`HOMER_SERVICE_CONTROL_SHM_NAME`, and `HOMER_SERVICE_SHM_TAG`.
-
-### DPU services
-
-Any selected-DPU workload (**all** Homer basebackup targets, including plain `mode=rdma`) needs the DPU
-service running. It is a **mandatory** role, not optional — `bbsink_homer_begin_backup`
-(`src/backend/backup/basebackup_homer.c`) calls `HomerClientOpenBaseBackupStreamSelectedDpu`
-unconditionally, so `pg_basebackup` otherwise fails with
-`could not connect to DPU setup listener 10.10.1.201:9727`.
-
-Run the native aarch64 binary directly as `ubuntu`, under `nohup setsid … </dev/null &` **invoked from a
-script on the DPU** (without `nohup` it dies when the ssh channel closes, and the only symptom is a client-side
-`could not connect`):
-
-```sh
-env HOMER_SERVICE_ENABLE_DPU_DMA=1 HOMER_SERVICE_ENABLE_DOCA_DMA=1 \
-    HOMER_SERVICE_DPU_SETUP_PORT=9727 HOMER_SERVICE_DOCA_DEV_PCI=0000:03:00.0 \
-    ~/dbcomm/citus-dbcomm/build/homer/citus_tuple_sink_service
-```
-
-The DPU binds **two** ports: `9727` (setup) and `9728` (spawn doorbell). Confirm the frontend attached with
-`homer frontend agent: attached DPU spawn doorbell …` in `postgres.log`.
-
-⚠ **`HOMER_SERVICE_ENABLE_DPU_DMA=1` requires the machine-baseline progress policy.** Under any other policy
-the DPU service starts, binds 9727, and **never accepts** (hazards §5.3).
-
----
-
-## Prepare the pgbench schema
-
-On farnet1. Citus is not required for the single-node pgbench workload.
-
-```sh
-sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench \
-  -h /tmp -p 5433 -U dbcomm -i -s "${SCALE:-1}" postgres
-
-DBOID=$(sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql -h /tmp -p 5433 -U dbcomm -AtX postgres \
-  -c "select oid from pg_database where datname = 'postgres'")
-USEROID=$(sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql -h /tmp -p 5433 -U dbcomm -AtX postgres \
-  -c "select oid from pg_roles where rolname = 'dbcomm'")
-printf 'DBOID=%s USEROID=%s\n' "$DBOID" "$USEROID"
-```
-
-⚠ **`-p 5433`, always.** On 5432 this initializes pgbench tables **inside another project's database** and
-returns *their* OIDs, with no error (Non-negotiable #1).
-
-Before each paired performance run group, reset the insert-only history table and refresh stats — a stale
-`pgbench_history` with millions of rows has already produced a **false Homer regression signal**:
-
-```sh
-for sql in "truncate pgbench_history" "vacuum analyze pgbench_accounts" \
-           "vacuum analyze pgbench_branches" "vacuum analyze pgbench_tellers"; do
-  sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql -h /tmp -p 5433 -U dbcomm \
-    -v ON_ERROR_STOP=1 postgres -c "$sql"
-done
-```
-
----
-
-## Workloads
-
-| workload | path | status | validates |
-|---|---|---|---|
-| **`pgbench --homer --homer-dpu-command`** | **DPU** | ✅ **THE GATE** | the full cross-node DPU command plane: farnet0 DPU → DPU↔DPU RDMA → farnet1 DPU → **DPU-spawned** backend |
-| **basebackup, 4-role DPU relay** | **DPU** | ✅ (was silently 🔴 for 2 days — see below) | the **only** validated basebackup topology; the **only** workload that exercises the byte-ring **WRAP** |
-| **DPU TCP transport smoke** | **DPU** | ✅ | the **only** single-node host↔DPU DMA regression net |
-| `pgbench --homer` (local) | host | ✅ | local control path, `CLIENT_SQL_SESSION`, backend spawn, local result sink |
-| `pgbench --homer` (remote RDMA) | host | 🔴 **BROKEN at HEAD** | fails at **session open** — `open request parameters mismatched existing sink` — before any payload flows; pgbench then **spins at 100% CPU instead of exiting**. Found 2026-07-12 the first time anyone ran it in weeks. **Not being fixed: host-service Homer is being removed.** |
-| backend-to-backend COPY | host | 🔴 **BROKEN at HEAD** | hangs; unbisected since citus `7a2eaed53` |
-| `pgbench --homer-dpu` (alone) | DPU result only | 🔴 **never completed e2e** | DPU result relay **without** the DPU command plane |
-
-**If you only run one thing, run the gate.** `pgbench --homer --homer-dpu-command` is the workload that
-exercises the DPU path end to end.
-
-> ⚠ **"RUN THE GATE" IS NOT "RUN ONLY THE GATE" — AND THAT MISREADING JUST COST TWO DAYS.**
-> citus `4382b65d65` (the commit that made the **gate** green) **broke the 4-role basebackup dead, at open, in
-> both roles, 100% of the time.** Nobody noticed, because the gate was the only workload re-run — and the gate
-> touches neither of the code paths it broke. Found only on 2026-07-13, when the basebackup was needed to
-> validate something else. Fixed in citus `ffe2c4ac9`.
->
-> **The gate and the basebackup prove DIFFERENT things, and neither substitutes for the other:**
-> - the **gate** moves one tiny result at a time, so its byte-ring ready range is ~one record. It almost
->   certainly **never wraps the ring**.
-> - the **basebackup** pushes ~21.6 GiB through a 512 KiB ring — **~44,000 laps**. It is the **only** workload
->   that exercises the wrap split, and therefore the only one that can validate a byte-relay change.
->
-> A green gate says nothing about the wrap. Run both.
-
-⚠ **THREE of the workloads above are broken at HEAD, and all three are HOST-SERVICE workloads.** That is not a
-coincidence: **host-service Homer is being removed** as the DPU command plane lands, and every host-service path
-has been rotting because nobody re-ran it while the substrate moved underneath. Do **not** spend time reviving
-them — the plan is deletion, not repair. See
-`docs/kb/implementations/citus/transport/copy_path_revival_contract.md`.
-
-The practical consequence for validation: **the DPU gate and the 4-role basebackup are the ONLY workloads that
-still prove anything.** There is currently **no working exerciser at all** for the host-service `SEND_QUEUE`
-payload arm — which is fine only because that arm is scheduled for removal.
-
-Broken command shapes — and why each *looks* plausible — are kept in
-`docs/kb/operations/farnet_diagnostics_and_baselines.md` §4, deliberately **out** of this runbook so nobody
-copy-pastes them.
-
-### Performance measurement rules
-
-- The **first** run after any restart, binary sync, geometry change, or peer-connection setup is a **warmup**.
-  Never quote it.
-- Quote **warmed steady state**: repeat without restarting PostgreSQL or either service, and report the
-  **full repeat set**, not the best run.
-- Prefer a workload lasting ≥ ~5 s, or aggregate several warmed repeats.
-- **Keep verbose logging and stats macros OFF.** Logging on the measured path has caused misleading
-  "regressions" in this prototype.
-- **"No error" is not "the intended path ran."** Confirm from the service logs that Homer actually executed
-  rather than a silent libpq/built-in fallback.
-
-### Stable validation events for new Homer code
+| `pgbench --homer --homer-dpu-command` | **THE GATE** | Full farnet0 host→local DPU→peer DPU→farnet1 DPU-spawned backend command/result path |
+| Four-role selected-DPU basebackup | **MANDATORY FOR TRANSPORT ACCEPTANCE** | Bulk byte-ring relay and wrap behavior; not covered by the gate |
+| DPU TCP transport smoke | **CONDITIONAL MANDATORY** | Single-node host↔DPU DMA regression net before/after DPU DMA, byte-ring, or bridge-ABI changes |
+| Local `pgbench --homer` | Diagnostic-only | Local host-service control path; no cross-node/DPU acceptance |
+| Remote host-service `pgbench --homer` | Broken; scheduled for removal | Never an acceptance gate |
+| Backend-to-backend COPY | Broken; scheduled for removal | Never an acceptance gate; do not revive during validation |
+| `pgbench --homer-dpu` without DPU command mode | Never completed end to end | Not the selected-DPU command gate |
+
+If only one observation is possible, lead with the gate; a full transport verdict still requires basebackup. The gate
+moves small results and does not validate byte-ring wrap. Host-service paths do not substitute for either.
+
+For any transport change:
+
+1. build the complete target set;
+2. run the selected-DPU gate;
+3. run four-role basebackup;
+4. add the DPU TCP smoke for DPU DMA, byte-ring, or bridge/ABI changes;
+5. include at least one workload with the frontend agent enabled and prove the DPU setup listener remains live
+   afterwards.
+
+The gate uses no host `citus_tuple_sink_service`. Keep client CPUs, DPU service CPUs, and socketless-backend CPUs
+disjoint and sized to the client count. The current byte-ring pool caps the gate at eight clients; prefer four for
+headroom. Scan both DPU logs, because the failure can be observed on one node and caused on the other.
+
+## Measurement and verdict rules
+
+- The first run after restart, sync, geometry change, or peer setup is warmup and is never quoted.
+- Quote the full warmed repeat set, not the best run; prefer candidates lasting at least about five seconds.
+- Keep verbose logging and stats macros off measured paths. Debug proof runs and stripped performance runs are not
+  comparable.
+- Compare only against a diagnostics row with the same SHA-relevant lineage, client count, transaction count, and
+  logging state. Baseline values live only in `farnet_diagnostics_and_baselines.md`.
+- Exit zero is not intended-path proof. Use candidate-bracketed role logs, structured events/checkers, correctness
+  anchors, and process/artifact identity.
+- A clean verdict answers both: **did the intended Homer path run?** and **was the candidate uncontaminated from
+  preflight through teardown?**
+
+## Stable validation events
 
 New or materially changed validation-bearing lifecycle, terminal, teardown, and invariant-failure sites use the
 shared `HOMER_EVENT(...)` API in
-`/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_event.h`. The stable line grammar is:
+`/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_event.h`:
 
 ```text
 HOMER_EVENT v=1 severity=<info|warn|alarm> component=<token> event=<stable_token> run=<token|-> key=value ...
 ```
 
-Keep these records allocation-free, bounded, present in performance builds, and off hot/retry loops. Arbitrary
-human prose remains a separate log line. A retry observation uses a caller-owned counter with
-`HomerEventShouldEmit()` and a terminal observed/emitted/suppressed summary; do not emit every retry. Bare `session`
-requires `session_kind`, and bare `generation` means only an exact peer-QP generation. New code must document each
-stable proof event in the applicable `docs/kb/implementations/**/CONTRACTS.md` entry.
+Events must be allocation-free, bounded, present in performance builds, and absent from hot/retry loops. Retry
+observations use `HomerEventShouldEmit()` with a caller-owned counter and terminal observed/emitted/suppressed
+summary. Bare `session` requires `session_kind`; bare `generation` means only exact peer-QP generation. Keep the
+human line during additive migration and document each stable proof event in the owning implementation
+`CONTRACTS.md`. `HOMER_SERVICE_LOG` and disabled `HOMER_TRACE_EVENT` are not acceptance evidence.
 
-`HOMER_SERVICE_LOG` and disabled `HOMER_TRACE_EVENT` are debugging aids, not acceptance evidence. Existing proof
-sites are being migrated additively: retain their human line while dual-emitting the structured record. Do not
-exhaustively rewrite unrelated legacy logging merely to satisfy this convention.
+## Deterministic runner authority
 
-### Deterministic validation runner — current authority boundary
+`tools/farnet_validation/` is **not verdict-authoritative while**
+[`farnet_validation_runner_plan.md`](docs/kb/operations/farnet_validation_runner_plan.md) says live execution is
+fail-closed. Do not bypass `LIVE_EXECUTION_READY = False`; live `run --execute`, `resume --execute`, and takeover
+cleanup execution remain prohibited.
 
-The runner implementation is under `tools/farnet_validation/`; its source-of-truth design and readiness status is
-`docs/kb/operations/farnet_validation_runner_plan.md`. Every validation agent must read that note's **Status** and
-**Current next step** before deciding which runner surfaces are ready.
+Current allowed/required uses:
 
-Here **verdict-authoritative** has one narrow meaning: a runner invocation has itself proved the complete chain from
-source/artifact receipt through process/listener identity, clean candidate-scoped logs, workload correctness/path,
-teardown, and cleanup, so its final `PASS` can stand as the acceptance verdict. It does **not** mean scripts below
-that boundary are untrusted or should be ignored. The current parser/checker layer is **evidence-producing**: every
-applicable checked-in checker **must** run during real manual validation over explicitly bracketed current-candidate
-logs. Preserve its exact input identity, raw evidence, and result. That result establishes the named predicate over
-the supplied interval; it does not by itself establish that the interval belongs to the candidate or prove the whole
-run. Combine it with the runbook's still-manual provenance, identity, ordering, and cleanup proof.
+- `validate.py plan` and non-executing `run` for exact expansion and journaling;
+- process-local tests and golden fixtures;
+- every applicable checked-in checker over explicitly bracketed current-candidate role intervals, preserving path,
+  device, inode, offsets, raw evidence, and result;
+- `summarize` only when a real complete receipt and journal-bound candidate logs exist.
 
-**Current state (2026-07-16): live execution is mechanically fail-closed.** Do not use:
+A checker proves only its named predicate over supplied input. The agent still proves candidate provenance, interval
+identity, ordering, teardown, and cleanup through the operator runbook.
 
-```sh
-python3 tools/farnet_validation/validate.py run ... --execute
-python3 tools/farnet_validation/validate.py resume ... --execute
-python3 tools/farnet_validation/validate.py takeover ... --cleanup --execute
-```
+## Unexpected-state ownership
 
-Those commands intentionally reject the invocation through `LIVE_EXECUTION_READY = False`. Do not edit or bypass
-that gate during validation. Until the KB records completed provenance/takeover/runtime-identity work, another
-adversarial pass, and a known-green live acceptance, execute the established manual workflow in this `AGENTS.md`.
+Automation never owns an unexpected state. A live process after deadline, identity change, contradictory/malformed
+evidence, or missing terminal predicate stops later phases before cleanup and transfers control to the validation
+agent for bounded observation.
 
-The runner currently exposes two categories:
+While runner takeover is disabled, retain a mode-0700 `/tmp` manifest with `cleanup_required=1`, exact PID/start/exe
+and listener identities, candidate log intervals, and a hold deadline no more than 300 seconds away. Capture only
+bounded read-only evidence, then perform identity-checked cleanup and record `cleanup_completed=1`. Leave live state
+only when the brief explicitly names an immediate cleanup owner and deadline. Otherwise return `INCONCLUSIVE` with
+every remaining identity.
 
-- `validate.py plan` to inspect exact profile/phase expansion;
-- `validate.py run` **without** `--execute` to journal a no-command dry run in a fresh evidence directory;
-- the process-local tests and golden structured/legacy parser fixtures;
-- `tools/farnet_validation/checks.py` parsing during real validation: run every applicable checked-in checker after
-  manually supplying explicitly bracketed current-candidate role intervals and recording their paths/device/inode/
-  offsets. Treat each result as the determination of its named predicate over that input, not the whole verdict; if
-  no applicable checker exists, perform the documented manual anchor check;
-- `validate.py summarize` only when a complete artifact receipt and journal-bound candidate logs exist. The current
-  live path cannot mint those yet, so do not manufacture receipt/journal data to make a summary pass.
+## Scheduler enum and collector changes
 
-When the KB later enables verdict-authoritative live execution, validation agents should use it for the deterministic
-known path: ordered build/install/sync, clean/start/preflight, expected success/rejection parsing, candidate-correlated
-`HOMER_EVENT` extraction, teardown, and concise JSON/Markdown reporting. **Automation never owns an unexpected
-state.** A hang, live process after deadline, identity change, contradictory/malformed evidence, or missing terminal
-predicate stops later phases before cleanup and transfers control to the validation agent for bounded evidence
-capture and active observational reasoning. The agent identifies the first unknown/violated predicate and may select
-further bounded read-only observations, but does not diagnose or patch source. Any timeout/interrupted attempt is
-diagnostic-only and a retry starts from the documented clean baseline.
+When adding a `HomerProgressSourceKind`, `HomerProgressCollectorKind`, or `HomerProgressActionKind`, enumerate every
+switch manually; `default:` arms defeat `-Wswitch`. A new collector requires the enum, collector→source map,
+collector→action map, **and** explicit placement in `HomerMachineBaselineCompileExecutionPlan`'s phase body. An armed
+collector omitted there is granted on no pass and looks like healthy idle state.
 
-While runner takeover is disabled, the validation agent owns one explicit manual handoff protocol: create a
-mode-0700 `/tmp` manifest with `cleanup_required=1`, exact retained PID/start/exe and listener identities, captured
-log intervals, and a hold deadline no more than 300 seconds away. Use that window for bounded observations, then
-default to identity-checked cleanup before returning: prove process exit/listener closure and record
-`cleanup_completed=1`. Leave live state only if the original brief explicitly names the parent as immediate cleanup
-owner and supplies a deadline. If cleanup cannot be proven, return `INCONCLUSIVE` with `cleanup_completed=0` and
-every exact remaining identity. Never invoke the disabled runner takeover-cleanup command as a substitute.
+## Knowledge routing
 
-### DPU TCP transport smoke
-
-Run it **before and after any DPU DMA, byte-ring, or bridge-ABI change.** It silently rotted through the
-byte-ring pool migration — it compiled; nobody ran it.
-
-⚠ **Launch the server and the client from the SAME shell invocation** (the server's `--timeout-ms` counts from
-process start, not from accept), pass **every leg flag to BOTH ends** (the server checks them too), and
-**always read the server log** — the client exits 0 on legs it wasn't told to expect
-(hazards §7).
-
-```sh
-# DPU (server), under nohup setsid </dev/null & from a script on the DPU
-./homer_dpu_tcp_transport_smoke --server --dev-pci 0000:03:00.0 --port 9727 \
-  --timeout-ms 45000 --expect-loop2-backpressure
-
-# farnet1 host (client) -- all six legs.
-#   --export-posix-shm  exports a tmpfs MAP_SHARED region (the postmaster spawn region's shape)  [spike S0]
-#   --fork-reader       forks a child that re-maps that object BY NAME at its own VA, touches no
-#                       DOCA, and must observe the DPU's DMA write; gates the exit code          [spike S0b]
-./build/homer/homer_dpu_tcp_transport_smoke --client --host 10.10.1.201 --dev-pci 0000:21:00.0 \
-  --port 9727 --timeout-ms 40000 \
-  --export-posix-shm --fork-reader \
-  --expect-backend-command-publish --expect-response-publish \
-  --expect-backend-completion-pull --expect-byte-ring-pull \
-  --expect-dpu-to-host-payload --expect-loop2-backpressure
-```
-
-Both ends print `homer_dpu_tcp_transport_smoke: ok` on a real pass.
-
-### `pgbench --homer` — legacy HOST-service paths (not acceptance)
-
-The farnet1-local form maps the local service control shm, opens a local `CLIENT_SQL_SESSION`, and drives a
-local socketless backend. It may still be useful when a task explicitly asks for a host-local control-path
-observation, but it proves no farnet0 startup, artifact sync, RDMA setup, peer-control progress/retirement, DPU
-path, or remote command/result transport. Label it diagnostic-only rather than an acceptance result.
-
-The farnet0 → farnet1 host-service RDMA form using `--homer-peer-host 10.10.1.101` is **broken at HEAD**: its
-session open fails and pgbench then spins instead of exiting. Host-service Homer is being removed, so do not run
-this form routinely, do not revive it as part of validation, and do not use it as a gate. Its historical command
-shapes and results remain in `docs/kb/operations/farnet_diagnostics_and_baselines.md` only.
-
-Cross-node acceptance is the selected-DPU command gate in the next section, using the farnet1 **DPU** address
-`10.10.1.201`. Resource-retirement and transport changes require that gate **and** the four-role basebackup;
-DPU DMA, byte-ring, or bridge-ABI changes also require the DPU TCP smoke above.
-
-```sh
-# local single-client smoke (farnet1)
-sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench -h /tmp -p 5433 -U dbcomm \
-  --homer --homer-database-oid "$DBOID" --homer-user-oid "$USEROID" \
-  --latency-percentiles --client-cpu=3 -n -M simple -c 1 -j 1 -t 1000 postgres
-
-# libpq baseline, same worker placement
-sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench -h /tmp -p 5433 -U dbcomm \
-  --latency-percentiles --client-cpus=8,9,10,11 -n -M simple -c 4 -j 4 -t 20000 postgres
-```
-
-Historical host-service numbers and their caveats: `docs/kb/operations/farnet_diagnostics_and_baselines.md`
-§3.2–§3.3.
-
-### `pgbench --homer --homer-dpu-command` — THE DPU GATE ✅
-
-The workload that proves the **cross-node DPU command plane**. Validated July 11–12, 2026 (P3 green; the
-~1.5 s per-connection RNR stall fixed by P7, citus `d33f6ded3`). `--homer-dpu-command` **implies** the DPU
-result relay — a DPU-spawned backend has **no host-shm result sink at all**, so its only egress is the arena
-role-5 byte ring, which only the DPU can drain. The relay is structurally mandatory, not optional.
-
-Do **not** confuse this with `pgbench --homer-dpu` alone (result relay on a *host* command plane) or with
-`citus_remote_exec_pgbench_transaction` + `citus.enable_experimental_homer_dpu_frontend` (the SQL-UDF
-single-node engine smoke — a cheap check, **not** the gate).
-
-| role | what runs there |
+| question | canonical document |
 |---|---|
-| **farnet0 host** | `pgbench` client. **NO host service** (see trap 2 — this changed at S7.0) |
-| **farnet0 DPU** (node A) | Homer service: DMA env **+ peer-bind** `10.10.1.200:9717` |
-| **farnet1 DPU** (node B) | Homer service: DMA env **+ peer-bind** `10.10.1.201:9717` |
-| **farnet1 host** | PostgreSQL with `citus.enable_homer_dpu_frontend_agent=on`. **NO host service.** |
-
-**Start NO host `citus_tuple_sink_service` at all.** The gate touches neither.
-
-#### ⚠ Two traps that each cost a validation cycle
-
-**1. `--homer-peer-host` SELECTS THE TOPOLOGY, and the wrong value silently validates the wrong path.**
-It must be **`10.10.1.201`** — the farnet1 **DPU**. With `10.10.1.101` (the deprecated farnet1 *host*
-service address) the farnet0 DPU relays the OPEN to the farnet1 **host service**,
-which spawns a backend through the deprecated host-service arm. **Everything "passes"** while the farnet1
-DPU, the arena spawn, and the arena backend arm are **never touched**. The only tell is the *absence* of
-`DPU backend spawn begin`/`COMPLETED` in the farnet1 DPU log.
-
-**2. ✅ FIXED AT S7.0 — START NEITHER HOST SERVICE. The old rule is retired; do not resurrect it.**
-
-> **The old rule said:** *"the farnet0 (client-side) host service must be UP; the farnet1 (backend-side) one
-> must be DOWN — not symmetric, and not what you would guess."* It was true, and it was a **smell**, and
-> nobody chased it.
->
-> **The reason it was true:** `pgbench --homer` opened a host-service control region **unconditionally**, and
-> `--homer-dpu-command` implies `--homer`. But the selected-DPU session open
-> (`HomerClientOpenSqlSessionSelectedDpu`) **takes no control region** — only the host-service
-> `HomerClientOpenSqlSession` does. **So the gate mapped a region it never used**, purely to satisfy a
-> `shm_open` that only the host service could create (`homer_client.c:400` — `shm_open`, *no* `O_CREAT`).
->
-> **S7.0 gates that call on `!homer_dpu_command_mode`.** With no control region open, **a silent fall back to
-> the host-service arm cannot even be expressed.** The anti-fallback property stopped being a procedure
-> someone has to remember and became a structural fact — and host-service Homer lost its last hold on the DPU
-> path (it is the real precondition for S7.1's deletion).
->
-> **Runs 13–16 passed by accident** on a **stale** `/dev/shm/citus_remote_execution_control_v27`, with the
-> farnet0 host service *down* — the dead mapping was satisfied by a corpse. **That object was STILL sitting on
-> farnet0 on 2026-07-13**, found by the S7.0 validation. **Still do the hard clean baseline** (the stale-arena
-> and stale-spawn-region traps are unaffected by S7.0).
-
-#### Run it
-
-```sh
-# farnet1 host: PostgreSQL with the frontend agent (env must be in the POSTMASTER's environment)
-sudo -n -u dbcomm env \
-  HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.201 HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
-  HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
-  /data/dbcomm/pg-citus/bin/pg_ctl -D /data/dbcomm/pg-citus/data \
-  -l /data/dbcomm/pg-citus/data/postgres.log \
-  -o "-c citus.enable_homer_dpu_frontend_agent=on" start -w
-
-# BOTH DPUs: DMA env + peer-bind env. (farnet1 DPU shown; farnet0 DPU uses 10.10.1.200.)
-env HOMER_SERVICE_ENABLE_DPU_DMA=1 HOMER_SERVICE_ENABLE_DOCA_DMA=1 \
-    HOMER_SERVICE_DPU_SETUP_PORT=9727 HOMER_SERVICE_DOCA_DEV_PCI=0000:03:00.0 \
-    HOMER_SERVICE_PEER_BIND_HOST=10.10.1.201 HOMER_SERVICE_PEER_PORT=9717 \
-    ~/dbcomm/citus-dbcomm/build/homer/citus_tuple_sink_service
-
-# farnet0 host: the client. Note the frontend points at farnet0's OWN DPU (10.10.1.200),
-# while --homer-peer-host names the REMOTE DPU (10.10.1.201). Those are different things.
-ssh farnet0 "sudo -n -u dbcomm sh -c 'env \
-  HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.200 HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
-  HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
-  /data/dbcomm/pg-citus/bin/pgbench -h /tmp -p 5433 -U dbcomm \
-    --homer --homer-dpu-command \
-    --homer-database-oid $DBOID --homer-user-oid $USEROID \
-    --homer-peer-host 10.10.1.201 --homer-peer-port 9717 --homer-peer-node 1 \
-    --debug -n -M simple -c 1 -j 1 -t 5 postgres'"
-```
-
-#### What a real pass looks like — FOUR proofs, not one
-
-1. **`transport:` line names the mode.** It must read `homer-dpu-command (implies dpu result relay)`.
-   ⚠ It used to print a bare `homer` — *indistinguishable in the log from a plain host-service run*. That is
-   the very line a validation log gets grepped for.
-2. **Decoded values, from `--debug`:** `client 0 Homer DPU result relay for sql_execute reached EOS: rows=1
-   abalance=<N>` — one per transaction, **five distinct values**, `5/5` processed, `0` failed.
-   ⚠ `-d` is `--dbname`, **not** `--debug`.
-3. **farnet1 DPU log:** `DPU backend spawn begin …` then `DPU backend spawn COMPLETED … launched_pid=N`.
-   **Absence of these = trap 1 fired.**
-
-   > ⚠ **This proof used to add "…and pid `N` appears in farnet1's `postgres.log`". THAT WAS A DECOY — DELETED.**
-   > `remote_execution_backend_bridge.c` contains **zero** `elog(LOG)`/`ereport(LOG)` calls: every "remote exec
-   > backend" message in it is inside an `ereport(ERROR)`. **A healthy socketless backend logs NOTHING to
-   > `postgres.log`. Its pid appears there only if it ERRORS.** The check dates from **S3.3, when the spawned
-   > backend was erroring** — S3.3b retired that ERROR, the pid went silent, and the runbook kept asking for it.
-   > **It was a proof that the backend CRASHED, mis-labelled as a proof that it ran**, and on a green run it is
-   > unsatisfiable — so every correct validation reported it as a deviation, which trains the reader to skip the
-   > deviation section. *(Caught 2026-07-13 by the S7.0 validation, which reported it honestly rather than
-   > rounding it to a pass.)*
-   > **A check that can only pass when something is broken is worse than no check.**
-
-4. **Anti-fallback — SINCE S7.0, THE STRONGEST FORM: run the gate with BOTH host services DOWN, and it passes.**
-   `pgbench --homer --homer-dpu-command` no longer opens the host-service control region at all
-   (`HomerClientOpenControl` is gated on `!homer_dpu_command_mode`), so **a silent fall back to the
-   host-service arm cannot even be expressed** — there is no control region to fall back through.
-   Prove no host service ran, by `/proc/<pid>/exe` (never `pgrep -f`).
-
-   > ⚠ **The old asymmetric rule — "the farnet0 (client-side) host service must be UP, the farnet1 one DOWN" —
-   > is RETIRED.** It existed only because the gate's client mapped a control region it never used. That dead
-   > mapping is exactly what let runs 13–16 "pass" against a **stale**
-   > `/dev/shm/citus_remote_execution_control_v27` with no host service alive at all. **Start neither.**
-   > (The S7.0 validation found that very stale object still sitting on farnet0, removed it, started zero host
-   > services, and the gate passed twice.)
-
-#### ⚠⚠ AFTER ANY **FAILED** GATE RUN, RESTART BOTH DPU SERVICES — A FAILED RUN LEAKS ARENA SLOTS
-
-**An aborted client does not release its arena slot.** Slot release runs only from the *semantic close*
-(`HomerDpuDmaUnbindRingSession`, whose sole caller is `tuple_sink_service_process.c:20428`); a client that
-times out and aborts logs `SKIPPED the semantic CLIENT_SQL_SESSION_CLOSE` and the slot **stays bound for the
-life of the DPU service process**. Nothing on the import host-detach/reclaim path releases it.
-
-**The arena has exactly `HOMER_FRONTEND_ARENA_SLOT_COUNT = 16` slots.** So one failed 16-client run consumes
-the *entire* arena, and **the next run then fails for a completely different and much more confusing reason** —
-observed 2026-07-13 as 16 × `DPU backend spawn begin` with **zero** `COMPLETED`, and a client timing out at
-*session open* rather than at command completion. Chasing that second failure is chasing a ghost.
-
-> **Rule: any gate run that aborts, times out, or is interrupted ⇒ restart both DPU services before the next
-> run.** Not just the backends — the *services*, because the leaked state lives in the DPU service's memory.
-> The reap loop does not fix this; it kills OS processes, not arena bindings.
-
-⚠ **This makes every post-failure run untrustworthy until the services are bounced.** It is the same shape as
-the post-gate discovery stall (hazards §8.1): *state carried over from a previous run, invisible until it
-isn't*. Treat a run that follows a failure without a service restart as **diagnostic-only**.
-
-#### CPU sets must be SIZED TO THE CLIENT COUNT, not just kept disjoint
-
-The socketless backends busy-poll (`remote_execution_backend_bridge.c:311`) and so does `pgbench --homer`. A
-descheduled busy-poller **does not yield** — it burns its slice spinning on a line that cannot change until the
-thread it is waiting for gets scheduled. So oversubscription does not degrade, it **collapses**.
-
-The runbook's `--client-cpus=8,9,10,11` example is for **4** clients. Carrying it to `-c 16` silently gives 16
-busy-polling workers 4 CPUs (and 16 busy-polling backends another 4) on a **96-CPU** machine. Size both sets to
-the client count and keep them disjoint:
-
-```sh
-HOMER_REMOTE_EXEC_BACKEND_CPUS=16,...,31   # one per backend  (set on the DPU service that spawns them)
---client-cpus=32,...,47                    # one per pgbench worker
-```
-
-*(⚠ Sizing the CPU sets correctly did **not** fix the 16-client gate — see the concurrency cliff below. Do it
-anyway, or you cannot tell the two failures apart.)*
-
-#### ⚠⚠ THE GATE CAPS AT **8 CLIENTS** — the DPU byte-ring pool has 8 slots
-
-**Each client SQL session consumes ONE DPU byte-ring slot** for its result relay, and there are exactly
-`HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (4) × 2 regions = **8**. So:
-
-| clients | result |
-|---|---|
-| ≤ 8 | ✅ passes |
-| 10 | ❌ 8 sessions get a slot, **exactly 2 do not** — and the run partially fails |
-| 12, 16 | ❌ worse |
-
-**The DPU says so itself, in plain English, and names its own knob:**
-```
-service-owned P3 result peer-open failed session=6 sink=6 detail=byte-ring pool exhausted:
-  no free slot for session=6 stream=6 purpose=0 (all 8 slots in use;
-  raise HOMER_DPU_BYTE_RING_SLOTS_PER_REGION / regions)
-```
-**Run the gate with `-c 8` or fewer.** If you need more clients, raise
-`HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (`homer_service_dpu_dma.h:41`) and rebuild **both DPUs**.
-
-> ⚠ **A `-c 8` run is at exactly 8/8 — zero headroom.** Prefer `-c 4` when you want margin, and never read a
-> `-c > 8` failure as a regression.
-
-⚠ **This took four validation cycles and three refuted hypotheses (CPU oversubscription; a 16-deep pool cliff; a
-generic race) to find — and the answer was in the DPU log the whole time.** The client only ever prints the
-*symptom* (`DPU result relay peer-open failed for result stream 10`); the **DPU prints the cause**. When a client
-reports a Homer failure, **read the DPU log before touching the source.**
-
-> ## ⚠⚠ AND "THE DPU LOG" MEANS **BOTH DPUs**. THE GATE HAS TWO.
-> **2026-07-14: this cost most of a day.** A 75-session loop failed on node B (farnet1 DPU) — it spawned a
-> backend and then landed *zero* commands. I read node B's log, found nothing there, and built an entire suspect
-> list out of node-B code. **Every suspect was wrong, because the bug was not on node B at all.**
->
-> **Node A's log (farnet0 DPU) — which nobody had ever opened — was 9.4 MILLION lines, and 9,416,076 of them
-> said `selected-DPU session table is full`.** Node A had leaked every selected session it ever created, so it
-> could not stage the client's commands, so node B never received any.
->
-> **A failure OBSERVED on one node is routinely CAUSED on the other.** Node A drives the command plane; node B
-> executes it. **Grep both, every time.** Node A's log lives on **farnet0's** DPU — reachable only via
-> `ssh farnet0` → `ssh dpu`, so **ship a script and invoke it by path** (Non-negotiable #5), and **grep it ON the
-> DPU**: a 9.4-million-line `cat` across a double hop simply times out.
->
-> *(Root cause: `HomerDpuDmaSetupContainsServiceSession` read `descriptor->serviceSessionId` — which is **0 for
-> every ring** of the frontend arena — instead of the runtime binding, violating a rule written in its own file.
-> Fixed citus `f12a96112`. Audit §44–§45.)*
-
-#### ⚠⚠ GREPPING THE SERVICE LOGS FOR `ALARM` IS NOT ENOUGH — THE WORST LINE IS NOT TAGGED
-
-The DMA engine can **die**, and none of the lines it emits when it does contain the string `ALARM`:
-```
-homer DPU DMA: grouped-control semantic validation failed: ... [ring=.. bound_session=.. line_generation=..]
-tuple-sink service: DPU DMA PE drain failed:
-tuple-sink service: DPU command-pull submit failed: DPU DMA engine is in fatal error state
-```
-`engine->fatalError = true` — **one ring's identity check kills the WHOLE engine, and every session on that DPU.**
-
-**A run can PASS while the engine dies underneath it**, if the engine dies after the last transaction. Every
-"zero ALARMs, clean" verdict recorded before 2026-07-13 was blind to this. **Always grep with:**
-
-```sh
-grep -aiE 'ALARM|semantic validation failed|fatal error state|PE drain failed|pool exhausted|peer-open failed' \
-  <dpu_service.log>
-```
-
-#### After the run — MANDATORY
-
-The DPU-spawned `postgres: remote exec backend` **survives** and does **not** respond to `pg_ctl stop -m
-fast` (socketless backends have no clean-shutdown path until S4). **Reap it by `/proc/<pid>/exe` + `kill -9`
-at end-of-run**, or the next preflight trips on a stale backend. Never `kill -9` it *mid-run* — that
-crash-restarts the postmaster (Non-negotiable #3).
-
-⚠ **A tps figure here is meaningless without its `-t` AND its logging state.** The gate example above uses
-`-t 5`, where the ~40 ms per-connection setup dominates and tps lands around **95–128**; at `-t 2000` setup
-amortizes away and the same system reports **~285–320**. They are not comparable, and **~3.5 ms/tx is the
-quantity that actually is.** Separately, `--debug` (needed for proof #2) prints ~12k lines onto the measured
-path and depresses tps by ~10%. **Never compare a `--debug` run to a stripped one** (KB audit §22.10.2).
-
-**Warmed steady-state gate band (`-t 2000`, stripped stack, no host service) — CURRENT: `291–304 tps`,
-citus `91482c840`.**
-
-> ⛔ **This used to read "3.14 ms/tx, **318 tps** after P7". THAT IS A POST-P7 (`d33f6ded3`) NUMBER AND IT
-> PREDATES THE ENTIRE P0 SERIES.** On 2026-07-13 a validation compared against it and dutifully reported an
-> **8% regression that does not exist**. **Compare against the CURRENT row in
-> `docs/kb/operations/farnet_diagnostics_and_baselines.md` §3.3, and add a row when you move it** — the band is
-> tracked there by SHA.
->
-> ⚠ And the `≈450 µs/command` that used to sit here was **ARITHMETIC, and 2× wrong** (3.14 ms ÷ ~7 statements).
-> The **measured** per-command control wait is **235.4 µs**.
->
-> 🔴 **Separately and genuinely open:** the P0 safety series cost an unattributed **~10%** (`318 → ~285`), and
-> **no stage saw it**, because each compared itself only to the stage before. *A stage-by-stage comparison can
-> hide an arbitrarily large cumulative drift.* Suspects (unverified): P0-i's signal-policy change, §24's WR-ID
-> decode, §29(b)'s per-post admission check. Not being chased now.
-
-The gate is **still far from the microsecond target** — an open performance question, not a pass/fail criterion.
-
-### Basebackup — the validated 4-role DPU relay (USE THIS)
-
-The **only** validated topology. RDMA lands in farnet0 **DPU** memory and is relayed to a `--homer-receive`
-consumer on the farnet0 **host**. Note the `host=` in the target selects the **receiver**, and choosing the
-farnet0 *host service* (`10.10.1.100`) instead is **broken** above ~8 MiB (diagnostics §4.1).
-
-| role | what runs there |
-|---|---|
-| farnet1 host | PostgreSQL (data source) + `pg_basebackup` **sender** |
-| farnet1 DPU | sender-side Homer service |
-| farnet0 DPU | receiver-side Homer service |
-| farnet0 host | `pg_basebackup --homer-receive` **consumer** (no PostgreSQL needed) |
-
-Peer RDMA is farnet1 DPU `10.10.1.201` → farnet0 DPU `10.10.1.200`. Geometry `slots=4,bytes=524288` — sender
-and consumer **must match**. **Start the receivers first.** Use `-X none` (WAL streaming is not yet Homer).
-
-```sh
-# Sender (farnet1 host), tag N
-/usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
-  -h /tmp -p 5433 -U dbcomm -X none -c fast \
-  -t 'homer:mode=rdma,host=10.10.1.200,port=9717,node=2,slots=4,bytes=524288,tag=N' -v
-
-# Consumer (farnet0 host), tag N -- frontend env points at its LOCAL farnet0 DPU
-ssh farnet0 "sudo -n -u dbcomm sh -c 'env \
-  HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.200 HOMER_FRONTEND_DPU_SETUP_PORT=9727 \
-  HOMER_FRONTEND_DOCA_DEV_PCI=0000:21:00.0 HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS=15000 \
-  /data/dbcomm/pg-citus/bin/pg_basebackup --homer-receive \
-    --homer-node 2 --homer-database-oid \$DBOID --homer-user-oid \$USEROID \
-    --homer-slots 4 --homer-bytes 524288 --homer-tag N'"
-```
-
-Local Homer blackhole smoke (producer/service baseline, no peer transport):
-
-```sh
-/usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pg_basebackup \
-  -h /tmp -p 5433 -U dbcomm -X none -c fast -t 'homer:mode=blackhole,node=1' -v
-```
-
-PostgreSQL's built-in `TARGET 'blackhole'` is **not** a Homer path. Warm the local and remote paths
-**separately** before comparing them.
-
-### Backend-to-backend COPY 🔴 BROKEN AT HEAD
-
-> **This workload HANGS.** Both service logs go silent right after peer-transport setup, no `remote exec
-> backend` is ever spawned on farnet0, and the COPY backend survives `pg_ctl stop -m fast`. Confirmed on
-> binaries built after citus `7a2eaed53`. Leading suspect: `a3cdd5f3c` ("delete the pending-binding
-> registry"), a session-pairing change validated only against basebackup. Tracked as "Problem 2" in
-> `docs/kb/implementations/citus/transport/byte_ring_slot_capacity_regression.md`.
-> **The June-6 baseline numbers are in the KB and must NOT be cited as evidence that COPY works today.**
-
-Exercises the Citus coordinator backend on farnet1, both Homer services, and a socketless Citus worker
-backend on farnet0 — the service-to-service tuple payload path. Needs PostgreSQL on **both** hosts.
-
-```sh
-# input (farnet1)
-awk 'BEGIN { for (i = 1; i <= 10000000; i++) printf "%d,%d,payload_%08d\n", i, i * 10, i }' \
-  > /tmp/homer_tuple_sink_copy_10m.csv
-
-# distributed table -- verify the single placement lands on 10.10.1.100
-sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql \
-  -h /tmp -p 5433 -U dbcomm -d postgres -v ON_ERROR_STOP=1 <<'SQL'
-SET citus.shard_count=1;
-DROP TABLE IF EXISTS homer_tuple_sink_copy_bench;
-CREATE TABLE homer_tuple_sink_copy_bench (id int, v bigint, payload text);
-SELECT create_distributed_table('homer_tuple_sink_copy_bench', 'id');
-SELECT p.shardid, n.nodename, n.nodeport
-FROM pg_dist_placement p JOIN pg_dist_node n ON p.groupid = n.groupid
-WHERE p.shardid IN (SELECT shardid FROM pg_dist_shard
-                    WHERE logicalrelid = 'homer_tuple_sink_copy_bench'::regclass)
-ORDER BY p.shardid, n.nodename;
-SQL
-
-# the run -- warm once, then take repeats.
-# NOTE the heredoc: `\copy` is a psql META-command and cannot be mixed with SQL in a
-# single `-c`. Feed it on stdin, not as an argument.
-/usr/bin/time -p sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/psql \
-  -h /tmp -p 5433 -U dbcomm -d postgres -v ON_ERROR_STOP=1 <<'SQL'
-SET citus.enable_experimental_tuple_sink_routing=on;
-SET citus.enable_experimental_tuple_sink_loopback_validation=off;
-TRUNCATE homer_tuple_sink_copy_bench;
-\copy homer_tuple_sink_copy_bench FROM '/tmp/homer_tuple_sink_copy_10m.csv' WITH (FORMAT csv);
-SELECT count(*), min(id), max(id), sum(v) FROM homer_tuple_sink_copy_bench;
-SQL
-```
-
-**Correctness anchors:** `count=10000000`, `min=1`, `max=10000000`, `sum=500000050000000`.
-**Intended-path proof:** `published_tail` advancing in the service logs — otherwise it silently fell back to
-vanilla libpq COPY.
-
-### Foreground pgbench + background basebackup ⚠ NEEDS RE-DERIVATION
-
-The intended network-interference shape: transactions as the foreground workload, basebackup streams as
-background traffic. The shape is: launch the basebackup in the background, `sleep 0.5`, run the pgbench in the
-foreground, `wait` for the basebackup, then report **both** return codes and keep **both** logs.
-
-> ⚠ **The two scripts that used to live here (c1 and c4) cannot run today and were deliberately not carried
-> over.** They were written in June, when the host-service basebackup target still worked; the selected-DPU
-> migration rotted them. They carry **two independent defects**, and the one that actually fires is not the
-> famous one:
->
-> 1. **`bytes=8388608` fails FAST, at stream open** — `basebackup record footprint 8388848 too large for byte
->    ring storage 8388608` (`homer_client.c:3655`, a 2× headroom guard that deliberately rejects "before
->    setup"). Not a hang: a loud, immediate error. **This is what you would actually see.**
-> 2. **`host=10.10.1.100`** (the farnet0 **host** service) is the one that *hangs*, at the first wrap
->    (~8 MiB) — but only if you fix (1) first, since nothing moves until the stream opens.
->
-> *(Status: INFERRED from the target strings, not observed — nobody re-ran these scripts. Both guards are
-> confirmed in code; see diagnostics §4.1–§4.2.)*
->
-> Re-deriving this against the **4-role DPU-relay** topology is **open work**: that topology needs a
-> `--homer-receive` consumer on the farnet0 host, while the foreground pgbench *also* runs from farnet0. So
-> the concurrent shape becomes five processes across four machines, and the CPU-set disjointness rule now has
-> to cover the consumer too. Do not improvise it — design it, then record the validated command here.
-
-Whatever it becomes: this is a **correctness** shape for the current milestone. Do not treat its throughput as
-a solved scaling result until the command/control scaling issue is addressed.
-
----
-
-## Regression sweep (before AND after any transport change)
-
-Three regressions landed July 6–8, 2026 and went unnoticed for days because each validation **built one
-target and ran one workload**. Cheap insurance:
-
-1. **Build every target** — all seven smokes (recipe above), not just `service-bin`.
-2. **Run the DPU workloads, and lead with the gate.** In order:
-   **(a) `pgbench --homer --homer-dpu-command`** — the cross-node DPU command plane. If you run only one
-   thing, run this. **(b) basebackup, 4-role DPU relay.** **(c) the DPU TCP transport smoke** (before *and*
-   after any DPU DMA / byte-ring / bridge-ABI change).
-   The host-service `pgbench --homer` and backend-to-backend COPY paths are **not acceptance gates**: they are
-   currently broken and scheduled for removal. Do not run them routinely or spend validation time reviving them.
-   Run one only when the task explicitly asks for a known-failure observation; label it diagnostic-only and never
-   let either its expected failure or an accidental success substitute for the gate/basebackup verdict.
-3. **Run at least one workload with `citus.enable_homer_dpu_frontend_agent=on`.** The agent puts a **permanent
-   49-ring mmap import** into the local DPU service — a state no default-off run ever reaches, and one that
-   **wedged the DPU setup listener for four days without a single log line.**
-
-   > ⚠ **An import being accepted proves NOTHING about the next connection.** The liveness signal is
-   > `ss -ltn | grep 9727` still showing `Recv-Q 0` **after** a workload has run. Cheapest end-to-end check:
-   > with the agent on, run the 4-role basebackup — its sender opens a *second* DPU setup connection, so it
-   > fails immediately if the listener is starved. (hazards §8.1)
-
-4. **When you add a `HomerProgressSourceKind` / `...CollectorKind` / `...ActionKind` enum member, enumerate the
-   switches BY HAND.** `-Wswitch` protects nothing — nearly every switch has a `default:` arm, so it compiles
-   clean and silently falls into it. **A new collector needs FOUR edits**, and the fourth is not a switch: it
-   must be **named** in `HomerMachineBaselineCompileExecutionPlan`'s phase body, or it is armed on every pass
-   and granted on none — which looks exactly like an idle service. (hazards §5)
-
-   ```sh
-   grep -n 'switch ((HomerProgressSourceKind)\|switch (sourceKind)' tuple_sink_service_process.c
-   grep -n 'FindCollector(candidateSet, HOMER_PROGRESS_COLLECTOR_' tuple_sink_service_process.c
-   ```
-
----
-
-## Post-run checklist
-
-```sh
-# 1. process state clean on both hosts (by /proc/exe -- see Non-negotiable #2)
-# 2. results
-grep -E 'transport:|tps|latency|p50|p95|p99|number of failed transactions' \
-  /data/dbcomm/pg-citus/homer_runs/*/*.log 2>/dev/null || true
-# 3. BOTH service logs -- the intended-path proof lives here, not in the exit code
-tail -n 80 /data/dbcomm/pg-citus/data/homer_service_farnet1.log
-ssh farnet0 "tail -n 80 /data/dbcomm/pg-citus/data/homer_service_farnet0.log"
-```
-
-Then ask the two questions that an exit code cannot answer:
-
-- **Did the intended Homer path actually run**, or did it silently fall back?
-- **Was the process set clean when the measurement started**, or is this number contaminated?
-
----
-
-## Where the details went
-
-| you want | read |
-|---|---|
-| **the CODE contract you are about to violate** — *"which session owns this ring?"*, *"why is everything 64?"*, *"can I trust `commandState`?"*, *"who decrements `activeSinkCount`?"* | **`docs/kb/implementations/citus/transport/CONTRACTS.md`** — **the inverted index. Keyed by the QUESTION, not the function. Read it BEFORE writing code that touches session / ring / sink ownership.** A rule stated perfectly in a comment was violated in the same file, 1,000 lines below its own statement, and cost a day — because the question arises where the answer is *used*, not where it is *defined*. |
-| why a rule exists; the trap it prevents | `docs/kb/operations/farnet_operational_hazards.md` |
-| diagnostic builds, `starve-diag`, RDMA link battery, measurement history, broken command shapes | `docs/kb/operations/farnet_diagnostics_and_baselines.md` |
-| the selected-DPU architecture of record | `docs/kb/implementations/citus/transport/selected_dpu_session_rings_and_lifecycle.md` |
-| the open P0 resource-retirement work | `docs/kb/implementations/citus/transport/resource_retirement_contract_audit.md` |
-| the command-plane migration plan (S0–S7) | `docs/kb/implementations/citus/transport/dpu_command_plane_migration_plan.md` |
-| open regressions behind the broken workloads | `docs/kb/implementations/citus/transport/byte_ring_slot_capacity_regression.md` |
+| Exact machine/build/deploy/workload commands | `docs/kb/operations/farnet_operator_runbook.md` |
+| Why an operational rule exists | `docs/kb/operations/farnet_operational_hazards.md` |
+| Diagnostic builds, network battery, historical measurements, broken shapes | `docs/kb/operations/farnet_diagnostics_and_baselines.md` |
+| Runner readiness and authority | `docs/kb/operations/farnet_validation_runner_plan.md` |
+| Current session/ring/sink identity, ownership, ordering, and capacities | `docs/kb/implementations/citus/transport/CONTRACTS.md` |
+| Selected-DPU architecture | `docs/kb/implementations/citus/transport/selected_dpu_session_rings_and_lifecycle.md` |
+| Broken host-service paths and removal boundary | `docs/kb/implementations/citus/transport/copy_path_revival_contract.md` |
+| Resource retirement | `docs/kb/implementations/citus/transport/resource_retirement_contract_audit.md` |

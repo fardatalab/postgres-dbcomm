@@ -1,12 +1,15 @@
 # Farnet operational hazards: checks that lie
 
+<!-- kb-summary: Incident-backed operational hazards for farnet process, database, artifact, shared-memory, tool, and validation identity checks whose failure modes can manufacture a false result. -->
+
 ## Purpose
 
-This is the **evidence archive behind the rules in the repo `CLAUDE.md`/`AGENTS.md`.** Every entry here is a
+This is the **evidence archive behind the concise rules in repository `AGENTS.md`.** Every entry here is a
 check that was *exactly right for the case its author thought about, and silently wrong for the one they did
 not*. Each cost at least one debugging cycle, and several cost days.
 
-`CLAUDE.md` carries the one-line imperative. This doc carries **why**, so the next reader does not
+`AGENTS.md` carries the one-line imperative and `farnet_operator_runbook.md` carries exact procedure. This doc carries
+**why**, so the next reader does not
 "simplify" a rule back into the bug. A rule without its incident is a rule that gets undone.
 
 > **THE UNIFYING PATTERN.** Every hazard below is an *identity check* — "is this the right process / the
@@ -128,16 +131,16 @@ prefix in `/proc/<pid>/exe`.
 foreign one holds 5432 fails **loudly** (`Is another postmaster already running on port 5432?`). The danger is
 entirely on the **client** side.
 
-**The rule:** ours runs on **5433**. Start it with `-o "-p 5433"`; give every `psql`/`pgbench`/`pg_basebackup`
-`-p 5433`. Confirm before a run:
+**The rule:** ours runs on **5433**. Farnet1's setting was verified pinned in `postgresql.conf` on 2026-07-16;
+give every `psql`/`pgbench`/`pg_basebackup` `-p 5433` and confirm before a run:
 
 ```sh
 sudo -n readlink -f /proc/$(sudo -n head -1 /data/dbcomm/pg-citus/data/postmaster.pid)/exe
 # want: /data/dbcomm/pg-citus/bin/postgres
 ```
 
-A permanent fix (uncommenting `port = 5433` in **our** `postgresql.conf`) is available and has **not** been
-applied — it changes runtime state on a shared machine and needs an explicit decision.
+Farnet0 currently has the installed prefix but no PostgreSQL data directory. Do not generalize that peer-role fact
+into permission to accept missing farnet1 data.
 
 ---
 
@@ -202,7 +205,7 @@ failure.** The same trap arms any `... | head -1`, `... | grep -m1`, or `... | r
 `citus.so` is built `-fvisibility=hidden` and leaves `HomerDpuFrontend*` **undefined**; those symbols resolve
 at `dlopen` time out of the **`postgres` executable**, which statically links `libhomer_client.a` and is linked
 `--export-dynamic`. Installing a new `citus.so` against an old `postgres` fails **every** backend with
-`undefined symbol: HomerDpuFrontendOpenDevice`. See `CLAUDE.md` for the ordered recipe; check with
+`undefined symbol: HomerDpuFrontendOpenDevice`. See `farnet_operator_runbook.md` for the ordered recipe; check with
 `nm -D /data/dbcomm/pg-citus/bin/postgres | grep HomerDpuFrontend`.
 
 ### 3.5 Stale installed binaries silently map an old shared-memory name
@@ -379,8 +382,8 @@ the `--debug` `homer_last_abalance` line is the end-to-end decode proof (note `-
 
 ## Related
 
-- `../../../CLAUDE.md` (→ `AGENTS.md`): the machine setup, the runbook, and the one-line form of every rule
-  here.
+- `../../../AGENTS.md`: the one-line form of every auto-loaded rule here.
+- `farnet_operator_runbook.md`: canonical current commands and workflow.
 - `farnet_diagnostics_and_baselines.md`: the diagnostic batteries (RDMA link checks, `starve-diag`, stats
   builds) and the historical measurement records these rules were learned from.
 - `../implementations/citus/transport/`: the transport implementation checkpoints these hazards surfaced during.
