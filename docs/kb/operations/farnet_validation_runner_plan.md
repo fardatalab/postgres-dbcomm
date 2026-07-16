@@ -9,6 +9,14 @@ and the forward structured-event API now exist, but `validate.py run --execute` 
 The current runbook remains authoritative until receipt minting, remote takeover/identity proof, lifecycle cleanup,
 negative tests, another adversarial pass, and one known-green live acceptance are complete.
 
+“The runbook remains authoritative” does not mean the runner scripts should sit unused. Every applicable checked-in
+parser/checker must run over manually bracketed current-candidate logs; its result determines the named predicate
+over that supplied interval. The agent still proves that the interval belongs to the candidate and combines the
+result with the remaining manual evidence. What remains disabled is
+**verdict-authoritative live orchestration**: the runner cannot yet establish the complete provenance, runtime
+identity, candidate-journal, teardown, and cleanup chain needed for its own final `PASS` to replace agent-supervised
+manual acceptance.
+
 ## Why this exists
 
 The clean Stage-2b acceptance ran from 14:50:25 through 15:10:43 and produced 75 evidence files under
@@ -378,3 +386,7 @@ ask for the one known-green `transport-acceptance` run and consider enabling `--
   token sanitization and no disabled-trace argument evaluation; both the Citus service target and full Citus build
   compile/link the structured sites. These are not runtime acceptance. No install, SSH, service start, workload, or
   live validation was performed at this checkpoint.
+- The shared repo `AGENTS.md` now makes the runner authority boundary explicit for every validation agent: use
+  plan/dry-run surfaces for inspection and parser/checker functions as evidence compressors over manually bracketed
+  candidate logs while this note says fail-closed; keep live orchestration on the manual runbook, and eventually split
+  deterministic known-path automation from agent-owned unexpected-state takeover.

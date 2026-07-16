@@ -557,6 +557,62 @@ stable proof event in the applicable `docs/kb/implementations/**/CONTRACTS.md` e
 sites are being migrated additively: retain their human line while dual-emitting the structured record. Do not
 exhaustively rewrite unrelated legacy logging merely to satisfy this convention.
 
+### Deterministic validation runner — current authority boundary
+
+The runner implementation is under `tools/farnet_validation/`; its source-of-truth design and readiness status is
+`docs/kb/operations/farnet_validation_runner_plan.md`. Every validation agent must read that note's **Status** and
+**Current next step** before deciding which runner surfaces are ready.
+
+Here **verdict-authoritative** has one narrow meaning: a runner invocation has itself proved the complete chain from
+source/artifact receipt through process/listener identity, clean candidate-scoped logs, workload correctness/path,
+teardown, and cleanup, so its final `PASS` can stand as the acceptance verdict. It does **not** mean scripts below
+that boundary are untrusted or should be ignored. The current parser/checker layer is **evidence-producing**: every
+applicable checked-in checker **must** run during real manual validation over explicitly bracketed current-candidate
+logs. Preserve its exact input identity, raw evidence, and result. That result establishes the named predicate over
+the supplied interval; it does not by itself establish that the interval belongs to the candidate or prove the whole
+run. Combine it with the runbook's still-manual provenance, identity, ordering, and cleanup proof.
+
+**Current state (2026-07-16): live execution is mechanically fail-closed.** Do not use:
+
+```sh
+python3 tools/farnet_validation/validate.py run ... --execute
+python3 tools/farnet_validation/validate.py resume ... --execute
+python3 tools/farnet_validation/validate.py takeover ... --cleanup --execute
+```
+
+Those commands intentionally reject the invocation through `LIVE_EXECUTION_READY = False`. Do not edit or bypass
+that gate during validation. Until the KB records completed provenance/takeover/runtime-identity work, another
+adversarial pass, and a known-green live acceptance, execute the established manual workflow in this `AGENTS.md`.
+
+The runner currently exposes two categories:
+
+- `validate.py plan` to inspect exact profile/phase expansion;
+- `validate.py run` **without** `--execute` to journal a no-command dry run in a fresh evidence directory;
+- the process-local tests and golden structured/legacy parser fixtures;
+- `tools/farnet_validation/checks.py` parsing during real validation: run every applicable checked-in checker after
+  manually supplying explicitly bracketed current-candidate role intervals and recording their paths/device/inode/
+  offsets. Treat each result as the determination of its named predicate over that input, not the whole verdict; if
+  no applicable checker exists, perform the documented manual anchor check;
+- `validate.py summarize` only when a complete artifact receipt and journal-bound candidate logs exist. The current
+  live path cannot mint those yet, so do not manufacture receipt/journal data to make a summary pass.
+
+When the KB later enables verdict-authoritative live execution, validation agents should use it for the deterministic
+known path: ordered build/install/sync, clean/start/preflight, expected success/rejection parsing, candidate-correlated
+`HOMER_EVENT` extraction, teardown, and concise JSON/Markdown reporting. **Automation never owns an unexpected
+state.** A hang, live process after deadline, identity change, contradictory/malformed evidence, or missing terminal
+predicate stops later phases before cleanup and transfers control to the validation agent for bounded evidence
+capture and active observational reasoning. The agent identifies the first unknown/violated predicate and may select
+further bounded read-only observations, but does not diagnose or patch source. Any timeout/interrupted attempt is
+diagnostic-only and a retry starts from the documented clean baseline.
+
+While runner takeover is disabled, the validation agent owns one explicit manual handoff protocol: create a
+mode-0700 `/tmp` manifest with `cleanup_required=1`, exact retained PID/start/exe and listener identities, captured
+log intervals, and a hold deadline no more than 300 seconds away. Use that window for bounded observations, then
+default to identity-checked cleanup before returning: prove process exit/listener closure and record
+`cleanup_completed=1`. Leave live state only if the original brief explicitly names the parent as immediate cleanup
+owner and supplies a deadline. If cleanup cannot be proven, return `INCONCLUSIVE` with `cleanup_completed=0` and
+every exact remaining identity. Never invoke the disabled runner takeover-cleanup command as a substitute.
+
 ### DPU TCP transport smoke
 
 Run it **before and after any DPU DMA, byte-ring, or bridge-ABI change.** It silently rotted through the
@@ -586,26 +642,21 @@ process start, not from accept), pass **every leg flag to BOTH ends** (the serve
 
 Both ends print `homer_dpu_tcp_transport_smoke: ok` on a real pass.
 
-### `pgbench --homer` — the HOST-service path (not a DPU test)
+### `pgbench --homer` — legacy HOST-service paths (not acceptance)
 
-> ⚠ **This section's `--homer-peer-host 10.10.1.101` is a HOST address on purpose.** Carry it into the
-> DPU-command gate below and you silently validate the wrong path — the DPU is never touched and the run
-> still "passes". The gate needs `10.10.1.201`, the farnet1 **DPU**.
+The farnet1-local form maps the local service control shm, opens a local `CLIENT_SQL_SESSION`, and drives a
+local socketless backend. It may still be useful when a task explicitly asks for a host-local control-path
+observation, but it proves no farnet0 startup, artifact sync, RDMA setup, peer-control progress/retirement, DPU
+path, or remote command/result transport. Label it diagnostic-only rather than an acceptance result.
 
-Two modes, and they are **different validation tiers**:
+The farnet0 → farnet1 host-service RDMA form using `--homer-peer-host 10.10.1.101` is **broken at HEAD**: its
+session open fails and pgbench then spins instead of exiting. Host-service Homer is being removed, so do not run
+this form routinely, do not revive it as part of validation, and do not use it as a gate. Its historical command
+shapes and results remain in `docs/kb/operations/farnet_diagnostics_and_baselines.md` only.
 
-- **farnet1-local** — maps the local service control shm, opens a local `CLIENT_SQL_SESSION`, drives a local
-  socketless backend. A fast smoke and local scheduler-overhead check. It does **not** validate farnet0
-  startup, artifact sync, RDMA setup, peer-control progress/retirement, or remote command/result transport.
-- **farnet0 → farnet1 RDMA** — the real thing. **Any scheduler, peer-control, RDMA, or cross-node change needs
-  at least the remote single-client smoke before correctness is claimed.** Use the remote multi-client run
-  when the change can affect fairness, resource retirement, batching, or shared transport scaling.
-
-CPU placement matters: frontend, service, and backend busy-poll shared cache lines. On farnet1, CPUs `2`,`3`,`4`
-share one L3 domain (`0-5,48-53`); `8`,`9` are in another. For the best single-client local number use service
-CPU `2`, backend CPU `4`, client CPU `3`. Use `--client-cpus=LIST` for multi-worker runs and **record the
-placement with the result**; `--client-cpu=CPU` pins every worker to one CPU and suits only single-client
-reproducibility.
+Cross-node acceptance is the selected-DPU command gate in the next section, using the farnet1 **DPU** address
+`10.10.1.201`. Resource-retirement and transport changes require that gate **and** the four-role basebackup;
+DPU DMA, byte-ring, or bridge-ABI changes also require the DPU TCP smoke above.
 
 ```sh
 # local single-client smoke (farnet1)
@@ -613,26 +664,13 @@ sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench -h /tmp -p 5433 -U dbcomm \
   --homer --homer-database-oid "$DBOID" --homer-user-oid "$USEROID" \
   --latency-percentiles --client-cpu=3 -n -M simple -c 1 -j 1 -t 1000 postgres
 
-# remote RDMA single-client smoke (from farnet0)
-ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench -h /tmp -p 5433 -U dbcomm \
-  --homer --homer-database-oid '$DBOID' --homer-user-oid '$USEROID' \
-  --homer-peer-host 10.10.1.101 --homer-peer-port 9717 --homer-peer-node 1 \
-  --latency-percentiles --client-cpu=3 -n -M simple -c 1 -j 1 -t 20000 postgres"
-
-# remote RDMA multi-client
-ssh farnet0 "sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench -h /tmp -p 5433 -U dbcomm \
-  --homer --homer-database-oid '$DBOID' --homer-user-oid '$USEROID' \
-  --homer-peer-host 10.10.1.101 --homer-peer-port 9717 --homer-peer-node 1 \
-  --latency-percentiles --client-cpus=8,9,10,11 -n -M simple -c 4 -j 4 -t 10000 postgres"
-
 # libpq baseline, same worker placement
 sudo -n -u dbcomm /data/dbcomm/pg-citus/bin/pgbench -h /tmp -p 5433 -U dbcomm \
   --latency-percentiles --client-cpus=8,9,10,11 -n -M simple -c 4 -j 4 -t 20000 postgres
 ```
 
-Before a remote run: sync artifacts to farnet0, run the preflight on both hosts, start both services.
-
-Current numbers and their caveats: `docs/kb/operations/farnet_diagnostics_and_baselines.md` §3.2–§3.3.
+Historical host-service numbers and their caveats: `docs/kb/operations/farnet_diagnostics_and_baselines.md`
+§3.2–§3.3.
 
 ### `pgbench --homer --homer-dpu-command` — THE DPU GATE ✅
 
@@ -657,8 +695,8 @@ single-node engine smoke — a cheap check, **not** the gate).
 #### ⚠ Two traps that each cost a validation cycle
 
 **1. `--homer-peer-host` SELECTS THE TOPOLOGY, and the wrong value silently validates the wrong path.**
-It must be **`10.10.1.201`** — the farnet1 **DPU**. With `10.10.1.101` (the farnet1 *host* service — the
-value in the plain `--homer` recipe above) the farnet0 DPU relays the OPEN to the farnet1 **host service**,
+It must be **`10.10.1.201`** — the farnet1 **DPU**. With `10.10.1.101` (the deprecated farnet1 *host*
+service address) the farnet0 DPU relays the OPEN to the farnet1 **host service**,
 which spawns a backend through the deprecated host-service arm. **Everything "passes"** while the farnet1
 DPU, the arena spawn, and the arena backend arm are **never touched**. The only tell is the *absence* of
 `DPU backend spawn begin`/`COMPLETED` in the farnet1 DPU log.
@@ -1012,8 +1050,10 @@ target and ran one workload**. Cheap insurance:
    **(a) `pgbench --homer --homer-dpu-command`** — the cross-node DPU command plane. If you run only one
    thing, run this. **(b) basebackup, 4-role DPU relay.** **(c) the DPU TCP transport smoke** (before *and*
    after any DPU DMA / byte-ring / bridge-ABI change).
-   Then the host-service path: `pgbench --homer`, and backend-to-backend COPY (**currently broken** — do not
-   let its failure be read as "no regression").
+   The host-service `pgbench --homer` and backend-to-backend COPY paths are **not acceptance gates**: they are
+   currently broken and scheduled for removal. Do not run them routinely or spend validation time reviving them.
+   Run one only when the task explicitly asks for a known-failure observation; label it diagnostic-only and never
+   let either its expected failure or an accidental success substitute for the gate/basebackup verdict.
 3. **Run at least one workload with `citus.enable_homer_dpu_frontend_agent=on`.** The agent puts a **permanent
    49-ring mmap import** into the local DPU service — a state no default-off run ever reaches, and one that
    **wedged the DPU setup listener for four days without a single log line.**
