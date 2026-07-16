@@ -3,7 +3,8 @@
 
 **Status: IMPLEMENTATION IN PROGRESS.** The corrected design is being implemented through
 [`send_cqe_coalescing_implementation_plan.md`](../../../implementations/citus/transport/send_cqe_coalescing_implementation_plan.md):
-Stage 1 is landed/validated and Stage 2a is implemented/validated; Stage 2b is next.
+Stage 1 and Stage 2a are landed/validated; Stage 2b's behavior-neutral substrate is implemented and validated.
+The next boundary is the Stage 2c signalling-policy flip.
 This document remains the historical design and contains superseded assumptions; the implementation plan is
 the source of truth. Prerequisite §29(b) send-queue admission accounting is in
 `../../../implementations/citus/transport/resource_retirement_contract_audit.md`.
@@ -199,9 +200,16 @@ checkpoint that will ever retire it**, and the lane wedges.
 ⚠ **That works today only by arithmetic luck** — every multi-post unit happens to have a **1-WR** tail. Give a unit
 a 2-WR tail and it tears again. **A fix that works for the wrong reason.**
 
-**The correct primitive: reserve the unit's TOTAL WRs before the first post**, then let the individual posts draw
-down that reservation. Every caller knows its total up front (body + tail = 2; a payload chain is one post). This
-makes *"a unit is never torn"* **structural** rather than arithmetic.
+**Implementation correction (Stage 2b plan, 2026-07-16):** "reserve" is a non-mutating all-or-nothing SOFTWARE
+preflight for the unit's exact total, immediately followed by its posts on the single-threaded service. There is no
+durable reserved-but-not-posted credit/token. Existing per-post admission remains a backstop; preflighting N WRs
+proves every earlier unsignalled prefix leaves the one-WQE reserve and the final signalled post fits. The preflight
+runs before CQ-owner reservation. Stage 2b now pairs that rule with one dynamically allocated 256/256 owner shard
+per ready `CRITICAL_CONTROL` QP: linked owners are bounded by that same QP's 256-WQE admission frontier, and the
+preflight ordering leaves room for the one transient unlinked owner. Multiple sessions on one QP share its shard;
+additional nodes/directions allocate independent shards during cold connection establishment, so no global
+session×peer size-out, quota, or second-QP fail-stop is required. See D-S2.1/D-S2.2/D-S2b in the implementation plan
+for the ready/reset lifecycle, shard-local WR-ID interpretation, and reset-defer continuation.
 
 ### C4. THE TERMINAL FLUSH ALREADY EXISTS IN THE PROTOCOL. No new WR.
 

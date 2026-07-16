@@ -182,15 +182,18 @@ the call site. If it is not on the list, **it has not been checked.**
   command's WQEs and (via the reap `TupleSinkServiceRetireClientSqlCommandWriteCompletionEntry`) advances
   `retiredEpoch`/`consumedEpoch`. It signals every write only because **send-CQE coalescing is not yet applied to
   this lane** — NOT because the lane is forbidden from amortizing.
-- **THE REAL INVARIANT (this is the violable rule):** ⛔ **no unsignalled command WR may be left without a signalled
-  successor.** Signalling every write satisfies it trivially; **coalescing satisfies it too** — a signalled checkpoint
-  every `≤ ½·SQ` per-QP retires the unsignalled prefix behind it. That IS the send-CQE coalescing project
+- **THE REAL INVARIANT (this is the violable rule):** ⛔ **an unsignalled command owner may be released only after a
+  later CQE or QP destruction proves its WR retired.** Signalling every write satisfies it trivially. Coalescing
+  preserves it by combining the per-QP half-SQ bound with source-pressure checkpoints and Stage-1's signalled
+  terminal close/abort. Half-SQ alone is NOT a successor guarantee: traffic can stop below the interval. An abnormal
+  abandonment with no terminal therefore retains its owner/MR and defers reset until a later checkpoint or QP
+  destruction; it must not manufacture completion. That IS the send-CQE coalescing project
   ([`../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md`](../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md)),
   and the command lane is **explicitly in scope** (it lists command / peer-client-completion / control /
   peer-command-completion as the four lanes multiplexed onto the shared SQ). Coalescing is SAFE for this lane
   because its drained pool is the 64-slot command mailbox (`CITUS_REMOTE_EXEC_LOCAL_COMMAND_MAILBOX_SLOTS`), so a
-  ≤32-deep checkpoint interval never starves source credit — **provided** it also carries a **terminal flush**
-  (force-signal the last write at close/quiesce), exactly as the PAYLOAD lane already does.
+  ≤32-deep source-pressure checkpoint prevents credit starvation, while the **terminal flush** force-signals the
+  last normal close/abort write, exactly as the PAYLOAD lane already does.
 - **DOES NOT MEAN:** that the command lane must forever signal every write (it is the coalescing project's explicit
   target), nor that inlining precludes signalling — `IBV_SEND_INLINE` (source in WQE) and `IBV_SEND_SIGNALED` (CQE)
   are **orthogonal**; a coalesced lane can inline AND signal-periodically.
@@ -403,6 +406,56 @@ the call site. If it is not on the list, **it has not been checked.**
   diagnostic reader of `admittedSendWr`; mark-table safety follows from this clamp alone (NOT from any
   CQ-size equality — the granted CQ depth may also exceed the request and is only logged).
 
+## `HomerServiceSendOwnerShard` — **one dynamically allocated 256/256 owner-capacity domain per ready `CRITICAL_CONTROL` QP generation.**
+
+- **MEANS:** the service-side lifecycle context for one exact local QP generation: 256 command owners, 256
+  peer-client-completion owners, one intrusive lane/cursor/counter set per class, and exact connection identity
+  (`tuple_sink_service_process.c:HomerServiceSendOwnerShard`). Multiple sessions sharing a QP share its shard;
+  additional peers/directions allocate independent shards during cold ready handoff.
+- **DOES NOT MEAN:** 256 entries per session, a global owner table, or a peer-count quota. The WR-ID's 16-bit index
+  is interpreted only after the CQ/post path resolves the generation-bound shard from the connection handle.
+- **CONTRACT / INVARIANT:** per shard,
+  `linked command + completion owners <= postedSendWrs-retiredSendWrs <= admittedSendWr <= 256`. Total-unit
+  preflight runs before the one transient `active && !linked` reservation, so normal table exhaustion is impossible.
+  Control owners remain transport-owned and consume WQEs without consuming shard slots, which only tightens the
+  inequality.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** `HomerServicePeerConnectionReady`,
+  `HomerServiceResolveSendOwnerShard`, both reserve/link/sweep/validator families,
+  `HomerServiceDestroySendOwnerShardAfterQpDeath`, and the active-shard round-robin CQ-drain enumeration. Every
+  reserve/clear/sweep/inactive-pop/zero-post-failure/QP-purge transition updates shard-local and aggregate counters
+  exactly once.
+- **DELIBERATELY NOT DONE:** no 4096/1024 global size-out, startup preallocation of 128 heavy shards, global quota,
+  hot-path hash/linear lookup, or WR-ID ABI expansion. A ready control-only `CRITICAL_CONTROL` QP may receive an
+  unused cold shard by design.
+
+## `HomerPeerConnectionLifecycleObserver.onReady` / `lifecycleContext` — **atomic ready ownership transfer; detach before reset-complete.**
+
+- **MEANS:** transport invokes `onReady` after bootstrap/notification RECV setup but before READY/canonical/
+  `bootstrapComplete` visibility. Context-out starts NULL and is stored only after callback success; a successful
+  owner-capable QP requires a complete non-NULL shard.
+- **DOES NOT MEAN:** every reset has a shard. `HomerPeerConnectionIdentity.lifecycleReadyNotified == false` is an
+  expected pre-ready/setup-allocation failure and reset-complete accepts NULL; a notified ready
+  `CRITICAL_CONTROL` QP with NULL context is corruption.
+- **CONTRACT / INVARIANT:** callback failure undoes partial allocation/list state and leaves NULL. Reset destroys
+  QP/CQs, detaches the pointer so accessors fail, then passes the local pointer to reset-complete; service
+  purges/rearms/unlinks/frees before any helper can reset a session or the fixed connection slot is reused.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** `TupleSinkServiceNotifyPeerConnectionReady`,
+  `TupleSinkServiceFinishPeerConnectionSetup`, `TupleSinkServiceResetPeerConnectionInternal`,
+  `HomerServicePeerConnectionResetComplete`, and transport destroy's active incoming/outgoing reset loops.
+
+## `TupleSinkServicePreflightSendUnitRdma` — **non-mutating total-unit verdict before owner reservation.**
+
+- **MEANS:** exact 1-or-2-WR admission using the QP's clamped outstanding arithmetic. The single-threaded caller
+  must execute the frozen branch immediately with no poll/callback/alternate post/yield before its final post.
+- **DOES NOT MEAN:** durable reserved-but-not-posted WQE credit. Existing per-post admission remains a backstop;
+  `sendAdmissionRefusalSerial` makes a refusal after successful preflight an observable ALARM/invariant failure,
+  while genuine zero-WR provider failures retain ordinary classification.
+- **CONTRACT / INVARIANT:** preflight precedes CQ-owner reservation. WOULD_BLOCK is retryable local send-resource
+  pressure; body-accepted/tail-failed is non-rollbackable and fail-stops in this research prototype.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** command and peer-client-completion post units,
+  `TupleSinkServiceAdmitSendChainRdma`, `HomerServiceFailIfSendAdmissionBackstopDisagreed`, and completion
+  transport-credit blocked-session rearm from the exact QP's next successful send CQE.
+
 ## `entry->frontierMark` (command-write / completion-publish owners) — **QP-wide retirement coordinate. Class-local ordinals are GONE.**
 
 - **MEANS:** the connection's cumulative `postedSendWrs` as of the owner's unit's LAST (signalled) post,
@@ -423,55 +476,78 @@ the call site. If it is not on the list, **it has not been checked.**
 - **`linked` MEANS:** threaded on its connection's post-order sweep lane (`nextIndex` is LIVE list state).
   Reserve MUST skip `active || linked` slots — re-reserving a linked slot threads one table slot into a
   lane twice and corrupts the intrusive list. Only the sweep pop (or a stale-generation purge) unlinks.
-- **`active` MEANS:** the entry holds owner accounting. Scenario-E abandonment clears `active` IN PLACE and
-  KEEPS `linked` (+ the signalled demand, next entry): the WR's CQE is still in flight and the sweep lazily
-  discards the entry when it arrives. A posted-but-unlinked entry is forbidden: lane capacity is structurally
-  at least owner capacity, and a post-success link failure ALARMs and fail-stops so process teardown fences
-  the QP. This deliberately simple research-prototype failure policy avoids a second orphan scheduler.
+- **`active` MEANS:** the entry still holds owner accounting. Normal live-QP reset retains both `active` and
+  `linked` until a CQE proves retirement; QP death purges the shard using destruction as that proof. The only
+  inactive-but-linked shape is defensive: `Clear...Index` was incorrectly called for a linked entry, so its
+  guard deactivates in place, retains list state and signalled demand, and ALARMs. A later sweep or QP-death
+  purge discards it. A posted-but-unlinked entry is forbidden: lane capacity is structurally at least owner
+  capacity, and a post-success link failure ALARMs and fail-stops so process teardown fences the QP. This
+  deliberately simple research-prototype failure policy avoids a second orphan scheduler.
 - **ENFORCES:** both reserve probe loops; `Clear...Index` (linked guard: deactivate-in-place + ALARM, never
-  memset); `Abandon...OwnerIndex`; the sweep pop unlink-before-retire order (the retire memsets).
+  memset); the sweep pop unlink-before-retire order (the retire memsets); the QP-death shard purge.
 
-## The signalled-demand counts (`...SignaledCompletionActiveCount`) — **released at CQE CONSUMPTION, never at abandonment.**
+## The signalled-demand counts (`...SignaledCompletionActiveCount`) — **released at CQE consumption or QP-death purge, never at live-QP reset.**
 
 - **MEANS:** "signalled send CQEs not yet consumed on some lane" — the CQ-drain scheduler's demand gates
   (`...SendCqShouldDrain`, the demand scan, scheduler feedback) key off these.
-- **DOES NOT MEAN** "active signalled owners": an abandoned (Scenario-E) owner is inactive but its CQE is
-  still in flight and still needs draining — that drain is the ONLY thing that frees the linked slot, so
-  releasing the demand at abandonment starves the very consumption that reclaims capacity (codex round 2).
-  The per-lane `...SweepLaneHasSignaledOwner` predicates are deliberately NOT gated on `active`.
+- **DOES NOT MEAN** "active signalled owners": the defensive inactive-but-linked shape may have a CQE still
+  in flight and therefore retains demand until the sweep or QP-death purge frees its linked slot. Releasing
+  demand at the linked-clear guard would starve the consumption that reclaims capacity. The per-lane
+  `...SweepLaneHasSignaledOwner` predicates are deliberately NOT gated on `active`.
 - **ENFORCES:** release points are exactly: `Clear...Index` UNLINKED path (post-failure, or retire after a
   sweep pop of an ACTIVE entry), the command retire's inline decrement, the sweep-pop/purge INACTIVE arms
-  (via `TupleSinkServiceRelease...SignaledDemand`), and unlinked Abandon. The Abandon/Clear LINKED arms
-  deliberately do not touch it.
+  (via `TupleSinkServiceRelease...SignaledDemand`), and the QP-death shard purge. The `Clear...Index` LINKED
+  guard deliberately does not touch it.
 
-## The sweep lanes' `connectionGeneration` — **dead-QP reclamation has THREE triggers, and purge RETIRES.**
+## `resetOwnedSessions` / `resetRunnableSessions` — **proof-backed indexed session-reset continuation.**
 
-- **MEANS:** the connection generation the lane's owners were posted under. A lookup that finds the
-  handle's CURRENT generation differs proves the QP+CQs were destroyed (reset memsets the connection AFTER
-  destroying them; re-establish assigns a fresh monotone generation) — no CQE for these owners can ever
-  arrive, so the lane is purged.
-- **Purge RETIRES active entries** (per-entry retire: session credits/epochs/outstanding counts advance) —
-  QP destruction is the P0 proof no WR still reads their sources, and a blind memset would strand a
-  sender session's bookkeeping when it outlives the shared CRITICAL_CONTROL connection (reset-complete
-  marks only `clientSqlPeerReceiver` sessions). Abandoned entries release their retained demand and free.
-- **ENFORCES — all three trigger sites, or a full table blocks the purge that would empty it:** the
-  generation check in `Find...SweepLane`; `PurgeStale...SweepLanes()` on reservation table-full (one
-  retry); the demand scan's per-lane generation check (purge instead of draining a dead/reused
-  connection's CQ).
+- **MEANS:** owned says destructive reset is still owed; runnable says all command/completion/partial-post owners
+  reached zero or exact QP destruction supplied physical retirement proof. `RETRY_SESSION_RESET` is the only
+  scheduler action that consumes runnable reset work.
+- **DOES NOT MEAN:** one retired owner is enough, nor may a live-QP timeout abandon owners/MRs. Nonconvergence
+  retains the session, sources, and exact `{handle,generation}` latch; send-CQ callbacks only arm readiness.
+- **CONTRACT / INVARIANT:** QP-death purge/rearm precedes reset-complete helpers that may call `ResetSession`.
+  Shutdown performs initial reset -> transport destroy -> final reset continuation -> zero-state assertions ->
+  control unmap. Completion publication blocked on transport credit similarly waits on an indexed bitmap and is
+  rearmed only by a successful send CQE on its exact QP generation; exact QP death instead cancels the staged
+  publication before session reset classification, never retries it against the dead generation.
+- **ENFORCES:** `TupleSinkServiceRetireSessionSendCompletions`,
+  `HomerServiceRearmPendingResetIfOwnerProofComplete`, `HOMER_PROGRESS_ACTION_RETRY_SESSION_RESET`,
+  `HomerServiceRearmCompletionTransportCreditForConnection`,
+  `HomerServiceCancelCompletionTransportCreditForDeadConnection`, reset-complete, and service shutdown.
 
-## `sendCheckpointSweep` / `TupleSinkServiceHandleTaggedSendCompletion` — **every successful CQE on an accounted QP retires and sweeps. NO raw consumers.**
+## The shard's `identity.connectionGeneration` — **bind-time identity; QP-death callback owns purge.**
+
+- **MEANS:** the exact connection incarnation under which every owner in the shard was reserved and posted.
+  Outgoing and incoming session bindings both snapshot generation; no post path rereads a recyclable handle's
+  current generation as proof.
+- **DOES NOT MEAN:** stale-generation lazy reclamation. The shard is detached only after QP/CQ destruction, then
+  reset-complete purges active/inactive linked owners, releases retained demand/accounting, rearms exact pending
+  resets, and frees the whole shard before slot reuse.
+- **ENFORCES:** generation-checked lifecycle-context lookup at every reserve/link/sweep/validator path;
+  `HomerServiceDestroySendOwnerShardAfterQpDeath`; outgoing bind beside `clientSqlPeerConnectionHandle`; reset
+  continuation's exact `{handle,generation}` latch.
+
+## `sendCheckpointSweep` / `TupleSinkServiceHandleTaggedSendCompletion` — **every successful CQE retires its QP frontier; service-owner sweep is only for owner-bearing QPs. NO raw consumers.**
 
 - **MEANS:** the scalar retire → control-FIFO sweep → `sendCheckpointSweep` sequence runs inside the
   dispatch's SUCCESS block for EVERY class including UNTAGGED; the class-typed callbacks afterwards are
   VALIDATORS (their contract comment in `remote_execution_peer_transport_rdma.h`), best-effort healing only
-  a surviving linked owner / frontier-skew anomaly. Post-success ownership insertion failures fail-stop.
+  a surviving linked owner / frontier-skew anomaly. `sendCheckpointSweep` must return immediately for every
+  non-`CRITICAL_CONTROL` traffic-class QP: those QPs correctly carry NULL service lifecycle context and have no
+  command/completion shard. On an owner-bearing `CRITICAL_CONTROL` QP it sweeps both service lanes through the
+  retired frontier. Post-success ownership insertion failures fail-stop.
+- **DOES NOT MEAN** "every traffic-class QP has a service shard." The transport callback is universal across
+  QPs; the service owner domain is not. Resolving a service shard before the traffic-class guard turns the
+  expected NULL context of a payload QP into a false generation/context ALARM (caught by the Stage-2b debug gate).
 - **DOES NOT MEAN** the bootstrap poll is exempt: `TupleSinkServicePollBootstrapSendCompletion` consumes an
   accounted-signalled CQE and therefore RETIRES (validated against the stashed
   `bootstrapSendWorkRequestId`). Before that fix the mark pairing was shifted by one for the QP's life and
   the sweep would strand the LAST owner of every burst — `SESSION_CLOSE`'s included (D-S2.3; the reason the
   bootstrap fix moved from 2b into 2a).
-- **ENFORCES:** the success block in `HandleTaggedSendCompletion`; both drain paths reject errored CQEs
-  before dispatch; the D-S0 choke point guarantees no NULL-callback consumer; the send-CQ poll inventory is
+- **ENFORCES:** the success block in `HandleTaggedSendCompletion`; the traffic-class guard at the top of
+  `HomerServiceHandleSendCheckpointSweepFromDrain`; both drain paths reject errored CQEs before dispatch; the
+  D-S0 choke point guarantees no NULL-callback consumer; the send-CQ poll inventory is
   exactly three (bootstrap poll, blocking waiter, drain loop) — a NEW `ibv_poll_cq` on a send CQ must
   either dispatch through `HandleTaggedSendCompletion` or retire explicitly, else owners leak and the
   validators ALARM.

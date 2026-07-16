@@ -7959,3 +7959,122 @@ named-CQE/sweep recovery diagnostics, zero live retirement ledgers, zero DMA tas
 also retained the pre-existing clean gate result-relay teardown shape (host-consumer detach → reason-4 reset → clean
 orphan reclaim, `response_slots=1`, all control-op state counts zero); it carried no Stage-2a alarm or recovery and is
 not evidence that the Stage-2a fallback ran.
+
+## §53 — send-CQE coalescing Stage 2b plan settlement: stateless unit preflight + per-QP owner shards + proof-backed deferred reset. PLANNED 2026-07-16.
+
+The post-Stage-2a readiness review found that the older D-S2.1/D-S2.2 prose had accumulated mutually exclusive
+designs. Owner clarification settled the actual Stage-2b boundary; the canonical implementation map is now
+`send_cqe_coalescing_implementation_plan.md` D-S2.1, D-S2.2, D-S2.4, and D-S2b.
+
+Decisions:
+
+- **Unit reservation is stateless software preflight, not durable credit.** Compute the exact 1-or-2-WR unit once,
+  admit the total before CQ-owner reservation, then post immediately without an intervening poll/yield. Existing
+  per-post admission remains a backstop. There is no reserved-but-not-posted frontier or rollback state. A body
+  accepted followed by tail failure is an exceptional non-rollbackable path and fail-stops in this research
+  prototype.
+- **Keep 256/256 owner capacity, but make it a dynamically allocated per-QP shard.** The earlier 4096/1024 global
+  session×pool size-out and the intermediate "reject a second owner-bearing QP" restriction are both superseded.
+  Each ready local `CRITICAL_CONTROL` QP generation gets one service-owned shard containing 256 command owners,
+  256 peer-client-completion owners, and one intrusive lane/cursor/counter set per class. Every linked owner in a
+  shard covers at least one software-unretired WQE on that same QP, bounded by its clamped 256-WQE admission
+  ceiling; preflight before owner reservation guarantees room for the one transient unlinked owner. Thus multiple
+  nodes and simultaneous directions allocate independent capacity domains without a session×peer cross-product,
+  global quota, or WR-ID expansion.
+- **Allocate/free only on the cold physical-connection lifecycle.** A new fallible ready observer runs inside
+  `TupleSinkServiceFinishPeerConnectionSetup` after bootstrap but before READY/canonical/bootstrap-complete is
+  published; it `calloc`s the shard for `CRITICAL_CONTROL` and returns an opaque connection context. Failure leaves
+  the QP non-ready and enters setup reset before owner-bearing posts. Reset-begin does not free. Reset-complete runs
+  after QP/CQ destruction; transport first detaches the opaque pointer so no accessor can return freed storage, then
+  service exact-purges `active || linked` owners, rearms pending session resets, unlinks/verifies/frees the shard,
+  and only afterwards runs reset-complete helpers that may call `TupleSinkServiceResetSession`. The existing
+  transport-destroy loop resets every active incoming/outgoing connection through this same callback. Multiple
+  sessions sharing one endpoint/class QP share its shard; inactive connection slots carry no heavy allocation.
+- **Ready allocation is an atomic ownership transfer.** Transport calls ready once with local context NULL and
+  stores it only after success. Callback failure frees/undoes every partial allocation/list insertion and leaves
+  NULL; `CRITICAL_CONTROL` success requires one fully initialized/listed non-NULL shard. Duplicate ready or a
+  pre-existing context is an invariant failure. Every ready `CRITICAL_CONTROL` QP is owner-capable, so a QP that
+  ends up carrying generic control only may receive an unused cold shard by design; no current typed-owner path is
+  missed.
+- **Dynamic lookup still needs fair drain enumeration.** The QP's opaque context gives O(1), generation-checked
+  reserve/sweep lookup, but Stage 2a's scheduled CQ drain currently discovers send CQs by scanning the global lane
+  arrays. Keep an intrusive active-shard list, cold-mutated at ready/reset, and walk it from a round-robin cursor under
+  the 64-grant bound so shard 65+ cannot starve. Preserve global owner/demand counters as aggregate scheduler facts;
+  shard-local counters select exact QPs and prove capacity. Neither is a quota.
+- **Half-SQ is a bound, not liveness.** Continuing traffic and source pressure force checkpoints; Stage-1 terminal
+  close/abort flushes normal tails. An abnormal fully quiet abandonment may retain a bounded unsignalled tail.
+  Stage 2b therefore removes live-QP Scenario-E release: owners/MRs stay live and reset defers until a covering CQE
+  or QP destruction proves retirement.
+- **Deferred reset gets an indexed continuation.** New session reset-owned/reset-runnable bitmaps and a per-session
+  latch are rearmed after that session's owner count reaches zero, or by exact QP-death purge/reset-complete. The
+  top-level scheduler retries reset; send-CQ
+  callbacks remain retire-only. Node A arms `forceNextSignalCheckpoint`; Node B trusts the close WIMM only when its
+  successful-post latch is set. Exact lane purge occurs after QP/CQ destruction, not from generation mismatch too
+  early in reset-complete.
+- **Generation and shutdown close the continuation end to end.** Incoming client-SQL binding already snapshots the
+  connection generation; outgoing command binding currently stores only the handle and must snapshot generation too
+  so shard lookup cannot bless a reused slot. Shutdown currently resets sessions, unmaps control, then destroys the
+  transport; Stage 2b reorders this to initial reset sweep -> transport destroy/QP-death purge -> final runnable-reset
+  sweep -> zero-live assertions -> control unmap. Otherwise transport destruction rearms a deferred reset after the
+  last scheduler opportunity and shutdown silently leaves the new continuation incomplete.
+
+Stage 2b remains behavior-neutral for signalling; Stage 2c later flips only the decision function. Acceptance keeps
+the gate + 4-role basebackup unchanged and adds direct send-frontier, owner-table topology/peak, and deferred-reset
+closure evidence. Exceptional defer may be validated with a bounded diagnostic injection or labelled honestly as
+code-reviewed-only.
+
+**Final adversarial verdict after the multi-peer revision: READY TO IMPLEMENT.** The review independently verified
+the per-shard 256-WQE capacity theorem (including the transient unlinked owner), shard-local WR-ID interpretation,
+ready/reset ownership transfer, active-shard drain enumeration, outgoing generation capture, and shutdown
+continuation. No high/medium design defect remains. Implementation watchpoints are exact per-shard+aggregate counter
+balance at every owner transition, round-robin cursor repair on shard unlink, and a loud invariant failure if any
+future command/completion owner appears on a non-`CRITICAL_CONTROL` QP. True simultaneous multi-peer execution is
+not covered by today's gate/basebackup and must remain labelled code-reviewed-only unless a dedicated exerciser is
+available.
+
+## §54 — send-CQE coalescing Stage 2b implemented and validated after one compile fix and one runtime correction. 2026-07-16.
+
+Stage 2b is now implemented in the three planned Citus/Homer files with signalling still unconditionally on. The
+source replaces global command/completion owner tables with cold-allocated per-`CRITICAL_CONTROL`-QP shards, adds
+non-mutating total-unit preflight before owner reservation, installs atomic ready/reset lifecycle context transfer,
+uses fair active-shard CQ enumeration, captures outgoing generation, and replaces live-QP Scenario-E release with
+an indexed proof-backed reset continuation. Shutdown now destroys transport before its final reset sweep.
+
+The independent diff review found three material gaps before build, all corrected in the working tree:
+
+- `lifecycleReadyNotified` distinguishes a legitimate pre-ready/setup-allocation reset with NULL context from a
+  ready owner-capable QP that lost its shard;
+- `completionTransportCreditBlockedSessions` makes local send-credit pressure a real `WAIT_CQ` dependency and the
+  exact QP's next successful CQE clears/rearms only matching generation-bound sessions; exact QP death instead
+  cancels the staged publication before reset classification so no dead-generation retry can wedge;
+- `sendAdmissionRefusalSerial` distinguishes a genuine zero-WR provider failure from the impossible case where a
+  per-post admission backstop refuses after successful unit preflight; the latter ALARMs and fail-stops.
+- impossible per-QP owner-shard exhaustion and both body-accepted/tail-failed arms fail-stop with explicit ALARMs.
+
+The repository formatter and `git diff --check` pass. The full all-target build, Citus/Postgres install/relink,
+farnet0 parity, and both-DPU rebuild/deploy subsequently passed. The debug gate completed 5/5 through the intended
+DPU path, but acceptance stopped before warmed repeats/basebackup because farnet1 emitted 24 owner-shard ALARMs.
+The first ALARM immediately followed establishment of outgoing generation 2 as `traffic_class=2` and reported a
+NULL lifecycle context while demanding `expected_class=1`; teardown still proved generation 2
+`posted=12 retired=12` and the final Stage-2b ledger was all zero.
+
+The defect was a missing boundary, not a missing shard: `sendCheckpointSweep` is transport-invoked for every
+successful CQE on every traffic-class QP, but service command/completion shards exist only on
+`CRITICAL_CONTROL` QPs. `HomerServiceHandleSendCheckpointSweepFromDrain` therefore tried to resolve service lanes
+on a payload QP whose NULL lifecycle context was correct. The callback now returns immediately for
+non-`CRITICAL_CONTROL` QPs after the transport scalar/control frontier has advanced. This retains the Stage-2a rule
+that every WR class on an owner-bearing QP can retire service owners.
+
+**Corrected re-validation: PASS.** The clean all-target build, Citus install, PostgreSQL relink/install, farnet0
+parity, and forced both-DPU rebuild/deploy all passed. The intended-path debug gate completed 5/5 and the four prior
+false shard-lookup ALARM classes remained zero on both DPUs. The stripped warmup was 297.990 TPS; complete warmed
+repeats were **300.149 / 298.033 / 294.586 TPS**, each 2000/2000 with no failures and no directional Stage-2a
+regression. Four-role basebackup delivered **23,254,799,975 bytes (21.657720 GiB)** in **7.06 s**, with both roles
+exit 0, `stream complete`, and `CLOSE_ACK`; 524,288-byte ring geometry proves **44,355 full laps + 5,735 bytes**.
+
+Both DPUs ended with zero global/Stage-2b alarms, zero pending reset/credit bits, zero active shards, zero live
+control/head-mirror owners, and `free_slots=3072/3072`, `fatal=false`; services stopped gracefully. Clean QPs had
+`postedSendWrs == retiredSendWrs`; clean-detach one-WR differences were explicitly reported as `flushed=1`, not
+mislabelled retirement. True simultaneous multi-peer execution and a deterministic injected deferred-reset
+transition remain code-reviewed-only because the current acceptance topology does not exercise them; this is the
+plan-approved research-prototype boundary, not a hidden runtime claim. **Stage 2b is accepted; next is Stage 2c.**
