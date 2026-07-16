@@ -1,0 +1,3 @@
+pg_basebackup: checkpoint completed
+pg_basebackup: base backup completed
+real 7.06

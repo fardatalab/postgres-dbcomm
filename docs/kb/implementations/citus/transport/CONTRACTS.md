@@ -170,8 +170,10 @@ the call site. If it is not on the list, **it has not been checked.**
 - **MEANS:** verbose development logging. `HOMER_SERVICE_VERBOSE_LOGGING` **defaults to 0**.
 - **DOES NOT MEAN:** anything you can rely on in a measured run. Same for
   `TupleSinkServiceLogPeerTransportStatsRdma` (`#if HOMER_SERVICE_PEER_TRANSPORT_STATS`).
-- **CONTRACT:** ⛔ **Never anchor a validation proof on a `HOMER_SERVICE_LOG` string.** Use a plain
-  `fprintf(stderr, ...)` for anything a *proof* depends on. (Operational hazards §9.)
+- **CONTRACT:** ⛔ **Never anchor a validation proof on a `HOMER_SERVICE_LOG` string.** New validation-bearing
+  cold/terminal sites use the always-on `HOMER_EVENT(...)` contract indexed by `../CONTRACTS.md`; during the narrow
+  migration, keep the existing plain `fprintf(stderr, ...)` line beside it so manual validation and legacy parsers
+  remain useful. (Operational hazards §9.)
 
 ---
 

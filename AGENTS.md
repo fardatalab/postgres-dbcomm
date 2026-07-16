@@ -537,6 +537,26 @@ copy-pastes them.
 - **"No error" is not "the intended path ran."** Confirm from the service logs that Homer actually executed
   rather than a silent libpq/built-in fallback.
 
+### Stable validation events for new Homer code
+
+New or materially changed validation-bearing lifecycle, terminal, teardown, and invariant-failure sites use the
+shared `HOMER_EVENT(...)` API in
+`/data/dbcomm/citus-dbcomm/src/include/distributed/homer/homer_event.h`. The stable line grammar is:
+
+```text
+HOMER_EVENT v=1 severity=<info|warn|alarm> component=<token> event=<stable_token> run=<token|-> key=value ...
+```
+
+Keep these records allocation-free, bounded, present in performance builds, and off hot/retry loops. Arbitrary
+human prose remains a separate log line. A retry observation uses a caller-owned counter with
+`HomerEventShouldEmit()` and a terminal observed/emitted/suppressed summary; do not emit every retry. Bare `session`
+requires `session_kind`, and bare `generation` means only an exact peer-QP generation. New code must document each
+stable proof event in the applicable `docs/kb/implementations/**/CONTRACTS.md` entry.
+
+`HOMER_SERVICE_LOG` and disabled `HOMER_TRACE_EVENT` are debugging aids, not acceptance evidence. Existing proof
+sites are being migrated additively: retain their human line while dual-emitting the structured record. Do not
+exhaustively rewrite unrelated legacy logging merely to satisfy this convention.
+
 ### DPU TCP transport smoke
 
 Run it **before and after any DPU DMA, byte-ring, or bridge-ABI change.** It silently rotted through the

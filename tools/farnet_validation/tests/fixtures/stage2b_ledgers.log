@@ -1,0 +1,7 @@
+all_alarm_or_fatal=0
+tuple-sink service: head-mirror MR accounting: registered=6 released_on_rebind=0 retired_on_clear=6 retired_at_exit=0 retired_on_open_failure=0 live=0
+tuple-sink service: peer control retirement accounting: retiring_entered=0 released_normally=0 reset_discarded=0 live=0 abandoned_partial_publish=0 abandoned_stale_async=0
+tuple-sink service: Stage-2b teardown ledger reset_owned=0x0000000000000000 reset_runnable=0x0000000000000000 completion_transport_blocked=0x0000000000000000 active_shards=0 peak_shards=1 shard_alloc_failures=0
+homer DPU DMA: teardown drain COMPLETE: entered with 0 outstanding task(s), converged after 0 progress round(s); free_slots=3072/3072 fatal=false
+tuple-sink service: send-owner shard released connection=0xf3 generation=1 command_peak=0 completion_peak=1 combined_linked_peak=1
+tuple-sink service: peer send frontier at QP destruction host=10.10.1.200 generation=2 posted=12 retired=12 flushed=0 signalled_post=7 signalled_retired=7 force_checkpoint=0

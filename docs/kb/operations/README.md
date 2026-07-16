@@ -1,5 +1,7 @@
 # Operations
 
+<!-- kb-summary: Operational runbooks, hazards, diagnostics, baselines, and deterministic validation tooling for the farnet Homer research rig. -->
+
 ## Purpose
 
 The **operational** knowledge for the farnet two-host + two-DPU prototype rig: the traps that make a check lie
@@ -30,6 +32,7 @@ The organizing idea behind almost everything in `farnet_operational_hazards.md`:
 ## Documents
 
 <!-- kb-docs:start -->
+- [farnet_validation_runner_plan.md](farnet_validation_runner_plan.md) - Implementation plan and current status for the deterministic, phase-based farnet validation runner that converts the manual multi-host Homer acceptance procedure into explicit profiles, resumable evidence, and machine-readable verdicts.
 - [farnet_diagnostics_and_baselines.md](farnet_diagnostics_and_baselines.md) - Diagnostic builds (`starve-diag`, the stats macros, `HOMER_REMOTE_EXEC_TRACE`) and how to READ their output; the RDMA/RoCE link battery and the open cross-lane L2-domain failure; the measurement history (P7's 1450ms->10ms RNR fix, the pgbench TPS bands, the STALE June-6 COPY baseline); and the broken command shapes kept out of the runbook so nobody copy-pastes them.
 - [farnet_operational_hazards.md](farnet_operational_hazards.md) - Every check in this project that LIES, with the incident that proved it: `pkill -f` matching its own argv; `/proc/<pid>/exe` and the non-optional trailing `*`; the SECOND PostgreSQL on farnet1 (same `dbcomm` user, port 5432) that silently swallows `pgbench -i`; sticky `make -B` stats builds; the shm object whose version is in its NAME; `-Wswitch` protecting nothing; and the subagent that reverted 30 edits.
 <!-- kb-docs:end -->

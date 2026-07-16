@@ -1,0 +1,2 @@
+tuple-sink service: DPU backend spawn begin handle=1 slot=16 session=1 db=5 user=10 bridge_generation=14926112376236424
+tuple-sink service: DPU backend spawn COMPLETED handle=1 slot=16 session=1 launched_pid=3510109 state_reads=2

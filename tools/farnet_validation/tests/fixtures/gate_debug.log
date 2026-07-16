@@ -1,0 +1,8 @@
+transport: homer-dpu-command (implies dpu result relay)
+pgbench: client 0 Homer DPU result relay for sql_execute reached EOS: rows=1 abalance=2636
+pgbench: client 0 Homer DPU result relay for sql_execute reached EOS: rows=1 abalance=2422
+pgbench: client 0 Homer DPU result relay for sql_execute reached EOS: rows=1 abalance=-1169
+pgbench: client 0 Homer DPU result relay for sql_execute reached EOS: rows=1 abalance=-3476
+pgbench: client 0 Homer DPU result relay for sql_execute reached EOS: rows=1 abalance=418
+number of transactions actually processed: 5/5
+number of failed transactions: 0 (0.000%)

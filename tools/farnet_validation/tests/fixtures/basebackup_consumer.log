@@ -1,0 +1,3 @@
+pg_basebackup: homer receive: consuming basebackup stream node=2 db=5 user=10 requested_slots=4 bytes=524288 tag=21616
+pg_basebackup: homer receive: stream complete, delivered_bytes=23254799975
+CONSUMER_WAIT_RC=0 supervisor_pid=123 start=456
