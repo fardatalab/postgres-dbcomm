@@ -404,10 +404,87 @@ the call site. If it is not on the list, **it has not been checked.**
 
 ---
 
+## `HOMER_PAYLOAD_CLOSE_FLAG_ABORT_RESET` — **staged-discard terminal flush on a SURVIVING connection. NOT the ABORTING failure machinery.**
+
+- **MEANS:** the sender is closing WITHOUT a drain contract (backend ERROR/cancel, cleanup without
+  OBJECT_END). Receiver: stop relay submissions, wait out the in-flight DOCA chain, publish the **FAILED**
+  credit-line terminal at the stopped frontier, respond with the ABORT_RESET echo (`peerBindingStillActive
+  =0`), tombstone `ABORTED_RESET`. Exactly one of {`NORMAL_DRAIN`, `ABORT_RESET`} per request.
+- **DOES NOT MEAN** `QUIESCED` (drained-to-final-tail + final head posted — an abort can never claim it;
+  the response shapes are mutually exclusive and separately latched). Does NOT mean
+  `HOMER_PAYLOAD_CLOSE_ABORTING` / `HomerPayloadFailureState` — that is the CONNECTION-RESET machinery,
+  whose clear-proof requires QP destruction; ABORT_RESET completes with the QP alive.
+- **ONLY `BASE_BACKUP_STREAM`**: the tuple-view relay has no discard implementation (its terminal is
+  gated on in-band EOS); the accept arm rejects other families loudly rather than wedge unscheduled.
+- **ENFORCES:** accept arm + family gate in `TupleSinkServiceHandlePeerCloseSinkRequest`; the exact-shape
+  tombstone arm in `HomerServiceTryBuildRetiredCloseResponse` (`closeFlags == ABORT_RESET`, because the
+  tombstone check runs BEFORE the live flag-shape validation); the abort echo arm in
+  `HomerServiceValidatePayloadCloseResponse`; the abort fact-arms in
+  `HomerServiceMarkPayloadCloseReclaimable` (exit(1) on unproven facts — never satisfy them by faking
+  `peerQuiesced`/`finalHeadObserved`).
+
+## `abortLocalSendDiscard` vs `abortResetDiscardActive` — **a wrong-neighbor pair. Sender pump gate vs receiver relay gate.**
+
+- **`abortLocalSendDiscard` MEANS (SENDER):** the local client abort-closed; the outgoing payload pump
+  (`HomerServicePumpOutgoingPayloadStream` — verified the SINGLE posting funnel) posts nothing further, so
+  the posted tail is FROZEN. **ORDER IS LOAD-BEARING:** it must be set BEFORE the close continuation
+  freezes the final tail (`HomerServiceFreezePayloadCloseFinalTail` exit(1)s on a moved tail);
+  `TupleSinkServiceBeginPayloadAbortReset` owns that order — always go through it.
+- **`abortResetDiscardActive` MEANS (RECEIVER):** the peer's CLOSE_SINK carried ABORT_RESET; the relay
+  pump submits no new DOCA segments and publishes FAILED once the in-flight chain retires. Landed bytes
+  beyond the stopped frontier are deliberately discarded, so `writtenTail < publishedTail` can hold
+  FOREVER — every drain-shaped predicate needs an abort arm (see the scheduler-trap entry below).
+- **DOES NOT MEAN** each other's side, and neither means `closeState->abortReset` (the close MODE flag,
+  set on both sides). Both are latches; the stream-entry reset clears them.
+
+## The abort scheduler rule — **a terminal path must be walked through ready-predicate → grant → executor, not just its own state machine**
+
+- Three predicates assumed drain progress an abort explicitly abandons, and each was a silent
+  forever-wedge: `HomerServicePayloadCloseActionReady` (receive-drain gate; abort arm returns
+  `relayTerminalPublished`), `HomerServicePayloadMustProgressBeforeClose` (early-false under either abort
+  flag), and the relay pump wake-up (graceful rides the final payload doorbell; the abort accept arm
+  latches a SYNTHETIC `receivePayloadDoorbellPending`).
+- **ENFORCES:** any future terminal/close variant (Stage 2's checkpoint flush included) must audit these
+  three sites plus `HomerServicePayloadStreamSourceReadyForScheduler`.
+
+## The SENDER failure channel — **`byteRingFailedCreditArmed/Published` + the credit line's `entryState`. The flags channel is DEAD for selected-DPU.**
+
+- **MEANS:** a selected-DPU SENDER learns of stream death ONLY through its credit line: the DPU arms a
+  one-shot FAILED credit terminal (`HomerDpuDmaArmFailedCreditForServiceSink`, ring resolved by the
+  RUNTIME binding — D5) on abort/reset teardown; the consumed-head publish sweep publishes it (equal or
+  ZERO frontier allowed — the stuck/never-credited abort has no new credit); the host's
+  `StillOpenForReserve` reads `entryState==FAILED` off the line `HomerClientDpuRefreshBaseBackupCredit`
+  already polls every reserve iteration.
+- **DOES NOT MEAN** the `byteRingControl->flags`/`terminalStatus` channel: that one is HOST-SERVICE-era —
+  `MarkPayloadStreamSendFailed` writes local queue controls a selected-DPU sender never maps; nothing
+  DPU-side writes the host's flags. Validation round 1 watched a walsender spin at 99% CPU >138 s on
+  exactly that assumption. Do not confuse this SENDER channel with the RECEIVER's FAILED terminal
+  (`SubmitByteRingWriteTerminal`, role-7 ring, entry above) — same entryState value, different ring
+  direction, different publisher family (`CREDIT_BODY/PUBLISH` vs `WRITE_PRODUCED_TAIL_*`).
+- **ONE-SHOT + SUPPRESSION:** `byteRingFailedCreditPublished` permanently suppresses later ACTIVE
+  publications (an ACTIVE re-stamp would erase the terminal the producer's exit decision reads).
+- **ENFORCES:** `HomerDpuDmaSubmitByteRingConsumedHeadPublication` (renamed from the LYING
+  `...SmokePublication` name — it was always the production Loop-1 submitter): ACTIVE keeps
+  strict-advance + nonzero; FAILED allows equal/zero. The sweep's FAILED eligibility arm; the ordinary
+  arm's `byteRingFailedCreditPublished` refusal; `HomerServiceArmSenderFailedCredit`'s two call sites
+  (`BeginPayloadAbortReset`, reset-complete sender real-failure arm).
+
+## `HomerClientPollBaseBackupReceive` terminal split — **FAILED is drain-INDEPENDENT and a poll FAILURE; CLOSED is drain-gated SUCCESS**
+
+- **MEANS:** `entryState==FAILED` (honored only once `dpuLastCreditEpoch != 0`) returns false with a
+  distinct truncation error — even with a torn tail holding `consumedHead < producedTail` forever.
+  `CLOSED` still requires the full drain before `*streamComplete`.
+- **DOES NOT MEAN** both states exit alike: before Stage 1 they both exited SUCCESS, which reported
+  aborted backups as good (the silent-truncation bug). Never re-merge them.
+- **ENFORCES:** the FAILED arm in `HomerClientPollBaseBackupReceive`;
+  `HomerDpuDmaSubmitByteRingWriteTerminal` accepts ONLY CLOSED/FAILED (in-function guard).
+
+---
+
 ## Related
 
 - [`resource_retirement_contract_audit.md`](resource_retirement_contract_audit.md) — the narrative and evidence
-  behind every entry here (§34–§45), including **six refuted mechanisms** and why each was tempting.
+  behind every entry here (§34–§45, D-S0 §50, Stage-1 abort §51), including **six refuted mechanisms** and why each was tempting.
 - [`selected_dpu_session_rings_and_lifecycle.md`](selected_dpu_session_rings_and_lifecycle.md) — the selected-DPU
   architecture of record.
 - `docs/kb/operations/farnet_operational_hazards.md` — the **operational** traps. *This file is the **code** traps.*

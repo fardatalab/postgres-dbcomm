@@ -29,6 +29,7 @@
 #include "distributed/homer/remote_execution_peer_control_protocol.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
 #include "utils/builtins.h"
 
 typedef struct bbsink_homer
@@ -80,6 +81,64 @@ bbsink_homer_error(const char *operation, const char *detail)
 			(errcode(ERRCODE_CONNECTION_FAILURE),
 			 errmsg("Homer base backup target failed during %s", operation),
 			 errdetail("%s", detail != NULL ? detail : "<no detail>")));
+}
+
+/*
+ * Stage 1 (D-S1 leg 1b): non-throwing interrupt probe for the Homer client
+ * library's byte-ring reserve wait loop.  The client lib is linked into both
+ * the postgres executable and frontend tools, so it cannot call backend
+ * interrupt machinery itself -- the walsender registers this wrapper instead.
+ * MUST NOT ereport/longjmp (the lib is mid-loop): it only reports that an
+ * interrupt is pending; the reserve then fails with an "interrupted" error,
+ * bbsink_homer_error raises the real ERROR from backend context, and the
+ * PG_FINALLY cleanup path issues the abort-close.
+ */
+static bool
+bbsink_homer_interrupt_pending(void)
+{
+	return INTERRUPTS_PENDING_CONDITION();
+}
+
+/*
+ * Stage 1 S1-FIX F2: proc_exit backstop for the FATAL path.
+ *
+ * PG_FINALLY does NOT run on FATAL (errfinish goes straight to proc_exit), so
+ * a walsender that dies on "connection to client lost" mid-backup never
+ * reaches bbsink_homer_cleanup -- validation round 1 showed the DPU then only
+ * sees the mmap teardown and the PEER IS NEVER TOLD (the pre-Stage-1 consumer
+ * hang, resurrected through the FATAL side door).  before_shmem_exit callbacks
+ * DO run on FATAL, and ours is registered later than ShutdownPostgres, so
+ * (LIFO) it runs before transaction/context teardown while the sink memory is
+ * still valid.
+ *
+ * Registration is once per process (cancel_before_shmem_exit is unsafe unless
+ * we are provably the newest callback); arming is via the static sink pointer,
+ * set at begin_backup and cleared by end_backup/cleanup -- whichever of the
+ * backstop and cleanup runs first disarms the other (the abort-close also
+ * memsets the stream, and stream_open guards the double-close).
+ *
+ * The abort-close performs bounded I/O (DPU mailbox + TCP setup-close, each
+ * under HOMER_FRONTEND_DPU_SETUP_TIMEOUT_MS); a FATAL'ing walsender may
+ * therefore linger up to those timeouts in proc_exit.  Acceptable on this
+ * control path -- the alternative is a consumer hung forever.
+ */
+static struct bbsink_homer *bbsink_homer_backstop_sink = NULL;
+static bool bbsink_homer_backstop_registered = false;
+
+static void
+bbsink_homer_abort_backstop(int code, Datum arg)
+{
+	struct bbsink_homer *mysink = bbsink_homer_backstop_sink;
+
+	bbsink_homer_backstop_sink = NULL;
+	HomerClientSetInterruptCheck(NULL);
+	if (mysink == NULL || !mysink->stream_open)
+		return;
+
+	ereport(LOG,
+			(errmsg("Homer base backup target: process exit with the stream still open; issuing abort-close")));
+	(void) HomerClientAbortBaseBackupStream(&mysink->stream, NULL, 0);
+	mysink->stream_open = false;
 }
 
 static void
@@ -300,6 +359,24 @@ bbsink_homer_begin_backup(bbsink *sink)
 		bbsink_homer_error("open stream", error);
 	mysink->stream_open = true;
 
+	/*
+	 * Stage 1 (D-S1 leg 1b): make the client lib's reserve wait interruptible
+	 * for the lifetime of this stream (cleared again in cleanup).  Before this,
+	 * a back-pressured sender could not even be pg_cancel'd -- only kill -9.
+	 */
+	HomerClientSetInterruptCheck(bbsink_homer_interrupt_pending);
+
+	/*
+	 * Stage 1 S1-FIX F2: arm the FATAL-path abort backstop (see its comment).
+	 * ⚠ Registration happens in bbsink_homer_new, NOT here: begin_backup runs
+	 * INSIDE basebackup.c's PG_ENSURE_ERROR_CLEANUP window (basebackup.c:280-403),
+	 * and registering on top of do_pg_abort_backup makes PG_END_ENSURE's
+	 * cancel_before_shmem_exit ERROR out with "is not the latest entry" -- which
+	 * killed EVERY basebackup at end-of-backup in validation round 2.  Here we
+	 * only ARM (set the pointer).
+	 */
+	bbsink_homer_backstop_sink = mysink;
+
 	mysink->scratch_buffer_length = options.payloadCapacityBytes;
 	mysink->scratch_buffer = palloc(mysink->scratch_buffer_length);
 	mysink->base.bbs_buffer = mysink->scratch_buffer;
@@ -392,6 +469,8 @@ bbsink_homer_end_backup(bbsink *sink, XLogRecPtr endptr, TimeLineID endtli)
 										  sizeof(error)))
 		bbsink_homer_error("close stream", error);
 	mysink->stream_open = false;
+	/* Graceful close completed: disarm the FATAL-path abort backstop. */
+	bbsink_homer_backstop_sink = NULL;
 	if (mysink->control_open)
 	{
 		HomerClientCloseControl(&mysink->control);
@@ -405,13 +484,27 @@ bbsink_homer_cleanup(bbsink *sink)
 {
 	bbsink_homer *mysink = (bbsink_homer *) sink;
 
+	/* The stream (and its reserve loop) is going away; drop the interrupt hook
+	 * and disarm the FATAL-path abort backstop (this cleanup owns the close now). */
+	HomerClientSetInterruptCheck(NULL);
+	bbsink_homer_backstop_sink = NULL;
+
 	if (mysink->stream_open)
 	{
 		char		error[HOMER_CLIENT_ERROR_BYTES];
 
-		(void) HomerClientCloseBaseBackupStream(&mysink->stream,
-												error,
-												sizeof(error));
+		/*
+		 * Stage 1 (D-S1 leg 1a): stream_open here means end_backup never completed
+		 * its graceful close -- this cleanup is running off an ERROR/cancel path
+		 * (basebackup.c's PG_FINALLY).  Before this change the cleanup issued a
+		 * NORMAL drain-close, and the consumer -- which never checks objectKind,
+		 * only the transport EOS -- reported an ABORTED backup as SUCCESS (the
+		 * live silent-truncation bug).  Abort-close is the correct default: the
+		 * receiver publishes a FAILED terminal and the consumer exits with an
+		 * error.  The graceful close remains exclusively end_backup's, which runs
+		 * only after OBJECT_END was submitted.
+		 */
+		(void)HomerClientAbortBaseBackupStream(&mysink->stream, error, sizeof(error));
 		mysink->stream_open = false;
 	}
 	if (mysink->scratch_buffer != NULL)
@@ -441,6 +534,24 @@ bbsink_homer_new(bbsink *next, char *target_detail)
 	*((const bbsink_ops **) &sink->base.bbs_ops) = &bbsink_homer_ops;
 	sink->base.bbs_next = next;
 	sink->target_detail = target_detail;
+
+	/*
+	 * Stage 1 S1-FIX F2 (round-2 validation fix): register the FATAL-path abort
+	 * backstop HERE, during sink construction -- which runs in SendBaseBackup
+	 * BEFORE perform_base_backup opens its PG_ENSURE_ERROR_CLEANUP window
+	 * (basebackup.c:280).  LIFO consequences, both desirable:
+	 *  - PG_END_ENSURE's cancel_before_shmem_exit(do_pg_abort_backup) finds its
+	 *    own callback on top (ours is BELOW), so graceful backups complete;
+	 *  - on FATAL, do_pg_abort_backup runs first (shared backup state), then our
+	 *    backstop abort-closes the Homer stream.
+	 * Registration is once per process; the callback is inert until begin_backup
+	 * arms the sink pointer.
+	 */
+	if (!bbsink_homer_backstop_registered)
+	{
+		before_shmem_exit(bbsink_homer_abort_backstop, (Datum) 0);
+		bbsink_homer_backstop_registered = true;
+	}
 
 	return &sink->base;
 }

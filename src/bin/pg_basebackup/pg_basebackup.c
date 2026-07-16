@@ -2378,6 +2378,18 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
  * The DPU setup endpoint/device come from HOMER_FRONTEND_DPU_SETUP_HOST/_PORT/
  * HOMER_FRONTEND_DOCA_DEV_PCI (point these at the LOCAL farnet0 DPU).
  */
+/*
+ * Stage 1 (D-S1 leg 3): SIGINT/SIGTERM flag for the receive-consume loop.  Before
+ * this, Ctrl-C killed the consumer with NO close at all -- the DPU kept the
+ * binding, the far sender kept publishing into a ring nobody drained, and its
+ * producer spun forever.  The handler only sets the flag; the loop notices it
+ * and issues the ABORT close (which resets the bound payload protocol so the
+ * far sender's producer unsticks) before exiting nonzero.
+ */
+static volatile sig_atomic_t homer_receive_interrupted = 0;
+
+static void homer_receive_signal_handler(SIGNAL_ARGS) { homer_receive_interrupted = 1; }
+
 static void
 RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots, uint32 payloadBytes,
 					   uint32 launchDiscriminatorTag)
@@ -2406,6 +2418,10 @@ RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots,
 	if (!HomerClientOpenBaseBackupReceiveStreamSelectedDpu(&options, &stream, error, sizeof(error)))
 		pg_fatal("homer receive: could not open receive-consume session: %s", error);
 
+	/* Stage 1 (D-S1 leg 3): abort-close instead of dying silently on Ctrl-C. */
+	pqsignal(SIGINT, homer_receive_signal_handler);
+	pqsignal(SIGTERM, homer_receive_signal_handler);
+
 	pg_log_info("homer receive: consuming basebackup stream node=%d db=%u user=%u requested_slots=%u bytes=%u tag=%u",
 				nodeId, dbOid, userOid, slots, payloadBytes, launchDiscriminatorTag);
 
@@ -2414,13 +2430,25 @@ RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots,
 	 * tail (advances consumedHead = Loop-2 back-pressure credit) and sets *complete when
 	 * the DPU's EOS terminal is observed AND everything has been drained.  A short pause
 	 * keeps a single receiver from spinning a core hot; the payload is discarded.
+	 *
+	 * Stage 1 (D-S1 leg 3), two abort exits, both nonzero and both abort-closing:
+	 *  - poll failure: includes the DPU's FAILED terminal (sender aborted; the poll
+	 *    reports it as an error with a TRUNCATED notice) and any transport error;
+	 *  - local interrupt (SIGINT/SIGTERM): consumer-initiated abort; the abort-close
+	 *    resets the bound payload protocol so the far sender's producer unsticks.
 	 */
 	while (!complete)
 	{
+		if (homer_receive_interrupted)
+		{
+			(void)HomerClientAbortBaseBackupStream(&stream, NULL, 0);
+			pg_fatal("homer receive: interrupted (delivered=%llu); abort-close issued toward the sender",
+					 (unsigned long long)deliveredTotal);
+		}
 		error[0] = '\0';
 		if (!HomerClientPollBaseBackupReceive(&stream, &deliveredTotal, &complete, error, sizeof(error)))
 		{
-			(void) HomerClientCloseBaseBackupStream(&stream, NULL, 0);
+			(void)HomerClientAbortBaseBackupStream(&stream, NULL, 0);
 			pg_fatal("homer receive: poll failed (delivered=%llu): %s",
 					 (unsigned long long) deliveredTotal, error);
 		}

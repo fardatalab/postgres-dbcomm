@@ -440,3 +440,15 @@ SPLIT, not to all-`dbcomm`**: build dirs + `/data/dbcomm/pg-citus` belong to `db
 which un-broke its build step and then broke the owner's editing and commits — over-normalization is just
 drift in the other direction); (3) `dbcomm` has NO ssh key auth to farnet0 — source-tree syncs currently need
 `-e 'ssh -l jasonhu'` transport with the receiving-side `--rsync-path='sudo -n -u dbcomm rsync'` intact.
+
+**§10 amendment (2026-07-15, Stage 1):** the citus tree builds IN-TREE, so "build dirs belong to `dbcomm`"
+includes artifacts INTERLEAVED with the sources: every `src/**/.deps/` directory (autotools dependency
+files — a jasonhu-owned `.deps/` fails the very next `dbcomm` build with `Permission denied` on `.Po`
+files) and `src/backend/distributed/cdc/build-cdc-*` (the cdc decoder copy-build dirs). The D-S0 repair
+chowned sources to the human user and broke `dbcomm` builds on exactly these; both are now on the
+`dbcomm` side of the split:
+
+```sh
+find /data/dbcomm/citus-dbcomm/src -type d \( -name .deps -o -name 'build-cdc-*' \) \
+  -exec sudo -n chown -R dbcomm:dbcomm {} +
+```

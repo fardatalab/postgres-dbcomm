@@ -371,7 +371,167 @@ the same commit; Stage 1 must already be landed).
 Then delete the `PEER_SEND_CQ` collector (`T:2747`/`T:17143`/`T:49533`), de-alias FB-2 posters, add the
 coalesced-poll stats macro.
 
-### D-S1 Stage 1 — FINALIZED against the 2026-07-15 abort-path trace (all sites VERIFIED by codex + spot-checked)
+### D-S1 Stage 1 — ✅ IMPLEMENTED + VALIDATED (3 validation rounds, 5 codex review rounds; 2026-07-16; audit §51)
+
+> **ACCEPTANCE MET (round 3, §51.6):** (i) consumer Ctrl-C → sender bounded error via the F3 FAILED credit
+> terminal (the 99%-CPU spin is dead); (ii) sender cancel → consumer bounded ERROR `stream is TRUNCATED`;
+> (iii) the truncation probe held three ways — an aborted sender NEVER yielded consumer success. The F2
+> backstop line was observed verbatim on the client-kill probe. Graceful basebackup + gate unregressed
+> (gate 292/294/298 tps in-band, round 2). Open caveats: probe-C's distinct hook detail string unobserved
+> (bounded exit proven mechanistically — §51.6); zero-frontier FAILED path code-reviewed-only.
+
+*(History of the two failed validation rounds and their fixes: §51.4–§51.6 and the S1-FIX block below.)*
+
+> **Status:** the full diff is in the working tree of both repos (control ABI **v34** — both DPUs must be
+> rebuilt; round-1 validation already synced+rebuilt farnet0 and both DPUs). Review: 2 codex rounds settled.
+> **Validation round 1 (2026-07-15, audit §51.4): the REGRESSION NET IS GREEN** — gate 4/4 proofs 5/5 tx,
+> graceful 4-role basebackup clean ×2 (21.66 GiB, CLOSE_ACK), full alarm battery empty on both DPUs through
+> every probe (`refusing to mark` empty ⇒ no new exit(1) arm ever fired; both DPU services survived all
+> three aborts), and the post-abort reuse run proves **aborted runs leak no byte-ring slots/bindings**.
+> **But none of the three abort probes reached the new abort path.** Root causes + decided fixes: S1-FIX
+> below. Gate perf note: repeats 290.1/281.4/225.9 tps — monotone decline under a multi-hour validation
+> session's load, no baseline row for this SHA; re-measure at re-validation before reading it as regression.
+
+### S1-FIX (DECIDED with owner, 2026-07-15): three fixes + corrected probe stimuli. The diff so far is kept; these are additive.
+
+> **Status: IMPLEMENTED; validation round 2 FAILED on an F2 REGISTRATION BUG (fixed; round 3 pending).**
+>
+> **Round-2 result (2026-07-15):** the gate is a clean in-band PASS (292.3/294.4/298.0 tps vs the 291–304
+> band — round 1's 225.9 outlier was indeed machine load), but **EVERY basebackup died at end-of-backup**
+> with `ERROR: before_shmem_exit callback ... is not the latest entry`: F2's backstop registered inside
+> `bbsink_homer_begin_backup`, which runs INSIDE basebackup.c's `PG_ENSURE_ERROR_CLEANUP(do_pg_abort_backup)`
+> window (`basebackup.c:280→318→403`); `PG_END_ENSURE`'s `cancel_before_shmem_exit` demands ITS callback be
+> newest and found ours on top. The very LIFO hazard F2's own design note dodged for OUR cancel, inflicted
+> on PostgreSQL's. **Fix: register in `bbsink_homer_new`** (sink construction precedes
+> `perform_base_backup`, `basebackup.c:1067`, hence precedes the window); arming stays in begin_backup.
+> LIFO now: on FATAL, `do_pg_abort_backup` runs first (shared backup state), then our backstop.
+> **Silver lining, recorded honestly:** the crash fired the sender-initiated abort chain END TO END on every
+> run — `local ABORT_RESET close armed` → `accepted peer ABORT_RESET close` → `peer ABORT_RESET close
+> cleared sink` + `armed/published FAILED credit terminal` → consumer exits nonzero `stream is TRUNCATED`,
+> `refusing to mark` empty, both DPU services alive — i.e. probe A's full mechanism worked under an
+> unplanned trigger; round 3 must still prove it under the DELIBERATE stimuli (attribution) and prove F2's
+> backstop line (never reached — the natural ERROR always preempted the client-kill).
+> - The F3 trace resolved the mystery: the smoke-named function IS the production Loop-1 credit submitter
+>   (name rot — renamed to `HomerDpuDmaSubmitByteRingConsumedHeadPublication`), reached via the
+>   `DPU_CONSUMED_HEAD_PUBLISH` collector; `entryState` rides the credit BODY ahead of the epoch gate word.
+> - F3 shape as landed: `creditEntryState` flavor on the submitter (ACTIVE strict-advance / FAILED
+>   equal-frontier-and-zero allowed); ring-runtime latches `byteRingFailedCreditArmed/Published` (published
+>   suppresses ALL later ACTIVE publication); `HomerDpuDmaArmFailedCreditForServiceSink` resolves by the
+>   RUNTIME binding (D5) and reuses the ordinary pending bit + per-class counter for scheduling; armed from
+>   `BeginPayloadAbortReset` and the reset-complete sender real-failure arm; client checks `entryState`
+>   in `StillOpenForReserve`. Import teardown drops the arm (moot) but keeps the published latch.
+> - **Round-3 catch (would have been round-1-probe-B all over again):** the submitter's argument guard
+>   rejected `consumedHead == 0` — the NEVER-credited abort shape — leaving the pending item armed forever.
+>   Fixed: zero allowed only under FAILED. Round 4 verified the corrected walk-through end-to-end.
+> - **Recorded coverage gap:** the zero-frontier FAILED path (never-credited stream) is code-reviewed-only —
+>   the runtime probes abort mid-flight (credit has flowed). A dedicated smoke leg (arm FAILED at
+>   released==published==0, prove the host sees FAILED on epoch 1) is deferred work.
+
+**Round-1 findings, each localized to a mechanism (evidence: audit §51.4):**
+
+- **F1 — probe stimuli were MIS-AIMED (validation-spec error, not code).** SIGINT went to the `pg_basebackup`
+  CLIENT. Under Homer, archive bytes never cross libpq, so the walsender does not notice a dead client until
+  it next touches the socket: early SIGINTs died in protocol I/O as **`FATAL: connection to client lost`**
+  (see F2), later ones let the backup run to natural completion (5/6 attempts). The designed entry point —
+  backend **ERROR** → `PG_FINALLY` → cleanup abort-close — was never stimulated.
+- **F2 — REAL GAP: the FATAL path skips the abort entirely.** `FATAL` does not unwind `PG_TRY`/`PG_FINALLY`
+  (straight to `proc_exit`), so `bbsink_homer_cleanup` never runs on client-connection-lost; farnet1's DPU
+  saw only the mmap teardown (`grouped-control read lost host export`), and the peer was never told.
+- **F3 — REAL GAP (the big one): a selected-DPU SENDER has no failure signal at all.** Probe-B's walsender
+  spun at 99% CPU >138 s after the consumer aborted and the connection reset, because:
+  (a) `HomerClientBaseBackupStreamStillOpenForReserve` (homer_client.c:307) polls host-memory
+  `byteRingControl->flags`/`terminalStatus` — a **host-service-era contract; nothing DPU-side ever writes
+  them** for a selected-DPU sender (its own comment "Transport reset publishes FAILED" describes the dead
+  architecture);
+  (b) `HomerClientDpuRefreshBaseBackupCredit` (homer_client.c:2362) — polled EVERY reserve iteration — reads
+  epoch/generation/ringIndex/consumedHead from `dpuPayloadCreditLine` but **never `entryState`**, which the
+  credit line carries (`HomerDpuBridgeDpuCreditLine.entryState`, DPU-owned).
+- **F4 — the RECEIVE abort arm targeted the wrong stream entry.** The consumer's `CLOSE_SESSION(abort)`
+  names ITS OWN sink id; the relay stream is a SEPARATE entry created by the far sender's peer OPEN, so
+  `peerBindingActive && !locallyInitiated` never held on the named entry and the arm no-op'd. Practically
+  masked: consumer exit → HOST_DETACHED → `terminating DPU relay after host consumer detached` →
+  `requesting exact reset for transport cutoff` achieves the identical connection reset (observed in the
+  run). The arm as written is dead code.
+
+**The fixes (work list, in order):**
+
+1. **F3 trace (BEFORE design freeze): locate the PRODUCTION writer of the sender's credit line.** The only
+   visible submitter of the `BYTE_RING_CREDIT_BODY/CREDIT_PUBLISH` two-task chain (D:3704-3718, which stamps
+   `entryState=ACTIVE` at D:3701) is `HomerDpuDmaSubmitByteRingConsumedHeadSmokePublication` — a SMOKE-named
+   function with no other callers found by grep, yet production credit demonstrably flows (21.6 GiB through
+   a 512 KiB ring). Either name rot (it IS the production path) or the credit line is written by another
+   mechanism entirely. **Do not design F3's publisher until this is traced** (codex-explore task).
+2. **F3 fix — sender-side FAILED credit publication + client check.** DPU side: on sender-stream
+   reset/abort teardown, publish `entryState=FAILED` on the SEND stream's credit line via (whatever step 1
+   finds) — mirror of leg 3's receiver FAILED terminal, pointed at the other host. Client side:
+   `HomerClientDpuRefreshBaseBackupCredit` (and/or `StillOpenForReserve`) checks credit-line
+   `entryState==FAILED` → reserve/submit paths fail with a distinct "stream failed by peer/service" error →
+   bbsink ERROR → cleanup abort-close (or plain exit if already closing). Also REWRITE the stale
+   host-service-era comment on `StillOpenForReserve` (it states the refuted contract as fact).
+3. **F2 fix — `before_shmem_exit` backstop in the bbsink.** Registered at `begin_backup` (after the stream
+   opens), disarmed after the graceful close in `end_backup` AND in `cleanup`; if it fires with
+   `stream_open` still true → best-effort `HomerClientAbortBaseBackupStream`. Runs on FATAL/proc_exit,
+   which `PG_FINALLY` does not. Must be re-entrancy-safe with cleanup (both may run; abort-close is
+   idempotent client-side — verify, else latch).
+4. **F4 fix — delete the dead RECEIVE arm, keep the semantics via HOST_DETACHED.** The existing
+   detach path already performs the connection reset the arm intended; re-targeting the arm would duplicate
+   it. Delete the arm + its log line; keep `closeFlags` accepted on RECEIVE (no error), and comment WHY the
+   consumer-initiated abort rides HOST_DETACHED (the abort-close's real work on RECEIVE is prompt process
+   exit; F3 is what unsticks the sender). ⚠ If F3's fix needs the reset to carry "abort" vs "failure"
+   flavor, revisit — but round-1 evidence shows the sender-side DPU already marks streams ABORTING on the
+   reset, which is sufficient input for F3's FAILED publication.
+5. **Corrected acceptance probes (re-validation spec):**
+   - **A (truncation probe): cancel the WALSENDER** — `pg_cancel_backend(<walsender pid>)` or SIGINT to the
+     backend pid mid-transfer → ERROR → PG_FINALLY → abort-close → `ABORT_RESET` → consumer exits nonzero
+     "terminated FAILED by sender abort", never "stream complete".
+   - **A2 (NEW, exercises F2): kill the CLIENT mid-transfer** (SIGKILL pg_basebackup client) → walsender
+     FATAL at next socket touch → before_shmem_exit backstop → same ABORT_RESET chain as A.
+   - **B (consumer Ctrl-C): unchanged stimulus**, but the sender-side pass criterion becomes: walsender
+     exits bounded via F3's FAILED credit signal (no 99%-CPU survivor).
+   - **C (interrupt hook): SIGSTOP consumer → backpressure → `pg_cancel_backend(<walsender pid>)`** (NOT
+     client SIGINT) → reserve loop's interrupt check fires → bounded ERROR ("interrupted while waiting for
+     ring space") → abort chain.
+6. Codex re-review of the S1-fix delta, then re-validate (regression net + A, A2, B, C + reuse run), then
+   commit code+KB as one Stage-1 commit set.
+
+**⚠ DEVIATIONS AND DECISIONS RECORDED AT IMPLEMENTATION (read before Stage 2):**
+
+1. **The abort POST keeps the `finalPayloadSendRetired` gate** (the plan text below says "bypasses ... for
+   the POST"). The gate is RNIC-local — an RDMA write completes once the remote HCA acks, no consumer
+   involvement — so it stays bounded with a wedged consumer, and it preserves the receiver-ring lifetime
+   guarantee identically to graceful close. What the abort actually bypasses: the caller's source-drain
+   gate (staged-but-unposted bytes are discarded), the tuple EOS wait, the remote-head wait, and the
+   QUIESCED retry loop.
+2. **Leg 4 needed NO new code**: the ALARM + Scenario-E cancellation already sits at the exact choke point
+   (`TupleSinkServiceRetireSessionSendCompletions`, `T:7100-7153`, called from `ResetSession` before the
+   MR deregs). The map's "add a check" is satisfied by the existing instrument.
+3. **The real implementation work beyond the map was SCHEDULER COVERAGE** — three forever-wedges found by
+   tracing + one by review, each invisible until an abort actually ran:
+   - `HomerServicePayloadCloseActionReady`: abort arm returns `relayTerminalPublished` BEFORE the
+     receive-drain gate (an abort discard is never "drained" — consumedHead stops by design);
+   - `HomerServicePayloadMustProgressBeforeClose`: early-false under either abort flag (both its
+     predicates hold forever in the stuck-consumer case — the exact case the abort exists for);
+   - the ABORT_RESET accept arm latches a **synthetic `receivePayloadDoorbellPending`** (graceful rides
+     the final payload doorbell to keep the relay pump hot; an abort can arrive with the pump COLD and no
+     doorbell ever coming);
+   - **(review) family gate**: ABORT_RESET is accepted ONLY for `BASE_BACKUP_STREAM` — the tuple-view
+     relay has no discard implementation and would wedge unscheduled; rejected loudly instead.
+4. **Tombstone repeats demand the EXACT abort shape** (`closeFlags == ABORT_RESET`): the tombstone check
+   runs BEFORE the live path's flag-shape validation, so it must validate shape itself.
+5. **KNOWN LIMITATION — PRE-EXISTING, verified against HEAD `f45556838` by both review rounds:** a
+   connection reset before the FAILED terminal is published still strands the selected-DPU consumer
+   (`MarkPayloadStreamReceivePeerFailed` no-ops when neither POSIX receiveQueue control exists,
+   `T:28325-28329`; reset-begin parks the stream at `ABORTING`, descheduled). Pre-diff there was NO
+   FAILED publisher at all, so the window is unchanged — Stage 1 strictly shrinks the hang set. The
+   named future fix (**§37/P2-L**): publish the role-7 FAILED terminal from reset-complete for
+   remotely-initiated selected-DPU relay streams. Reset paths never call
+   `MarkPayloadCloseReclaimable`, so the new abort `exit(1)` fact-arms are unreachable mid-reset.
+6. **Freeze-order rule (load-bearing):** the sender pump gate (`abortLocalSendDiscard`) is set BEFORE the
+   close continuation freezes the final tail — `TupleSinkServiceBeginPayloadAbortReset` owns that order;
+   the freeze guard `exit(1)`s on a moved tail. `HomerServicePumpOutgoingPayloadStream` was verified
+   (review C2) to be the SINGLE posting funnel, so the one gate freezes the tail.
+
+*(Original finalized design below, unchanged except where superseded by the deviations above.)*
 
 **Mechanism: (b) `CLOSE_SINK | ABORT_RESET`** — transport close-level, posted **signalled** on the
 **stream-bound connection** (`T:29847` requires that connection anyway; the graceful close is already posted
@@ -464,6 +624,66 @@ Liveness detection is §37/P2-L territory.
 exits with a bounded error (no reserve-loop spin); (ii) cancel the sender mid-transfer → consumer exits with
 **ERROR**, bounded; (iii) the truncation probe: a sender aborted after N bytes must NEVER yield consumer
 success — this is a NEW check no run ever made before.
+
+### D-S1 IMPLEMENTATION MAP (2026-07-15, pre-diff site enumeration — all sites re-read at HEAD)
+
+Micro-decisions SETTLED at implementation:
+- **Interrupt-hook shape: a registered callback** (`homer_client.c` is client-lib code linked into both the
+  `postgres` executable and frontend tools — it cannot reference backend-only symbols). The bbsink registers a
+  non-throwing `INTERRUPTS_PENDING_CONDITION()` wrapper at begin_backup; the reserve loop polls it on its
+  existing `terminalCheckCountdown` cadence and returns false ("interrupted") — the abort then flows through
+  the normal bbsink ERROR → `PG_FINALLY` → cleanup-abort path. The callback must NOT throw (no longjmp out of
+  lib code).
+- **FAILED drain-independence mechanics: poll returns FALSE with a distinct error.** In
+  `HomerClientPollBaseBackupReceive`, `entryState == FAILED` (honored only once `dpuLastCreditEpoch != 0`) is
+  checked AFTER the drain pass but OUTSIDE the `consumedHead >= producedTail` gate: deliver what drained,
+  then return false with a "sender aborted / truncated" error. The consumer's existing poll-false path
+  (best-effort close + `pg_fatal`) becomes the abort exit lane — structurally impossible to report SUCCESS.
+  `CLOSED` keeps the drain-gated success arm unchanged.
+- **Direction split confirmed by code**: consumer-initiated abort rides the EXISTING
+  `HomerServiceRequestBoundPayloadProtocolReset` (`T:5060` → connection reset → sender-side transport reset
+  publishes FAILED into the byte-ring flags `StillOpenForReserve` polls, `homer_client.c:299-316`). Only the
+  sender-initiated abort needs the new `CLOSE_SINK|ABORT_RESET` on the surviving connection.
+
+Concrete edits (`T` = tuple_sink_service_process.c, `H` = homer_client.c, `D` = homer_service_dpu_dma.c):
+
+1. **ABI** — `homer_control_abi.h`: `CitusRemoteExecCloseSessionRequest` gains `uint32_t closeFlags` (+pad) +
+   `CITUS_REMOTE_EXEC_CLOSE_SESSION_FLAG_ABORT_RESET`; **bump `CITUS_REMOTE_EXEC_CONTROL_PROTOCOL_VERSION`**
+   (host↔DPU lockstep rebuild — both DPUs). `HomerDpuDmaSubmitByteRingWriteTerminal` (`D:4121`, hardcoded
+   CLOSED at `D:4247`) gains an `entryState` arg; existing callers (`T:35668`, `T:36500`) pass CLOSED.
+2. **Client** — `HomerClientCloseBaseBackupStream` → internal `...Internal(stream, abortReset, err, bytes)`;
+   new public `HomerClientAbortBaseBackupStream`. Abort skips the tail flush and stamps
+   `closeFlags=ABORT_RESET` into the `CLOSE_SESSION` request (`H:5677-5707`). Interrupt hook: global callback +
+   setter, polled in the reserve loop's countdown branch (`H:5380-5391`).
+3. **bbsink** — `bbsink_homer_cleanup` (`basebackup_homer.c:404`): `stream_open==true` at cleanup ⇒
+   end_backup never completed ⇒ **abort-close** (this IS the truncation-kill: no new flag needed — end_backup
+   already sets `stream_open=false` only after its graceful close). `bbsink_homer_begin_backup` registers the
+   interrupt callback.
+4. **Consumer** — FAILED arm per micro-decision above; SIGINT/SIGTERM handler in `RunHomerReceiveConsume`
+   (volatile sig_atomic_t; loop check → abort-close → `pg_fatal`); poll-false path switches to abort-close.
+5. **Sender service** — `TupleSinkServiceHandleCloseSession` (`T:41527`) threads `closeFlags`; SEND abort ⇒
+   abort variant of `TupleSinkServicePeerCloseSinkBestEffort` (`T:28873`): gate the outgoing payload pump
+   FIRST (new stream flag; the freeze guard `T:27208` exit(1)s on a moved tail), freeze at the now-stable
+   posted tail, `closeState->abortReset=true`, skip the EOS-wait (`T:28905`) and `finalPayloadSendRetired`
+   (`T:28945`) gates for the POST only. Close continuation (`T:28983-29112`): abort builds the request with
+   `ABORT_RESET` (`T:27394`), response validation (`T:27400`) gains the abort-echo arm (`peerBindingStillActive
+   ==0` + `ABORT_RESET` flag, ≠ QUIESCED), the final-head gate (`T:29101`) is skipped under abort.
+   **`HomerServiceMarkPayloadCloseReclaimable` (`T:27223`) gets a distinct abort fact-arm** — its existing arms
+   exit(1) on unproven facts and must NOT be satisfied by faking `peerQuiesced`/`finalHeadObserved`; the abort
+   arm requires `finalPayloadSendRetired` (owner counters zero — the frontier proof; all WRs signalled at HEAD)
+   + the abort response (or connection death). MRs/owners live until then.
+6. **Receiver service** — `TupleSinkServiceHandlePeerCloseSinkRequest` reject (`T:29843`) becomes the
+   ABORT_RESET accept arm: same identity checks (tokens/connection/direction), then STAGED discard: set
+   discard flag; relay pump (`T:35528+`) stops new submissions; terminal publish arm (`T:35663`) under abort
+   drops the `writtenTail == publishedTail` requirement (waits only `!writeInFlight`) and publishes **FAILED**;
+   response echoes ABORT_RESET with `peerBindingStillActive=0`. Receiver reclaim arm in `T:27223` (abort):
+   FAILED terminal published + response posted; skips `finalHeadWimm*` (the final-head WIMM `T:37520` is
+   normal-close-only). NOT reusing payload `ABORTING` (`T:27263` clear-proof requires QP destruction).
+7. **RECEIVE-direction abort** (consumer-initiated) — `HandleCloseSession` RECEIVE + ABORT flag ⇒
+   `HomerServiceRequestBoundPayloadProtocolReset` per bound stream; teardown then converges via the existing
+   reset machinery (S1c full-reset path).
+8. **Leg 4** — defensive check+ALARM at `TupleSinkServiceResetSession` (`T:25006`): unretired session send WRs
+   on a surviving connection ⇒ ALARM (instrument only; D-S2.4 DEFER rule arrives with Stage 2b).
 
 ---
 
