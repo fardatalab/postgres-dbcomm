@@ -10,7 +10,11 @@
 > see §2); **each individual site is still re-confirmed at implementation time.** A KB index is a pointer and a
 > warning, never a substitute for reading the `file:line`.
 >
-> **NOT STARTED. Gated behind S6** (verified: `--homer-dpu` non-command still uses the host arm — §1).
+> **⟳ UNBLOCKED 2026-07-17 — S6 has LANDED** (Track A fold + peer-arm gut + Stage 2, all committed; the §1 gate
+> — "native `--homer-dpu` still uses the host arm" — is dissolved). **RE-GROUNDED at citus `3d5047146` / postgres
+> `58af2f7c5a3`**: the `file:line` anchors below were scoped at the older `7e08343f2` and have DRIFTED — see the
+> **"## ⟳ RE-GROUNDING 2026-07-17"** section immediately below for the current S7.1 map + FOUR material
+> corrections. Implementation itself is **NOT STARTED.**
 >
 > **✅ DECISION SETTLED (owner, 2026-07-17): DELETE the Homer COPY scaffolding** (§9, Option A). §3.4 is the
 > final DELETE set. What settled it: the re-plumb reuses the DPU transport substrate/API (KEEP bucket, §4),
@@ -19,6 +23,62 @@
 >
 > **Parent plan:** [`dpu_command_plane_migration_plan.md`](./dpu_command_plane_migration_plan.md) §S7
 > (`~L2896`). This doc expands that outline and **corrects two stale entries in it** (§2).
+
+---
+
+## ⟳ RE-GROUNDING 2026-07-17 (post-S6/Stage-2, at citus `3d5047146` / postgres `58af2f7c5a3`)
+
+S6 (the S7 gate) has LANDED — Track A folded native `--homer-dpu` onto the selected-DPU path + gutted the two
+PEER host-spawn arms, and Stage 2 (per-session SOURCE ring) closed the `-c2` blocker. Those commits rewrote
+`pgbench.c`, `tuple_sink_service_process.c`, and `homer_service_dpu_dma.c`, so the scoping-era anchors (§3–§6,
+scoped at `7e08343f2`) drifted. **The plan's STRUCTURE, buckets, and decisions are unchanged and sound** — this
+section refreshes the S7.1 anchors and records FOUR material corrections. (S7.2/S7.3 anchors are re-confirmed
+when we reach them, per §1a.) Provenance: a codex-explore read-only pass, spot-verified by the main agent (the
+STARTUP_WAIT finding was read directly). Each site is still re-confirmed at implementation time (§1a).
+
+**FOUR material corrections (more than a line shift):**
+
+1. **§1/§5 discriminator RENAMED.** The gate is now `homer_dpu_selected_command = homer_dpu_mode ||
+   homer_dpu_command_mode` (`pgbench.c:9031`); native `--homer-dpu` IS the selected-DPU path, so §5's
+   `homer_dpu_command_mode` references are stale. Current pgbench forks: host-control-map guard
+   `if (!homer_dpu_selected_command)` `pgbench.c:9377-9385` (close, guarded by `thread->homer_control_open`,
+   `:9654-9657`); `openHomerSession` selected `:9841-9856` vs host `else if` `:9864-9879`; `finishHomerSession`
+   selected `:9754-9760` vs host `:9762-9766`; `HomerDrainPendingResultSink` DPU `:3946-3947` vs host
+   `:3949-3956`; `HomerApplyCommandCompletion` DPU `:4015-4077` vs host-SHM `:4078+` (host sink open `:4102-4117`,
+   drain `:4137-4142`).
+
+2. **§3.2 "four callers" is stale — the TWO PEER arms are ALREADY GUT (Track A).**
+   `TupleSinkServiceSubmitBackendSpawnRequest` (def `tuple_sink_service_process.c:22937`) now has **two real
+   LOCAL callers** — local command-session open `:40285-40287`, local START fallback `:44304-44307` — plus **two
+   PEER fail-closed replacement arms**: peer-OPEN emits `peer_host_spawn_retired` + `exit(1)` at `:44713-44725`
+   (former host call left commented `:44696-44711`; selected-DPU spawn is `TupleSinkServiceBeginDpuBackendSpawn`
+   `:44623-44673`); peer-START `!backendLoopActive` arm at `:44935-44947` (former call commented `:44920-44933`).
+   ⇒ **S7.1(b)'s gut-first step is DONE for the peer arms.** What REMAINS: gut+delete the two LOCAL callers,
+   delete `SubmitBackendSpawnRequest` wholesale, and delete the peer fail-closed shells + their commented history.
+
+3. **§3.3 pump — `LOCAL_CONTROL` is in TWO pump modes, not just MAIN_LOOP (wrong-neighbor trap).**
+   `TUPLE_SINK_SERVICE_PUMP_LOCAL_CONTROL` (`:2807`) is in **both** `..._PUMP_MAIN_LOOP` (`:2816-2822`) **and**
+   `..._PUMP_STARTUP_WAIT` (`:2824-2827`, used `:24419-24420`); `HEARTBEAT` (`:2812`) is main-loop-only. So
+   dropping the host-control pump arm must handle the STARTUP_WAIT path too — and S7.1 must FIRST confirm
+   STARTUP_WAIT's local-control is host-role-only (the control region is host-private) before removing it.
+   `TupleSinkServicePumpOnce` is now progress-policy/ready-set based (`:52280-52443`), collecting local-control
+   whenever `controlState != NULL` (`:52323-52334`); ready-set collector arms local-control `:15858-15865`,
+   heartbeat `:15937-15942`. Daemon: `TupleSinkServiceMapControlRegion` def `:25828`; `main` maps `:52672-52673`,
+   pumps `:52727-52728`, unmaps `:52929`.
+
+4. **§2 corrections STILL HOLD (re-verified).** (i) `SubmitBackendSpawnRequest` is pure-host — rejects the DPU
+   arm `:22954-22961`; DPU spawn is `TupleSinkServiceBeginDpuBackendSpawn:22731`. (ii)
+   `HomerClientOpenSqlResultReceiveStreamSelectedDpu` still has NO C/H source occurrence (only historical KB
+   text); role-7 is folded into `HomerClientOpenSqlSessionSelectedDpu` (descriptor `homer_client.c:3354`, receive
+   init `:3474-3490`) + `HomerClientPollSqlResultDpuReceive` `:5052-5065`.
+
+**Refreshed S7.1 anchors — client host surface (§3.1):** `HomerClientOpenControl` def `homer_client.c:425`
+(pgbench `:9379`); `HomerClientCloseControl` def `:514` (pgbench `:9656`; + guarded basebackup closes
+`basebackup_homer.c:476`/`:518`); `HomerClientOpenSqlSession` def `:1572` (pgbench host `:9871`);
+`HomerClientCloseSession` def `:1703` (pgbench host `:9762`); `HomerClientOpenBaseBackupStream` def `:2793` — no
+source caller (dead, delete). **§6:** DPU slot translation still present — `HOMER_SERVICE_DPU_SPAWN_MAX_PENDING`
+DPU-slot-based (`homer_service_dpu_spawn.h:95`), assignment starts at the DPU partition
+(`homer_service_dpu_spawn.c:230`).
 
 ---
 
@@ -378,10 +438,13 @@ APIs — useless as a working template. The re-plumb instead reuses the DPU tran
 ## 12. Per-sub-item deletion checklist (feeds the gut-first → delete-later pattern)
 
 - **S7.0** ✅ DONE (postgres `22a8f9951e6`).
-- **S7.1** — gut then remove: (a) client host surface §3.1; (b) host spawn claimant §3.2 + its 4 call-site
-  arms §5; (c) daemon control region + host pump arms §3.3 (**after** gutting local-control/heartbeat, §1); (d)
-  D7 host CAS + range constants, rewrite DPU translations §6; (e) COPY scaffolding §3.4 **iff Option A** (§9).
-  **Precondition: S6 green.**
+- **S7.1** — gut then remove: (a) client host surface §3.1; (b) host spawn claimant §3.2 + its call-site arms
+  §5 — ⟳ **the two PEER arms are ALREADY gut (Track A); only the two LOCAL callers + the peer-shell/commented
+  deletion remain**; (c) daemon control region + host pump arms §3.3 (**after** gutting local-control/heartbeat,
+  §1 — ⟳ note `LOCAL_CONTROL` is ALSO in `STARTUP_WAIT`, not just the main loop, and confirm it is host-only
+  there); (d) D7 host CAS + range constants, rewrite DPU translations §6; (e) COPY scaffolding §3.4 **iff Option
+  A** (§9). **Precondition: S6 green ✅ (landed 2026-07-17).** ⟳ All anchors + the discriminator rename are
+  refreshed in the "RE-GROUNDING" section at the top.
 - **S7.2** — UDF §3.5; decide on an explicit later-version `DROP FUNCTION`.
 - **S7.3** — Tier-2 DMA frontend §3.6; this removes the **last** host-resident spawn claimant ⇒ **assert D7′**.
 - **S7.4** — confirm `sessionUID` stays (§4); record the confirmation in code + CONTRACTS.
