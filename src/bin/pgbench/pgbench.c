@@ -338,13 +338,12 @@ static bool homer_dpu_mode = false;
  * instead of a mapped host-service control region. No host Homer service takes part in
  * the command open.
  *
- * Deliberately a SEPARATE flag from --homer-dpu rather than folded into it. S1a's gate is
- * only "the DPU service logs an OP_COMMAND_SESSION open arriving over the DPU control
- * slot"; per-command execution still needs the host-shm command mailbox, which the
- * DPU-native opener does not create (the backend lives on another node). Folding this into
- * --homer-dpu would break that path immediately and destroy our ability to bisect. Once S4
- * carries commands and completions over the DPU, this flag folds into --homer-dpu and
- * disappears.
+ * Was deliberately a SEPARATE flag from --homer-dpu (for bisection): pre-S4, per-command execution still needed the
+ * host-shm command mailbox, which the DPU-native opener does not create (the backend lives on another node), so
+ * folding it into --homer-dpu would have broken that path. S6 Track A (2026-07-17) DID the fold: S4 is complete
+ * (B.1's -c1 --homer-dpu-command gate carried commands+completions over the DPU end to end), so native --homer-dpu
+ * now adopts this command plane via homer_dpu_selected_command (below). This flag is kept ONE cycle as a deprecated
+ * alias, then deleted.
  *
  * STALE AS OF P3 (July 11, 2026) -- the paragraph that used to live here said "expect the run
  * to fail at the first transaction with 'invalid arguments while starting ...' (session->control
@@ -354,6 +353,15 @@ static bool homer_dpu_mode = false;
  * quoted in older KB sections.
  */
 static bool homer_dpu_command_mode = false;
+
+/*
+ * S6 Track A fold: the derived command-plane predicate -- TRUE under EITHER flag. S4 (pgbench --homer-dpu-command
+ * end to end) is now complete (validated by B.1's -c1 gate), so native --homer-dpu adopts the selected-DPU command
+ * plane -- exactly the fold the homer_dpu_command_mode comment above anticipated ("Once S4 ... folds into
+ * --homer-dpu"). --homer-dpu-command is kept one cycle as a deprecated alias, then deleted. Derived once at
+ * option-validation time; used at the two command-selection sites (host-control guard + selected opener).
+ */
+static bool homer_dpu_selected_command = false;
 
 /*
  * P3 hop 6: does this run need the DPU RESULT relay (client-exported role-7 DPU->host ring)?
@@ -8093,9 +8101,9 @@ printResults(StatsData *total,
 	 */
 	printf("transport: %s\n",
 		   !homer_mode ? "libpq" :
-		   (homer_dpu_mode && homer_dpu_command_mode) ? "homer-dpu+dpu-command" :
+		   (homer_dpu_mode && homer_dpu_command_mode) ? "homer-dpu+dpu-command (implies dpu result relay)" :
 		   homer_dpu_command_mode ? "homer-dpu-command (implies dpu result relay)" :
-		   homer_dpu_mode ? "homer-dpu" : "homer");
+		   homer_dpu_mode ? "homer-dpu (implies dpu result relay)" : "homer");
 	printf("query mode: %s\n", QUERYMODE[querymode]);
 	printf("number of clients: %d\n", nclients);
 	printf("number of threads: %d\n", nthreads);
@@ -9014,6 +9022,14 @@ main(int argc, char **argv)
 		 */
 		homer_dpu_result_relay = (homer_dpu_mode || homer_dpu_command_mode);
 
+		/*
+		 * S6 Track A fold: the command-plane predicate, derived here beside the result-relay predicate. Identical
+		 * value today, DISTINCT meaning -- this selects the DPU COMMAND plane (which client opener to use), not the
+		 * result relay. After the fold native --homer-dpu takes the selected-DPU command open, same as
+		 * --homer-dpu-command.
+		 */
+		homer_dpu_selected_command = (homer_dpu_mode || homer_dpu_command_mode);
+
 		if (!validateHomerScriptSupport())
 			exit(1);
 	}
@@ -9358,7 +9374,7 @@ threadRun(void *arg)
 		 * the host service cannot be deleted while the DPU gate's own client still
 		 * boots through a region only that service creates.
 		 */
-		if (!homer_dpu_command_mode)
+		if (!homer_dpu_selected_command)
 		{
 			if (!HomerClientOpenControl(&thread->homer_control,
 										errorMessage,
@@ -9822,7 +9838,7 @@ openHomerSession(TState *thread, CState *st)
 	 * is passed, and no backend mailboxes are mapped -- see the flag's comment above for
 	 * why the run is expected to stop at the first transaction.
 	 */
-	if (homer_dpu_command_mode)
+	if (homer_dpu_selected_command)
 	{
 		if (!HomerClientOpenSqlSessionSelectedDpu(&sessionOptions,
 												  &st->homer_session,
@@ -9840,7 +9856,7 @@ openHomerSession(TState *thread, CState *st)
 	}
 	/*
 	 * S7.0: this fork and the HomerClientOpenControl() fork in threadRun() are the
-	 * SAME condition (homer_dpu_command_mode) and must stay in lockstep: only this
+	 * SAME condition (homer_dpu_selected_command, after the S6 Track A fold) and must stay in lockstep: only this
 	 * branch consumes the control region, and it is only mapped for this branch.
 	 * Fail loudly rather than hand HomerClientOpenSqlSession() an unopened region --
 	 * that would be a use of a zeroed HomerClientControl, which reads as a bogus fd.
@@ -9848,8 +9864,8 @@ openHomerSession(TState *thread, CState *st)
 	else if (!thread->homer_control_open)
 	{
 		pg_log_error("client %d: host-service Homer SQL session requested but no control region is open "
-					 "(dpu_command_mode=%d) -- the control-region fork and the session-open fork disagree",
-					 st->id, homer_dpu_command_mode ? 1 : 0);
+					 "(dpu_selected_command=%d) -- the control-region fork and the session-open fork disagree",
+					 st->id, homer_dpu_selected_command ? 1 : 0);
 		return false;
 	}
 	else if (!HomerClientOpenSqlSession(&thread->homer_control,

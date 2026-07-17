@@ -190,6 +190,27 @@ the call site. If it is not on the list, **it has not been checked.**
   migration, keep the existing plain `fprintf(stderr, ...)` line beside it so manual validation and legacy parsers
   remain useful. (Operational hazards §9.)
 
+## `HOMER_EVENT event=peer_host_spawn_retired` — **the RETIRED peer host-spawn tripwire. Its ABSENCE is the per-run proof.**
+
+- **MEANS:** a peer (cross-node) command handler reached the retired host-service backend-spawn arm and
+  **fail-closed with `exit(1)`** (S6 Track A / S7.1 pulled forward, 2026-07-17). Emitted from the peer OPEN `else`
+  and the peer START `!backendLoopActive` arm in `tuple_sink_service_process.c`; `site=open|start` distinguishes.
+- **DOES NOT MEAN:** positive proof that the DPU command path ran — that is the `dpu_spawn` events
+  (`checks.py:103`). This is a **negative tripwire**: on a healthy run it is **ABSENT**, and that absence is the
+  load-bearing proof that the DPU spawn arm was active (doorbell attached) before the first OPEN.
+- **CONTRACT — the two arms are ASYMMETRIC (do NOT "simplify" them together):** peer OPEN fires when
+  `TupleSinkServiceDpuBackendSpawnArmActive()` is false — a **config+doorbell** predicate (`:22491` requires
+  `attached && !fatalError && bridgeGeneration!=0`), reachable on a **cold-start doorbell race**, not only a host
+  service. Peer START fires on `!backendLoopActive` — a **per-session** flag the `FAILED` clear can drop (see the
+  `backendLoopActive` entry above).
+- **⚠ WHY `exit(1)` IS SAFE (both reachability paths checked, plan §1.4.1):** the peer-START crash is
+  **unreachable for pgbench** (a failed command is non-retryable → `CSTATE_ABORTED`, so the client never re-STARTs
+  on the long-lived session); the peer-OPEN cold-start crash **replaces a pre-gut SILENT HANG** (the old arm fell
+  through to a DPU `shm_open` no postmaster reads, `:22940`/`:22879`).
+- **ENFORCES:** every healthy validation run must assert this alarm is **ABSENT in BOTH DPU logs** (it can be
+  caused on one node and observed on the other). A present alarm = the doorbell was not attached before OPEN = the
+  run is contaminated, **NOT a pass**.
+
 ---
 
 ## `signalCommandWrite` / `TupleSinkServiceClientSqlCommandWriteShouldSignal` — **a REAL decision since Stage 2c: terminal ‖ pool ‖ transport. Most command writes are UNSIGNALLED.**

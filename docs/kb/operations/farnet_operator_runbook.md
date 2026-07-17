@@ -447,16 +447,19 @@ ssh farnet0 "/tmp/farnet-validation-$RUN_ID/helpers/gate.sh" \
 
 A debug gate requires four independent proofs:
 
-1. client transport line is `homer-dpu-command (implies dpu result relay)`;
+1. client transport line is `homer-dpu (implies dpu result relay)` (native flag after the S6 Track A fold; the
+   deprecated `--homer-dpu-command` alias prints the same suffix);
 2. five distinct decoded `abalance` values, `5/5` processed, zero failed;
 3. farnet1 DPU candidate interval contains backend spawn begin and completed with launched PID;
-4. canonical process probes prove both host services absent, making host-service fallback impossible.
+4. canonical process probes prove both host services absent, AND the `peer_host_spawn_retired` alarm (the S6
+   Track A fail-closed tripwire) is ABSENT in both DPU logs — together proving the peer host-spawn fallback did
+   not fire and the DPU spawn arm (doorbell attached before the first OPEN) served the command session.
 
 Collect both candidate intervals and run every applicable checker from `tools/farnet_validation/checks.py` over the
 recorded device/inode/offset ranges. The fallback alarm scan must include untagged fatal strings:
 
 ```sh
-grep -aiE 'ALARM|semantic validation failed|fatal error state|PE drain failed|pool exhausted|peer-open failed' \
+grep -aiE 'ALARM|peer_host_spawn_retired|semantic validation failed|fatal error state|PE drain failed|pool exhausted|peer-open failed' \
   candidate-dpu-service.log
 ```
 

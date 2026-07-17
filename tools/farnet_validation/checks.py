@@ -94,7 +94,7 @@ def alarm_check(*texts: str) -> CheckResult:
 
 def gate_check(client: str, backend_dpu: str, expected_transactions: int,
                require_debug_values: bool = False) -> CheckResult:
-    transport = len(re.findall(r"^transport: homer-dpu-command \(implies dpu result relay\)$", client, re.M))
+    transport = len(re.findall(r"^transport: homer-dpu\S* \(implies dpu result relay\)$", client, re.M))
     processed = re.findall(r"number of transactions actually processed: (\d+)/(\d+)", client)
     failed = re.findall(r"number of failed transactions: (\d+)", client)
     events, schema_checks = parse_events(backend_dpu)

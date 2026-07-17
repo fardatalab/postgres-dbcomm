@@ -28,6 +28,42 @@ cadence dominate?"*, not "instrument the round trip."
 
 ## 1. TRACK A — native `--homer-dpu` bring-up (CLI consolidation + fail-closed gut)
 
+### 1.0 Re-grounding + preconditions (VERIFIED 2026-07-17, codex + own read)
+
+Re-verified every §1 site at current HEAD after Stage 3's `tuple_sink` rewrite. **The sites did NOT drift** — pgbench
+fold forks at `pgbench.c:9361` (host-control guard) / `:9825` (selected opener); fatal-gut peer arms at
+`tuple_sink_service_process.c:44613` (peer OPEN) / `:44808` (peer START); DPU-arm predicate `:22476`; host-spawn
+helper `TupleSinkServiceSubmitBackendSpawnRequest:22889` (LOCAL arms `:40224`/`:44244` must NOT be touched).
+
+**TWO in-code comments gate Track A on "S4 done", and B.1 satisfies it — both PRESCRIBE this change:**
+- `pgbench.c:341-347`: "Once S4 carries commands and completions over the DPU, this flag folds into --homer-dpu and
+  disappears."
+- `tuple_sink_service_process.c:22922-27`: the host arm "stays fully FUNCTIONAL through S6 … until pgbench
+  --homer-dpu-command completes end to end (S4) … Do NOT gut it early."
+B.1's `-c1 --homer-dpu-command` gate PASSED end to end (`spawn_pairs=1`, real `dpu_spawn`) ⇒ **S4 is DONE**; both
+preconditions met. Both comments MUST be rewritten in the same commit as their change (a stale "do not gut" beside a
+gut is the exact trap the inspection pass exists to catch).
+
+**Behavioral effect:** native `--homer-dpu` today = "host command plane + DPU result" (pre-P3 hybrid, `pgbench.c:364`).
+The fold RETIRES that hybrid — native `--homer-dpu` becomes the full selected-DPU command path (DPU command + DPU
+result). `--homer-dpu-command` stays a deprecated alias one cycle, then deletes.
+
+**Full fold surface (pgbench.c, 14 uses):** derive `homer_dpu_selected_command = homer_dpu_mode ||
+homer_dpu_command_mode` at `:9015` (beside the identical `homer_dpu_result_relay`); flip forks `:9361`/`:9825`;
+diagnostic `:9852` + lockstep comment `:9843`; transport string `:8094-8098`; flag comments `:326-356`. Leave `:3934`
+and `:9015`'s relay predicate. Validation `:8963/:8965/:8985/:8995` is optional cleanup.
+
+**Transport-string / checks.py decision (SIMPLIFIES §1.3):** native `--homer-dpu` now emits `homer-dpu (implies dpu
+result relay)` (the DPU-command variants all carry that suffix). Rather than change the literal and churn the golden
+fixture + tests, BROADEN `checks.py:97` to `^transport: homer-dpu\S* \(implies dpu result relay\)$`, which matches
+`homer-dpu`, `homer-dpu-command`, and `homer-dpu+dpu-command` — and the existing `gate_debug.log` fixture still
+matches, so no fixture/test change.
+
+**Staging (owner: single-client first, then multi):**
+1. **Fold** (this) + broadened `checks.py` → validate native `--homer-dpu -c1` gate works.
+2. **Fatal-gut** the two peer arms → `FATAL` + rewrite the `:22922` comment → validate fail-closed (`dpu_spawn` proof).
+3. **Byte-ring pool Stage 2** (the `-c2` blocker) → multi-client (`-c2+`).
+
 ### 1.1 The change — fold `--homer-dpu-command` into `--homer-dpu`, at TWO sites
 
 Introduce `homer_dpu_selected_command = homer_dpu_mode || homer_dpu_command_mode`, used at the **only two**
@@ -68,11 +104,12 @@ the host-SHM spawn `TupleSinkServiceSubmitBackendSpawnRequest` (`:44613`, `HOST_
 - `/proc/PID/exe` **cannot distinguish** the arms (both launch a postgres backend; the real distinction is
   `backendChannelMode` from `arenaSlotIndex`, `:22444`).
 
-**⇒ Fail-closed the cheap way (owner decision): gut the PEER host-spawn arm to a `FATAL`.** Replace the `else`
-host arm at `:44613` (peer OPEN) and the peer START host fallback at `:44809` with
-`elog(FATAL, "host-service peer backend spawn is retired (S7.1, pulled forward for S6); DPU spawn arm must be
-active")`. This **is** S7.1's gut-first step on those two call sites, pulled forward — no peer-ABI change, no
-throwaway. The healthy gate (DPU arm active) never reaches it; if it does, it is loud.
+**⇒ Fail-closed the cheap way (owner decision): gut the PEER host-spawn arm to a loud tripwire** at the `else`
+host arm (peer OPEN) and the peer START host fallback. This **is** S7.1's gut-first step on those two call sites,
+pulled forward — no peer-ABI change, no throwaway. The healthy gate (DPU arm active) never reaches it; if it does,
+it is loud. **See §1.4.1 for the IMPLEMENTED form** — the plan's original `elog(FATAL, ...)` was WRONG for this
+file (it has zero `elog`; the primitive is `HOMER_EVENT("alarm",...) + fprintf + exit(1)`) — **and for the
+verified reachability analysis that showed the two arms are asymmetric.**
 
 **Scope:** the two PEER (cross-node) arms only. Leave the LOCAL host arms (`:40224`, `:44244` = plain
 `--homer`, removed wholesale by S7.1).
@@ -86,8 +123,56 @@ fallback; the events *positively prove* the DPU arm ran.
 maximal loudness matches S7.1's pattern. Consequence accepted: node B's DPU service is single-threaded, so if
 the tripwire ever fires it crashes the whole service (not just this OPEN) — the intended blast radius for a
 "must not happen" guard.
-**Startup-race check (implementation):** confirm the gate attaches the frontend-agent doorbell BEFORE pgbench
-sends OPENs, so the tripwire does not fire on a cold-start race.
+**Startup-race check:** superseded by §1.4.1's OPERATIONAL CONDITION — codex showed "attach-before-OPEN" is not
+provable from the checked-in files, so it is VALIDATED per-run (the `peer_host_spawn_retired` alarm must be
+ABSENT), not assumed.
+
+### 1.4.1 Implemented (2026-07-17) — primitive correction, arm asymmetry, verified reachability
+
+Implemented at `tuple_sink_service_process.c` peer OPEN handler (`else` of the DPU-arm `if`) and peer START
+handler (`if (!backendLoopActive)`). Adversarial loop with codex settled the design; every load-bearing claim
+re-verified in code by the main agent.
+
+**Primitive correction: `HOMER_EVENT("alarm","service","peer_host_spawn_retired","site=<open|start> service_session=.. op=..")`
++ a human `tuple-sink service: ALARM ...` line + `exit(1)` — NOT `elog`.** This file compiles into the STANDALONE
+DPU service binary and contains **zero** `elog(` calls; its fatal-tripwire idiom is `fprintf(stderr,"... ALARM
+...\n"); exit(1)` (e.g. the FB-1 bijection guards), and it already emits `HOMER_EVENT` for service lifecycle
+events. `elog(FATAL)` needs PostgreSQL's backend error stack, absent here. (Caught by own grep + codex —
+"verify claims, don't inherit conclusions": the *design* review reasoned about intent, not the compilation unit.)
+New stable event documented in the transport `CONTRACTS.md`.
+
+**The two peer arms are ASYMMETRIC — same "host-spawn arm" name, different predicate (the money line):**
+- **Peer OPEN** gut is the `else` of `if (TupleSinkServiceDpuBackendSpawnArmActive())`. That predicate
+  (`:22476`, doc `:22468`) is a **service-config + doorbell** fact: false unless scheduler+engine+doorbell exist
+  AND `attached && !fatalError && bridgeGeneration!=0` (`:22491`). So the `else` is reachable NOT only on a host
+  service but on a **cold-start / doorbell-attach race** — it is NOT "impossible on a DPU" (corrects the first
+  draft's premise).
+- **Peer START** gut fires on `!sessionState->backendLoopActive` — a **per-session runtime** fact that the
+  `currentCommandState==FAILED` clear at the end of the handler sets on any command failure.
+
+**Why `exit(1)` is still correct at BOTH (settled with codex, both sides recorded):**
+- The feared peer-START **false crash** (command fails → flag cleared → a later START on the long-lived session
+  crashes) is **UNREACHABLE for pgbench (VERIFIED):** a failed completion sets `ESTATUS_OTHER_SQL_ERROR`
+  (`pgbench.c:4186`), non-retryable (`canRetryError:4750` = serialization/deadlock only), so the client goes
+  `CSTATE_ABORTED → finishCon → return` (`:5508`/`:5874`) and never issues another START on that session.
+- On the peer-OPEN cold-start race, `exit(1)` is **strictly better than pre-gut**: the old `else` called
+  `SubmitBackendSpawnRequest`, whose own refuse-guard (`:22906`) is ALSO false on an unattached doorbell (same
+  predicate), so it fell through to `shm_open` (`:22940`) → a DPU region no postmaster reads → a **SILENT HANG**
+  (`:22879`). A graceful peer error would not save the gate either (node A turns the non-OK OPEN into failure,
+  opener tears down, no retry — `:42893`/`homer_client.c:3447`/`pgbench.c:9841`), so a cold-start OPEN fails the
+  attempt regardless; `exit(1)` only makes it a diagnosable, structured alarm instead of a hang. Blast radius
+  (single-threaded service dies) is the accepted trade-off for a retired-path tripwire.
+
+**OPERATIONAL CONDITION (codex correction to the original "startup-race check"):** "the gate attaches the doorbell
+before the first OPEN" is **not provable from the checked-in files** (`gate.sh` runs pgbench once; the client
+submits OPEN right after DPU setup, `homer_client.c:3410`/`:3447`). B.1's passing gate is *empirical* evidence it
+held then, not a guarantee. ⇒ **Every healthy -c1 run must VALIDATE that the `peer_host_spawn_retired` alarm is
+ABSENT** (alongside `dpu_spawn` present) — that absence proves the doorbell was attached before OPEN.
+
+**Also done in the same change:** the `:22922` "Do NOT gut it early" comment in
+`TupleSinkServiceSubmitBackendSpawnRequest` was rewritten (S4 precondition now met; the function stays live only
+for the LOCAL `--homer` arms). Forward within-file line refs in the new comments were made symbolic (they drift
+on edits).
 
 ### 1.5 The gate + `-c 2` handoff
 
@@ -370,7 +455,16 @@ Pass 1 + Pass 2 attacked the first draft independently; Pass 3 attacked the corr
   distinguish arms; the real per-run proof is the structured `dpu_spawn` events (`checks.py:103`). (P3) the
   cleanup missed the validator's transport matcher (`checks.py:97`).
 - **Corrected:** two-site fold + full cleanup incl. `checks.py`; the node-B fallback closed **fail-closed** by
-  gutting the peer arm to a FATAL (S7.1 pulled forward), with `dpu_spawn` events as positive proof.
+  gutting the peer arm to a loud tripwire (S7.1 pulled forward), with `dpu_spawn` events as positive proof.
+- **Refuted again (P4, implementation 2026-07-17):** (a) the plan's `elog(FATAL)` is WRONG for this file — the
+  standalone DPU service has zero `elog`; primitive is `HOMER_EVENT("alarm",...) + fprintf + exit(1)`. (b) The two
+  peer arms are ASYMMETRIC: peer-OPEN's `else` = `!DpuBackendSpawnArmActive()` (reachable on a cold-start doorbell
+  race — NOT "impossible on a DPU"); peer-START's = `!backendLoopActive`, a failure-cleared flag, which raised a
+  false-crash fear. (c) "Attach-before-OPEN" is not source-provable.
+- **Corrected (P4):** verified the peer-START false crash is UNREACHABLE for pgbench (a failed command is
+  non-retryable → `CSTATE_ABORTED` → the client never re-STARTs on the session); `exit(1)` kept at both arms
+  (strictly better than today's silent hang on the OPEN cold-start race); attach-before-OPEN became a per-run
+  VALIDATION (the `peer_host_spawn_retired` alarm must be ABSENT). See §1.4.1.
 
 ### Track B
 - **Drafted:** `D = cadence/2 + scan→accept`, keyed by `(serviceSessionId, commandSequence)`.
