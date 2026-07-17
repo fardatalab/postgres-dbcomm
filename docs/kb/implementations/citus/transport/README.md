@@ -35,6 +35,7 @@ remote execution session semantics.
 - [peer_recv_dispatcher_v14_checkpoint.md](peer_recv_dispatcher_v14_checkpoint.md) - Landed checkpoint for peer protocol v14 immediate-data ABI and permanent receive-CQ dispatch.
 - [post_gate_basebackup_open_stall.md](post_gate_basebackup_open_stall.md) - Diagnosis and resolution record for the basebackup open stall discovered after the DPU gate.
 - [resource_retirement_contract_audit.md](resource_retirement_contract_audit.md) - Ordered Homer transport resource-retirement audit, implementation decisions, evidence, and validation history.
+- [s6_native_homer_dpu_and_latency_plan.md](s6_native_homer_dpu_and_latency_plan.md) - Two-track S6 plan: fold native `--homer-dpu` onto the selected-DPU command path (no host service), and attribute per-command latency now that the synchronous START round trip is already gone.
 - [s7_host_service_retirement_plan.md](s7_host_service_retirement_plan.md) - The three-bucket (DELETE / KEEP / GUT-THE-ARM) map of the host-service Homer surface that S7 retires, verified against code, with per-sub-item checklists, boundary hazards, and the one open scoping decision.
 - [selected_dpu_session_rings_and_lifecycle.md](selected_dpu_session_rings_and_lifecycle.md) - Architecture of record for selected-DPU session identities, ring roles, exports, and lifecycle.
 - [send_cqe_coalescing_implementation_plan.md](send_cqe_coalescing_implementation_plan.md) - Ordered stage plan for re-arming send-CQE coalescing on the peer RDMA transport, with the 2026-07-15 site-enumeration corrections to the design.

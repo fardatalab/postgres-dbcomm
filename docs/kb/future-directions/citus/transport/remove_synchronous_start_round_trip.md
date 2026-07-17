@@ -1,6 +1,16 @@
 # P-START: remove the synchronous START round trip on the selected-DPU command path
 
-**Status: PLANNED, not implemented. Measured 2026-07-13.**
+**Status: ✅ IMPLEMENTED — this doc's earlier "PLANNED" was STALE (verified in code at citus `7e08343f2`, 2026-07-17).**
+The selected-DPU START is now fire-and-forget: `HomerClientStartCommandWithCompletionFlags` mints the sequence
+and synthesizes `PENDING` locally, submitting without waiting (`homer_client.c:6556`); the submitter returns on
+`fireAndForget` without `HomerClientDpuWaitForControlResponse` (`homer_client.c:2741`). The 235 µs synchronous
+wait recorded below is HISTORICAL (pre-removal, 2026-07-13).
+**⇒ THE LIVE QUESTION IS NOW D-vs-R, and it moved to MEASUREMENT:** removing R (this round trip) did **not**
+move `-c 1` tps — suggestive (not yet measured) that **D, the DPU discovery cadence, dominates**, exactly as
+"AND 235 µs IS NOT A DMA COST" predicted. Attributing D is Track B of
+[`../../implementations/citus/transport/s6_native_homer_dpu_and_latency_plan.md`](../../implementations/citus/transport/s6_native_homer_dpu_and_latency_plan.md).
+
+**(Original status line, kept for the record: PLANNED, not implemented. Measured 2026-07-13.)**
 **Motivation is NOT performance tuning — we are not tuning yet. It is that this round trip is pure waste and we
 should not carry it forward into pipelining, pooling, or the completion-ring work that all build on top of it.**
 
