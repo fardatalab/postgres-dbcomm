@@ -190,9 +190,147 @@ DPU — farnet0 DPU — which discovers the client's role-1 publication) with th
 `censoring_bound_D` relative to per-command time ⇒ discovery dominates ⇒ the DPU poll cadence is the target (and
 the echo marker §2.1 can pin it if the bound is not tight enough to conclude).
 
-**In flight at plan-record time:** a codex-worker draft of this section was started, then STOPPED pending this
-record + a conversation compaction. After compaction, (re)implement against THIS section; verify no stray
-worker edits remain in the citus tree first.
+### 2.5.1 Grounding + the anchor correction (VERIFIED against citus `c0b9f06bd`, 2026-07-17)
+
+Before implementing, every §2.5 site was re-read in the real tree. Two provenance facts first:
+- The real path carries a `utils/` segment: `src/backend/distributed/utils/homer/homer_service_dpu_dma.c`.
+- **`homer_service_dpu_dma.c` is UNCHANGED** from the plan's grounding SHA `7e08343f2` to HEAD `c0b9f06bd`
+  (Stage 3, "replace broad send-CQ polling with exact demand"), so every DMA-file line below is current.
+  **`tuple_sink_service_process.c` was REWRITTEN by Stage 3 (723 ins / 711 del)** — its line numbers drifted;
+  that matters for Track A (§1.4 fatal-gut sites must be re-found by symbol), not for these DMA-file spans.
+
+**THE CORRECTION — anchor the per-command D at the fresh-epoch accept, NOT the `discoveredReady` latch.**
+- *Drafted (§2.5 "precise discovery point"):* D ends at the `discoveredReady` transition
+  (`homer_service_dpu_dma.c:14191`).
+- *Refuted by grounding:* `:14191` is a ONE-SHOT LATCH — its guard is `else if (... && !ringRuntime->discoveredReady)`
+  and it is reset only when the ready-ref is consumed (`HomerDpuDmaClearDiscoveredReady`, called from the
+  command-pull accept at `:14332`; the reset itself sets `discoveredReady = false` at `:9339`). So it fires ~once
+  per arming cycle; at the `-c1` scope of S6 proper (§1.5) that collapses to ~ONE D sample, not a distribution.
+  This is the KB's own "never one-shot; sample repeatedly" rule applied to probe placement.
+- *Corrected anchor:* the **fresh-epoch grouped-control accept** at `:14130`
+  (`ringRuntime->acceptedPublishedEpoch = line->publishedEpoch;`), **filtered to role 1 =
+  `HOMER_DPU_BRIDGE_DESCRIPTOR_ROLE_FRONTEND_CONTROL_SLOT`** (`homer_dpu_bridge_abi.h:108`). A new command advances
+  the publication epoch, so this fires once PER COMMAND.
+- *Load-bearing assumption, VERIFIED:* the command ring keeps getting grouped-read-polled every scheduler pass —
+  the scan's submit (`:1717`) is gated ONLY by `!pollQuiesced` (`:1703`) and `!controlReadInFlight` (`:1713`),
+  **not** by `discoveredReady`. So each command's arrival is genuinely caught by a fresh grouped-read accept.
+
+**Verified sites (all in `homer_service_dpu_dma.c` unless noted):** clock `HomerDpuDmaMonotonicNowNs` `:6722`
+(file-local, callable directly — no "expose" needed); grouped submit `HomerDpuDmaSubmitOneGroupedControlRead`
+`:12621`, owner populated `:12747`, DMA submit success `:12842`; stale accept (epoch unchanged) `:14045`;
+fresh-epoch consume `:14130`; command-pull submit `HomerDpuDmaSubmitOneCommandPull` success `:13011`; command-pull
+accept `HomerDpuDmaAcceptCommandPullSlot` success `:14338`; dump venue `HomerDpuDmaDestroy` `:1367` (the sole clean
+teardown, called from `tuple_sink_service_process.c:48846`). Owner struct `HomerDpuDmaTaskOwner:301`; ring runtime
+`HomerDpuDmaRingRuntime:464`.
+
+**Design decisions (improvised during grounding, recorded per KB discipline):**
+1. **Aggregate storage — SUPERSEDED, now ENGINE-level (see §2.5.3).** The first cut put the four `HomerDpuDmaSpanStat`
+   on per-ring `ringRuntime` and reasoned "the role-1 command ring is a per-session export, never arena-reset, so the D
+   target is safe." **Validation refuted this** (§2.5.3): being *per-session* is exactly what gets the ring
+   **full-freed at session close** (`HomerDpuDmaClearHostMmapImport` does `free(import->ringRuntime)` + memset,
+   `:9669`), a STRONGER teardown than the arena tenancy reset I guarded against, and it runs BEFORE the shutdown dump —
+   so the dump was always empty. Aggregates now live on `HomerDpuDmaEngine.engineSpans[role][kind]` (outlives reclaim);
+   only the transient pairing scratch (`spanLastSubmitNs`, `spanPrevStaleSubmitNs`, per-task `submitNs`) stays per-ring.
+2. **`submitNs` on `slot->owner`** (per-task, `HomerDpuDmaTaskOwner`), NOT a per-ring/global scalar — the grouped read
+   is single-ring (`:12763`) and the slot travels submit→completion→accept, so a reused slot cannot mis-pair.
+3. **Censoring bound recorded ONLY when `spanPrevStaleSubmitNs != 0`** (an empty poll was observed since the last
+   fresh accept). Back-to-back commands with no intervening empty poll are interval-censored and skipped — there is no
+   "last known empty" witness, so no honest bound.
+4. **Macro `HOMER_DPU_DISCOVERY_SPANS`, default 0**, mirroring `HOMER_SERVICE_PEER_TRANSPORT_STATS`
+   (`remote_execution_peer_transport_rdma.c:429`: `#ifndef/#define …0`, `#if …` guards, enabled by a build `-D`).
+   OFF ⇒ compiled out. Dump runs in `HomerDpuDmaDestroy` before `HomerDpuDmaFreeStage5Scaffolding`, on BOTH the clean
+   and the Scenario-E leak-abandon (`:1408` early return) paths — `ringRuntime` is valid on both.
+
+### 2.5.2 Adversarial review outcome (codex, 2026-07-17) — one real bug, two refinements
+
+Reviewed the diff before any DPU build. **One load-bearing bug (both sides recorded):**
+
+- **Drafted:** stamp `submitNs` on the success path AFTER `doca_task_submit_ex()` returns.
+- **Refuted (the money finding):** DOCA DMA is **asynchronous** — the engine harvests completions later via
+  `doca_pe_progress`, so the hardware can sample the host publish line AFTER the submit is armed but BEFORE the
+  post-submit clock read. If the host publishes in that window, the stale read's recorded `submitNs` is LATER than
+  the instant the DMA actually sampled "nothing there," so `fresh_accept − submitNs` can fall **BELOW the true D** —
+  a censoring "upper bound" that is not one (a lying diagnostic). Same defect hit `grouped_submit_to_accept` and the
+  command-pull span. Mechanism verified in-repo (not inherited): the whole engine is completion-harvested async.
+- **Corrected:** stamp `submitNs` in program order **BEFORE** `doca_task_submit_ex()` (both submit hooks). The clock
+  read then provably precedes the arm, which precedes any DMA sample, so `submitNs ≤ sample_instant` and the bound
+  is a true upper bound (`D ≤ fresh_accept − submitNs`), with only small submit-call overhead as slack. The interval
+  (item 2) now measures issue→issue between pre-submit reads; on submit failure the slot is retired (submitNs moot).
+
+**Two refinements (no code change, interpretation only):**
+- The per-command anchor is valid **for the serialized `-c1` role-1 producer** (STARTs are serialized and reserve one
+  slot; the producer advances tail+epoch once per publish), NOT as a generic epoch property. Poll submission is
+  gated by MORE than `!pollQuiesced && !controlReadInFlight` — also scheduler grant budget, active-import state, role
+  enrollment, and backpressure. ⇒ `censoring_bound_D` is a valid upper bound but is **scheduler-contention-dependent**,
+  not an isolated "pure discovery cadence." (Consistent with §2 killing the causal A/B; the bound is a bound.)
+- Recording is done for **all enrolled roles** (identity-safe — no mis-pairing, VERIFIED), but only the **role-1
+  (`FRONTEND_CONTROL_SLOT`) `censoring_bound_D`** is a command-discovery D bound. Other roles' "fresh epoch" means
+  something else (a DPU→host payload ring's fresh line is the host consumed-head/backpressure, not command discovery).
+  The dump labels role and points at role 1; interpret only that row for D.
+
+**Confirmed safe (VERIFIED by review):** no wrong-slot/ring pairing (owner-carried identity, acceptance re-checks
+kind/generation/ring); default-off compiles out; tenancy reset clears the added per-ring fields cleanly via the
+whole-struct memset; the dump null-checks and skips detached imports.
+
+### 2.5.3 Validation finding + fix — the empty dump → engine-level aggregates (2026-07-17)
+
+First live measurement (node A DPU built with the macro, `-c1` `--homer-dpu-command` gate): **the gate PASSED
+(`spawn_pairs=1`, 5/5 tx, 5 decoded `abalance`, no alarms) but the `[dpu-span]` dump was EMPTY** — header + footer,
+zero rows. Root-caused, not patched blind:
+
+- **Diagnosis — H1 (hooks DID fire), confirmed by codex + own verification.** Node A discovers the host's role-1
+  command via the instrumented DMA path (`HomerFrontendDmaPublishControlSlotRequest` → node-A grouped-read
+  `HomerDpuDmaSubmitOneGroupedControlRead`/`AcceptGroupedControlSnapshot` → command-pull) and only THEN relays to the
+  peer. A command cannot be relayed unless it was DMA-staged, and staging IS the instrumented path — so samples were
+  recorded. (Not an alternate COMCH/host-service receive path.)
+- **The bug — VERIFIED in the node-A log + code.** The samples lived on **per-session `ringRuntime`**, which is
+  **freed at session close**: `HomerDpuDmaReclaimDetachedImports` → `HomerDpuDmaClearHostMmapImport` does
+  `free(import->ringRuntime); memset(import, 0, …)` (`homer_service_dpu_dma.c:9668-9670`), and the node-A log shows
+  "reclaiming host-detached import" ~35 lines BEFORE the shutdown dump. The dump then skipped the emptied import slots.
+  Same **lifetime-mismatch shape** as the review's timestamp bug — I assumed data-lifetime ≥ dump-time; at `-c1` every
+  session is reclaimed first.
+- **The fix — engine-level aggregates.** The four `HomerDpuDmaSpanStat` moved from `ringRuntime` to
+  `HomerDpuDmaEngine.engineSpans[HOMER_DPU_SPAN_ROLE_SLOTS=9][HOMER_DPU_SPAN_KIND_COUNT=4]`, keyed by descriptor role ×
+  span kind. The engine is `calloc`'d (zero-init) and freed only in `HomerDpuDmaDestroy` AFTER the dump, so it outlives
+  every import reclaim. The three aggregate-recording hooks now write `engine->engineSpans[descriptor->descriptorRole]
+  [kind]` (role bounds-checked); the pairing scratch stays per-ring. Single-threaded service ⇒ no atomics. Dump
+  rewritten to iterate `[role][kind]`; line format changed `import=/ring=/role=` → `role=/span=`. All four DOCA×macro
+  configs compile clean; net B.1 diff +250.
+- **Interpretation consequence:** aggregates now sum **by role across the whole run** (all role-1 discovery samples
+  together) — exactly the D distribution wanted. Per-ring granularity is gone, fine at `-c1`.
+
+### 2.6 Track B measurement RESULT (validated, 2026-07-17)
+
+**Validated run:** node A DPU built with `COPT="-DHOMER_DPU_DISCOVERY_SPANS=1"`, `-c1` `--homer-dpu-command` gate
+(5 tx ≈ 40 role-1 commands), gate PASS (`spawn_pairs=1`, 5/5 tx, 0 failures, sane `abalance`), clean-rebuild
+diagnostic-absent proven (rule 6). Node A `[dpu-span]` role=1 (FRONTEND_CONTROL_SLOT command ring):
+
+| span | count | min | avg | max |
+|---|---|---|---|---|
+| `censoring_bound_D` (UPPER BOUND on D) | 40 | 14.8µs | **38.4µs** | 174.9µs |
+| `grouped_submit_interval` (poll cadence) | 2080 | 9.1µs | 44.6µs | 22.2ms (idle outlier) |
+| `grouped_submit_to_accept` (discovery DMA read) | 40 | 2.6µs | 10.6µs | 25.6µs |
+| `command_pull_submit_to_accept` (body-fetch DMA) | 40 | 9.4µs | 17.5µs | 62.1µs |
+
+(Role=7 DPU→host payload/credit ring also recorded: ~45µs cadence, ~38µs censoring bound over 6 samples.)
+
+**Reading:**
+- **D is cadence-limited at ~tens of µs.** The censoring UPPER BOUND on per-command discovery latency D averages
+  **~38µs** (min ~15µs, max ~175µs); the poll cadence averages ~44µs (mode ~16–32µs). D ≈ cadence/2, as expected for
+  closed-loop arrival — the DPU notices a freshly-published command within roughly one poll interval. 2080 grouped
+  submits vs 40 fresh accepts ⇒ ~52 polls between commands, so the ring is polled far faster than commands arrive:
+  **D is bounded by the poll interval, not by scan starvation.**
+- **Discovery is the largest single DPU-INGRESS component, but NOT the dominant per-command latency.** DPU-side command
+  ingress ≈ D(~38µs upper bound) + discovery read(~10µs) + command pull(~17µs) ≈ **~65µs upper bound** — real and
+  measurable, but small against the full per-command path (cross-node round trip + backend spawn/exec/result-relay
+  dominate; the `-c1` debug run was ~9.3ms/tx ≈ ~1.2ms/command, so discovery is low-single-digit % of the whole).
+- **Lever if D reduction is ever wanted:** tighten the command-ring poll cadence (poll role-1 more often), trading DPU
+  CPU/DMA bandwidth for a lower discovery floor. Not warranted by these numbers.
+
+**RECOMMENDATION (pending owner call): the echo marker (§2.1) is NOT needed.** The local censoring bound is conclusive:
+a true same-clock upper bound (post-review timestamp fix), consistent with the independently-measured cadence, placing
+D firmly in the tens-of-µs, cadence-limited range — modest, not dominant. The bridge-ABI diag line + two-DPU redeploy
+(rule 10) the echo marker costs is not justified. If accepted, **Track B is COMPLETE at the DPU-local-spans stage.**
 
 ---
 
