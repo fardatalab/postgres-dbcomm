@@ -327,10 +327,12 @@ diagnostic-absent proven (rule 6). Node A `[dpu-span]` role=1 (FRONTEND_CONTROL_
 - **Lever if D reduction is ever wanted:** tighten the command-ring poll cadence (poll role-1 more often), trading DPU
   CPU/DMA bandwidth for a lower discovery floor. Not warranted by these numbers.
 
-**RECOMMENDATION (pending owner call): the echo marker (§2.1) is NOT needed.** The local censoring bound is conclusive:
-a true same-clock upper bound (post-review timestamp fix), consistent with the independently-measured cadence, placing
-D firmly in the tens-of-µs, cadence-limited range — modest, not dominant. The bridge-ABI diag line + two-DPU redeploy
-(rule 10) the echo marker costs is not justified. If accepted, **Track B is COMPLETE at the DPU-local-spans stage.**
+**DECISION (owner, 2026-07-17): SKIP the echo marker (§2.1).** The local censoring bound is conclusive: a true
+same-clock upper bound (post-review timestamp fix), consistent with the independently-measured cadence, placing D
+firmly in the tens-of-µs, cadence-limited range — modest, not dominant. The bridge-ABI diag line + two-DPU redeploy
+(rule 10) the echo marker costs is not justified. **Track B is COMPLETE at the DPU-local-spans stage.** Full write-up
+(method, the two bugs, results, and the bottleneck question the result raises) in the canonical findings doc
+[`dpu_discovery_latency_measurement.md`](./dpu_discovery_latency_measurement.md).
 
 ---
 

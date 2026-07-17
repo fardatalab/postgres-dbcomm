@@ -26,6 +26,7 @@ remote execution session semantics.
 - [dpu_collector_feedback_aliasing_defect_b.md](dpu_collector_feedback_aliasing_defect_b.md) - Active diagnosis and remediation plan for DPU collector feedback aliasing and starvation suppression.
 - [dpu_command_plane_migration_plan.md](dpu_command_plane_migration_plan.md) - Detailed staged plan and decisions for moving the Homer SQL command plane onto the DPUs.
 - [dpu_crossnode_command_completion_bridges_design.md](dpu_crossnode_command_completion_bridges_design.md) - Design and implementation steps for selected-DPU cross-node command and completion bridges.
+- [dpu_discovery_latency_measurement.md](dpu_discovery_latency_measurement.md) - S6 Track B measurement of DPU per-command discovery latency D (~38µs, cadence-limited): method, the two lifetime bugs found, results, and the still-open bottleneck question.
 - [dpu_dma_backend_homer_service_implementation_checkpoint.md](dpu_dma_backend_homer_service_implementation_checkpoint.md) - Stage-by-stage implementation checkpoint for the DPU-pull Homer service migration.
 - [dpu_gate_concurrency_limits.md](dpu_gate_concurrency_limits.md) - Current DPU gate concurrency limits imposed by the byte-ring pool and related fixed-capacity resources.
 - [dpu_payload_byte_ring.md](dpu_payload_byte_ring.md) - Current DPU payload byte-ring wrap protocol, mirror geometry, egress parsing, and invariants.
