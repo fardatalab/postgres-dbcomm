@@ -55,10 +55,63 @@ Two facts decide every bucket assignment below. Get either wrong and you delete 
 - **Retirement pattern = gut-first, delete-later** (parent plan `~L2899`): replace each host arm's body with a
   loud `elog(FATAL, "host-service … is retired (S7.x); use the DPU path")`, keep the shell one cycle, then
   delete. A retired-but-present branch turns "a forgotten caller still needs this" into an attributable crash.
+  **Made precise in §1a (the two-step + what the tripwire proves), and §1b (the dead-data sweep).**
 - **Intra-stage ordering constraint (INFERRED, confirm at implementation):** delete the control-region
   *mapping* **only after** gutting the local-control/heartbeat pump arms. The daemon's internal control-state
   pointer is currently non-null across several scheduler interfaces; unmapping first would leave those reading
   a dead pointer. Gut the arms (§5 daemon), *then* drop the mapping.
+
+---
+
+## 1a. Retirement mechanics — the two-step made precise
+
+**Per sub-item, in the §12 order — NOT one global gut-all** (the S6 gating and S7.2/S7.3 ordering forbid a
+monolithic pass, and a `FATAL` in a monolithic pass is unattributable). For each sub-item's arms:
+
+1. **Gut to `FATAL`, keep the shell** (function, signature, call sites). **Validate the FULL surviving workload
+   set** — gate + 4-role basebackup + DPU TCP smoke + at least one frontend-agent-enabled run. Different host
+   arms sit on different paths (spawn / client control-map / basebackup-close / backend command-map are four
+   distinct workloads); one workload trips only its own. **No `FATAL` fires ⇒ no surviving path reached it.**
+2. **Delete** the gutted arms, their now-dead functions, and their call sites; **re-validate the same set**
+   (catches compile/link breakage and any path the deletion re-routed).
+
+**⚠ What the tripwire proves — and what it does NOT.** "No `FATAL` fired" proves *the kept paths don't reach
+this arm*, which **is** the retirement safety property (we have accepted the host-service workloads — plain
+`--homer`, COPY — are gone and not returning). It is **not** proof of universal deadness — that over-read is
+the recorded `a3cdd5f3c` error (*"the WARN never fired, so this deletion is a no-op"* — a necessity argument
+counting only observed cases; see [`copy_path_revival_contract.md` §1](./copy_path_revival_contract.md)). Run
+the tripwire against the **kept** paths; read its silence as exactly "the kept paths don't need this."
+
+**The tripwire is for the GUT-THE-ARM bucket (§5) — the shared-function risk surface.** Genuinely-dead,
+no-caller code (e.g. `HomerClientOpenBaseBackupStream`, §3.1) has nothing to trip it — **just delete it** in
+step 2 without a FATAL cycle.
+
+## 1b. Dead data — structs, members, module vars, enum arms (sweep AFTER the readers go)
+
+The buckets are function/branch/call-site centric **on purpose: dead DATA is discovered, not enumerated
+upfront.** A member looks alive until its *last reader* is deleted, and guessing the last reader is the
+wrong-neighbor error this whole map exists to avoid. So **after each sub-item deletes its code, sweep for what
+is now unreferenced** (`-Wunused-function`/`-variable`, and `git grep` the type/field/var names) and delete it
+**in the same sub-item's step 2.** The compiler + grep are authoritative post-deletion; a pre-deletion list is
+a guess.
+
+**Seed list already surfaced** (delete when their readers go; verify unreferenced first):
+- `HomerClientControl` struct + host-only fields — `remote_execution_client.h:32`/`:129`/`:241` (§3.1).
+- GUC backing vars — `EnableExperimentalTupleSinkRouting` (`homer_tuple_queue_frontend.c:45`),
+  `EnableExperimentalHomerDpuFrontend` (`homer_frontend_dma.c:67`).
+- Tier-2 `dpuControlChannel` state — `homer_frontend_internal.h:23` (§3.6).
+- The `HOST_SERVICE_SHM` spawn-mode enum **arm** (§5, `:22444`) — remove the arm; **keep the enum type**
+  (native DPU uses its siblings).
+- The host control-region ABI layout — `homer_shm_channel_abi.h` (`/citus_remote_execution_control_v27`, ver
+  `34U`): deletable **wholesale** once §3.3's mapper is gone (no surviving reader).
+- Host-only session-state members — identified at S7.1 deletion, not before.
+
+**⚠ ABI vs private — the one place "just delete it" is wrong.** Private/module-level dead data deletes freely,
+compiler-guided. **Shared-ABI structs do not:** the spawn region (`/citus_remote_exec_backend_spawn_v15`) and
+the bridge protocol are read by the postmaster and the DPU, so shrinking a struct or **renumbering an enum**
+there is a cross-component ABI change — **both DPUs rebuilt/redeployed** (CLAUDE.md rule 10) — and §6 already
+fixes the 32-slot spawn cardinality as *kept*. Only the host control-region ABI (host-role-private) goes
+wholesale.
 
 ---
 
