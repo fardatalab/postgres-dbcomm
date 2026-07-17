@@ -2896,6 +2896,11 @@ service anywhere in the command path. Then `-c 2`, which unblocks byte-ring pool
 ### S7 — retire the superseded paths
 Only after S6.
 
+> **📄 Detailed, code-verified map (authoritative): [`s7_host_service_retirement_plan.md`](./s7_host_service_retirement_plan.md)**
+> — the three-bucket DELETE / KEEP / GUT-THE-ARM classification at citus `7e08343f2`, with per-sub-item
+> checklists and the boundary-hazard list. It **supersedes the symbol lists below**, which predate several
+> refactors; two stale claims are corrected there (§2) and annotated inline below.
+
 > ### The retirement pattern (decided with the user, applies to every item below)
 >
 > **Gut the branch's body first; delete the branch later.** Replace the work with a loud, fatal assertion
@@ -2915,10 +2920,13 @@ Only after S6.
   `!homer_dpu_command_mode`. **Until this lands, "delete the host service" breaks the gate at client boot.**
   Retires the gate's trap-2 asymmetry (client-side host service UP / backend-side DOWN) and the whole
   stale-control-region accident class. **Validate: the gate passes with BOTH host services down.**
-- **S7.1** `HomerClientOpenSqlSession` (host-SHM command path) for pgbench, **and** the `shm_open` arm of
-  `TupleSinkServiceSubmitBackendSpawnRequest` (S3.5). Together these retire plain `pgbench --homer` and
-  backend-to-backend COPY. **Precondition:** the S3 gate has passed (so `--homer-dpu-command` is the spawn
-  net), **and S7.0 has landed**.
+- **S7.1** `HomerClientOpenSqlSession` (host-SHM command path) for pgbench, **and**
+  `TupleSinkServiceSubmitBackendSpawnRequest`. ⚠ **CORRECTED (2026-07-17):** that function is now a
+  **pure-host** claimant — it *refuses* the DPU arm (`tuple_sink_service_process.c:22906`), and DPU spawn is
+  the separate `TupleSinkServiceBeginDpuBackendSpawn` — so **delete it wholesale and gut its four call-site
+  arms**, not "an `else` arm" (S3.5's one-function framing is stale; see detailed doc §2). Together these
+  retire plain `pgbench --homer` and backend-to-backend COPY. **Precondition:** the S3 gate has passed (so
+  `--homer-dpu-command` is the spawn net), **and S7.0 has landed**.
   ⛔ **The old second precondition — "the cross-node `--homer` baseline has been captured and SHA-stamped" —
   is WAIVED (owner, July 13, 2026).** It was written when the host path still worked; that workload is broken
   at HEAD and is deliberately not being fixed. **You cannot baseline a corpse**, and the purpose the baseline
@@ -2936,9 +2944,12 @@ Only after S6.
   not disappear when the session table moves. Confirm in code; record the reasoning.
 
 **MUST NOT touch, at any stage** (basebackup calls the first unconditionally; `--homer-dpu` result
-delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu` (`homer_client.c:2551`, from
-`basebackup_homer.c:289`), `HomerClientOpenBaseBackupReceiveStreamSelectedDpu` (`:2922`),
-`HomerClientOpenSqlResultReceiveStreamSelectedDpu` (`:3522`).
+delivery rides the third): `HomerClientOpenBaseBackupStreamSelectedDpu`,
+`HomerClientOpenBaseBackupReceiveStreamSelectedDpu`, and the role-7 SQL-result receive **folded into
+`HomerClientOpenSqlSessionSelectedDpu`** (`homer_client.c:3354`/`:3474` + `HomerClientPollSqlResultDpuReceive`
+`:5052`). ⚠ **CORRECTED (2026-07-17):** the old `HomerClientOpenSqlResultReceiveStreamSelectedDpu` symbol
+**no longer exists**, and the line numbers previously here predated the folding; current symbols/lines are in
+the detailed doc §2/§4.
 
 ---
 
