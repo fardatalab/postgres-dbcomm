@@ -153,6 +153,47 @@ echo line is a **new default-off diagnostic export field**; reuse the `calls_in_
 exact one-way D is ever required (not for the upper-bound marker). **Run first on the existing
 `--homer-dpu-command` gate.**
 
+### 2.5 Stage B.1 — DPU-local spans: the concrete implementation (BUILD THIS FIRST)
+
+> **Owner decision (2026-07-17): STAGE it.** Implement these DPU-local spans first — no bridge/ABI change,
+> default-off — and escalate to the echo marker (§2.1, which costs a diag bridge line + a two-DPU redeploy under
+> rule 10) **only if the local censoring bound is inconclusive.** The local spans cannot *pin* D (the DPU does
+> not know when the host published relative to its DMA sample), but they can often *bound* it hard enough to
+> answer "does discovery dominate," at zero ABI cost — the "cheap external bound first" lesson (`rping`).
+
+**Precise discovery point:** for a role-1 command, D ends at the `discoveredReady` transition
+(`homer_service_dpu_dma.c:14191`, the `else if (!DpuToHostByteRing && !discoveredReady)` arm) — NOT the generic
+epoch-stamp at `:14130` (which fires for every ring on the snapshot). `:14191` is where the DPU has noticed and
+enqueued THIS command.
+
+**All behind a new default-off macro (e.g. `HOMER_DPU_DISCOVERY_SPANS`):** OFF ⇒ compiled out, zero overhead;
+ON ⇒ allocation-free static aggregates, bounded histograms, no extra DMA / no scheduler perturbation; clock =
+`HomerDpuDmaMonotonicNowNs` (`:6721`). Keyed per `(importIndex, ringIndex)`, primarily role-1:
+
+1. **Grouped-read submit→accept** — stamp `submitNs` into the **task owner** (identity at `:12747`) at submit
+   (`:12842`); on FRESH accept (`:14130`/`:14191`) record `now − submitNs`. Read submitNs from the SAME
+   task/ring owner (a global would mis-pair a reused slot).
+2. **Per-ring submit INTERVAL (cadence)** — `now − lastSuccessfulSubmitNs` at each successful submit.
+3. **Censoring bound `0 ≤ D < fresh_accept − prev_stale_SUBMIT`** — per ring, on STALE accept (`:14045`) set
+   `prevStaleSubmitNs = taskOwner.submitNs`; on FRESH accept record `now − prevStaleSubmitNs`, then invalidate.
+   ⚠ **`prev_stale_SUBMIT`, not `prev_stale_accept`** — the accept edge is unsafe (the host may publish after
+   the stale DMA sampled memory but before its callback ran; that would shrink the bound below the true D).
+4. **Command-pull submit→accept** (secondary) — `:13011` submit → `:14256` accept.
+
+Aggregate per span: count / total / max / min + a power-of-two ns histogram (~24 buckets), static/file-local.
+Dump (histograms + stale/fresh counts, labeled per ring/role/span) at DPU service shutdown (teardown path in
+`tuple_sink_service_process.c`) and/or an env trigger.
+
+**Measure:** default-off keeps perf builds clean. To read D, build **node A's DPU service** (the client's local
+DPU — farnet0 DPU — which discovers the client's role-1 publication) with the macro ON, run the existing
+`--homer-dpu-command` gate, read the shutdown dump. A large `submit_interval` / `submit→accept`, or a large
+`censoring_bound_D` relative to per-command time ⇒ discovery dominates ⇒ the DPU poll cadence is the target (and
+the echo marker §2.1 can pin it if the bound is not tight enough to conclude).
+
+**In flight at plan-record time:** a codex-worker draft of this section was started, then STOPPED pending this
+record + a conversation compaction. After compaction, (re)implement against THIS section; verify no stray
+worker edits remain in the citus tree first.
+
 ---
 
 ## 3. Sequencing
