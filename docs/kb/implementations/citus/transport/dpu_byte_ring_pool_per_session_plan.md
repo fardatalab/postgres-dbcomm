@@ -20,7 +20,8 @@
   slot 0 / slot 1), with NO `RECV_CQ_FAILURE` / `observed>posted` / `DISCONNECT` /
   `ambiguous receive-relay resolve`. The original reset-before-any-byte-moved bug is
   fixed. Remaining: the deferred mirror-cache cleanup, Stage 2 (tuple-source for
-  concurrent `--homer-dpu`), and the connection-binding-fix disposition. Plan mirror
+  concurrent `--homer-dpu`) — **RE-GROUNDED + UNBLOCKED 2026-07-17, see its STATUS section** — and the
+  connection-binding-fix disposition. Plan mirror
   file was `~/.claude/plans/here-s-a-snippet-on-linked-papert.md`; this doc is canonical.
 - **Progress:**
   - **Stage 0a — DONE + validated (single-session, byte-identical).** New module
@@ -90,8 +91,13 @@
     concurrent 2-session basebackup completed with byte conservation on both, distinct
     per-session landing+mirror slots, no reset, no ambiguous-resolve. This closes the
     concurrent-basebackup goal.
-  - Stage 2 (tuple-source for concurrent `--homer-dpu`): pending. Deferred cleanup: the
-    mirror-slot cache + const-casts (see Stage 1a-mirror note).
+  - Stage 2 (tuple-source for concurrent `--homer-dpu`): **IMPLEMENTED (Phase A + B, 2026-07-17) — uncommitted,
+    pending live validation.** Per-session SOURCE slot bound at receive peer-open (gated TUPLE_VIEW_BATCH); the
+    relay reads the stored `dpuSourceRingHandle`; the `writeSource` discriminator + the `engine->tupleSourceRing`
+    singleton are retired; slot budget raised 4→8 (16 slots for `-c 4`). **RING-SIZE UNIFICATION dropped** — the
+    claimed basebackup corruption was FALSIFIED (the mirror is byte-verbatim, size-decoupled; see the retraction
+    in the RING-SIZE UNIFICATION subsection). Deferred cleanup: the mirror-slot cache + const-casts (see Stage
+    1a-mirror note).
 - **Doc type:** implementation plan / in-flight.
 - **Source:** `src/backend/distributed/utils/homer/homer_service_dpu_dma.c` (+`.h`),
   `.../tuple_sink_service_process.c`, and the new module
@@ -165,7 +171,14 @@ Every slot is one byte-ring with the **uniform superset layout**
 slot serves ANY purpose (mirror/landing/source) from one pool. Grounding: the payload
 storage is ALREADY uniform across purposes today —
 `mirrorRingBytes == tupleSourceRingBytes == HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`
-(8 MiB, verified `homer_service_dpu_dma.c:9931-9933`); the control block is NOT (only
+(8 MiB, verified `homer_service_dpu_dma.c:9931-9933`) **[2026-07-17: STALE VALUE — the pool now sizes every
+slot at the SQL-result `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES` = 10 MiB (the larger purpose); the
+uniformity POINT stands (slots homogeneous for the DOCA arena), the 8 MiB value does not. The slot is a
+CONTAINER, decoupled from a stream's LOGICAL ring — basebackup rings stay 8 MiB and SQL 10 MiB, and that is
+FINE. An earlier note here called the 10-vs-8 slot/host gap a "confirmed LATENT basebackup bug + fix = assert
+`slot == host == remote`"; that was FALSIFIED — the mirror is byte-verbatim size-decoupled, and the assert
+would false-fire on basebackup. VALIDATED 2026-07-17 (44,356 basebackup ring laps at 10-MiB slot / 8-MiB host,
+no corruption). See the RING-SIZE UNIFICATION retraction in the Stage-2 STATUS block.]**; the control block is NOT (only
 landing reserves an inline `landingPayloadOffset` prefix; mirror tracks head/tail in a
 separate `controlCells` staging pool, tuple-source has none). We make it uniform BY
 DESIGN: give every slot the control prefix — landing uses it, mirror/source leave it
@@ -185,7 +198,9 @@ The design generalizes to any R; 2 is the starting point.
 ### Sizing = plenty
 `slotStorageBytes` default `HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES` (8 MiB — the max the
 current geometry needs; the real basebackup ring at `slots=4,bytes=524288` ≈ 2 MiB fits
-inside). Per-region slot count from a constant; with R=2 regions under the ceiling we
+inside). **[2026-07-17: STALE — the pool now inits slots at `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES`
+= 10 MiB (`homer_service_dpu_dma.c:15796`), the SQL-result size, so the SOURCE slot equals the role-7
+ring. Recompute region sizing at 10 MiB — see the Stage-2 STATUS re-grounding block.]** Per-region slot count from a constant; with R=2 regions under the ceiling we
 get plenty (e.g. 2×8 = 16 slots ≈ 128 MiB across two ~64 MiB mmaps) — well above
 expected concurrency. To scale further: add regions, raise the per-region count, or
 shrink `slotStorageBytes` toward the real geometry.
@@ -412,31 +427,140 @@ under `-d` precisely for this).
 with its own role-7 stream, so `pgbench --homer --homer-dpu ... -c 2 -j 2` would produce two live
 streams over the one shared ring — *if the path ran at all*. It does not (see STATUS below).
 
-### STATUS (July 9, 2026): Stage 2 is BLOCKED — its acceptance gate does not exist
+### STATUS (2026-07-17): Stage 2 UNBLOCKED + RE-GROUNDED — ready to implement
 
-An attempted `-c 2` repro returned **INCONCLUSIVE**: `-c 1` never reached a working baseline.
-Investigation established that **`pgbench --homer-dpu` has NEVER run end-to-end — not at `-c 2`,
-not at `-c 1`, not ever.** (An earlier revision of this note guessed "probably only exercised at
-`-c 1`". That was wrong; corrected here.) The checkpoint doc says so in its own words: code steps
-1-6 landed, but *"step 7 the 3-machine validation"* was never performed — Part 3.5.1 (`sessionUID`)
-and then Stage 1 (basebackup) took priority. See `cross_node_dpu_migration_checkpoint.md`, "Step 7".
+**Supersedes the July 9 "BLOCKED" verdict.** Both blockers are resolved, the precondition is met, and the
+mechanics have been re-verified against current code. The July-9 analysis (Failures A/B, resequencing) is
+retained below as **resolved history + design rationale**, not current status.
 
-Consequences:
-1. **The `tupleSourceRing` aliasing is real but currently UNREACHABLE.** The two-ring relay is gated
-   on the per-stream `dpuRelayResultStream` flag — only a flagged pgbench SQL-result stream relays.
-   Basebackup and non-DPU pgbench never touch `tupleSourceRing`. Stage 2 fixes a latent bug in a
-   path that has never executed.
-2. **Stage 2's gate ("2 concurrent sessions → correct decoded results") presupposes ONE session
-   producing correct decoded results.** It doesn't.
-3. **Stage 3's precondition is unmet.** Stage 3 == the checkpoint's "step 8", which states removal
-   of `citus_remote_exec_pgbench_transaction` *"comes AFTER validation confirms the new path."*
-   Retiring the UDF harness before `--homer-dpu` works would delete the only functioning DPU command
-   path and leave nothing behind it.
+**Precondition MET — `pgbench --homer --homer-dpu -c 1` is VALIDATED (2026-07-17).** The S6 Track A fold made
+native `--homer-dpu` the full selected-DPU path; its `-c 1` gate PASSED end to end (5/5 tx, 5 distinct decoded
+`abalance`, DPU role-7 result relay active, NO `batch_slot_capacity=32712/1024` error), which means the
+two-ring `tupleSourceRing` relay ran correctly single-session. The "one session producing correct decoded
+results" that Stage 2's gate presupposes now exists.
+- **Failure A (unknown parent session) — RESOLVED.** The role-7 parent lookup was made optional/diagnostic
+  (`26b2e1994`): the DPU service legitimately cannot see a host-created command session, and the load-bearing
+  bind is the `sessionUID` match the relay already performs.
+- **Failure B (batch geometry `32712 != 1024`) — RESOLVED + VALIDATED.** The descriptor split
+  (`slotCapacityBytes` → `maxRecordBytes`) landed; see
+  [byte_ring_slot_capacity_regression.md](byte_ring_slot_capacity_regression.md) ("Problem 1 is FIXED").
 
-**Resequenced (decided with the user, July 9, 2026):** do the checkpoint's **step 7 bring-up first**
-(get `--homer-dpu -c 1` correct end-to-end), THEN Stage 2 with a real before/after gate, THEN Stage 3.
+**⚠ `-c 2` symptom correction.** `-c 2` is **NOT hard-blocked** — the 8-slot pool holds `-c 2`'s 4 receiver
+slots. It RUNS and **silently corrupts** results (two streams interleaving one shared `tupleSourceRing`; wrong
+`abalance`, no crash). Hence repro-first, asserting on decoded VALUES not exit status (§2.1).
 
-Two failures block the bring-up, in order:
+Stage 3 (the UDF retirement) already moved to the command-plane plan (see "Stage 3 — DISSOLVED" above) and is
+NOT gated on Stage 2.
+
+#### Stage 2 — refreshed anchors + three refinements (2026-07-17, VERIFIED: own read + codex)
+
+The file drifted **~6000 lines** since July 9 (the relay moved `:31564` → `:37692`), so **every line number in
+the Stage-2 prose below is stale**. `tupleSourceRing` is STILL an engine singleton on the real flagged
+SQL-result path (dispatch `tuple_sink_service_process.c:38457-38461`; family `TUPLE_VIEW_BATCH` &&
+`HomerServicePayloadStreamUsesDpuMirrorSource()`, stamped at stream creation `:28116-28135`), so `-c 2`
+genuinely aliases it. The migration added `sessionUID` correctness + descriptor-scoped per-target frontiers
+but requires **no Stage-2 redesign**. Pool API is ready as-is: `HOMER_DPU_BYTE_RING_PURPOSE_SOURCE = 2`
+(`homer_dpu_byte_ring_pool.h:64`), `HomerDpuByteRingBind` (`homer_dpu_byte_ring_pool.c:145`) accepts it
+unchanged. Constants (CORRECT names): `HOMER_DPU_BYTE_RING_POOL_REGIONS=2`,
+`HOMER_DPU_BYTE_RING_SLOTS_PER_REGION=4`, `HOMER_DPU_BYTE_RING_MAX_REGION_BYTES=96 MiB`
+(`homer_service_dpu_dma.h:40-42`).
+
+| Stage-2 step | stale anchor | CURRENT anchor |
+|---|---|---|
+| two-ring relay pump | `:31564` | `HomerServicePumpIncomingTupleViewDpuTwoRingRelay` `tuple_sink_service_process.c:37692` |
+| tuple-source obtain → replace w/ SOURCE bind | `:31681` | `:37939-37960` (the `HomerDpuDmaGetTupleSourceRingMemory` call `:37947`) |
+| deform write (`% sourceStorage`) | `:31450` | `HomerServiceTupleSourceRingProduceRecord` `:37574-37618`; relay passes base/bytes `:38099-38102` |
+| DMA-read addressing (task builder) | `:9429-9443` | `HomerDpuDmaSubmitOneByteRingTask` ring `homer_service_dpu_dma.c:14014-14028`, mmap `:14098-14112` |
+| DMA-read size check (SEPARATE site) | — (missed) | `HomerDpuDmaSubmitByteRingWrite` `homer_service_dpu_dma.c:4123-4130` |
+| LANDING bind = SOURCE template | — | `HomerServiceEnsureLocalReceiveByteRing` `tuple_sink_service_process.c:19750`, invoked at receive peer-open `:31133-31140` |
+| unbind (frees ALL purposes) | — | `HomerDpuByteRingUnbind` `homer_dpu_byte_ring_pool.c:250`; called on reset `tuple_sink_service_process.c:27972-27990` |
+| singleton fields / alloc / getter to retire | `:505-508` | fields `homer_service_dpu_dma.c:949/:965/:1068`, alloc `:15129-15140`, getter `:5295-5320` (one non-doc caller) |
+
+**Three refinements to the §2.2–2.6 mechanics (VERIFIED):**
+1. **THREE singleton-touch sites, not two.** Besides the task-builder branch (`:14014`/`:14098`) there is a
+   SEPARATE `writeSource == TUPLE_SOURCE` size-check in `HomerDpuDmaSubmitByteRingWrite`
+   (`homer_service_dpu_dma.c:4123-4130`, vs `engine->tupleSourceRingBytes`). The SOURCE handle threads through
+   all three; the relay passes `writeSource` at `tuple_sink_service_process.c:38154-38157`. **Keep `writeSource`
+   until an audit proves no non-addressing users — do NOT delete blind** (revises §2.3).
+2. **Geometry: 10 MiB SQL-result, NOT 8 MiB payload.** Pool slots are `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES
+   = 10 MiB` (`homer_queue_abi.h:218`; pool init `homer_service_dpu_dma.c:15796`), not the
+   `HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES` = 8 MiB this plan cites (§"Sizing", §2's "correct by construction").
+   The load-bearing invariant is **SOURCE slot storage == the role-7 host ring storage** (both SQL-result
+   10 MiB) — assert THAT, not the stale constant.
+3. **Bind SOURCE at receive peer-open, alongside LANDING** (`HomerServiceEnsureLocalReceiveByteRing` `:19750`),
+   conditional on the flagged tuple stream — not lazily in the relay. Store the handle beside
+   `dpuMirrorRingHandle` (`:2254`) so LANDING+SOURCE acquire atomically before peer-open success and reset
+   releases both. **Clarification:** unlike Stage 1a-mirror there is NO circular consumer-first deadlock here
+   (SOURCE's producer + DMA reader both run after the relay enters, `:38099`/`:38154`); stream-open binding is
+   chosen for clean lifetime, not to break a deadlock.
+
+#### Stage 2 — RING-SIZE UNIFICATION [⚠ RETRACTED 2026-07-17 — the "latent basebackup bug" was FALSIFIED; the mirror is byte-verbatim size-decoupled, this fix is unnecessary, and its assert would false-fire on basebackup. See the retraction note below + CONTRACTS "SLOT vs RING size".]
+
+> **⚠ RETRACTED 2026-07-17 (post-implementation re-examination) — RECOMMEND DROPPING; pending user confirmation.**
+> Fresh reading of the mirror path + an independent codex refutation (both VERIFIED) find the claimed "silent
+> basebackup corruption" DOES NOT EXIST. The sender MIRROR is a **byte-verbatim** staging buffer whose slot size is
+> **decoupled** from the wire: PULL fills it at `absoluteStart % dpuRingBytes` and egress reads it at
+> `releasedByteTail % mirrorStorageBytes` — the SAME slot modulus both sides (`homer_service_dpu_dma.c:14005`,
+> `:5433`) — so it round-trips bytes by absolute offset regardless of size. The wire carries `hostRingBytes`
+> (`:5456`, the HOST size, not the mirror size), and `HomerServicePumpOutgoingByteRingDpuMirror` enforces only
+> **host == remote** (`tuple_sink_service_process.c:34983`), with split records across the mirror wrap explicitly
+> supported (`:34978`). So the mandatory equality is **host == remote** (already enforced), NOT slot == host — and
+> the proposed `slot == host == remote` assert would **FALSELY FIRE on basebackup** (slot=10 MiB, host=8 MiB, both
+> correct), turning a non-bug into a crash. The unification is therefore unnecessary AND its assert is harmful.
+> The **basebackup regression** in the Stage-2 gate is the empirical arbiter (it will PASS at the current 10-vs-8
+> geometry). This does NOT touch the SOURCE path, whose `source == host` requirement is real and already enforced
+> at `tuple_sink_service_process.c:37968`. Both sides retained below per KB discipline (the original claim + what
+> refuted it).
+
+**⚠ SUPERSEDED 2026-07-17 — the "silent corruption" claim in this Finding was FALSIFIED (see the RETRACTED note
+above and the CONTRACTS "SLOT vs RING size" entry; basebackup validated at 10-MiB slot / 8-MiB host, 44,356 ring
+laps, no corruption). Kept below as the hypothesis that did not survive, per plan decision-history discipline.**
+
+**Finding (verified static + timeline; owner confirmed basebackup has NOT run since P3).** The homogeneous pool
+sizes EVERY slot at `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES` = 10 MiB (`HomerDpuByteRingResolveHandle` sets
+`handle.storageBytes = pool->slotStorageBytes`, `homer_dpu_byte_ring_pool.c:35`; the bind fit-check is `<=`, not
+`==`). The MIRROR wraps on that slot size (`homer_service_dpu_dma.c:5433`). But **basebackup host rings are
+still 8 MiB** (`HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`, `homer_frontend_control.c:746`, the `OP_TUPLE_SINK`
+open), while **SQL-result host rings are 10 MiB** (the frontend arena result ring, `homer_frontend_agent.h:139`).
+Timeline: the pool was raised 8→10 MiB by **P3 `4382b65d6` (July 11)**; the recorded concurrent-basebackup
+validations are **July 9 (pre-P3, at 8 MiB slots)**. So a basebackup MIRROR now binds a 10 MiB slot over an
+8 MiB host ring → the mirror wrap (10 MiB) and the host wrap (8 MiB) no longer coincide → **SILENT byte
+corruption**, un-manifested only because basebackup has not run at the current geometry. SQL is safe (10 == 10),
+which is why `--homer-dpu -c 1` validated. **NOT merely code smell — a live latent bug.**
+
+**Why `hostRingStorageBytes` is NOT a scar (answers the question that surfaced this).**
+`HomerDpuDmaFillMirroredByteRange` computes `hostRingStorageBytes = descriptor->ringBytes -
+descriptor->hostRingOffset` (the host ring's payload extent, `:5413`) and enforces `hostRingBytes ==
+remoteRingBytes` at `tuple_sink_service_process.c:34983` (host↔remote). `hostRingOffset` is set by the CURRENT
+frontend (`homer_frontend_agent.c`/`homer_frontend_dma.c`), not the host-service path. The gap is that the
+**slot↔host** leg of that same equality chain is NOT asserted — which is exactly where the 8-vs-10 drift hid.
+
+**⚠ SUPERSEDED 2026-07-17 — this whole "Decision" was FALSIFIED and NOT implemented.** The mirror is byte-verbatim
+size-decoupled (the reframing egress that once needed 1:1 was replaced by a byte-oriented relay; see
+`tuple_sink_service_process.c:35048` "THE WR-BUDGET LOOP IS GONE"), so `slot == host` is not required, and a
+`slot == host == remote` assert would false-fire on basebackup (slot 10 MiB, host 8 MiB — both correct).
+Empirically confirmed 2026-07-17 (44,356 basebackup ring laps at 10/8, no corruption). The original
+(now-rejected) decision text is kept below per plan decision-history discipline.
+
+**Decision (owner, SUPERSEDED): FIX = ONE ring-storage constant. Rejected: wrap-on-stream-bytes (b).** Collapse
+`HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES` and `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES` into a SINGLE ring-storage
+constant (10 MiB, the max), used for every host ring AND every pool slot, so `slot == host == remote` holds by
+construction — the homogeneous + mirrored (same size, same wrap) contract, restored. Rejected (b) "wrap the
+mirror on the stream's ring bytes": it splits the single-size design into two sizes (slot allocation 10 MiB vs
+stream wrap 8 MiB) and forces auditing every `%`/bound site — intrusive, high risk of a NEW wrap bug; the pool
+exists precisely to keep ONE size, one wrap.
+- **ENFORCE with assertions** (the contract must be loud, not assumed): assert `slot storage == host ring
+  storage == remote ring storage` at the mirror fill/bind and the pool init. Such an assertion would have caught
+  this drift the moment P3 landed.
+- **Document the invariant in BOTH code comments AND KB** (owner directive): the pool-init comment
+  (`homer_service_dpu_dma.c` ~`:15784`) is already fixed to state the current reality + this fix; the invariant
+  is recorded in the transport `CONTRACTS.md`.
+- **Fold into Stage 2; its gate (d) basebackup regression is the empirical confirmation** — basebackup at HEAD
+  before the fix corrupts (or the new assertion fires); after unification it conserves bytes. This also finally
+  RE-VALIDATES basebackup at the current geometry, closing the July-9-only gap.
+
+Two failures blocked the bring-up, in order **(BOTH RESOLVED as of 2026-07-17 — see the STATUS above; this
+subsection and its Classification are retained as history + design rationale, not current status)**:
 - **Failure A (blocking).** `client SQL result DPU receive referenced an unknown parent session`
   (`tuple_sink_service_process.c:33797`), after
   `TupleSinkServiceFindSessionById(sessionStates, request->parentServiceSessionId)` returns NULL at
@@ -601,9 +725,12 @@ unbind call is needed). Receive resolver here is already per-`sessionUID`-correc
 
 **Slot sizing is already correct by construction.** The relay enforces
 `hostRingStorageBytes == sourceStorage` (`:31701`) so one `absoluteStart` addresses both the source
-(DMA read) and the host role-7 ring (DMA write). Both are `HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`,
-which IS the pool's `slotStorageBytes` — so a bound SOURCE slot satisfies that check without
-touching it. The homogeneous-slot design assumption is load-bearing here, not merely convenient.
+(DMA read) and the host role-7 ring (DMA write). **[2026-07-17 correction: both are the SQL-result size
+`HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES` = 10 MiB (`homer_queue_abi.h:218`), NOT
+`HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES` = 8 MiB as originally written; the pool's `slotStorageBytes` IS that
+10 MiB SQL-result size.]** So a bound SOURCE slot satisfies that check without touching it — **assert the
+invariant against the role-7 ring's storage, not a fixed constant name.** The homogeneous-slot design
+assumption is load-bearing here, not merely convenient.
 
 **Finish the invariant in the same commit.** After the bind lands, delete `engine->tupleSourceRing`,
 `engine->tupleSourceRingMmap`, `engine->tupleSourceRingBytes`, and
@@ -650,17 +777,22 @@ correct single-session baseline there is nothing to compare `-c 2` against.
   was retired. **Relocate, do not delete, the geometry rationale:** the relay's
   `hostRingStorageBytes == sourceStorage` invariant (`:31701`) — one `absoluteStart` addresses both the
   source (DMA read) and the host role-7 ring (DMA write). It is satisfied by construction once SOURCE is a
-  pool slot, because `slotStorageBytes == HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`. Move the comment to the
-  `HomerDpuByteRingPoolInit` call site next to the mirror 1:1 invariant.
+  pool slot, because `slotStorageBytes` (the SQL-result 10 MiB `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES` — NOT
+  the 8 MiB payload constant originally named here) equals the role-7 ring's storage. Assert THAT equality, not
+  a fixed constant. Move the comment to the `HomerDpuByteRingPoolInit` call site next to the mirror 1:1 invariant.
   **After this, no engine-owned data-carrying byte-ring remains anywhere.** That is the invariant Stage 2 closes.
-- **2.6 — RAISE THE SLOT BUDGET before any multi-client run.** The pool is
-  `HOMER_DPU_BYTE_RING_POOL_REGIONS=2` x `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION=4` = **8 slots**
-  (`homer_service_dpu_dma.h:40-41`). A `--homer-dpu` session consumes **2 slots on the RECEIVER DPU**
-  (LANDING + SOURCE) and 1 on the sender (MIRROR). So `-c 4` exactly saturates the receiver pool, and
-  `-c 4` plus a single concurrent basebackup **exhausts it into the deliberate `exit(1)`**.
-  Raise `SLOTS_PER_REGION` to 8 (⇒ 16 slots; region = 8 x 8388672 ≈ 67 MB, still under the 96 MB
-  `HOMER_DPU_BYTE_RING_MAX_REGION_BYTES` ceiling). Do this BEFORE `-c 4` or any concurrent
-  basebackup + pgbench run, or the fatal-on-exhaustion policy will fire as designed and look like a bug.
+- **2.6 — RAISE THE SLOT BUDGET NOW (owner decision 2026-07-17: `-c 4` is the standing target workload).**
+  The pool is `HOMER_DPU_BYTE_RING_POOL_REGIONS=2` x `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION=4` = **8 slots**
+  (`homer_service_dpu_dma.h:40-42`). A `--homer-dpu` session consumes **2 slots on the RECEIVER DPU**
+  (LANDING + SOURCE) and 1 on the sender (MIRROR). So `-c 4` exactly saturates the receiver pool, and `-c 4`
+  plus a single concurrent basebackup **exhausts it into the deliberate `exit(1)`**. `-c 2`/`-c 3` fit the
+  current 8-slot pool, but since `-c 4` is the long-standing target, raise
+  `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` to **8** (⇒ 16 slots) as PART OF THIS STAGE, not deferred.
+  **Ceiling recheck with the ACTUAL 10 MiB slot storage** (the plan's old 8 MiB math is stale — headroom
+  shrank): region = 8 x (`landingPayloadOffset` + 10 MiB) ≈ **80 MiB**, still under the 96 MiB
+  `HOMER_DPU_BYTE_RING_MAX_REGION_BYTES` ceiling — but recompute the exact bytes at implementation and assert
+  it against the ceiling (the `HomerDpuByteRingPoolInit` overflow/ceiling guard already exists; confirm 16
+  slots pass it). If a future slot count would breach 96 MiB, add a region instead of enlarging one.
 
 **Gates.** (a) the `-c 2` repro fails on decoded values BEFORE the fix; (b) after the fix, `-c 2` returns
 correct decoded values with DISTINCT `purpose=2` slot indices in the receiver-DPU log; (c) `-c 1`

@@ -47,6 +47,31 @@ the call site. If it is not on the list, **it has not been checked.**
   sizing in `HomerServiceEnsureLocalReceiveByteRing()`; `HomerServiceFillPayloadStreamQueueDescriptor()`;
   `TupleSinkServiceCompleteStreamOpenAsyncOp()`; and `TupleSinkServiceStartServiceResultPeerOpen()`.
 
+## Byte-ring SLOT size vs RING size — **slots are HOMOGENEOUS (DOCA arena); the wire equality is PER-PAIR host==remote / source==host, NOT slot==host**
+
+- **MEANS:** the pool sizes every slot at `slotStorageBytes` = `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES`
+  = 10 MiB, and slots are HOMOGENEOUS — same size + `[control | storage]` layout — because the multi-region
+  DOCA arena requires it (one DOCA mmap per region of N uniform slots; `doca_buf_inventory_buf_get_by_addr`
+  resolves any slot within its region's mmap). A slot is only a CONTAINER: a stream's LOGICAL ring lives inside
+  it, may be SMALLER, and may differ by stream-type — basebackup 8 MiB (`HOMER_PAYLOAD`), SQL 10 MiB
+  (`HOMER_SQL_RESULT`). "Independent relay chains may use different capacities" (`tuple_sink_service_process.c:35020`).
+- **DOES NOT MEAN:** slot storage == the stream's logical ring, and NOT slot == host. The sender MIRROR is a
+  byte-verbatim, position-preserving STAGING buffer: the pull clamps each copy to cross neither the host wrap
+  nor the mirror-slot wrap (`homer_service_dpu_dma.c:4698-4710`), and egress ships slices at matching absolute
+  offsets — so a record may be split across the mirror-slot STAGING wrap (rejoined at the far end by absolute
+  offset) but is NEVER split across a RING wrap (the wrap-gap protocol keeps records off the ring wrap, carried
+  byte-identically). The mirror slot need only be `>=` the in-flight credit window (capacity), NOT `==` the host ring.
+- **⚠ TEMPTING WRONG MOVE:** do NOT add a `slot == host` (or `slot == host == remote`) assertion. The mirror is
+  size-decoupled, so it would FALSE-FIRE on every basebackup (slot 10 MiB, host 8 MiB — both correct). An earlier
+  revision wrongly called the 10-vs-8 slot/host mismatch a "silent corruption / CURRENTLY VIOLATED" bug; it is
+  not — VALIDATED 2026-07-17 (4-role basebackup: 44,356 ring laps at 10-MiB slot / 8-MiB host, no corruption / no
+  failure signature).
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** the real invariant is PER PAIR, fail-closed —
+  sender `host frontend ring == remote receiver ring` (`hostRingBytes == remoteRingBytes`,
+  `tuple_sink_service_process.c:35031`); receiver `source ring == host role-7 ring`
+  (`hostRingStorageBytes == sourceStorage`, `:37968`). Slot homogeneity is set once at the
+  `HomerDpuByteRingPoolInit` call (`homer_service_dpu_dma.c:~15664`). Records never straddle a ring wrap.
+
 ## `HomerServiceStreamNeedsLocalShmQueues()` — service-level local-backend test
 
 - **MEANS:** this service has no active DPU DMA engine and therefore may have a local backend process polling

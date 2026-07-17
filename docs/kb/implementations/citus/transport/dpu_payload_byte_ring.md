@@ -178,7 +178,19 @@ Two flow-control loops (see the cross-node checkpoint for the full picture):
 Loop-1 = far-sender credit tied to the DPU's relayed/released frontier; Loop-2 =
 host-consumer back-pressure read by DPU grouped-control.
 
-## The mirror-must-be-1:1-with-source invariant (and the bug)
+## The mirror-must-be-1:1-with-source invariant (and the bug) — ⚠ SUPERSEDED
+
+> **⚠ SUPERSEDED 2026-07-17.** The 1:1 requirement below belonged to the REFRAMING-era egress, which parsed
+> record headers out of the mirror and therefore needed a header not to straddle the mirror wrap. That egress was
+> later replaced by a BYTE-VERBATIM, position-preserving relay (`tuple_sink_service_process.c:35005-35053`, "THE
+> WR-BUDGET LOOP IS GONE ... the protocol now leaves a wrap GAP and this relay is byte-oriented"), which ships
+> raw bytes at matching absolute offsets and reassembles at the far end. So the mirror SLOT is now
+> **size-decoupled** from the source/host ring — it need only hold the in-flight window (capacity), NOT match the
+> source size. The real, still-current invariant is PER PAIR: sender host==remote
+> (`tuple_sink_service_process.c:35031`), receiver source==host (`:37968`); slots are homogeneous only for the
+> DOCA arena. VALIDATED 2026-07-17 (basebackup: 44,356 ring laps at 10-MiB slot / 8-MiB host, no corruption). The
+> reframing-era bug below is kept as instructive history; its "decided fix = one constant / 1:1" was NOT
+> implemented and is unnecessary. Canonical current statement: the transport `CONTRACTS.md` "SLOT vs RING size".
 
 The DPU-local mirror is the DPU's copy of the **source** (host producer) ring,
 used as the RDMA egress source (the DPU cannot RDMA directly from host memory —
@@ -253,10 +265,11 @@ multiples. Do not trust power-of-two coincidence for wrap alignment.
   a DMA whose source must be DPU-registered memory; a small cache-line-sized
   registered cell holds that word (do not conflate it with the 64 KB payload
   staging it used to ride on).
-- **The reframing egress needs contiguous headers, not contiguous payloads.**
-  Payload fragments freely at any wrap; only the fixed-size framing header must be
-  contiguous. Any future byte-ring change must keep that guarantee (1:1 mirror
-  provides it).
+- **[SUPERSEDED] The reframing egress needed contiguous headers.** In the reframing era the egress parsed
+  headers out of the mirror, so the fixed-size framing header had to be contiguous (which 1:1 provided). The
+  CURRENT egress is byte-verbatim (no header parse), so a header may be split across the mirror STAGING wrap and
+  rejoined at the far end by absolute offset; records never straddle a RING wrap (wrap-gap protocol on the
+  host/remote ring, which are equal per pair). The mirror slot is size-decoupled — see the section banner above.
 
 ## Related
 
