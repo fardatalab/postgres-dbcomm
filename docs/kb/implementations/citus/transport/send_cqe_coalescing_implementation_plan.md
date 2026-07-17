@@ -10,8 +10,16 @@ impossible ownership-insertion failures with the scoped fail-stop policy in D-S2
 IMPLEMENTED + VALIDATED below (D-S2b, 2026-07-16). The first runtime acceptance built/deployed cleanly and the
 debug gate completed 5/5, but FAILED on false owner-shard ALARMs because the universal CQE callback tried to resolve
 service lanes on a non-owner payload QP. The traffic-class guard fixed that boundary; the complete re-validation
-then passed the unchanged gate + 4-role basebackup acceptance with zero alarms. Signalling remains always-on.
-Next: Stage 2c policy flip only.**
+then passed the unchanged gate + 4-role basebackup acceptance with zero alarms. Signalling remains always-on
+through 2b. **Stage 2c (the policy flip) is IMPLEMENTED + VALIDATED as Citus `7e08343f2` (2026-07-17): adversarial review
+SETTLED-WITH-RECORDED-RESIDUALS after 14 rounds (residuals = D-S2c map items 25, 28, 32, and the 33 family);
+rig validation green across two attempts (D-S2c validation records below) with the engagement proof
+landed — ~3.1% of command units and ~12.5% of completion units signalled on the gate, all alarm batteries
+zero, basebackup ×2 with wrap proof, and the warmed band satisfied at stamped-clean load.** The 2c diff also
+carries the review-driven fixes to pre-existing machinery it surfaced: the one-shot synchronous-response
+continuation, dispatch-time bounded credit, deferred-response classification, the machine-baseline startup
+guard, the spawn capacity probe (item 34), and the peerBindingOpen timing fix (item 35). Next: Stage 3
+(D-S3 drain de-schedule, gated on exact control-only send-CQ demand per map items 16/28).
 Graduated from the design
 [`../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md`](../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md)
 (C1–C5). Prerequisite **§29(b) send-queue accounting is LANDED** (`postedSendWrs` / `retiredSendWrs` /
@@ -795,6 +803,391 @@ and the injected deferred-reset transition remain honestly code-reviewed-only, a
 
 **Commit boundary:** one Citus Stage-2b code commit plus the matching PostgreSQL KB commit after independent diff
 review and full acceptance. No push. **Acceptance is complete; next: Stage 2c policy flip only.**
+
+### D-S2c IMPLEMENTATION MAP (2026-07-16) — IN PROGRESS. The policy flip.
+
+**Stage boundary:** flip the three signalling decisions to
+`forceNextSignalCheckpoint ‖ per-QP-half-SQ ‖ source-pool-pressure ‖ terminal` and replace the P0-i tripwires in
+the same commit. NOTHING else moves: the PEER_SEND_CQ collector stays scheduled (D-S3), payload/head-ack/bootstrap
+signalling is untouched, and no owner/sweep/shard machinery changes.
+
+Re-derived anchors at HEAD = citus `193ae007a` (`T` = `tuple_sink_service_process.c`,
+`R` = `remote_execution_peer_transport_rdma.c`): tripwires `T:422-432` (completion) / `T:441-451` (command);
+P0-i protocol comment `T:6200-6251`; completion funnel `T:6252` (already receives `reservedCount` + `commandKind`);
+command funnel `T:7911`; completion decision callsite `T:21433-21436`; command decision callsite `T:23834-23838`;
+control funnel `TupleSinkServicePublishControlMessage` `R:9137` (hardcoded signalled `true` at `R:9225`; post-post
+WR-ID decode + FIFO append `R:9242-9260`); accounting `R:11525-11537` (force flag cleared `R:11535`); per-post
+admission reserve `R:11493-11502`; unit preflight `R:8291`; force set/query `R:8324`/`R:8342`; control FIFO append
+`R:4494` / sweep `R:4526` / release `R:4410` / find `R:4570`, depth 128; pool constants: command mailbox full-gate
+`SLOTS-1` (`T:23793`), completion ring `HOMER_SERVICE_PEER_CLIENT_COMPLETION_PUBLISH_RING_SLOTS`=16 (`T:409`),
+control `OP_SLOTS`=64 / `RESPONSE_PUBLISH_SLOTS`=64 (`R.h:55-56`); terminal kinds
+`CITUS_REMOTE_EXEC_COMMAND_CLIENT_SQL_SESSION_CLOSE`=8 (`homer_control_abi.h:109`),
+`CITUS_REMOTE_EXEC_PEER_REQUEST_CLOSE_SINK`=2 (`remote_execution_peer_control_protocol.h:48`).
+
+Micro-decisions (settled before implementation; attack these first in review):
+
+1. **New per-connection `lastSignalledPostFrontier`**, stamped `= postedSendWrs` inside
+   `TupleSinkServiceAccountPostedSendChainRdma`'s signalled arm (beside the mark-table stamp and the force-flag
+   clear). Connection memset zeroes it; the always-signalled bootstrap send initializes it naturally.
+2. **New exported transport-term helper** `TupleSinkServicePeerSendCheckpointDueRdma(handle, expectedGeneration,
+   unitWrCount)` = `forceNextSignalCheckpoint ‖ (postedSendWrs + unitWrCount - lastSignalledPostFrontier >=
+   admittedSendWr/2)`. Conservative TRUE on NULL/stale/generation-mismatch: signalling is always safe; only
+   UNSIGNALLED needs the guaranteed-successor proof.
+3. **Command funnel becomes real:** terminal (`sourceRecord->commandKind == SESSION_CLOSE`) ‖ pool
+   (`acceptedEpoch - retiredEpoch >= (CITUS_REMOTE_EXEC_LOCAL_COMMAND_MAILBOX_SLOTS-1)/2`) ‖ transport term.
+   Callsite motion: `wholeMessageWrite`/`unitWrCount` (pure computations) move ABOVE the decision so the funnel
+   receives the unit's exact WR count.
+4. **Completion funnel becomes real:** terminal (`commandKind == SESSION_CLOSE` — the close-completion WIMM's
+   record carries the close kind, D-S2.4 node-B terminal) ‖ pool (`reservedCount >= RING_SLOTS/2` = 8) ‖ transport
+   term. The existing parameters already carry the pool/terminal inputs; only the connection handle+generation are
+   added.
+5. **Control decision moves INSIDE `PublishControlMessage`**, replacing the hardcoded `true`: force ‖ transport
+   term (`chainWrs`=1) ‖ TWO pool terms ‖ terminal (`requestKind == CLOSE_SINK`, BOTH message kinds — a
+   CLOSE_SINK request or response is exactly the "traffic may stop here" marker; Stage 1's abort path is
+   CLOSE_SINK|ABORT_RESET and is covered). **CORRECTED IN ADVERSARIAL REVIEW — the first draft's single
+   FIFO-count pool term had a REAL wedge (review finding 1, VERIFIED).** The draft rationale claimed
+   `outstandingControlOps` "tracks WAIT_RESPONSE protocol state and over/under-counts retention" — that claim was
+   INFERRED and WRONG: the counter decrements ONLY in `TupleSinkServiceReleasePeerControlOp` (slot release), so
+   it is EXACT op-slot occupancy including RETIRING, precisely the plan's original letter. The wedge the wrong
+   rationale opened: an op slot OUTLIVES its send owner (WAIT_RESPONSE holds the slot after its owner swept;
+   RETIRING holds it when the response was consumed before a checkpoint), so a sweep can empty the FIFO while 33
+   WAIT_RESPONSE ops hold slots, 31 further unsignalled requests then strand in RETIRING, and the 64-slot table
+   fills below every threshold — reservation WOULD_BLOCK spins until the stale responses arrive. FINAL terms:
+   requests signal past `outstandingControlOps >= OP_SLOTS/2` (own op can never strand; its CQE sweeps all
+   earlier owners); the FIFO-population term (`controlSendOwnerCount >= FIFO_DEPTH/4`) stays as the RESPONSE
+   pool bound — response slots release exactly with their send owner, so for them the FIFO population IS the
+   retention.
+6. **The WR-ID decode moves BEFORE the post** in `PublishControlMessage` (it is pure; the append reuses the
+   decoded fields). **REVISED in review round 2: the failure stays a FAIL-STOP** (ALARM + `control_wr_id_refused`
+   stable event + `exit(1)`). The draft downgraded it to ALARM + refuse on the argument "nothing was posted yet";
+   round 2 showed that under the one-shot publication retry (item 14) a deterministic impossible failure would
+   re-enter the same site every scheduler pass forever, emitting an unbounded alarm — exactly what the
+   stable-event retry contract forbids. Structurally impossible + would-loop-forever = fail-stop, per the item-14
+   (2a map) doctrine. The post-success FIFO overflow fail-stop in `AppendControlSendOwner` stays.
+7. **Tripwires replaced in the same commit:** both `#ifdef ..._SIGNAL_INTERVAL #error` blocks (`T:429`, `T:448`)
+   are deleted; the P0-i protocol comment (`T:6200`) and both funnel comments are REWRITTEN: the invariant text (a
+   deferred retirement needs a GUARANTEED signalled successor) is unchanged; the guarantee is now supplied by
+   construction — terminal force-signal at every lane's "traffic may stop" point, pool-pressure terms bounding
+   source retention, the force-next-checkpoint flag for deferred resets (D-S2.4), and QP-death purge as the final
+   proof. The old "signals EVERY publish" sentences die with the stubs.
+8. **Item 15 residual ADJUDICATED — NO scalar-accounting repair, by design.** After the closed raw-consumer
+   inventory (2a) + bootstrap retire, a mark-pairing skew can only mean a NEW raw consumer bug; the per-CQE ALARM
+   battery owns detection, and validation greps make any occurrence a failed run. Repair machinery for a
+   structurally impossible state adds risk for zero live benefit. Likewise the service-arm heal still cannot sweep
+   the transport control FIFO: ACCEPTED — control owners covered by a proven mark are released late (next control
+   checkpoint, next sweep, or QP death), and late release is safe by the item-17 argument.
+9. **Item 19 residual ADJUDICATED — MOOT under the 2b shard lifecycle.** The demand scan walks only live listed
+   shards (`T:17409-17437`); dead-connection reclamation runs in `HomerServiceDestroySendOwnerShardAfterQpDeath`
+   (`T:7033`) at exact QP death, signalling-INDEPENDENT; the `PurgeStale*` table-full triggers died with the
+   global tables in 2b. No demand-predicate reordering is needed; the 2a-era note is superseded.
+10. **Engagement proof — CORRECTED IN ADVERSARIAL REVIEW (finding 6, VERIFIED):** the draft's
+    `signalledPostOrdinal < postedSendWrs` check was VACUOUS — the ordinal counts signalled POSTS while
+    `postedSendWrs` counts WRs, and a split command unit's body WR is unsignalled under EVERY policy, so the
+    old always-on policy also passes it. Real proof = DECISION-level unit counters, incremented only at post
+    success: service statics `ClientSqlCommandWriteUnitsPosted/Signalled` +
+    `PeerClientCompletionPublishUnitsPosted/Signalled` printed at shutdown ("Stage-2c signal engagement" line +
+    `send_signal_engagement` HOMER_EVENT), and per-connection `controlSendUnitsPosted/Signalled` added to the
+    transport's QP-destruction `send_frontier` line/event. Gate acceptance: `command_signalled` strictly less
+    than `command_units` (expected far less).
+11. **Comment sweep bound to this commit:** `R:4396`/`R:4482` "signalled control publish/WR" → "posted";
+    the P2-o note (`T:23861-23884`) "readySeq SIGNALLED" → carries the unit's decision; funnel/protocol comments
+    per item 7; `R:9126-9135` publish doc note that the sender-side CQE policy is now selective while the
+    receiver-side immediate doorbell is unaffected.
+12. **New/changed invariant-failure sites follow the stable-event policy** (`HOMER_EVENT`, component/event tokens
+    per the owning `CONTRACTS.md`); unchanged pre-existing fprintf ALARMs are not migrated here. New tokens:
+    `peer_transport/control_wr_id_refused` (alarm, pre-post decode refusal), `service/send_signal_engagement`
+    (info, shutdown), and two fields (`control_units`, `control_signalled`) added to the existing
+    `peer_transport/send_frontier` event.
+
+Adversarial review round 1 (2026-07-16) returned NOT-SETTLED: 4 defects, 3 concerns, T2/T3 clean. Every
+load-bearing claim was re-verified in code before acting. Outcomes:
+
+13. **Finding 1 (DEFECT, VERIFIED) → the item-5 correction above.** The reviewer's mechanism held end to end:
+    op-reserve fails flat with no drain/retry; RETIRING entered when a response is consumed before send
+    retirement; release (and the `outstandingControlOps` decrement) only in `ReleasePeerControlOp`.
+14. **Finding 2 (DEFECT, VERIFIED) → three-part fix, completed in round 2.** (a) Response-slot reservation
+    moved BEFORE the request handler in `TupleSinkServiceProcessIncomingMailboxRequest` (a reserve failure now
+    precedes any handler side effect; a deferred response releases the untouched slot). (b)
+    `TupleSinkServiceReserveControlResponsePublishSlot` gained a scan-after-final-drain (the old two-pass shape
+    discarded the second drain's frees and reported "full" with slots just reclaimed — under 2c a checkpoint
+    CQE frees response slots in batches, making that window real). (c) **Round 2 REFUTED the draft's "publish
+    failure after the handler is a pre-existing residual" boundary:** selective signalling adds a NEW
+    admission-refusal path after handler side effects (an unsignalled response is refused the checkpoint-reserve
+    WQE at `outstanding == admitted-1`, where the old always-signalled policy could spend it), and the replay
+    mechanism is real end to end (publish false → message uncommitted → drain false → executor records
+    EXECUTOR_FAILED → next scheduler pass re-presents → handler re-runs). Fix: the **one-shot publication
+    continuation** — `pendingSyncResponse{Valid,Phase,SlotIndex,Sequence,PostTicket}` on the connection latches
+    PREPARED (publish still owed; slot keeps the prepared response) or PUBLISHED (only the response-post ticket
+    handler owed — re-publishing would double-publish, a pre-existing bug this also closes) and the next drain
+    of the same message resumes at `TupleSinkServiceFinishSyncResponsePublication`, never the handler. Sequence
+    mismatch on resume is an in-order-mailbox violation: `sync_response_latch_mismatch` alarm + drop the latch.
+    This closes BOTH the 2c-new admission window and the pre-existing ring-full window.
+15. **Finding 3 (CONCERN, VERIFIED) → two fixes + one acceptance.** (a) Completion terminal widened: a
+    completion with `postCommandState` DO_NOT_REUSE or FAILED initiates session teardown on the consumer side,
+    so it too may be the session's last publish — it now force-signals (the funnel takes the completion record,
+    not just the kind). (b) The deferred-reset force-checkpoint latch widened from 2b's command-owner-only
+    condition to EVERY deferral (completion-only deferral equally needs the covering CQE; over-signalling is
+    safe). (c) Failed/deferred OPEN responses keep `requestKind=OPEN` and may go unsignalled — ACCEPTED as
+    bounded response-slot retention (receiver notification is the immediate doorbell, not the sender CQE).
+16. **Finding 4 (CONCERN, VERIFIED) → Stage-3 gate recorded:** control-only checkpoints today reach a CQE
+    consumer only via the still-scheduled generic PEER_SEND_CQ collector — the exact service demand scan keys
+    on command/completion signalled owners only. **D-S3 must add an exact control-demand/pressure drain before
+    deleting the collector.**
+17. **Finding 5 (CONCERN, VERIFIED, no change):** the one-WQE checkpoint reserve admits a 1-WR checkpoint at
+    `outstanding == admitted-1` but not a 2-WR signalled unit; no wedge — the half-SQ term guarantees an
+    earlier signalled checkpoint before that state, admission failure is retryable WOULD_BLOCK, and admission
+    failure does NOT clear `forceNextSignalCheckpoint` (cleared only by successful signalled accounting).
+
+Adversarial review round 2 (2026-07-16) verified findings 1/2/3/6/7 corrected (the dual control pool terms
+close the mixed-lifetime wedge; ordering, terminal coverage, and engagement accounting confirmed sound with
+file:line evidence) and returned NOT-SETTLED on one new defect plus contract debt. Outcomes:
+
+18. **Round-2 finding 1 (DEFECT, VERIFIED) → the item-14(c) one-shot publication continuation.** Round-2
+    finding 2 (the `control_wr_id_refused` unbounded-retry hazard) is closed by the same change plus the
+    item-6 fail-stop revision.
+19. **Round-2 finding 3 (comment/contract debt, all VERIFIED) → fixed:** the protocol comment's TERMINAL and
+    POOL bullets now name the DO_NOT_REUSE/FAILED completion terminals and the dual control terms; the
+    deferred-ticket API comment reflects reserve-before-handler; the response-owner release comment reflects
+    sweep-based release; the transport CONTRACTS control-pool wording is explicitly OR; the citus-level stable
+    event index gained `control_wr_id_refused`, `sync_response_latch_mismatch`, `send_signal_engagement`, and
+    the `send_frontier` field additions.
+20. **Round-2 residual notes, accepted as recorded:** engagement unit counters for command/completion are
+    process-global — they prove engagement on the isolated gate workload but do not attribute per QP (control
+    engagement IS per-connection); a force-checkpoint rejection against a stale generation with retained
+    owners remains log-only (the QP-death purge owns that continuation); 64 long-latency WAIT_RESPONSE ops
+    filling the table is semantic peer-response backpressure, not a send-CQE wedge.
+
+Adversarial review round 3 (2026-07-16) verified the one-shot continuation's normal backpressure, reset,
+capacity, and signalling paths sound — and found three defects in its FAILURE state machine (the round-2 draft
+latched every failure as retryable). All verified by me, all fixed:
+
+21. **Failure classification (round-3 defects 1–3): WOULD_BLOCK is the ONLY latch-and-retry outcome.**
+    `FinishSyncResponsePublication` now inspects the publish `HomerPeerPostResult`: a non-WOULD_BLOCK failure
+    (hard verbs error, dying connection, impossible encoder failure) ALARMs once, requests a connection reset
+    (`HOMER_PEER_RESET_SEND_CQ_FAILURE`), and still latches — the latch only blocks handler replay on the
+    passes before the reset destroys mailbox + latch together. A response-post-ticket failure after a
+    successful publish FAIL-STOPS (`response_post_ticket_failed`): every false return is a permanent invariant
+    violation (unknown owner kind / lost context / stale stream / violated close state — all VERIFIED), so
+    retrying cannot converge and the response is already on the wire. **The PUBLISHED latch phase is deleted**
+    (it existed only to retry that unretryable handler); the latch is PREPARED-only, which also simplifies the
+    mismatch analysis and makes "the latched slot stays inUse for its whole life" exactly true.
+22. **Impossible latch states fail-stop (round-3 defect 3 + concern 4):** sequence mismatch on resume,
+    latched slot index out of range, or a latched slot not inUse → ALARM + `sync_response_latch_mismatch` +
+    exit(1) (the round-2 "drop the latch and continue" would replay completed handler side effects or abandon
+    an owed response). A commit failure after a fully processed request → ALARM + `control_commit_failed` +
+    exit(1) (the latch is already cleared by then; a replay would have nothing to stop it). Both are
+    structurally impossible; each event emits at most once.
+23. **Round-3 nits fixed:** the latch CONTRACTS entry rewritten (writers = Finish + reset memset; PREPARED-only
+    lifetime; fail-stop policies); the control-FIFO depth comment now states the bound is from above (a
+    reserved slot may briefly have no FIFO entry — between reserve and post, and while a latch holds a
+    prepared response); the P0-i protocol comment's payload citations re-anchored (the signalled payload tails
+    are at R:~12259 / R:~12555, not the pre-Stage-1 lines); the stable-event index gained
+    `response_post_ticket_failed` and `control_commit_failed`.
+
+Adversarial review round 4 (2026-07-16) verified all direct round-3 corrections landed, then attacked the
+surrounding failure surfaces and found: one REAL pre-existing deadlock the latch retries into, one refutation
+of my round-4 scoping claim, one consistency gap in a sibling caller, and two pre-existing platform gaps. All
+verified before acting:
+
+24. **Round-4 finding 1 (DEFECT) → credit applied AT DISPATCH.** The outgoing-ring credit
+    (`senderConsumedHead`, piggybacked on every incoming control message) was applied only at COMMIT — so a
+    request whose response hit ring-full could never commit, and the credit that would have un-filled the
+    ring rode on that very message: a hard deadlock once the peer pipelines the full 64-op window
+    (pre-existing at HEAD via the handler-replay path; the latch made it a clean permanent wedge). The drain
+    now applies the credit right after message validation — it is a monotonic fact about the peer's
+    consumption, true whether or not this message ever commits; the commit-side update stays as an idempotent
+    max.
+25. **Round-4 finding 3 (DEFECT — MY round-4 claim refuted) → response-arm commit failure fail-stops too.**
+    I had asserted the RESPONSE arm was replay-safe ("generation-checked"); in fact
+    `TupleSinkServiceCompletePeerControlOp` irreversibly consumes the op BEFORE commit, so a replayed
+    response can never match again and wedges the head. Same impossible-bookkeeping class, same policy
+    (`control_commit_failed arm=response` + exit). ⚠ RESIDUAL, pre-existing, recorded not fixed: an
+    INITIALLY duplicate/stale/unmatched response (a misbehaving peer) also fails the match and today wedges
+    that connection's mailbox head via endless drain failure — connection-local blast radius, predates 2c,
+    needs its own protocol-policy decision (drop-and-commit vs reset).
+26. **Round-4 finding 4 (DEFECT) → the deferred-response caller got the same classification.**
+    `TupleSinkServicePostDeferredPeerResponseRdma` now inspects the publish result: WOULD_BLOCK returns
+    false (the deferred table retries next pass, unchanged); any other failure ALARMs, requests the
+    connection reset, and returns success-with-`posted=false` — the established "vanished connection" drop
+    verdict, which also lets the existing `resetRequested` identity guard drop sibling tickets. Encoder
+    failure fail-stops (both here and in the sync path — round-4 finding 6b: it is exactly as impossible as
+    the WR-ID decode, which already fail-stops).
+27. **Round-4 finding 5 (CONCERN) → both remaining replay branches fail-stop:** a handler arming BOTH
+    tickets (contract violation, side effects already ran) and a valid response-post ticket with no
+    installed handler (would silently lose close-state latches) — both ALARM + `response_post_ticket_failed`
+    with a detail token + exit(1).
+28. **Round-4 findings 2 and 6a/6c — PRE-EXISTING platform gaps, recorded not fixed here:** (a) requested
+    connection resets are executed only by the machine-baseline scheduler policy's RESET phase; under the
+    legacy selectable policies (fixed/round-robin/unblocked/CPU-liveness/adaptive) EVERY reset requester —
+    not just 2c's — strands, so the gap belongs to the scheduler-policy matrix, and machine-baseline is the
+    operative policy on the rig. **WIDENED by round-5 finding 4, CORRECTED by round-6 finding 4:**
+    fixed/round-robin/unblocked-first/adaptive also lack ANY control-only send-CQ collection (their CQ-drain
+    discovery keys on command/completion shards and payload streams), so under those four a control-only
+    connection can strand RETIRING op slots until the 64-slot table fills; **cpu-liveness is the exception —
+    it schedules a dedicated peerSendCqSource and lacks only the RESET phase**. **Peer transport is
+    therefore machine-baseline-only, and since round 6 that is ENFORCED at startup**: the service fail-stops
+    IMMEDIATELY AFTER policy selection when `HOMER_PROGRESS_POLICY` names a legacy policy — moved there by
+    round-7 finding 1, because the original pre-transport placement ran AFTER the DPU engine creation and
+    after the shared-control-region mapping that unconditionally reinitializes the queue, so a mislaunch
+    could clobber a live service's control region before dying. (Verified safe to enforce: nothing in either
+    tree sets the env var; the default is machine-baseline; only the standalone service binary links this
+    startup path — smokes and the extension do not.) ⚠ Round-7 correction: legacy policies are UNREACHABLE
+    in this binary, full stop — the transport is created unconditionally, so "usable without the peer
+    transport" would require a transport-less harness that does not exist. The pre-existing DPU-DMA policy
+    tripwire deeper in startup is retained as a second layer, its "no runtime selector exists" comment
+    corrected (the env selector has existed since the policy became runtime-selectable).
+    (b) `admittedSendWr == 0` still classifies as WOULD_BLOCK in per-post admission (impossible on an
+    established connection; the missing-capacity ALARM covers it); (c)
+    `TupleSinkServicePrepareConnectionForWrite` rechecks only `active` after its CM-event drain, so one post
+    can slip after `resetRequested` latches mid-drain — bounded (the WR is flushed and ledgered at QP
+    destruction).
+
+Adversarial review round 5 (2026-07-16, delivered via operator paste after a session-limit cutoff) confirmed
+the round-4 corrections sound, confirmed original T1 CLOSED under stated assumptions (valid peer traffic,
+nonzero admitted capacity, machine-baseline policy), and found three code defects plus the item-28 widening
+above. All verified before acting:
+
+29. **Round-5 finding 1 (DEFECT) → stale-ticket disposal re-runs session retirement — ⚠ PARTIAL COVERAGE
+    (round-6 finding 1 refuted the general claim; see item 33).** A reset can run its reset-complete
+    retirement sweep while a deferred-response entry still holds `peerCommandResponsePending`; the disposal
+    now re-runs `activeSinkCount == 0 && TupleSinkServiceSessionShouldRetireWhenIdle` →
+    `TupleSinkServiceResetSession` on the drop path. This fires ONLY when no result sink is held — i.e. the
+    spawn-FAILED arm. A SUCCESSFUL spawn's eager result-sink reservation (taken at spawn start; after
+    success relinquished only by normal T4 or abandonment backend teardown, whose reclaim funnel may defer
+    the actual decrement to clean peer-reset reclamation) keeps `activeSinkCount > 0`, so for
+    spawn-succeeded orphans this re-run is a no-op — that arm is item 33's recorded gap.
+30. **Round-5 finding 2 (DEFECT) → partial-post slot retention, both response-publication callers.** The
+    deferred path released `publishSlot->inUse` unconditionally on publish failure; a FAILED_PARTIAL result
+    (postedWrCount != 0 — possible via a nonconforming bad_wr==NULL classification) would leave the RNIC
+    reading an unledgered, reusable slot. Now both callers follow the async request path's P0-b rule:
+    release only when `postedWrCount == 0`; a partial post retains the slot for the reset memset and uses
+    `HOMER_PEER_RESET_PARTIAL_POST`. ADDITIONALLY (found while fixing): `PublishControlMessage` mutates the
+    message source BEFORE its reset cutoff, so a latched-partial sync retry would have scribbled a live RDMA
+    source — `FinishSyncResponsePublication` now short-circuits (return false, touch nothing) whenever
+    `resetRequested/resetInProgress` is up; the reset owns the latch and slot from there.
+31. **Round-5 finding 3 (DEFECT) → dispatch-time credit is bounded.** `senderConsumedHead` is now validated
+    against `outgoingControlPublishedTail` BEFORE either monotonic-max writer: a larger value would poison
+    the mirror forever and wrap the unsigned ring-occupancy subtraction into a permanently-full ring.
+    Violation = peer-side protocol corruption → ALARM + `control_credit_rejected` stable event + connection
+    reset + message rejected. (The missing bound predated 2c at the commit-side writer; the dispatch-time
+    move made it worth closing.)
+32. **Round-5 confirmations recorded:** T1 no-wedge across all three lanes + the one-shot machinery holds
+    under the stated assumptions; the initially-unmatched-response head-wedge remains the accepted
+    pre-existing residual of item 25; the drop-verdict guard release ordering vs reset completion is sound
+    (reset is requested before the service clears the guard, so reset-complete observes it cleared or the
+    disposal re-runs retirement — item 29's fix covers the spawn-failed arm; item 33 records the rest).
+    Round-6 note on item 31: `HOMER_PEER_RESET_CLOSE_PROTOCOL` is semantically imprecise for credit
+    corruption (the enum has no generic control-protocol reason) but non-blocking — the exact
+    `control_credit_rejected` event carries the diagnosis; adding a generic reason token is a possible
+    cleanup, not owed by 2c.
+
+33. **Round-6 finding 1 — the selected-DPU ABANDONMENT gap: PRE-EXISTING, recorded for §37/P2-L, NOT fixed
+    in 2c (corrected per round-7 finding 3).** VERIFIED mechanism: spawn START eagerly reserves the DPU
+    result-stream identity and takes an `activeSinkCount` reference
+    (`TupleSinkService...ReserveDpuResultStreamIdentity`, T:~22692). Release inventory: a FAILED spawn
+    start rolls back via `TupleSinkServiceUndoDpuResultStreamIdentity` (T:~22701); **after a SUCCESSFUL
+    spawn, release eligibility requires normal (T4, T:~48089) or abandonment
+    (`HomerServiceDpuAbandonArenaTeardown`, T:~47920) backend teardown** — and NOTHING triggers either when
+    the requester vanishes. The window, conditioned on the spawn SUCCEEDING (a failed async spawn undoes
+    the reservation itself, T:~50226): connection reset during spawn whose spawn then completes and
+    activates the backend (DROP verdict), or disconnect after OPEN and ANY number of reusable commands but
+    before CLOSE (terminal-CLOSE bookkeeping clears backend lifetime, T:~47309) or a
+    `DO_NOT_REUSE`/`FAILED` terminal completion (the teardown-initiation trigger, T:~46909). In each such
+    spawn-succeeded case session + spawned backend are pinned forever: the
+    reset sweep's retirement and item 29's re-run are both blocked by the sink reference, and the backend
+    waits in the bridge with no completion to start teardown. All arms are reachable at HEAD via ordinary
+    CM disconnects — 2c only added reset triggers. The fix the review demands (connection loss cancels an
+    in-flight spawn, or initiates selected-DPU backend teardown after a successful one, releasing the eager
+    sink reference before session retirement) is a new lifecycle mechanism through the T4/P2-L
+    arena-teardown contracts and is deliberately NOT improvised inside the 2c policy flip: it extends the
+    §37/P2-L abandonment-reclaim work item (D-S2.4 point 3) to the node-B/receiver side, and the trap is
+    indexed on the `activeSinkCount` CONTRACTS entry. ⚠ Round-13 addition to the repair spec: since item
+    35 delays `peerBindingOpen` past the spawn window, a connection reset BEFORE spawn success skips that
+    session in the reset-complete sweep, so it never gains `connectionResetComplete` — and retirement
+    requires `peerWritersQuiesced || connectionResetComplete`. The §37/P2-L repair must therefore RESTORE
+    the reset/quiescence proof in addition to tearing down the backend and releasing the sink (design
+    alternative recorded: open the binding at successful response PUBLICATION and keep it false on DROP).
+    Review round 7 ACCEPTED this boundary for Stage-2c acceptance (clean gate runs close semantically;
+    interrupted gates already mandate service restarts; basebackup spawns no such backend). **Owner SIGNED
+    OFF (2026-07-16): keep it recorded, not fixed in 2c — a non-normal, not-expected error path**,
+    unreachable by the acceptance workloads.
+
+34. **Round-11 finding (DEFECT in pre-existing spawn machinery, FIXED — the cheap arm of the reviewer's own
+    proposal).** The deferred-response queue insert runs only AFTER `TupleSinkServiceBeginDpuBackendSpawn`,
+    and a post-begin insert failure cannot cancel the launch: `HomerServiceDpuSpawnAbandon` only flags the
+    tracking entry, the spawn machinery continues abandoned entries to completion, and the reaper then
+    DISCARDS the launched PID — an unowned backend process (worse than item 33's tracked orphan). Reachable
+    pre-2c: the 16-entry deferred table can be full (unpostable responses under ring backpressure) while
+    spawn slots are free. FIX: `HomerServiceDeferredPeerResponseSlotAvailable` — a capacity probe checked
+    BEFORE spawn-begin, refusing the OPEN as a clean synchronous error. Race-free by construction: the
+    service is single-threaded and the OPEN handler is the table's ONLY filler, so between probe and insert
+    the population can only shrink (the disposal loop frees entries). The post-begin failure arm remains as
+    a defensive backstop for non-capacity failures, its comment corrected (the old text claimed "a leak of
+    exactly one session"; the real hazard is the unowned process). Phase-aware abandonment (cancel
+    unpublished spawns / tear down published ones instead of discarding the PID) remains the thorough arm —
+    recorded for the §37/P2-L family, not owed by 2c.
+
+35. **Round-12 finding (DEFECT in pre-existing spawn machinery, FIXED — `peerBindingOpen` timing).** The
+    OPEN handler set `peerBindingOpen = true` (and REUSE_ALLOWED) at OPEN time for BOTH spawn arms — but on
+    the deferred-DPU arm the peer learns the command-mailbox descriptor only from the SUCCESS response, so
+    no peer writer can exist before spawn completion. The premature flag made EVERY pre-success failure arm
+    (spawn-begin refusal, queue-insert failure, async `spawnOk == false`) take
+    `TupleSinkServiceResetPeerOpenFailureIfSafe`'s FENCE branch (`MayDeregister` sees an open binding) —
+    and the fence waits for a peer CLOSE that a failed-OPEN requester never sends (it only resets its LOCAL
+    session), stranding the fenced receiver session until an unrelated connection reset. FIX: for the
+    deferred arm both flags move to spawn-SUCCESS binding
+    (`HomerServiceDpuSpawnBindDeferredPeerResponse`), beside `backendLoopActive` — the split the design's
+    own OPEN-handler comment already prescribed for spawn-completion state. Every pre-success failure now
+    passes `MayDeregister` (binding never opened) and takes the historical full `ResetSession`. The
+    non-deferred arm keeps its OPEN-time flags (its backend exists synchronously). Pre-existing defect
+    (ordinary postmaster refusal reached it); found by review round 12 while attacking the round-11 fix.
+    Round-13 precision: spawn-success binding is a CONSERVATIVE pre-publication fence — the descriptor
+    reaches the peer only at deferred response PUBLICATION (which may DROP), so the flag opens strictly
+    before any possible peer writer; the reset-before-success proof loss this creates is recorded as the
+    item-33 repair-spec addition.
+
+**Validation attempt 1 (2026-07-17): INCONCLUSIVE — functionally green everywhere; open items are a
+performance band miss under contaminated load and a split-segment evidence gap.** Full chain ran (5/5 landed
+proofs; debug gate 4/4 proofs; basebackup ×2 PASS at 23,255,054,431 / 23,255,090,783 bytes, 44,355 laps both;
+ALL alarm batteries zero across every interval; frontier checks exact; final ledgers all zero; teardown
+deltas legitimate: farnet0 `flushed=1` explicit, farnet1 exact). **ENGAGEMENT PROVEN with strong numbers:**
+node-A `command_signalled=1754` vs `command_units=56050` (~3.1% of units signalled), node-B completion
+`7009/56050` (~12.5%), control `4/6` per connection — the flip demonstrably engaged. Open: (a) warmed
+repeats 279.4/212.9/265.8 tps, all below the 291–304 band — measured on a visibly BUSY shared host (load
+avg 6.06 on farnet0, 4 live foreign interactive sessions on farnet1, strict process-preflight never
+converging due to /proc scan races with tenant churn); the non-monotone 25% swing between repeats is the
+shape of CPU contention, not of a code slowdown, and the send path now posts ~3% of its former CQEs — but
+variance-vs-regression is NOT ESTABLISHED and requires a quiet-host repeat set; (b) a mid-run
+environment-repair restart (runbook tag recipe produced an all-numeric tag that overflows the basebackup
+`tag=` int32 parse — recipe now fixed in the runbook) split the candidate, and the gate segment's teardown
+ledger (its `peak_shards>0`, its `send_signal_engagement` HOMER_EVENT, its control frontier lines) was lost
+to the supervisor's log truncation — only the raw legacy engagement line was captured from that segment;
+the basebackup-only final segment legitimately trips the checker's `peak_shards` not-vacuous guard.
+Attempt 2 (same binaries, no rebuild): quiet-host warmed repeats ×5 + clean gate-segment stop that
+preserves the full ledger/event evidence before any restart; basebackup evidence from attempt 1 stands.
+
+**Validation attempt 2 (2026-07-17): both gaps CLOSED — Stage 2c is VALIDATED.** Load-gated start
+(farnet0 1-min load 1.98 at gate; every repeat stamped 0.44–0.62). Debug gate 4/4 proofs reconfirmed.
+Warmed repeats: **290.6 / 295.9 / 293.9 / 295.2 / 299.4 tps** (warmup 292.1 discarded) — 4/5 inside the
+291–304 band, repeat 1 a 0.4-tps boundary touch; the set's mean (~295.0) lies within the intra-set spread
+of the 2a/2b comparators, so no regression is established, and attempt 1's below-band set is attributed to
+its measured load-average 5.5–11.5 contention window. Gate-segment evidence complete on BOTH DPUs after a
+clean stop: engagement `command_units=84056 command_signalled=2630` (node A, ~3.1%, strictly less) /
+`completion_units=84056 completion_signalled=10511` (node B, ~12.5%); `send_signal_engagement` HOMER_EVENT
+present; per-connection `control_units`/`control_signalled` fields across all 9 generations
+(signalled <= units everywhere); `peak_shards=1` both sides; `checks.py` alarm/frontier/teardown checks
+ALL PASS (resolving attempt 1's not-vacuous `peak_shards` FAIL); full battery zero hits. The farnet1
+strict process-preflight non-convergence reproduced identically and is a `/proc` glob-scan race with
+foreign tenant churn (stability-checked rescan clean both attempts) — an ops-script weakness, not
+contamination.
+
+**Acceptance:** all-target build; gate debug proof + warmed repeats (band vs 2a/2b: 294–304 tps observed) +
+4-role basebackup with wrap proof, both with zero global/Stage-2a/2b/2c alarms on BOTH DPUs; teardown ledgers show
+engagement (item 10). ⚠ `posted==retired` expectation CHANGES vs 2b: a connection's LAST WRs may legitimately be
+unsignalled under 2c (e.g. a trailing control response after the terminal), so a clean QP reports EITHER exact
+`posted==retired` OR a small explicit `flushed=N` delta at QP destruction (the 2b ledger already distinguishes
+these); what remains forbidden is any sweep/skew/orphan/stale alarm or an unreported delta. DPU setup listener
+live afterwards. The deferred-reset arm and true multi-peer remain code-reviewed-only (unchanged 2b boundary).
 
 ### D-S3 Drain de-schedule: the pull points that replace the PEER_SEND_CQ collector
 

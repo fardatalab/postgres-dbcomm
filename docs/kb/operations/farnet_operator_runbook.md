@@ -478,7 +478,10 @@ Use `slots=4,bytes=524288`, the same unique tag on both roles, and `-X none`. St
 first using the checked-in helper:
 
 ```sh
-TAG=$(printf '%s' "$RUN_ID" | tr -cd 'A-Za-z0-9' | tail -c 12)
+TAG=t$(printf '%s' "$RUN_ID" | tr -cd 'A-Za-z0-9' | tail -c 11)
+# The leading letter is LOAD-BEARING: an all-numeric tag is parsed as int32 by the basebackup
+# `tag=` target option (pg_strtoint32, basebackup_homer.c:~233) and a 12-digit run-derived tag
+# overflows it -- the sender aborts and the still-waiting receiver hangs (observed 2026-07-17).
 ssh farnet0 "/tmp/farnet-validation-$RUN_ID/helpers/basebackup_consumer.sh" \
   start "$RUN_ID" /data/dbcomm/pg-citus "$DBOID" "$USEROID" "$TAG" 4 524288
 ```

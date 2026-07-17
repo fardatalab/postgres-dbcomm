@@ -24,12 +24,18 @@
   `/data/dbcomm/postgres-citus/tools/farnet_validation/checks.py:31`, `:95`, and `:212`; initial dual-emission sites
   are DPU spawn begin/complete (`homer_service_dpu_spawn.c:252`, `:558`), frontend DPU-doorbell attachment
   (`homer_frontend_agent.c:1670`), peer send frontier/control retirement
-  (`remote_execution_peer_transport_rdma.c:7013`, `:5564`), head-mirror/Stage-2b teardown
-  (`tuple_sink_service_process.c:52463`, `:52526`), and DPU-DMA teardown completion
+  (`remote_execution_peer_transport_rdma.c:~7074`, `:~5622` — Stage 2c shifted these; re-grep before use), head-mirror/Stage-2b teardown
+  (`tuple_sink_service_process.c:~52611`, `:~52691` — likewise shifted; re-grep before use), and DPU-DMA teardown completion
   (`homer_service_dpu_dma.c:7114`).
 - **CURRENT STABLE EVENT NAMES:** `frontend_agent/dpu_doorbell_attached`; `dpu_spawn/begin` and `complete`;
-  `peer_transport/send_frontier` and `control_retirement`; `service/head_mirror_accounting` and
-  `stage2b_teardown`; `dpu_dma/teardown_complete`. Identity/counter field names at these sites are parser ABI: add
+  `peer_transport/send_frontier` (Stage 2c added the optional `control_units`/`control_signalled` fields),
+  `control_retirement`, `control_wr_id_refused` (alarm; fail-stop follows, so it emits at most once),
+  `sync_response_latch_mismatch`, `response_post_ticket_failed`, and `control_commit_failed` (all three
+  alarm + fail-stop: structurally impossible one-shot-continuation states, each emits at most once),
+  and `control_credit_rejected` (alarm; peer-side credit corruption — the message is rejected and the
+  connection reset, so it emits at most once per connection incarnation);
+  `service/head_mirror_accounting`, `stage2b_teardown`, and `send_signal_engagement` (Stage 2c shutdown
+  engagement ledger); `dpu_dma/teardown_complete`. Identity/counter field names at these sites are parser ABI: add
   optional fields freely, but version the schema before deleting or changing a required field's meaning.
 - **TEMPTING WRONG MOVE:** changing an English legacy log line and its regex together while omitting the stable
   event makes the proof dependent on prose again. During migration, retain the human line and add the event.

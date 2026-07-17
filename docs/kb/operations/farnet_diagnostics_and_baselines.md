@@ -269,7 +269,10 @@ Measured on a **fully stripped** stack (no `cmtrace`, no `p3trace`, no `p2diag`,
 > | after the P0 series, pre-P-START | ~`e85abe531` | `-c 1` | 286.7 / 285.1 / **282.4** | ⚠ measured with the START-wait instrumentation ON |
 > | after P-START | `91107bc11` | `-c 1` | 290.2 / 295.5 / 292.2 | |
 > | after P1-f | `91482c840` | `-c 1` | 291.0 / 295.8 / 304.1 | stripped stack, no host service (S7.0) |
-> | **after P2-i (CURRENT)** | **`2b37e8701`** | **`-c 1`** | **285.6 / 291.0 / 299.1** | at/marginally below the P1-f row, with a **monotone within-set decline** (299→291→286) ⇒ machine drift after an hour of 23 GB transfers, **not** a step change. **Re-measure on a rested machine before quoting.** |
+> | after P2-i | `2b37e8701` | `-c 1` | 285.6 / 291.0 / 299.1 | monotone within-set decline (299→291→286) ⇒ machine drift after an hour of 23 GB transfers, not a step change. |
+> | after coalescing Stage 2a | `bdcb7eb70` | `-c 1` | 303.4 / 298.3 / 295.4 | `-t 2000`, logging off; frontier sweep, signalling still always-on |
+> | after coalescing Stage 2b | `6b1d77553` | `-c 1` | 300.1 / 298.0 / 294.6 | `-t 2000`; per-QP shards + preflight, signalling still always-on |
+> | **after coalescing Stage 2c (CURRENT)** | **`7e08343f2`** | **`-c 1`** | **290.6 / 295.9 / 293.9 / 295.2 / 299.4** | `-t 2000`, logging off, warmup discarded, **five** repeats each stamped with farnet0 1-min load 0.44–0.62. Selective signalling live (~3.1% of command units signalled). An earlier same-binary set (279.4/212.9/265.8) was measured under load-average **5.5–11.5** foreign contention and is recorded only as a contamination example — do not quote it. ⚠ Note for the ~10% open item below: 2c cuts send-CQE volume ~30× yet the `-c 1` band did NOT move up ⇒ evidence AGAINST the P0-i more-CQEs suspect at this client count. |
 > | *(reference, NOT comparable)* | `91482c840` | `-c 4` | 404–424 **aggregate** | ≈105 tps/**client**. Kept here only so nobody re-derives the phantom. |
 >
 > Compare against the CURRENT row **at the same client count**, and add a row when you move it.

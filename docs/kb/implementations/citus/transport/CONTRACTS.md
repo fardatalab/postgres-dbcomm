@@ -108,8 +108,14 @@ the call site. If it is not on the list, **it has not been checked.**
 - **MEANS:** how many payload sinks a service session still owns.
 - **DOES NOT MEAN:** a number you may adjust locally. **It is not a plain refcount you can `--`.**
 - **CONTRACT:** **`TupleSinkServiceMaybeReclaimSinkAndSession()`** (`tuple_sink_service_process.c:~27726`) is the
-  **single decrement point.** It guards inactive streams, checks underflow, decrements **exactly once**, resets
-  the stream, **and retires the session if that was its last sink.**
+  **single decrement point for every sink that ever went LIVE.** It guards inactive streams, checks underflow,
+  decrements **exactly once**, resets the stream, **and retires the session if that was its last sink.**
+  **THE ONE SANCTIONED EXCEPTION:** `TupleSinkServiceUndoDpuResultStreamIdentity` (`:~22701`) decrements
+  directly — it unwinds an EAGER reservation that never reached SUCCESSFUL BACKEND ACTIVATION (spawn start
+  failure, deferred-response queueing failure, async `spawnOk == false`). "Live" here means activated-backend
+  ownership, NOT the stream entry's `active` flag — reservation sets that flag immediately. Do not remove
+  that rollback (the count pins) and do not add funnel accounting to it (double release/underflow, guarded at
+  `:~29996`).
   ⛔ **Never call `HomerServiceResetPayloadStreamEntry()` directly on a path that owns a sink reference** — that
   frees the stream and leaves the count pinned.
 - **⚠ WHY ONE MISS IS CATASTROPHIC:** **every** retirement path is gated on `activeSinkCount == 0` — the
@@ -122,7 +128,16 @@ the call site. If it is not on the list, **it has not been checked.**
   never bound).
 - **ENFORCES:** `TupleSinkServiceReleaseServiceOwnedDpuResultSinkAfterBackendTeardown()` (called from **T4** and
   from **`HomerServiceDpuAbandonArenaTeardown`**); the `peerResetAfterCleanClose` branch
-  (`tuple_sink_service_process.c:~30098`).
+  (`tuple_sink_service_process.c:~30098`); a reservation that never reached successful backend activation
+  rolls back through `TupleSinkServiceUndoDpuResultStreamIdentity` instead.
+- **⚠ KNOWN TRAP — REQUESTER ABANDONMENT (recorded, unfixed; coalescing plan D-S2c item 33):** after a
+  SUCCESSFUL spawn, release eligibility requires normal **or abandonment** backend teardown — and **nothing
+  triggers either when the REQUESTER vanishes** (its connection resets mid-spawn *and the spawn then
+  succeeds and activates the backend* — a failed spawn undoes its own reservation — or it disconnects after
+  OPEN/reusable commands but before CLOSE or a `DO_NOT_REUSE`/`FAILED` terminal). The never-closed backend
+  produces no terminal completion, so the reference is held forever and all three retirement paths refuse —
+  session + backend orphan. Owner-accepted Stage-2c boundary; the fix (connection loss cancels an in-flight
+  spawn / initiates backend teardown) belongs to the §37/P2-L abandonment-reclaim item.
 - **COST:** the clean-close branch used to free the stream and `return`, bypassing the funnel ⇒ node-B sessions
   never retired; the 64-slot session table filled. Fixed citus `494751b7b`. Audit §39.1, §43.
 - ⚠ **The comment above that branch carefully listed three functions it was "deliberately NOT calling", each
@@ -177,36 +192,36 @@ the call site. If it is not on the list, **it has not been checked.**
 
 ---
 
-## `signalCommandWrite` / `TupleSinkServiceClientSqlCommandWriteShouldSignal` — **TODAY signals every command write. That is the PRE-COALESCING state, not an eternal rule.**
+## `signalCommandWrite` / `TupleSinkServiceClientSqlCommandWriteShouldSignal` — **a REAL decision since Stage 2c: terminal ‖ pool ‖ transport. Most command writes are UNSIGNALLED.**
 
-- **MEANS (today):** `ShouldSignal` returns `true` **unconditionally** (`tuple_sink_service_process.c:7110`), so the
-  terminal WR of every client-SQL command post is `IBV_SEND_SIGNALED` + WR-id-tagged and its send CQE retires that
-  command's WQEs and (via the reap `TupleSinkServiceRetireClientSqlCommandWriteCompletionEntry`) advances
-  `retiredEpoch`/`consumedEpoch`. It signals every write only because **send-CQE coalescing is not yet applied to
-  this lane** — NOT because the lane is forbidden from amortizing.
+- **MEANS:** the unit signals iff `commandKind == CLIENT_SQL_SESSION_CLOSE` (terminal) ‖
+  `acceptedEpoch - retiredEpoch >= (CITUS_REMOTE_EXEC_LOCAL_COMMAND_MAILBOX_SLOTS-1)/2` (mailbox source pressure) ‖
+  `TupleSinkServicePeerSendCheckpointDueRdma` (forceNextSignalCheckpoint from a deferred reset, or the per-QP
+  half-SQ interval against `lastSignalledPostFrontier`). The decision is made AFTER `unitWrCount` is known and the
+  SAME boolean flows into the unit preflight and every post of the unit; an unsignalled unit's owner is popped by a
+  later checkpoint's frontier sweep. Sibling funnels: peer-client-completion
+  (`TupleSinkServicePeerClientCompletionPublishShouldSignal` — terminal = SESSION_CLOSE **or**
+  `postCommandState` DO_NOT_REUSE/FAILED, the teardown-inducing completions; pool = source ring ≥ 8) and control
+  (inside `TupleSinkServicePublishControlMessage` — terminal = CLOSE_SINK either kind; TWO independent OR-ed pool
+  terms: requests also signal at op-slot occupancy `outstandingControlOps` ≥ 32, and ANY control post signals at
+  control-FIFO population ≥ 32).
 - **THE REAL INVARIANT (this is the violable rule):** ⛔ **an unsignalled command owner may be released only after a
-  later CQE or QP destruction proves its WR retired.** Signalling every write satisfies it trivially. Coalescing
-  preserves it by combining the per-QP half-SQ bound with source-pressure checkpoints and Stage-1's signalled
-  terminal close/abort. Half-SQ alone is NOT a successor guarantee: traffic can stop below the interval. An abnormal
-  abandonment with no terminal therefore retains its owner/MR and defers reset until a later checkpoint or QP
-  destruction; it must not manufacture completion. That IS the send-CQE coalescing project
-  ([`../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md`](../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md)),
-  and the command lane is **explicitly in scope** (it lists command / peer-client-completion / control /
-  peer-command-completion as the four lanes multiplexed onto the shared SQ). Coalescing is SAFE for this lane
-  because its drained pool is the 64-slot command mailbox (`CITUS_REMOTE_EXEC_LOCAL_COMMAND_MAILBOX_SLOTS`), so a
-  ≤32-deep source-pressure checkpoint prevents credit starvation, while the **terminal flush** force-signals the
-  last normal close/abort write, exactly as the PAYLOAD lane already does.
-- **DOES NOT MEAN:** that the command lane must forever signal every write (it is the coalescing project's explicit
-  target), nor that inlining precludes signalling — `IBV_SEND_INLINE` (source in WQE) and `IBV_SEND_SIGNALED` (CQE)
-  are **orthogonal**; a coalesced lane can inline AND signal-periodically.
+  later CQE or QP destruction proves its WR retired.** The terms above carry the successor guarantee: terminals
+  self-signal at every point the protocol promises nothing further; past each pool threshold EVERY post of that lane
+  signals, so a source pool cannot exhaust with nothing signalled outstanding; a deferred reset latches
+  `forceNextSignalCheckpoint` (ANY owner class — widened from 2b's command-only latch); and an abandonment below all
+  thresholds retains its owners/MRs until a covering checkpoint or QP-death purge — it must not manufacture
+  completion. Half-SQ alone is NOT a successor guarantee: traffic can stop below the interval.
+- **DOES NOT MEAN** a tunable interval — there is deliberately NO `-D` macro (the old `SIGNAL_INTERVAL` tripwires
+  died with the flip; the policy lives in one function per lane), and inlining does not preclude signalling —
+  `IBV_SEND_INLINE` (source in WQE) and `IBV_SEND_SIGNALED` (CQE) are **orthogonal**.
 - **THE TRAP (learned the hard way):** the deleted `useInlineCommandPost` fast path made BOTH command WRs
   **unsignalled with no successor guarantee at all** (no ≤½ checkpoint, no terminal flush), so on a compact-only
   stream or at quiesce the tail never retired → SQ leak / `exit(1)`. DELETED 2026-07-14 (audit §32); the surviving
-  `TupleSinkServicePostRemoteClientSqlCommandRecord` posts an unsignalled body + a **SIGNALLED** readySeq tail, and
-  the §29(b) admission reserve (`remote_execution_peer_transport_rdma.c:10898`) guarantees that signalled tail is
-  always postable after its unsignalled body. ⚠ **When coalescing lands here it MAY re-introduce unsignalled command
-  writes — but ONLY with the reserve + ≤½-pool checkpoint + terminal flush that guarantee the successor.**
-  Unsignalled-*without*-successor is the bug; unsignalled-*with-guaranteed*-successor is the goal.
+  `TupleSinkServicePostRemoteClientSqlCommandRecord` posts an unsignalled body + a readySeq tail carrying the unit's
+  decision, and the §29(b) admission reserve plus the Stage-2b unit preflight guarantee a SIGNALLED tail is always
+  postable after its unsignalled body. Unsignalled-*without*-successor is the bug;
+  unsignalled-*with-guaranteed*-successor is what the decision terms provide.
 
 ---
 
@@ -460,12 +475,13 @@ the call site. If it is not on the list, **it has not been checked.**
 
 ## `entry->frontierMark` (command-write / completion-publish owners) — **QP-wide retirement coordinate. Class-local ordinals are GONE.**
 
-- **MEANS:** the connection's cumulative `postedSendWrs` as of the owner's unit's LAST (signalled) post,
-  stamped at the post site immediately after the unit's final post succeeds
-  (`TupleSinkServicePeerConnectionPostedSendWrsRdma`). A later successful CQE whose retired frontier `F`
-  reaches the mark proves this WR — and everything posted before it on the same QP — completed; the sweep
-  pops per-connection post-order lanes while `mark <= F`, so retirement is CROSS-CLASS (a payload or
-  control CQE retires command/completion owners on that QP for free).
+- **MEANS:** the connection's cumulative `postedSendWrs` as of the owner's unit's LAST post (signalled only
+  when the Stage-2c decision said so), stamped at the post site immediately after the unit's final post
+  succeeds (`TupleSinkServicePeerConnectionPostedSendWrsRdma`). A later successful CQE whose retired
+  frontier `F` reaches the mark proves this WR — and everything posted before it on the same QP —
+  completed; the sweep pops per-connection post-order lanes while `mark <= F`, so retirement is
+  CROSS-CLASS (a payload or control CQE retires command/completion owners on that QP for free), and an
+  UNSIGNALLED owner is popped exclusively by a later checkpoint's sweep.
 - **DOES NOT MEAN** a per-class sequence number (`postOrdinal` and the array lane FIFOs are deleted), and
   `0` is NOT a posted mark: it flags "reserved, unit not yet posted."
 - **ENFORCES:** stamp+link ONLY after the unit's posts all succeed (command post fn, completion publish fn
@@ -556,18 +572,63 @@ the call site. If it is not on the list, **it has not been checked.**
 
 ## `connectionState->controlSendOwners[]` — **the control class's post-order sweep FIFO. Appended ONLY by `TupleSinkServicePublishControlMessage`.**
 
-- **MEANS:** transport-internal ring of in-flight signalled CONTROL sends `{responsePublish, slotIndex,
-  slotGeneration(0 for responses), frontierMark}`, swept by `TupleSinkServiceSweepControlSendOwners` on
-  every successful CQE; release runs the decode-free core `TupleSinkServiceReleaseControlSendOwner`
-  (old per-CQE retire semantics preserved: response slot `inUse=false`; request `sendCompletionRetired` +
-  conditional op release).
-- **DOES NOT MEAN** a service-visible structure, and the CONTROL dispatch arm does NOT normally release: it
-  validates that the entry is gone after its own CQE's sweep and best-effort sweeps a surviving linked entry.
-  There is no dropped-entry slot-state fallback.
+- **MEANS:** transport-internal ring of in-flight CONTROL sends — signalled or, since Stage 2c, mostly
+  unsignalled — `{responsePublish, slotIndex, slotGeneration(0 for responses), frontierMark}`, swept by
+  `TupleSinkServiceSweepControlSendOwners` on every successful CQE; release runs the decode-free core
+  `TupleSinkServiceReleaseControlSendOwner` (old per-CQE retire semantics preserved: response slot
+  `inUse=false`; request `sendCompletionRetired` + conditional op release). Its population
+  (`controlSendOwnerCount`) is the RESPONSE-side pool-pressure term of the control signalling decision.
+- **DOES NOT MEAN** a service-visible structure, and NOT the request-op pool term — an op slot OUTLIVES its
+  send owner (WAIT_RESPONSE after the owner swept; RETIRING after the response was consumed first), so
+  request pressure reads `outstandingControlOps` (exact op-slot occupancy: ++ at reserve, -- only in
+  `TupleSinkServiceReleasePeerControlOp`). Confusing those two produced a real reviewed-out wedge: a table
+  of 33 WAIT_RESPONSE + 31 RETIRING ops with an empty-enough FIFO forces reservation failure below every
+  signalling threshold. The CONTROL dispatch arm does NOT normally release: it validates that the entry is
+  gone after its own CQE's sweep and best-effort sweeps a surviving linked entry. There is no dropped-entry
+  slot-state fallback.
 - **ENFORCES:** the append after the post in `PublishControlMessage` (all three control encode sites funnel
-  there); the connection-reset memset zeroes it with the accounting; depth = op+response slot counts, so
-  overflow is structurally impossible. Overflow or failure to decode the locally encoded CONTROL WR-ID
-  ALARMS and fail-stops; process exit destroys the QP rather than continuing with an untracked live source.
+  there — the WR-ID decode now runs BEFORE the post; decode failure ALARMS with the `control_wr_id_refused`
+  stable event and FAIL-STOPS, because it is structurally impossible and the one-shot publication retry would
+  otherwise re-enter the site every scheduler pass forever); the connection-reset memset zeroes it with the
+  accounting; depth = op+response slot counts, so overflow is structurally impossible. Overflow after a
+  successful post still ALARMS and fail-stops; process exit destroys the QP rather than continuing with an
+  untracked live source.
+
+## `connectionState->pendingSyncResponse*` — **the ONE-SHOT synchronous response continuation. NOT the deferred-response ticket.**
+
+- **MEANS:** a latched "the request handler for the CURRENT uncommitted mailbox head already ran; the
+  response PUBLICATION is still owed from its reserved slot (which stays `inUse` for the latch's whole
+  life)." The next drain of the SAME message resumes at `TupleSinkServiceFinishSyncResponsePublication`,
+  never at the handler. Only publish WOULD_BLOCK retries toward success; a non-retryable publish failure
+  latches AND requests a connection reset (the latch only blocks handler replay until the reset destroys
+  mailbox + latch together); a ticket-handler failure after a successful publish FAIL-STOPS
+  (`response_post_ticket_failed` — every failure mode is a permanent invariant violation with the response
+  already on the wire), so no post-publish latch state exists.
+- **DOES NOT MEAN** `HomerPeerDeferredResponseTicket` — that is a HANDLER'S choice to answer later from
+  service-owned state, releases the pre-reserved slot immediately, and posts through
+  `TupleSinkServicePostDeferredPeerResponseRdma`; the latch is the TRANSPORT's involuntary continuation for
+  publication backpressure (ring full, or Stage 2c admission refusing an unsignalled response the reserve
+  WQE). It also does NOT mean the mailbox message was consumed: the message stays uncommitted, which is
+  exactly what re-presents it.
+- **ENFORCES:** `TupleSinkServiceProcessIncomingMailboxRequest` validates the latch BEFORE
+  reserving/dispatching — sequence mismatch, slot index out of range, or a latched slot not `inUse` is a
+  structurally impossible state and FAIL-STOPS (`sync_response_latch_mismatch`; dropping the latch would
+  replay handler side effects or abandon an owed response). Writers are exactly
+  `TupleSinkServiceFinishSyncResponsePublication` (latch/clear) and the connection-reset memset. Commit
+  failure after a fully processed REQUEST fail-stops (`control_commit_failed`) — a replay there would have no
+  latch left to stop it — and so does commit failure after a consumed RESPONSE (`arm=response`):
+  `TupleSinkServiceCompletePeerControlOp` irreversibly moves the op out of WAIT_RESPONSE before commit, so a
+  replayed response could never match again and would wedge the mailbox head. The drain also applies the
+  piggybacked `senderConsumedHead` credit AT DISPATCH (not only at commit) — the latch's ring-full retry
+  deadlocked otherwise, because the credit that would un-fill the ring rode on the very message that could
+  not commit — and BOUNDS it first: `senderConsumedHead` must not exceed `outgoingControlPublishedTail`
+  (the peer cannot have consumed more than we published; a larger value would poison the monotonic mirror
+  and wrap the unsigned occupancy into a permanently-full ring — `control_credit_rejected` + connection
+  reset). `FinishSyncResponsePublication` short-circuits untouched whenever `resetRequested/resetInProgress`
+  is up: `PublishControlMessage` mutates the message source before its own reset cutoff, so a latched retry
+  after a PARTIAL post must never reach it; the reset memset owns latch and slot. The reason this machinery
+  exists: re-running a request handler duplicates non-idempotent side effects (OPEN allocating session
+  state) — Stage 2c review round 2 proved selective signalling made that window real.
 
 ---
 
