@@ -210,7 +210,7 @@ farnet1 DPU:
 
 ```sh
 cd /data/dbcomm/postgres-citus
-DPU_HELPERS=(dpu_build.sh dpu_supervisor.sh dpu_process_cleanup.sh \
+DPU_HELPERS=(proc_identity.py dpu_build.sh dpu_supervisor.sh dpu_process_cleanup.sh \
              dpu_process_probe.sh dpu_tcp_smoke.sh)
 ssh dpu install -d -m 0700 "/tmp/farnet-validation-$RUN_ID/helpers"
 for helper in "${DPU_HELPERS[@]}"; do
@@ -231,7 +231,7 @@ never inline the second hop:
 
 ```sh
 REMOTE="/tmp/farnet-validation-$RUN_ID"
-HOST_HELPERS=(dpu_dispatch.sh postgres_stop.sh host_process_cleanup.sh host_process_probe.sh \
+HOST_HELPERS=(proc_identity.py dpu_dispatch.sh postgres_stop.sh host_process_cleanup.sh host_process_probe.sh \
               project_shm_cleanup.sh gate.sh basebackup_consumer.sh)
 ssh farnet0 install -d -m 0700 "$REMOTE/helpers"
 for helper in "${HOST_HELPERS[@]}" "${DPU_HELPERS[@]}"; do
@@ -265,8 +265,9 @@ ssh farnet0 "/tmp/farnet-validation-$RUN_ID/helpers/postgres_stop.sh" \
   /data/dbcomm/pg-citus --allow-missing-data
 ```
 
-Reap host clients/services and socketless backends only through canonical process identity. The helper fails closed
-on an unreadable user process:
+Reap host clients/services and socketless backends only through canonical process identity. The helper treats a
+proved raced exit, zombie, or `PF_KTHREAD` task as clean; it fails closed on every other unreadable live process and
+uses a pidfd plus start-time/executable revalidation before signaling a selected process:
 
 ```sh
 bash tools/farnet_validation/remote/host_process_cleanup.sh /data/dbcomm/pg-citus
@@ -280,6 +281,10 @@ ssh dpu "/tmp/farnet-validation-$RUN_ID/helpers/dpu_process_cleanup.sh" "$RUN_ID
 ssh farnet0 "/tmp/farnet-validation-$RUN_ID/helpers/dpu_dispatch.sh" \
   dpu_process_cleanup.sh "$RUN_ID"
 ```
+
+The DPU login is unprivileged. Its process helpers use the same `sudo -n` executable-read fallback and privileged
+pidfd signaling as the host helpers; a root-owned task with an unreadable executable must not make the DPU scan
+either falsely clean or permanently inconclusive.
 
 Inventory, then remove only project-owned shared memory. The checked-in helper refuses foreign ownership:
 

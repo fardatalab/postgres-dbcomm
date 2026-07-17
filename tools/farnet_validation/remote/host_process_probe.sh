@@ -31,6 +31,7 @@ printf 'PREFIX_IDENTITY logical=%q canonical=%q\n' "$prefix_logical" "$prefix_ca
 unreadable=0
 postgres_count=0
 forbidden=0
+identity_helper="$(dirname "$0")/proc_identity.py"
 for proc in /proc/[0-9]*; do
     pid=${proc#/proc/}
     exe=
@@ -55,14 +56,21 @@ for proc in /proc/[0-9]*; do
         esac
         continue
     fi
-    if [[ -r "$proc/cmdline" ]] && [[ ! -s "$proc/cmdline" ]]; then
-        printf 'KERNEL_NO_EXE pid=%s\n' "$pid"
-    elif [[ -r "$proc/cmdline" ]] && [[ -s "$proc/cmdline" ]]; then
-        unreadable=$((unreadable + 1))
-        printf 'UNREADABLE_USER pid=%s reason=exe\n' "$pid"
+
+    # procfs advertises cmdline st_size=0 even for live user processes, so
+    # shell `-s` is not an identity predicate. The helper performs a bounded
+    # content read plus PF_KTHREAD/zombie classification and distinguishes a
+    # proven raced exit from a still-live unreadable identity.
+    classification=
+    privileged_classification=
+    if classification=$(python3 "$identity_helper" classify "$pid" 2>&1) ||
+        privileged_classification=$(sudo -n python3 "$identity_helper" classify "$pid" 2>&1); then
+        [[ -n "$privileged_classification" ]] && classification=$privileged_classification
+        printf '%s\n' "$classification"
     else
+        [[ -n "$privileged_classification" ]] && classification=$privileged_classification
         unreadable=$((unreadable + 1))
-        printf 'UNREADABLE_USER pid=%s reason=cmdline-and-exe\n' "$pid"
+        printf '%s\n' "$classification"
     fi
 done
 printf 'SUMMARY unreadable_user=%s postgres_processes=%s forbidden_processes=%s expectation=%s\n' \

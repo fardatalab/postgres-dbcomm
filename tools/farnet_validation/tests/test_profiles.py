@@ -67,6 +67,18 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(installs)
         self.assertTrue(all(prepare < install for install in installs))
 
+    def test_python_identity_helper_is_uploaded_installed_and_hashed(self):
+        config = RunConfig("test", "transport-acceptance", "current-source", "dpus",
+                           "/pg", "/citus", "/data/dbcomm/pg-citus", "/tmp/evidence")
+        specs = PhasePlanner(config).specs("orient")
+
+        for host in ("dpu", "farnet0"):
+            self.assertTrue(any(spec.name == f"upload-{host}-proc_identity.py" for spec in specs))
+            self.assertTrue(any(spec.name == f"install-{host}-proc_identity.py" for spec in specs))
+            self.assertTrue(any(spec.name == f"hash-{host}-proc_identity.py" for spec in specs))
+        self.assertTrue(any(spec.name == "farnet0-dpu_dispatch-install" and
+                            spec.argv[-1] == "proc_identity.py" for spec in specs))
+
 
 if __name__ == "__main__":
     unittest.main()

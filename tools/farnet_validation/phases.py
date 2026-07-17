@@ -43,6 +43,12 @@ def _sudo_dbcomm(*argv: str) -> tuple[str, ...]:
     return ("sudo", "-n", "-u", "dbcomm", *argv)
 
 
+def _remote_helper_names() -> tuple[str, ...]:
+    """Return every checked-in executable helper that must retain digest parity."""
+    return tuple(path.name for path in sorted(HELPER_ROOT.iterdir())
+                 if path.suffix in {".sh", ".py"})
+
+
 class PhasePlanner:
     """Translate each named state into auditable argv without executing shell text."""
 
@@ -59,7 +65,7 @@ class PhasePlanner:
         if phase in {"orient", "artifact-receipt-validate"}:
             specs = [CommandSpec("git-postgres-head", ("git", "-C", pg, "rev-parse", "HEAD"), pg),
                      CommandSpec("git-citus-head", ("git", "-C", citus, "rev-parse", "HEAD"), pg)]
-            helpers = tuple(path.name for path in sorted(HELPER_ROOT.glob("*.sh")))
+            helpers = _remote_helper_names()
             specs += upload_specs("dpu", c.run_id, helpers, pg)
             specs += upload_specs("farnet0", c.run_id, helpers, pg)
             specs += [invoke_spec("farnet0", c.run_id, "dpu_dispatch.sh", ("prepare",), pg, 60, True)]
@@ -314,7 +320,7 @@ class PhaseEngine:
             return path.read_text(errors="replace") if path else ""
         if phase in {"orient", "artifact-receipt-validate"}:
             for host in ("dpu", "farnet0"):
-                for helper in sorted(path.name for path in HELPER_ROOT.glob("*.sh")):
+                for helper in _remote_helper_names():
                     output = text(f"hash-{host}-{helper}").split()
                     if len(output) < 2 or output[0] != helper_digest(helper):
                         return Verdict.INCONCLUSIVE, FailureKind.IDENTITY.value

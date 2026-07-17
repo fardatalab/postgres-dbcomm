@@ -8,14 +8,26 @@ found=0
 expected_found=0
 unexpected=0
 unreadable=0
+identity_helper="$(dirname "$0")/proc_identity.py"
 for proc in /proc/[0-9]*; do
-    exe=$(readlink -f "$proc/exe" 2>/dev/null) || {
-        if [[ ! -r "$proc/cmdline" || -s "$proc/cmdline" ]]; then unreadable=$((unreadable + 1)); fi
+    pid=${proc#/proc/}
+    exe=$(readlink -f "$proc/exe" 2>/dev/null) || exe=$(sudo -n readlink -f "$proc/exe" 2>/dev/null) || {
+        classification=
+        privileged_classification=
+        if classification=$(python3 "$identity_helper" classify "$pid" 2>&1) ||
+            privileged_classification=$(sudo -n python3 "$identity_helper" classify "$pid" 2>&1); then
+            [[ -n "$privileged_classification" ]] && classification=$privileged_classification
+            printf '%s\n' "$classification"
+        else
+            [[ -n "$privileged_classification" ]] && classification=$privileged_classification
+            unreadable=$((unreadable + 1))
+            printf '%s\n' "$classification"
+        fi
         continue
     }
     case "$exe" in
         */citus-dbcomm/build/homer/citus_tuple_sink_service*|*/dpu-build/build/homer/citus_tuple_sink_service*)
-            pid=${proc#/proc/}; start=$(awk '{print $22}' "$proc/stat")
+            start=$(awk '{print $22}' "$proc/stat")
             digest=$(sha256sum "$proc/exe" | awk '{print $1}')
             printf 'DPU_SERVICE pid=%s start=%s digest=%s exe=%s run=%s\n' "$pid" "$start" "$digest" "$exe" "$run_id"
             found=$((found + 1))

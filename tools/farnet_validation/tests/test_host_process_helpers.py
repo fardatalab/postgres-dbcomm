@@ -144,6 +144,53 @@ class HostProcessHelperTests(unittest.TestCase):
             self.assertEqual(result.returncode, 3)
             self.assertIn("installed prefix identity changed", result.stderr)
 
+    def test_probe_uses_privileged_classifier_result_after_unprivileged_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logical_prefix, _physical_prefix = self._prefix_fixture(root)
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+
+            # Force both executable reads to fail for procfs paths while
+            # preserving prefix canonicalization. The real unprivileged
+            # classifier rejects the live fixture; sudo then supplies a clean
+            # sentinel so the shell OR chain must replace, not retain, output.
+            fake_readlink = fake_bin / "readlink"
+            fake_readlink.write_text(
+                "#!/bin/sh\n"
+                "for arg in \"$@\"; do case \"$arg\" in /proc/*/exe) exit 1;; esac; done\n"
+                "exec /usr/bin/readlink \"$@\"\n"
+            )
+            fake_readlink.chmod(0o700)
+            fake_sudo = fake_bin / "sudo"
+            fake_sudo.write_text(
+                "#!/bin/sh\n"
+                "[ \"$1\" = -n ] && shift\n"
+                "case \"$1\" in\n"
+                "  readlink) exit 1;;\n"
+                "  python3) echo PRIVILEGED_CLASSIFICATION pid=\"$4\"; exit 0;;\n"
+                "esac\n"
+                "exit 2\n"
+            )
+            fake_sudo.chmod(0o700)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+            process = subprocess.Popen(["/bin/sleep", "30"])
+            try:
+                result = subprocess.run(
+                    ["bash", str(HELPER_ROOT / "host_process_probe.sh"), str(logical_prefix), "stopped"],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"PRIVILEGED_CLASSIFICATION pid={process.pid}", result.stdout)
+                self.assertNotIn(f"UNREADABLE_USER pid={process.pid}", result.stdout)
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
     def test_probe_fails_before_scan_when_prefix_cannot_be_canonicalized(self):
         missing = Path(tempfile.gettempdir()) / "farnet-validation-missing-prefix"
         result = subprocess.run(

@@ -59,13 +59,11 @@ brackets too.
 
 ### 1.4 What actually works: `/proc/<pid>/exe`
 
-No shell can fake it:
+No shell can fake the executable identity. The checked-in helpers additionally pin the selected process with a
+pidfd before cleanup so a numeric PID cannot be reused between identity proof and signaling:
 
 ```sh
-for d in /proc/[0-9]*; do
-  exe=$(readlink -f "$d/exe" 2>/dev/null) || exe=$(sudo -n readlink -f "$d/exe" 2>/dev/null)
-  case "$exe" in */pg-citus/bin/citus_tuple_sink_service*) sudo -n kill -9 "${d#/proc/}";; esac
-done
+bash tools/farnet_validation/remote/host_process_cleanup.sh /data/dbcomm/pg-citus
 ```
 
 Three parts of that are **not optional**:
@@ -82,8 +80,29 @@ Three parts of that are **not optional**:
   preflight prints "clean" **while the entire stack is up** — a false negative, strictly worse than the
   `ps | grep` false positive it was written to replace. **Count the pids you could not identify and say so**,
   rather than letting an unreadable `/proc` masquerade as an empty one.
-- **`sudo -n` on the kill itself.** A plain `kill`/`pkill` against a `dbcomm`-owned process reports
-  `Operation not permitted` and leaves it alive.
+- **Privileged pidfd signaling.** A plain `kill`/`pkill` against a `dbcomm`-owned process reports
+  `Operation not permitted` and leaves it alive. More subtly, an executable-path check followed by numeric
+  `kill -9 <pid>` has a PID-reuse window. `proc_identity.py signal` opens a pidfd, revalidates the expected
+  start time and executable while that handle pins the task, and signals through the pidfd.
+
+### 1.4.1 A `/proc/[0-9]*` snapshot contains legitimate raced exits
+
+**Discovered July 17, 2026 during the Stage-3 send-CQE acceptance preflight.** A short-lived process may disappear
+after the shell expands `/proc/[0-9]*` but before `readlink /proc/<pid>/exe`. Counting every failed executable read
+as an unreadable live user process therefore makes a clean baseline fail nondeterministically. Retrying the same
+probe can pass without any machine-state change; that is evidence of the race, not permission to ignore all failed
+reads.
+
+The safe distinction is explicit:
+
+- a vanished `/proc/<pid>` after the failed read is `RACED_EXIT` and clean;
+- a zombie or a process with `PF_KTHREAD` is a proved no-executable task and clean;
+- every other still-live process whose executable remains unreadable is `UNREADABLE_USER` and fails closed.
+
+Do not use `[[ -s /proc/<pid>/cmdline ]]` for this classification. procfs reports a zero `st_size` for cmdline even
+when a bounded content read returns user-process arguments, and a live user task can also have an empty cmdline.
+The checked-in `proc_identity.py classify` helper reads `/proc/<pid>/stat` and one cmdline byte, and uses
+`PF_KTHREAD`/zombie state rather than file size as the clean no-executable proof.
 
 ### 1.5 Never `kill -9` a LIVE `postgres: remote exec backend` mid-run
 
@@ -94,8 +113,9 @@ This matters more since **S3.3b+S3.2c** (citus `30dfc9e9a`): the DPU-spawned bac
 control region — it binds a frontend-arena slot and **survives, idling in its command loop**. It does **not**
 respond to `pg_ctl stop -m fast`/`SIGTERM`, because socketless backends have no clean-shutdown path yet
 (S4's `CLIENT_SQL_SESSION_CLOSE` / S3.4's doorbell-EOF teardown will add one). So after any
-`--homer-dpu-command` run the clean baseline **must** reap it by `/proc/<pid>/exe` + `kill -9`; a plain
-`pg_ctl stop` leaves it alive and the *next* preflight trips on a stale backend. Pre-S3.2c the backend died
+`--homer-dpu-command` run the clean baseline **must** reap it through `host_process_cleanup.sh`, which matches
+`/proc/<pid>/exe` and sends SIGKILL through a revalidated pidfd; a plain `pg_ctl stop` leaves it alive and the
+*next* preflight trips on a stale backend. Pre-S3.2c the backend died
 instantly, so it never survived to need reaping — do not read older notes with the new meaning.
 
 ---

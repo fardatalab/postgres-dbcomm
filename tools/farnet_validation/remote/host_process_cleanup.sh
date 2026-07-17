@@ -21,10 +21,26 @@ fi
 printf 'PREFIX_IDENTITY logical=%q canonical=%q\n' "$prefix_logical" "$prefix_canonical"
 
 unreadable=0
+identity_helper="$(dirname "$0")/proc_identity.py"
 for proc in /proc/[0-9]*; do
     pid=${proc#/proc/}
     exe=$(readlink -f "$proc/exe" 2>/dev/null) || exe=$(sudo -n readlink -f "$proc/exe" 2>/dev/null) || {
-        if [[ ! -r "$proc/cmdline" || -s "$proc/cmdline" ]]; then unreadable=$((unreadable + 1)); fi
+        classification=
+        privileged_classification=
+        if classification=$(python3 "$identity_helper" classify "$pid" 2>&1) ||
+            privileged_classification=$(sudo -n python3 "$identity_helper" classify "$pid" 2>&1); then
+            [[ -n "$privileged_classification" ]] && classification=$privileged_classification
+            printf '%s\n' "$classification"
+        else
+            [[ -n "$privileged_classification" ]] && classification=$privileged_classification
+            unreadable=$((unreadable + 1))
+            printf '%s\n' "$classification"
+        fi
+        continue
+    }
+    start=$(awk '{print $22}' "$proc/stat" 2>/dev/null) || {
+        [[ ! -d "$proc" ]] && continue
+        unreadable=$((unreadable + 1))
         continue
     }
     kill_pid=0
@@ -35,7 +51,9 @@ for proc in /proc/[0-9]*; do
             [[ "$args" == *"remote exec backend"* ]] && kill_pid=1
             ;;
     esac
-    if (( kill_pid )); then sudo -n kill -9 "$pid"; fi
+    if (( kill_pid )); then
+        sudo -n python3 "$identity_helper" signal "$pid" "$start" "$exe"
+    fi
 done
 (( unreadable == 0 )) || { printf 'UNREADABLE_USER count=%s\n' "$unreadable" >&2; exit 2; }
 # Re-resolve the stable logical name, but require it still names the exact tree
