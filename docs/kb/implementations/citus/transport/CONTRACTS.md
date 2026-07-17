@@ -211,7 +211,9 @@ the call site. If it is not on the list, **it has not been checked.**
   signals, so a source pool cannot exhaust with nothing signalled outstanding; a deferred reset latches
   `forceNextSignalCheckpoint` (ANY owner class — widened from 2b's command-only latch); and an abandonment below all
   thresholds retains its owners/MRs until a covering checkpoint or QP-death purge — it must not manufacture
-  completion. Half-SQ alone is NOT a successor guarantee: traffic can stop below the interval.
+  completion. Half-SQ alone is NOT a successor guarantee: traffic can stop below the interval. Normal close/abort
+  and continuing traffic have a protocol or pressure successor; accepted abnormal sub-threshold abandonment may
+  instead retain an unsignalled tail until a later checkpoint or verified QP destruction supplies retirement proof.
 - **DOES NOT MEAN** a tunable interval — there is deliberately NO `-D` macro (the old `SIGNAL_INTERVAL` tripwires
   died with the flip; the policy lives in one function per lane), and inlining does not preclude signalling —
   `IBV_SEND_INLINE` (source in WQE) and `IBV_SEND_SIGNALED` (CQE) are **orthogonal**.
@@ -220,8 +222,8 @@ the call site. If it is not on the list, **it has not been checked.**
   stream or at quiesce the tail never retired → SQ leak / `exit(1)`. DELETED 2026-07-14 (audit §32); the surviving
   `TupleSinkServicePostRemoteClientSqlCommandRecord` posts an unsignalled body + a readySeq tail carrying the unit's
   decision, and the §29(b) admission reserve plus the Stage-2b unit preflight guarantee a SIGNALLED tail is always
-  postable after its unsignalled body. Unsignalled-*without*-successor is the bug;
-  unsignalled-*with-guaranteed*-successor is what the decision terms provide.
+  postable after its unsignalled body. Releasing an unsignalled owner without either a covering successor or
+  verified QP-death proof is the bug; retaining an abnormal quiet tail is deliberate, bounded proof deferral.
 
 ---
 
@@ -405,8 +407,8 @@ the call site. If it is not on the list, **it has not been checked.**
   comment at the struct): these callbacks now run from mid-operation transport drains NOT bracketed by
   `HomerServiceSendCqDrainDepth`. A callback that posts a WR or polls a CQ requires extending that guard to
   every dispatch site FIRST.
-- **ENFORCES:** the guard in `...DrainTaggedSendCompletionsInternal` (transport); the wrapper
-  `TupleSinkServiceDrainTaggedSendCompletions` and the pump SEND_CQ phase both pass
+- **ENFORCES:** the guard in `...DrainTaggedSendCompletionsInternal` (transport); the public drain wrapper and
+  every exact scheduled, pressure, and post-checkpoint pull pass
   `transportState->sendCompletionCallbacks/-Context`; registration happens once in service init
   (`TupleSinkServiceRegisterPeerSendCompletionCallbacksRdma`) before any peer connection exists.
 
@@ -438,7 +440,7 @@ the call site. If it is not on the list, **it has not been checked.**
   inequality.
 - **ENFORCES / EVERY SITE THAT MUST OBEY IT:** `HomerServicePeerConnectionReady`,
   `HomerServiceResolveSendOwnerShard`, both reserve/link/sweep/validator families,
-  `HomerServiceDestroySendOwnerShardAfterQpDeath`, and the active-shard round-robin CQ-drain enumeration. Every
+  `HomerServiceDestroySendOwnerShardAfterQpDeath`, and the transport's unified exact-QP CQ-demand index. Every
   reserve/clear/sweep/inactive-pop/zero-post-failure/QP-purge transition updates shard-local and aggregate counters
   exactly once.
 - **DELIBERATELY NOT DONE:** no 4096/1024 global size-out, startup preallocation of 128 heavy shards, global quota,
@@ -460,7 +462,7 @@ the call site. If it is not on the list, **it has not been checked.**
   `TupleSinkServiceFinishPeerConnectionSetup`, `TupleSinkServiceResetPeerConnectionInternal`,
   `HomerServicePeerConnectionResetComplete`, and transport destroy's active incoming/outgoing reset loops.
 
-## `TupleSinkServicePreflightSendUnitRdma` — **non-mutating total-unit verdict before owner reservation.**
+## `TupleSinkServicePreflightSendUnitRdma` / `...WithPressureRdma` — **non-mutating total-unit verdict; pressure adds one exact pull and one rescan.**
 
 - **MEANS:** exact 1-or-2-WR admission using the QP's clamped outstanding arithmetic. The single-threaded caller
   must execute the frozen branch immediately with no poll/callback/alternate post/yield before its final post.
@@ -468,8 +470,11 @@ the call site. If it is not on the list, **it has not been checked.**
   `sendAdmissionRefusalSerial` makes a refusal after successful preflight an observable ALARM/invariant failure,
   while genuine zero-WR provider failures retain ordinary classification.
 - **CONTRACT / INVARIANT:** preflight precedes CQ-owner reservation. WOULD_BLOCK is retryable local send-resource
-  pressure; body-accepted/tail-failed is non-rollbackable and fail-stops in this research prototype.
-- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** command and peer-client-completion post units,
+  pressure; the pressure wrapper performs at most one exact-QP bounded pull and one second arithmetic verdict.
+  It never polls between successful preflight and the final post. Body-accepted/tail-failed is non-rollbackable
+  and fail-stops in this research prototype.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** command, peer-client-completion, payload batch/byte-ring, and
+  receiver-head-ACK post units,
   `TupleSinkServiceAdmitSendChainRdma`, `HomerServiceFailIfSendAdmissionBackstopDisagreed`, and completion
   transport-credit blocked-session rearm from the exact QP's next successful send CQE.
 
@@ -504,10 +509,12 @@ the call site. If it is not on the list, **it has not been checked.**
 - **ENFORCES:** both reserve probe loops; `Clear...Index` (linked guard: deactivate-in-place + ALARM, never
   memset); the sweep pop unlink-before-retire order (the retire memsets); the QP-death shard purge.
 
-## The signalled-demand counts (`...SignaledCompletionActiveCount`) — **released at CQE consumption or QP-death purge, never at live-QP reset.**
+## The service owner signalled counts (`...SignaledCompletionActiveCount`) — **proof counters, no longer scheduler discovery.**
 
-- **MEANS:** "signalled send CQEs not yet consumed on some lane" — the CQ-drain scheduler's demand gates
-  (`...SendCqShouldDrain`, the demand scan, scheduler feedback) key off these.
+- **MEANS:** "signalled send CQEs not yet consumed on this service owner lane"; they remain useful for ownership
+  validation and diagnostics.
+- **DOES NOT MEAN:** complete QP-wide CQ demand. Control, payload, ACK, bootstrap, and blocking owners share the
+  physical send CQ, so scheduler discovery keys on the transport ordinal/index contract below instead.
 - **DOES NOT MEAN** "active signalled owners": the defensive inactive-but-linked shape may have a CQE still
   in flight and therefore retains demand until the sweep or QP-death purge frees its linked slot. Releasing
   demand at the linked-clear guard would starve the consumption that reclaims capacity. The per-lane
@@ -578,6 +585,10 @@ the call site. If it is not on the list, **it has not been checked.**
   `TupleSinkServiceReleaseControlSendOwner` (old per-CQE retire semantics preserved: response slot
   `inUse=false`; request `sendCompletionRetired` + conditional op release). Its population
   (`controlSendOwnerCount`) is the RESPONSE-side pool-pressure term of the control signalling decision.
+- **CONTRACT / INVARIANT:** each FIFO entry records the actual `signalled` post decision.
+  `controlSignalledSendOwnerCount` increments only after that exact successfully posted entry is appended and
+  decrements only when it is swept; it is always `<= controlSendOwnerCount`. It is a control-specific proof
+  counter, not the generic pressure authorization predicate.
 - **DOES NOT MEAN** a service-visible structure, and NOT the request-op pool term — an op slot OUTLIVES its
   send owner (WAIT_RESPONSE after the owner swept; RETIRING after the response was consumed first), so
   request pressure reads `outstandingControlOps` (exact op-slot occupancy: ++ at reserve, -- only in
@@ -593,6 +604,85 @@ the call site. If it is not on the list, **it has not been checked.**
   accounting; depth = op+response slot counts, so overflow is structurally impossible. Overflow after a
   successful post still ALARMS and fail-stops; process exit destroys the QP rather than continuing with an
   untracked live source.
+
+## `sendCqDemandIndexed` / transport send-CQ demand index — **QP-wide exact demand, separate from control readiness.**
+
+- **MEANS:** `signalledPostOrdinal-signalledRetiredOrdinal != 0` for one exact ready QP generation. The transport
+  arms one direction/traffic-class bit when the delta transitions 0→1 and clears it on 1→0; the global count is
+  the O(1) scheduler readiness predicate. The indexed action carries generation, direction, class, and connection
+  index; execution resolves that identity back to the current table handle and revalidates it immediately before
+  polling.
+- **DOES NOT MEAN:** control-mailbox readiness, a service owner-shard member, or proof that a CQE is already
+  available. The index is independent of `HomerControlReadyIndex`; command, completion, control, payload, and ACK
+  checkpoints on every traffic class all share this one demand domain.
+- **CONTRACT / INVARIANT:** every normal mutation changes the per-QP mirror bit, direction/class bitset, and
+  aggregate count together. Common post
+  accounting arms the bit before returning but never polls; common scalar retirement clears it, including
+  bootstrap and blocking waiters. Reset/destroy clears the live bit before connection memset. Enumeration retains
+  one flat cursor so a 64-action page cannot starve a stable suffix or one owner family. Its bounded consistency
+  fence fail-stops when the aggregate count is nonzero, the caller has action capacity, and a complete flat-index
+  scan emits no action: that proves the scheduler-visible count has no enumerable bit. This is deliberately NOT a
+  hot-path full-popcount reconciliation and does not claim to detect arbitrary memory corruption.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** `TupleSinkServiceAccountPostedSendChainRdma`, common successful-CQE
+  scalar retirement, connection reset/destruction, `TupleSinkServicePendingSendCqConnectionCountRdma`,
+  `TupleSinkServiceAppendPendingSendCqActionsRdma`, and exact action validation/drain.
+
+## `TupleSinkServicePullPeerSendCqRdma(reason)` — **one canonical bounded exact-QP pull after commit or under pressure.**
+
+- **MEANS:** typed owner-dispatch on one generation-checked QP using the persistent RETIRE-ONLY callbacks.
+  `POST_CHECKPOINT` asks `ibv_poll_cq` for at most one CQE; `PRESSURE` and scheduled actions request at most one
+  bounded batch. The canonical drain caps the actual poll request to remaining `maxCqes`; it never dequeues a
+  larger array and silently discards the suffix.
+- **DOES NOT MEAN:** a post retry, a polling admission predicate, or permission to poll before semantic owner
+  installation. A nonzero ordinal delta authorizes one useful attempt but does not prove CQ arrival or that the
+  particular source/owner pool will free.
+- **CONTRACT / INVARIANT:** post-checkpoint hooks run only at the semantic commit tail: command after sweep link,
+  outstanding/pending/accepted/terminal/stats bookkeeping; peer completion after owner link, READY_POSTED and
+  published-state bookkeeping; control only at the three outer request/sync/deferred tails; payload after owner
+  POSTED plus all frontier/progress writes; ACK after owner POSTED plus token/tail/progress writes. A post-success
+  pull failure is not retryable and crosses the reset/fail-stop error boundary. A stream/session-local SEND_CQ
+  grant uses `SCHEDULED` on only that captured connection/generation; local source/owner pressure uses `PRESSURE`
+  on the same exact QP, performs at most one pull and one rescan, then returns blocked/still-ready when unchanged.
+  Only proof-backed session reset convergence may repeat exact pulls, and its wall-clock deadline remains mandatory.
+- **CONTRACT / INVARIANT — diagnostic correlation:** an empty POST latch belongs to one generation and signalled
+  ordinal. A later scheduled/pressure pull may log and clear it only when generation still matches and
+  `signalledRetiredOrdinal >= emptyPostCheckpointOrdinal`; productive earlier CQEs leave it armed. A productive
+  POST that covers the ordinal clears it without falsely attributing the coverage to another reason.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** the command/completion/payload/ACK semantic tails in
+  `tuple_sink_service_process.c`; the three outer control tails and control-op/response-slot pressure sites in
+  `remote_execution_peer_transport_rdma.c`; all pressure-aware send-unit preflights.
+
+## `HOMER_PROGRESS_COLLECTOR_COMMAND_SEND_CQ` — **typed exact-QP drain across every owner and traffic class; the name is historical.**
+
+- **MEANS:** scheduler fallback for the transport-global exact demand index. Readiness is the O(1) pending-QP
+  count; execution enumerates fair generation-bearing actions and drains those exact QPs with typed callbacks.
+  The machine-baseline grant carries `maxItems=1,maxPolls=1`; the executor preserves that outer grant instead of
+  rebuilding a 64-action plan. The legacy/global fallback likewise requests one cursor item per pass. Readiness
+  has explicit phase ownership: only the machine COLLECTOR phase mutates the machine-baseline cooldown and can
+  grant this collector; SEMANTIC observes raw pending count only as its scan trigger; RESET and LOCAL_IPC ignore
+  send-CQ demand; and the non-machine fallback samples its separate cooldown exactly once per fallback pass.
+- **DOES NOT MEAN:** command owners only, `CRITICAL_CONTROL` only, or the deleted broad peer-control CQ scan.
+  `HOMER_PROGRESS_WAIT_PEER_SEND_CQ` maps here for exact send-CQE liveness, while the surviving
+  `HOMER_PROGRESS_SOURCE_PEER_SEND_CQ` belongs only to the two explicitly indexed DPU egress collectors.
+- **ENFORCES:** the policy cooldown remains armed until the global/per-QP checkpoint delta reaches zero. Coarse
+  fallback construction uses `peerTransportState` as both the transport-global lookup and CQ source owner; an
+  uninitialized session registry must not substitute `sessionStates` for that identity. The
+  deleted collector/action tokens and `TUPLE_SINK_SERVICE_PEER_PUMP_PHASE_SEND_CQ` must remain textually absent;
+  a zero/ALL peer-pump phase mask never polls a send CQ.
+
+## FB-2 peer-send source/feedback slots — **exact cardinality two and one canonical bijection.**
+
+- **MEANS:** `DPU_PEER_COMMAND_EGRESS -> 0` and `DPU_PEER_COMPLETION_EGRESS -> 1`; every other collector maps to
+  NONE. Registry state stores two independently indexed source cores and two independent feedback slots.
+- **DOES NOT MEAN:** one scalar peer-send source/feedback object shared by both collectors. Source stamps,
+  feedback writer attribution, and feedback reader resolution all derive their slot from the same canonical map.
+- **CONTRACT / INVARIANT:** registry initialization validates range, injectivity, exact count two, and full slot
+  coverage. Both egress executors require the mapped source index and the DPU scheduler-state owner before doing
+  work. Per-slot writer ownership rejects a source stamped by one egress collector updating the other's feedback.
+  The starvation diagnostic legend therefore names each slot separately and contains no `+` alias.
+- **ENFORCES:** `HomerServicePeerSendCqFeedbackSlotForCollector`,
+  `HomerServiceValidatePeerSendCqFeedbackSlotMap`, registry initialization,
+  collector-to-source resolution, source-id core/feedback writers, and collector feedback readers.
 
 ## `connectionState->pendingSyncResponse*` — **the ONE-SHOT synchronous response continuation. NOT the deferred-response ticket.**
 

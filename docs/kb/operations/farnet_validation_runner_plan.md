@@ -374,6 +374,16 @@ any mismatch is invalid invocation or `INCONCLUSIVE`, never a comparison PASS.
 
 ## Current next step
 
+The Stage-3 process-scan follow-up is complete. `host_process_{probe,cleanup}.sh` and
+`dpu_process_{probe,cleanup}.sh` now resolve the complete `/proc` snapshot in one interpreter, with at most one
+privileged full-snapshot retry when the unprivileged pass finds an unreadable user identity. Kernel-thread, zombie,
+and raced-exit cases are aggregate by default; resolved executables, forbidden matches, and unreadable identities
+remain per-PID, and `HOMER_VALIDATION_VERBOSE_PROC=1` restores benign per-PID records. Production identity and the
+PostgreSQL role bit are pidfd-bracketed; all four wrappers validate numeric records and reconcile emitted record
+counts with the summary. A matched DPU service alone gets a cold second helper action that pins and revalidates
+PID/start/executable before and after hashing. Exact cleanup similarly reopens and revalidates only a matched pidfd
+before signaling. The stopped-DPU comparison is 8.37 seconds old versus 1.03 seconds batch.
+
 Canonical-prefix matching and role-explicit absent-data handling discovered by the farnet0 home-backed layout audit
 are now fixed and covered by process-local alias, sibling-tree, identity-drift, and capability tests. Next complete
 the provenance receipt writer and runtime identity/preflight/cleanup/takeover implementation while keeping
@@ -382,6 +392,25 @@ another independent diff review. Only after every live false-PASS/contamination 
 ask for the one known-green `transport-acceptance` run and consider enabling `--execute`.
 
 ## Milestone history
+
+### 2026-07-17 — basebackup tag and shell-status false-PASS closure
+
+- A manual Stage-3 acceptance wrapper generated an alphanumeric tag even though the sender target parser uses
+  `pg_strtoint32`. The sender failed before transfer, leaving the already-started consumer waiting. Exact takeover
+  cleanup stopped PostgreSQL, the consumer, and both DPU services and marked the candidate diagnostic-only.
+- The phase planner now derives a stable positive signed-int32 tag from the run ID. `basebackup_consumer.sh`
+  independently rejects nonnumeric, zero, oversized, and out-of-range tags before creating run state or launching a
+  process. The operator runbook uses the same numeric/int32 contract.
+- The interactive `bash script | tee evidence` wrapper initially exposed only `tee`'s zero status. The operational
+  hazard now requires outer `pipefail` (or direct redirection) plus terminal-receipt inspection.
+- Exact process probes now resolve one complete `/proc` snapshot per interpreter, with at most one privileged retry,
+  rather than spawning Python and sudo per unresolved PID. Benign kernel/zombie/race cases are aggregate by default;
+  resolved executables and unreadable users remain per-PID. On the stopped direct DPU, the old probe took 8.37
+  seconds; the final batch probe took 1.03 seconds (about 8x faster), summarized 79 executable processes plus 369 kernel
+  tasks, and corrected empty listener output from false `nonzero_recvq=1` to zero.
+- Process-local validation has 75 passing tests, including planner, basebackup preflight, batch identity, production
+  pidfd role reads, pinned digest success/mismatch, malformed-record/summary rejection, privileged retry, bounded
+  benign output, and empty-listener coverage. Live runner execution remains fail-closed.
 
 ### 2026-07-16 — fail-closed framework and logging-contract checkpoint
 

@@ -3,10 +3,26 @@
 set -euo pipefail
 action=${1:?start|supervise|wait required}; run_id=${2:?run id required}
 root="/tmp/farnet-validation-$run_id/basebackup-consumer"
+
+# Both the sender target option and --homer-tag are parsed as signed int32.
+# Reject a bad tag synchronously, before creating consumer state or a process
+# that would otherwise wait after the sender rejects its target string.
+validate_tag() {
+    local tag=${1:?tag required}
+    [[ "$tag" =~ ^[0-9]+$ ]] || { echo "tag must be numeric" >&2; return 2; }
+    [[ ${#tag} -le 10 ]] || { echo "tag exceeds int32" >&2; return 2; }
+    local value=$((10#$tag))
+    (( value >= 1 && value <= 2147483647 )) || {
+        echo "tag must be in positive int32 range" >&2
+        return 2
+    }
+}
+
 case "$action" in
 supervise)
     prefix=${3:?prefix required}; dboid=${4:?db oid required}; useroid=${5:?user oid required}
     tag=${6:?tag required}; slots=${7:?slots required}; bytes=${8:?bytes required}
+    validate_tag "$tag"
     mkdir -p -m 0700 "$root"
     set +e
     sudo -n -u dbcomm env HOMER_VALIDATION_RUN_ID="$run_id" \
@@ -22,6 +38,8 @@ supervise)
     ;;
 start)
     shift 2
+    [[ $# -eq 6 ]] || { echo "start requires prefix dboid useroid tag slots bytes" >&2; exit 2; }
+    validate_tag "$4"
     [[ ! -e "$root" ]] || { echo "consumer state already exists" >&2; exit 2; }
     mkdir -p -m 0700 "$root"
     nohup setsid "$0" supervise "$run_id" "$@" >/dev/null 2>&1 </dev/null &

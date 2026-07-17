@@ -69,6 +69,116 @@ class ProcIdentityTests(unittest.TestCase):
                 self.assertIn(f"UNREADABLE_USER pid={pid}", result.stdout)
                 self.assertIn(reason, result.stdout)
 
+    def test_scan_aggregates_benign_tasks_and_keeps_executable_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for pid, state, flags in ((11, "S", PF_KTHREAD), (12, "Z", 0)):
+                proc_dir = root / str(pid)
+                proc_dir.mkdir()
+                _write_stat(proc_dir, pid, state, flags, 90 + pid)
+                (proc_dir / "cmdline").write_bytes(b"")
+
+            proc_dir = root / "13"
+            proc_dir.mkdir()
+            _write_stat(proc_dir, 13, "S", 0, 103)
+            (proc_dir / "exe").symlink_to("/bin/true")
+            (proc_dir / "cmdline").write_bytes(b"/bin/true\0")
+
+            result = subprocess.run(
+                ["python3", str(HELPER), "scan", "--proc-root", str(root)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"SCAN_EXE\t13\t103\t{os.path.realpath('/bin/true')}\t0", result.stdout)
+            self.assertIn("SCAN_SUMMARY\t1\t1\t1\t0\t0", result.stdout)
+            self.assertNotIn("SCAN_BENIGN", result.stdout)
+            self.assertNotIn("KERNEL_NO_EXE", result.stdout)
+
+            verbose = subprocess.run(
+                ["python3", str(HELPER), "scan", "--proc-root", str(root), "--verbose-benign"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(verbose.returncode, 0, verbose.stdout + verbose.stderr)
+            self.assertIn("SCAN_BENIGN\tkernel-no-exe\t11\tclassified", verbose.stdout)
+            self.assertIn("SCAN_BENIGN\tzombie-no-exe\t12\tclassified", verbose.stdout)
+
+    def test_scan_fails_closed_for_live_user_without_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc_dir = root / "21"
+            proc_dir.mkdir()
+            _write_stat(proc_dir, 21, "S", 0, 121)
+            (proc_dir / "cmdline").write_bytes(b"worker\0")
+
+            result = subprocess.run(
+                ["python3", str(HELPER), "scan", "--proc-root", str(root)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("SCAN_UNREADABLE\t21\texe-missing", result.stdout)
+            self.assertIn("SCAN_SUMMARY\t0\t0\t0\t0\t1", result.stdout)
+
+    def test_scan_fixture_encodes_remote_exec_role(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc_dir = root / "31"
+            proc_dir.mkdir()
+            _write_stat(proc_dir, 31, "S", 0, 131)
+            (proc_dir / "exe").symlink_to("/bin/true")
+            (proc_dir / "cmdline").write_bytes(b"postgres: remote exec backend\0")
+
+            result = subprocess.run(
+                ["python3", str(HELPER), "scan", "--proc-root", str(root)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"SCAN_EXE\t31\t131\t{os.path.realpath('/bin/true')}\t1", result.stdout)
+
+    def test_scan_carries_remote_exec_role_under_production_pidfd_snapshot(self):
+        process = subprocess.Popen(
+            ["bash", "-c", 'exec -a "postgres: remote exec backend" /bin/sleep 30']
+        )
+        try:
+            result = subprocess.run(
+                ["python3", str(HELPER), "scan"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            expected = f"SCAN_EXE\t{process.pid}\t"
+            matching = [line for line in result.stdout.splitlines() if line.startswith(expected)]
+            self.assertEqual(len(matching), 1, result.stdout + result.stderr)
+            self.assertTrue(matching[0].endswith("\t1"), matching[0])
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
+    def test_scan_preserves_deleted_executable_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc_dir = root / "41"
+            proc_dir.mkdir()
+            _write_stat(proc_dir, 41, "S", 0, 141)
+            (proc_dir / "exe").symlink_to("/tmp/deleted-fixture (deleted)")
+            (proc_dir / "cmdline").write_bytes(b"fixture\0")
+
+            result = subprocess.run(
+                ["python3", str(HELPER), "scan", "--proc-root", str(root)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("SCAN_EXE\t41\t141\t/tmp/deleted-fixture (deleted)\t0", result.stdout)
+
     def test_classify_real_zombie_through_production_pidfd_path(self):
         process = subprocess.Popen(["/bin/true"])
         try:
@@ -131,6 +241,53 @@ class ProcIdentityTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("PIDFD_IDENTITY_MISMATCH", result.stdout)
+            self.assertIsNone(process.poll())
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
+    def test_pidfd_digest_hashes_only_matching_pinned_identity(self):
+        process = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            stat_text = Path(f"/proc/{process.pid}/stat").read_text()
+            starttime = int(stat_text.rsplit(") ", 1)[1].split()[19])
+            expected_exe = os.path.realpath(f"/proc/{process.pid}/exe")
+            result = subprocess.run(
+                ["python3", str(HELPER), "digest", str(process.pid), str(starttime), expected_exe],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            fields = result.stdout.strip().split("\t")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(fields[:3], ["PIDFD_DIGEST", str(process.pid), str(starttime)])
+            self.assertRegex(fields[3], r"^[0-9a-f]{64}$")
+            self.assertEqual(fields[4], expected_exe)
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+
+    def test_pidfd_digest_rejects_identity_mismatch(self):
+        process = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            stat_text = Path(f"/proc/{process.pid}/stat").read_text()
+            starttime = int(stat_text.rsplit(") ", 1)[1].split()[19])
+            expected_exe = os.path.realpath(f"/proc/{process.pid}/exe")
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(HELPER),
+                    "digest",
+                    str(process.pid),
+                    str(starttime + 1),
+                    expected_exe,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("PIDFD_DIGEST_IDENTITY_MISMATCH", result.stdout)
             self.assertIsNone(process.poll())
         finally:
             process.terminate()

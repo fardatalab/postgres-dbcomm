@@ -2,7 +2,7 @@
 
 <!-- kb-summary: Ordered stage plan for re-arming send-CQE coalescing on the peer RDMA transport, with the 2026-07-15 site-enumeration corrections to the design. -->
 
-**Status: IMPLEMENTATION IN PROGRESS (2026-07-16).** Stage 1 is landed and validated (§51 in the retirement
+**Status: STAGES 1-3 IMPLEMENTED + VALIDATED (2026-07-17).** Stage 1 is landed and validated (§51 in the retirement
 audit). **Stage 2a is LANDED + VALIDATED** as Citus `bdcb7eb70`: the gate and 4-role basebackup passed
 on the corrected final binary, with no Stage-2a/global alarms and no directional gate regression (D-S2a
 acceptance below; audit §52). A post-implementation review replaced unsafe orphan/drop recovery on structurally
@@ -18,8 +18,12 @@ landed — ~3.1% of command units and ~12.5% of completion units signalled on th
 zero, basebackup ×2 with wrap proof, and the warmed band satisfied at stamped-clean load.** The 2c diff also
 carries the review-driven fixes to pre-existing machinery it surfaced: the one-shot synchronous-response
 continuation, dispatch-time bounded credit, deferred-response classification, the machine-baseline startup
-guard, the spawn capacity probe (item 34), and the peerBindingOpen timing fix (item 35). Next: Stage 3
-(D-S3 drain de-schedule, gated on exact control-only send-CQ demand per map items 16/28).
+guard, the spawn capacity probe (item 34), and the peerBindingOpen timing fix (item 35). **Stage 3 is IMPLEMENTED
+AND VALIDATED as Citus `c0b9f06bd` (D-S3; audit §55):** exact indexed demand and bounded exact-QP pull
+points replace the broad scheduled collector; FB-2 has distinct runtime-validated slots; the diagnostic gate,
+stripped gate repeats, four-role wrapping basebackup, listener reuse, alarm batteries, and teardown ledgers passed.
+True `PRESSURE` execution was not reached by the maximum-supported-client diagnostic shape and remains explicitly
+unexercised; no DPU DMA/ring/bridge ABI was touched, so DPU TCP smoke was not required.
 Graduated from the design
 [`../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md`](../../../future-directions/citus/transport/send_cqe_coalescing_and_pool_depth.md)
 (C1–C5). Prerequisite **§29(b) send-queue accounting is LANDED** (`postedSendWrs` / `retiredSendWrs` /
@@ -1191,17 +1195,221 @@ live afterwards. The deferred-reset arm and true multi-peer remain code-reviewed
 
 ### D-S3 Drain de-schedule: the pull points that replace the PEER_SEND_CQ collector
 
-1. **Post-clocked:** after any post that carried a signalled WR, bounded nonblocking poll (catches the
-   *previous* checkpoint's CQE; its own arrives later).
-2. **Pressure-forced:** on source-credit BLOCKED (`T:22637`→`blockedOnSourceCredit`), completion-ring
-   reservation failure, control mailbox/op exhaustion (`R:8613`), or admission WOULD_BLOCK — drain that
-   connection's send CQ synchronously, then retry once. ⚠ The credit gate at `T:22637` returns BLOCKED
-   *before* touching the CQ today; the drain must be inserted on that path or the retry loop spins without
-   ever freeing credit.
-3. **Terminal:** session close/reset drains until converged or, after Stage 2b, proof-backed DEFER retains the
-   session until a covering checkpoint/QP destruction rearms the indexed reset continuation.
-Then delete the `PEER_SEND_CQ` collector (`T:2747`/`T:17143`/`T:49533`), de-alias FB-2 posters, add the
-coalesced-poll stats macro.
+**Stage boundary (2026-07-17): Stage 3 is implemented + validated; this remains the source-of-truth map and
+acceptance record.**
+The short draft above was directionally right but omitted owner-install ordering, conflated local send-owner
+pressure with remote mailbox consumer credit, and did not enumerate the collector/FB-2 wiring. Stage 3 proceeds
+in the following order; later items must not land before item 1 proves control-only demand is represented.
+
+**Implementation/review status (2026-07-17): IMPLEMENTED + VALIDATED.**
+The first Stage-3 adversarial diff review rejected four shortcuts and the correction pass now records them as
+load-bearing current facts: (1) the compiled `DRAIN_COMMAND_SEND_CQ` action preserves its outer one-QP
+`maxItems/maxPolls` grant instead of rebuilding a 64-action subplan; the transport cursor carries fairness across
+passes; (2) every stream/session-local SEND_CQ or local-resource pressure observation pulls only its captured
+connection/generation, with ordinary pressure bounded to one pull plus one rescan, while only the proof-backed
+session-reset path retains its explicit two-second exact-QP convergence deadline; (3) the dormant broad peer-pump
+SEND_CQ phase is deleted, including zero/ALL-mask reachability; and (4) empty-POST diagnostic correlation requires
+matching generation plus retirement through the stored ordinal, with productive POST coverage cleared without
+mislabeling it scheduled/pressure. The nested coarse ready-set receives `peerTransportState` directly, so local or
+startup pumps with no peer request context still observe transport-global exact CQ demand. These corrections
+passed the ordered runtime acceptance recorded after item 7.
+
+The second Stage-3 adversarial pass found that coarse ready-set construction was aliasing one mutating readiness
+helper across all machine phases. The corrected design passes an explicit send-CQ readiness mode: only COLLECTOR
+mutates the machine cooldown and may grant the collector, SEMANTIC reads raw pending count only to decide whether
+its semantic scan is useful, RESET/LOCAL_IPC ignore send-CQ demand, and the non-machine fallback mutates its own
+cooldown exactly once per pass. The uninitialized-registry fallback CQ source now also carries
+`peerTransportState`, matching the initialized exact-action path. Enumeration adds a bounded fail-stop for the
+specific impossible boundary `aggregate pending != 0 && caller has capacity && full flat scan emitted no action`;
+it intentionally does not add a hot full-popcount audit or claim arbitrary-corruption coverage. Finally, successor
+wording is narrowed: normal close/abort and continuing traffic provide a later checkpoint, while accepted abnormal
+sub-threshold abandonment may retain its unsignalled tail until another checkpoint or verified QP destruction.
+The corrected phase-specific cooldown, fallback context, bounded fail-stop, and scoped successor contract passed
+the final static review and ordered runtime gate.
+
+1. **Exact control-only demand (the review-established gate).** Add `signalled` to
+   `TupleSinkServiceControlSendOwnerEntry` and maintain a per-connection
+   `controlSignalledSendOwnerCount`: increment only after a successfully posted signalled control WR has been
+   appended to `controlSendOwners[]`; decrement when that exact FIFO entry is swept. Assert/count-check
+   `controlSignalledSendOwnerCount <= controlSendOwnerCount`, and expose the generation-checked O(1) predicate
+   needed by exact-connection pressure/post hooks. Existing candidates are insufficient:
+   `signalledPostOrdinal-signalledRetiredOrdinal` mixes all WR classes, `controlSendOwnerCount` mixes signalled
+   and unsignalled owners, and `outstandingControlOps` is request-slot occupancy rather than CQ demand.
+   Maintain the control-specific count as a classification/proof counter, but make scheduler discovery uniformly
+   QP-wide: add a transport-global `sendCqDemandConnectionCount` plus a dedicated transport-owned indexed
+   connection set when `signalledPostOrdinal-signalledRetiredOrdinal` transitions 0->1 / 1->0. The index is
+   separate from `HomerControlReadyIndex`: send-CQE retirement demand and receive-mailbox readiness are different
+   events/lifetimes and must never clear each other's bits. Use direction + traffic-class bitsets (connection
+   indices are already bounded below 64), a generation-bearing action/enumeration API, and a retained cursor so
+   more than one 64-grant page cannot starve the stable suffix. Reset/destroy clears the exact bit and decrements
+   the aggregate before connection memset; a count/bit/per-QP mismatch is a fail-stop research-prototype
+   invariant failure.
+
+   **Rejected narrower corrections:** the service active owner-shard list is not a complete control-demand index.
+   It intentionally contains only CRITICAL_CONTROL QPs, while payload OPEN/CLOSE control requests publish on the
+   already-selected FOREGROUND/BULK payload QP. Once that stream has no payload/ACK owner, the payload loop also
+   stops discovering the connection. Nor is it sufficient to add an independent control scan before/after the
+   current command-shard and payload scans: whichever family runs first can fill the shared 64-handle cap forever.
+   Therefore the one transport index covers **all signalled checkpoints on all traffic classes and owner
+   families**. `TupleSinkServiceAccountPostedSendChainRdma` may arm the bit before semantic owner commit because it
+   does not poll or yield; the single service thread cannot execute the indexed collector until the post call
+   returns. The matching common scalar-retire path clears the bit, including bootstrap/blocking waiters, so their
+   dedicated consumer cannot leave a stale scheduler demand.
+
+2. **One canonical bounded exact-QP pull, with safe owner ordering.** Add one internal typed-drain core, using
+   the already-registered persistent retirement callbacks, with reason-tagged wrappers for POST_CHECKPOINT and
+   PRESSURE. POST_CHECKPOINT requests at most one CQE; PRESSURE requests one bounded poll batch. First fix the
+   canonical drain's `maxCqes` enforcement: today it asks `ibv_poll_cq()` for 16 entries and checks `maxCqes`
+   only after dequeue, so a `maxCqes=1` caller can silently discard already-dequeued CQEs 2..16. Cap the actual
+   poll request to the remaining budget before polling. Track handled CQEs in an unconditional local counter;
+   `drainResult` is optional reporting and must not be required for the bound to work.
+
+   **Rejected placement:** do not poll in `TupleSinkServiceAccountPostedSendChainRdma`. Command and completion
+   owners have `frontierMark=0` until their post-success stamp/link (`T:21655-21659`, `T:24115-24119`), and the
+   control owner is appended only after the post helper returns (`R:9433-9435`). A low-level immediate poll can
+   therefore sweep the new owner before it exists (or while its zero mark makes it look already covered); the
+   same accounting helper also serves bootstrap/blocking sends whose CQE has a dedicated waiter. Post-clocked
+   pulls run only at each **semantic commit tail**, after every field its retirement callback reads or mutates and
+   after the posting caller's last access to the owner/source slot:
+
+   | family | hook must be after |
+   |---|---|
+   | command | sweep-link **and** outstanding/pending/accepted-epoch, terminal latch, awaiting-terminal mark, stats/delta bookkeeping; place immediately before the successful return from `TupleSinkServicePostRemoteClientSqlCommandRecord` |
+   | peer-client completion | sweep-link, source state READY_POSTED, published epoch + last-state fields, terminal latch and stats; place immediately before the successful return from `TupleSinkServicePublishPeerClientCommandCompletion` |
+   | control async request | `TupleSinkServicePublishControlMessage` owner append **and** every returned `asyncOp` identity/`requestPublished` field |
+   | synchronous/deferred control response | owner append, response-post ticket/latch handling or `*posted=true`, and the caller's last response-slot access; never inside the common publish helper |
+   | payload | `HomerServiceCommitPayloadSendOwnerReservation` plus posted-tail/credit/progress fields at every byte-ring, DPU-mirror, and regular-object success tail |
+   | receiver-head ACK | owner POSTED state plus posted tail/next-token/frontier/progress fields at both ACK success tails |
+
+   The earlier “after link/owner live” wording was rejected: command retirement can decrement outstanding before
+   the caller increments it; completion retirement can memset/recycle the source slot before the caller marks it
+   READY_POSTED; payload/ACK retirement similarly observes post-commit frontier fields. For control, plumb the
+   actual checkpoint decision out of `TupleSinkServicePublishControlMessage`, but invoke the hook only at the
+   three outer semantic commit tails. A pull failure is post-success, hence never retryable as a post; record it
+   once and request/reset/fail-stop through the existing transport error boundary.
+
+3. **Pressure-forced pull, then exactly one retry/rescan.** Keep
+   `TupleSinkServiceAdmitSendChainRdma` a pure non-mutating arithmetic predicate; put drain/retry around the
+   pre-post pressure site instead of hiding callbacks inside admission.
+
+   - Command source credit: both the inner gate in `TupleSinkServicePostRemoteClientSqlCommandRecord`
+     (`T:23898-23901`) and the outer host-pump shortcut (`T:24254-24257`) must pull the session's exact QP,
+     reread `acceptedEpoch-retiredEpoch`, and block only if still full. This explicitly closes the early-BLOCKED
+     spin identified by review and covers both host and selected-DPU callers.
+   - Peer-client completion source-ring reservation (`T:21312-21331`): on the first full scan, pull the exact
+     QP and rescan once before returning `BLOCKED_SOURCE_CREDIT`. Its send-unit preflight WOULD_BLOCK
+     (`T:21516-21527`) likewise pulls and retries the preflight once, before any CQ owner/post mutation.
+   - Control request-op exhaustion (`R:9586-9626`) and response-publish-slot exhaustion (`R:9788-9833`): use
+     scan -> one bounded exact-QP pressure pull -> one rescan. The current response-slot two-drain/three-scan
+     loop becomes one retry, matching the Stage-3 bound. Do not gate this pressure pull solely on
+     `controlSignalledSendOwnerCount`: a pending command/completion/payload checkpoint on the same QP can sweep
+     earlier unsignalled control owners. The exact-QP generic predicate is
+     `signalledPostOrdinal != signalledRetiredOrdinal`; if it is zero, the bounded final rescan/error remains.
+     A nonzero ordinal delta authorizes a useful nonblocking **attempt**; it does not prove the CQE has arrived or
+     that this particular pool will free. A table of WAIT_RESPONSE ops whose sends already retired needs
+     recv/mailbox progress instead, so one pull + one rescan is the deliberate bound.
+   - Admission WOULD_BLOCK: command/completion use the unit preflight wrapper; control, payload batch/byte-ring,
+     and receiver-head ACK use an explicit pre-post admit-with-one-pressure-retry wrapper. The ordinary per-post
+     admission inside split-unit leaf helpers remains a defensive backstop and must not poll between a
+     successful all-or-nothing unit preflight and its final post.
+
+   Control ordering is stricter than “before verbs”: compute the control signal decision and complete the
+   pressure-aware one-WR preflight before `TupleSinkServicePublishControlMessage` writes `messageSource`'s
+   `ringSequence` / `senderConsumedHead` or `*tailSource` (`R:9319-9329`). The later leaf admission stays a pure
+   backstop. Control-op full retry stays inside `TupleSinkServiceReservePeerControlOp`'s scan using the already
+   chosen message sequence; never replay the outer `++nextOutgoingMessageSequence` (`R:13332`) around the drain.
+
+   `outgoingControlPublishedTail - peerControlConsumedHeadMirror == mailbox slots` is **remote consumer
+   credit**, not local send-CQ pressure: a local send drain cannot advance it. Leave that return under the recv
+   CQ/mailbox progress path. Owner insertion failures after post and partial-post failures remain invariant/
+   terminal paths, not retryable pressure.
+
+4. **Keep exact pending-CQE liveness, then delete only the scheduled generic collector.** A post-clock pull is
+   opportunistic: if it runs before the newly signalled CQE is ready, exact demand remains nonzero. Fold the
+   global send-CQ demand count into `HomerServiceCommandSendCqReadyForScheduler` /
+   `HomerMachineBaselinePolicyCommandSendCqDue`, and replace the three separately capped command-shard,
+   payload/ACK, and new-control discovery walks in `HomerServiceExecuteCqDrainProgressPlan` with the transport's
+   one fair direction/class index. Each action is `(handle,generation,direction,class,index)` validated immediately
+   before polling; one retained cursor round-robins across the unified index, so the 64-grant cap carries work over
+   without cross-family or stable-suffix starvation. Keep granting the typed collector on its bounded cooldown
+   until the global/per-QP pending checkpoint count reaches zero. Also map machines waiting on the surviving generic
+   `HOMER_PROGRESS_WAIT_PEER_SEND_CQ` vocabulary to this exact typed collector rather than to the deleted broad
+   peer scan. This closes the quiet **signalled-but-unpolled** control checkpoint: POST_CHECKPOINT catches it when
+   already ready; otherwise the exact scheduler fallback eventually does, while pressure can accelerate it.
+
+   Re-audit terminal close/reset paths:
+   they must either consume the exact QP's pending checkpoint(s) to convergence or take the already-landed
+   Stage-2b proof-backed DEFER/QP-destruction path. Then delete
+   `HOMER_PROGRESS_COLLECTOR_PEER_SEND_CQ` and `HOMER_PROGRESS_ACTION_DRAIN_PEER_CONTROL_SEND_CQ` from the enum,
+   registry, collector candidate/demand builder, machine-baseline peer bundle/wait order, source-to-action maps,
+   executor, feedback, stats labels, and comments. Remove SEND_CQ from the broad peer pump phase. Do **not**
+   blindly delete `HOMER_PROGRESS_SOURCE_PEER_SEND_CQ` or `HOMER_PROGRESS_WAIT_PEER_SEND_CQ`: the two DPU egress
+   collectors and close/dependency vocabulary still use them until separately migrated. Any surviving source
+   arm must route only to those live owners; no generic source -> deleted drain action compatibility path remains.
+   `COMMAND_SEND_CQ` is now a historical name for the typed exact-QP drain across every WR owner class and traffic
+   class. Update its comments and `CONTRACTS.md` so nobody narrows it back to command-only or critical-only. The static
+   deletion gate is zero textual occurrences of both `HOMER_PROGRESS_COLLECTOR_PEER_SEND_CQ` and
+   `HOMER_PROGRESS_ACTION_DRAIN_PEER_CONTROL_SEND_CQ`; the surviving source token must be reachable only through
+   the two explicitly indexed DPU egress collectors, never a generic source-to-action compatibility arm.
+
+5. **FB-2, exact cardinality two.** Add the canonical map
+   `DPU_PEER_COMMAND_EGRESS -> 0`, `DPU_PEER_COMPLETION_EGRESS -> 1`, every other collector -> NONE; add a
+   runtime validator proving range, injectivity, exact count, and full slot coverage, and call it at registry
+   init. Route both source-ref stamping and feedback write/read resolution through this one map. Store two
+   independent source cores/refs stamped with indices 0/1 **and** two independent feedback slots, replacing the
+   scalar `peerSendCqSource` / `peerSendCqFeedback` alias. Source-core and feedback resolvers range-check and index
+   both arrays; collector -> source, writer feedback, and reader feedback all derive the slot from the one map.
+   Add per-slot writer-attribution/owner validation analogous to the DPU-DMA feedback guard so a source stamped by
+   one egress collector cannot update the other's slot. This mirrors
+   `HomerServiceDpuFeedbackSlotForCollector` / `HomerServiceValidateDpuFeedbackSlotMap`; a `_Static_assert` is
+   insufficient because it cannot prove the mapping is a bijection. Update the `+` starvation-diagnostic legend.
+
+6. **Owner-requested cost measurement.** Extend the existing default-off
+   `HOMER_SERVICE_PEER_TRANSPORT_STATS` block rather than adding always-on hot-path stores. Record separately for
+   POST_CHECKPOINT and PRESSURE: calls, actual `ibv_poll_cq` calls, empty polls, CQEs handled, total elapsed ns,
+   and max elapsed ns. Clock reads and counter updates compile out in performance builds. Emit the aggregate
+   beside `TupleSinkServiceLogPeerTransportStatsRdma`; validation captures an explicitly bracketed diagnostic
+   run, reports average/max and productive/empty ratios, then rebuilds the final non-diagnostic candidate before
+   the acceptance workloads. Nanoseconds were chosen over cycles to avoid calibrated invariant-TSC and CPU
+   migration assumptions; timer overhead is part of the diagnostic build and must not be compared as candidate
+   throughput.
+
+7. **Stage-3 acceptance and commit boundary.** Format and all-target build; adversarial diff review; diagnostic
+   cost run proving post-clock and pressure counters are distinguishable; final forced non-diagnostic rebuild
+   with stats strings absent; selected-DPU gate + four-role basebackup with wrap proof and zero Stage-1/2/3/global
+   alarm battery on both DPUs; DPU setup listener remains live. FB-2's validator must pass at startup; both egress
+   collectors must show nonzero grants attributed to their own distinct source/feedback slot, and their two own-age
+   counters must each remain below `MAX_SKIP_GRANTS` (the age counters alone do not prove non-aliasing). Exact
+   send-CQ demand must return to zero globally (aggregate + every direction/class index bit) and per connection on
+   every surviving ready QP of every traffic class, while the control-specific signalled-owner count also returns
+   to zero; reset/destroy must prove it removed any still-armed bit before memset. Add bounded diagnostic-only
+   per-QP correlation (direction/class/index, generation, pending ordinal) so
+   the run can prove an empty post-clock attempt was later covered by a productive exact scheduled/pressure pull,
+   rather than correlating unrelated aggregate counters. For pressure coverage, first use a stats-enabled sustained
+   maximum-supported-client selected-DPU diagnostic run; require nonzero PRESSURE calls/polls when that shape
+   reaches pressure, and otherwise explicitly record the arm as unexercised instead of manufacturing a PASS.
+   Record the exact run evidence and
+   any research-scope residuals here and in the retirement audit, update current `CONTRACTS.md`, then commit code,
+   comments, contracts, and KB together. DPU TCP smoke is not required unless implementation unexpectedly touches
+   DPU DMA, byte-ring geometry, or the bridge ABI.
+
+   **Acceptance record (2026-07-17): PASS.** The diagnostic selected-DPU gate completed 4,000/4,000 transactions.
+   Direct-DPU POST_CHECKPOINT pulls were 5,248 polls / 63 CQEs, average 1,471.6 ns and maximum 65.281 us;
+   farnet0-DPU pulls were 454 / 32, average 1,991.5 ns and maximum 8.970 us. Every recorded empty POST attempt
+   was later covered by a productive scheduled pull (5,124 direct and 422 farnet0). `PRESSURE` stayed at zero on
+   both DPUs, so that arm is honestly unexercised under the permitted acceptance rule. FB-2 attributed 26,806
+   grants to completion-egress slot 1 and 23,180 to command-egress slot 0, both at maximum own-age zero with no
+   owner mismatch. Final indexed demand and control-signalled-owner counts were zero.
+
+   The stripped warmup was discarded; five 2,000-transaction repeats completed with zero failures at
+   299.207 / 300.422 / 297.390 / 299.907 / 298.754 TPS (mean 299.136). These are candidate measurements, not a
+   regression verdict, because no exact same-lineage baseline was available. The separately bracketed debug gate
+   passed 5/5. Four-role basebackup tag 656829856 delivered 23,255,654,972 bytes in 15.52 seconds, proving 44,356
+   complete 524,288-byte laps plus 336,444 bytes; both roles exited zero with `CLOSE_ACK`. A subsequent 1/1 gate
+   proved listener reuse. Both DPU alarm batteries were empty, teardown ledgers balanced, every frontier satisfied
+   `posted = retired + flushed`, and final process/listener/shared-memory scans were clean. Checked-in evidence is
+   under `/tmp/farnet-validation-stage3-fresh-20260717T124510Z/evidence/`; DPU TCP smoke was correctly omitted
+   because Stage 3 changed no DPU DMA, byte-ring geometry, or bridge ABI.
 
 ### D-S1 Stage 1 — ✅ IMPLEMENTED + VALIDATED (3 validation rounds, 5 codex review rounds; 2026-07-16; audit §51)
 

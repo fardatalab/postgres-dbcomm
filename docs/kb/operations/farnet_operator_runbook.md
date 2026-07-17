@@ -142,6 +142,10 @@ The required installed closure includes `postgres`, `pgbench`, `pg_basebackup`, 
 `citus.so`, installed Homer headers, and `libhomer_client.a`. After a protocol/control-region change, prove consumers
 agree:
 
+On this Meson installation, the extension object is
+`/data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so`; do not use the stale path without the
+`postgresql/` component in receipt or diagnostic scripts.
+
 ```sh
 strings /data/dbcomm/pg-citus/bin/pgbench | grep citus_remote_execution_control
 strings /data/dbcomm/pg-citus/bin/citus_tuple_sink_service | grep citus_remote_execution_control
@@ -483,10 +487,11 @@ Use `slots=4,bytes=524288`, the same unique tag on both roles, and `-X none`. St
 first using the checked-in helper:
 
 ```sh
-TAG=t$(printf '%s' "$RUN_ID" | tr -cd 'A-Za-z0-9' | tail -c 11)
-# The leading letter is LOAD-BEARING: an all-numeric tag is parsed as int32 by the basebackup
-# `tag=` target option (pg_strtoint32, basebackup_homer.c:~233) and a 12-digit run-derived tag
-# overflows it -- the sender aborts and the still-waiting receiver hangs (observed 2026-07-17).
+read -r TAG_CRC _ < <(printf '%s' "$RUN_ID" | cksum)
+TAG=$((TAG_CRC % 2147483647 + 1))
+[[ "$TAG" =~ ^[0-9]+$ ]] && (( TAG >= 1 && TAG <= 2147483647 )) || exit 2
+# LOAD-BEARING: the sender target option uses pg_strtoint32.  Derive a stable,
+# positive numeric int32 tag and reject bad values before starting the consumer.
 ssh farnet0 "/tmp/farnet-validation-$RUN_ID/helpers/basebackup_consumer.sh" \
   start "$RUN_ID" /data/dbcomm/pg-citus "$DBOID" "$USEROID" "$TAG" 4 524288
 ```

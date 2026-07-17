@@ -8078,3 +8078,50 @@ control/head-mirror owners, and `free_slots=3072/3072`, `fatal=false`; services 
 mislabelled retirement. True simultaneous multi-peer execution and a deterministic injected deferred-reset
 transition remain code-reviewed-only because the current acceptance topology does not exercise them; this is the
 plan-approved research-prototype boundary, not a hidden runtime claim. **Stage 2b is accepted; next is Stage 2c.**
+
+## §55 — send-CQE coalescing Stage 3 implemented and validated: exact indexed demand replaces the broad collector. 2026-07-17.
+
+**Status: IMPLEMENTED + VALIDATED as Citus `c0b9f06bd`.** The canonical design and acceptance record are
+`send_cqe_coalescing_implementation_plan.md` D-S3. Stage 3 completes the coalesced send-CQ retirement work without
+leaving a quiet signalled tail: the transport owns one direction/class/index demand bitmap and aggregate count,
+arms it on the first unretired signalled frontier, and clears it on common scalar retirement or verified reset.
+`TupleSinkServiceSetSendCqDemandIndexed` (`remote_execution_peer_transport_rdma.c:1514`) owns bit/count mutation;
+`TupleSinkServiceEnumeratePeerSendCqDemandRdma` (`remote_execution_peer_transport_rdma.c:5520`) emits bounded,
+generation-bearing exact actions with a retained fair cursor; and `TupleSinkServicePullPeerSendCqRdma`
+(`remote_execution_peer_transport_rdma.c:5628`) is the one reason-tagged bounded exact-QP pull. The actual verbs
+dequeue is capped by the caller's remaining `maxCqes`, so a poll-one caller cannot dequeue and discard a suffix.
+
+The semantic post tails invoke `POST_CHECKPOINT` only after each retirement owner is fully committed. Local
+owner/admission pressure invokes `PRESSURE`, then performs one rescan/retry; remote mailbox consumer credit remains
+on recv progress and is not mislabeled as send-CQ pressure. The scheduler's surviving historical
+`COMMAND_SEND_CQ` name now means the typed exact-QP drain across every owner and traffic class. The broad
+`PEER_SEND_CQ` collector/action and broad peer-pump reachability are deleted. Coarse readiness is phase-specific:
+only COLLECTOR mutates/consumes the machine cooldown, SEMANTIC reads pending state without consuming it, and the
+non-machine fallback owns a separate once-per-pass cooldown. This correction closes the static-review starvation
+counterexample in which the due sample could always land in a phase incapable of granting the collector.
+
+Control sends now classify signalled FIFO owners through per-connection `controlSignalledSendOwnerCount`
+(`remote_execution_peer_transport_rdma.c:1177`, insertion/sweep at `:4701-4765`), while QP-wide demand remains the
+scheduler truth. FB-2 is de-aliased into exactly two source/feedback slots; the runtime bijection validator
+`HomerServiceValidatePeerSendCqFeedbackSlotMap` (`tuple_sink_service_process.c:4299`) proves injective/full coverage
+at registry initialization. Diagnostic counters attribute writer ownership and age per slot. Normal close/abort or
+continued traffic provides a later checkpoint; accepted abnormal sub-threshold abandonment may retain a bounded
+unsignalled tail until another checkpoint or verified QP destruction. Arbitrary corruption and extraordinary
+post-success abandonment remain outside this research-prototype proof boundary.
+
+**Runtime acceptance: PASS.** The diagnostic selected-DPU gate completed 4,000/4,000. POST_CHECKPOINT cost was
+5,248 polls / 63 CQEs at 1,471.6 ns average and 65.281 us maximum on the direct DPU, and 454 / 32 at 1,991.5 ns
+average and 8.970 us maximum on the farnet0 DPU. All 5,124 direct and 422 farnet0 empty post-clock records were
+later covered by productive scheduled pulls. The maximum-supported-client shape did not enter `PRESSURE`, so that
+arm remains explicitly unexercised rather than inferred green. FB-2 reported completion-egress slot 1 with 26,806
+grants and command-egress slot 0 with 23,180 grants, both maximum own-age zero and no owner mismatch. Final indexed
+demand and control-signalled-owner counts were zero.
+
+After a discarded warmup, five stripped 2,000-transaction repeats completed without failure at 299.207 / 300.422 /
+297.390 / 299.907 / 298.754 TPS (mean 299.136); these are candidate measurements, not a same-lineage regression
+verdict. A separately bracketed debug gate passed 5/5. Four-role basebackup delivered 23,255,654,972 bytes in
+15.52 seconds with both roles exit zero and `CLOSE_ACK`, proving 44,356 full 524,288-byte laps plus 336,444 bytes.
+The following 1/1 gate proved listener reuse. Both DPU alarm batteries were empty, teardown ledgers balanced, every
+send frontier satisfied `posted = retired + flushed`, and final process/listener/shared-memory scans were clean.
+Evidence is under `/tmp/farnet-validation-stage3-fresh-20260717T124510Z/evidence/`. DPU TCP smoke was not required:
+Stage 3 changed no DPU DMA, byte-ring geometry, or bridge ABI.

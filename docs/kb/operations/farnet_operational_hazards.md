@@ -101,8 +101,16 @@ The safe distinction is explicit:
 
 Do not use `[[ -s /proc/<pid>/cmdline ]]` for this classification. procfs reports a zero `st_size` for cmdline even
 when a bounded content read returns user-process arguments, and a live user task can also have an empty cmdline.
-The checked-in `proc_identity.py classify` helper reads `/proc/<pid>/stat` and one cmdline byte, and uses
-`PF_KTHREAD`/zombie state rather than file size as the clean no-executable proof.
+The checked-in `proc_identity.py scan` helper resolves the complete snapshot in one interpreter, pins production
+PIDs while reading identity, and uses `/proc/<pid>/stat`, a bounded cmdline read, and `PF_KTHREAD`/zombie state rather
+than file size as the clean no-executable proof. The wrappers try one unprivileged batch and, only if it contains an
+unreadable user identity, repeat the whole batch once through `sudo -n`. Proven kernel tasks, zombies, and raced exits
+are aggregate counts by default; `HOMER_VALIDATION_VERBOSE_PROC=1` restores per-PID benign records. Do not regress
+to one interpreter or sudo invocation per PID: that shape took 8.37 seconds for a stopped-DPU probe with 370 kernel
+tasks, versus 1.03 seconds for the final batch scan on 2026-07-17. Retain per-process pidfd revalidation only after
+the batch selects a process that affects the verdict: DPU executable hashing validates PID/start/executable before
+and after the hash, and cleanup validates the same identity immediately before signaling. This cold matched-process
+work does not belong in the full-snapshot loop.
 
 ### 1.5 Never `kill -9` a LIVE `postgres: remote exec backend` mid-run
 
@@ -219,6 +227,31 @@ if ! strings "$BIN" | grep -F "$PROOF" >/dev/null; then echo "NOT LANDED"; exit 
 It failed *safe* (a false negative, not a false pass), which is the only reason it did not cost a run. But it is
 the same disease this whole KB keeps cataloguing: **a diagnostic whose success is indistinguishable from its
 failure.** The same trap arms any `... | head -1`, `... | grep -m1`, or `... | read` under `pipefail`.
+
+### 3.3c A successful `tee` can mask a failed validation script
+
+Observed on 2026-07-17 during Stage-3 stripped acceptance. The inner script used `set -euo pipefail` and correctly
+stopped when `pg_basebackup` rejected an invalid tag, but the interactive wrapper was:
+
+```sh
+bash run_acceptance.sh 2>&1 | tee evidence.txt
+```
+
+The outer shell had no `pipefail`, so the command reported `tee`'s zero status. Evidence-file presence and a zero
+wrapper status therefore looked green even though reuse and teardown files were absent. Use one of these forms and
+still verify the terminal receipt set:
+
+```sh
+set -o pipefail
+bash run_acceptance.sh 2>&1 | tee evidence.txt
+
+# Or avoid the pipeline when live streaming is not required.
+bash run_acceptance.sh >evidence.txt 2>&1
+```
+
+The basebackup tag failure also established a separate preflight contract: `tag=` is parsed by `pg_strtoint32`, so
+the tag must be numeric and within positive signed-int32 range. Validate it before starting the consumer; otherwise
+the sender can reject immediately while the receiver remains waiting.
 
 ### 3.4 Install order is load-bearing (since command-plane S2)
 

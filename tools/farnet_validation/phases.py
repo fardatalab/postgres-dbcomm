@@ -7,6 +7,7 @@ import re
 import time
 import fcntl
 import os
+import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -41,6 +42,14 @@ class RunConfig:
 
 def _sudo_dbcomm(*argv: str) -> tuple[str, ...]:
     return ("sudo", "-n", "-u", "dbcomm", *argv)
+
+
+def _basebackup_tag(run_id: str) -> str:
+    """Return a stable positive int32 tag accepted by both basebackup roles."""
+    # The target-option parser uses pg_strtoint32().  Keep the run-derived tag
+    # numeric and in range rather than passing an opaque run-id suffix through.
+    tag = zlib.crc32(run_id.encode("utf-8")) & 0x7fffffff
+    return str(tag or 1)
 
 
 def _remote_helper_names() -> tuple[str, ...]:
@@ -214,7 +223,7 @@ class PhasePlanner:
                      f"{phase}-farnet1-dpu-interval", f"{phase}-farnet0-dpu-interval")
             return [replace(spec, name=name) for spec, name in zip(specs, names)]
         if phase == "basebackup":
-            tag = c.run_id.replace("-", "")[-12:]
+            tag = _basebackup_tag(c.run_id)
             specs = [invoke_spec("dpu", c.run_id, "dpu_supervisor.sh", ("mark", c.run_id, "basebackup"), pg),
                     invoke_spec("farnet0", c.run_id, "dpu_dispatch.sh",
                                 ("dpu_supervisor.sh", "mark", c.run_id, "basebackup"), pg),

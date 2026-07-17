@@ -1,7 +1,9 @@
 from pathlib import Path
+import os
+import subprocess
 import unittest
 
-from tools.farnet_validation.phases import PhasePlanner, RunConfig, render_plan
+from tools.farnet_validation.phases import PhasePlanner, RunConfig, _basebackup_tag, render_plan
 from tools.farnet_validation.profiles import PROFILES, expand_profile
 from tools.farnet_validation.remote_helpers import HELPER_ROOT
 
@@ -44,6 +46,35 @@ class ProfileTests(unittest.TestCase):
         self.assertIn("--homer-peer-host 10.10.1.201", (HELPER_ROOT / "gate.sh").read_text())
         sender = next(c for c in commands if c["name"] == "basebackup-sender")
         self.assertTrue(any("host=10.10.1.200" in arg for arg in sender["argv"]))
+
+    def test_basebackup_tag_is_stable_positive_int32(self):
+        tag = _basebackup_tag("stage3-fresh-20260717T124510Z")
+        self.assertEqual(tag, _basebackup_tag("stage3-fresh-20260717T124510Z"))
+        self.assertTrue(tag.isdecimal())
+        self.assertGreaterEqual(int(tag), 1)
+        self.assertLessEqual(int(tag), 2147483647)
+
+        config = RunConfig("alpha-run-id", "transport-acceptance", "current-source", "dpus",
+                           "/pg", "/citus", "/prefix", "/tmp/evidence")
+        sender = next(spec for spec in PhasePlanner(config).specs("basebackup")
+                      if spec.name == "basebackup-sender")
+        target = next(arg for arg in sender.argv if arg.startswith("homer:"))
+        self.assertIn(f"tag={_basebackup_tag(config.run_id)}", target)
+
+    def test_basebackup_consumer_rejects_bad_tag_before_state_creation(self):
+        run_id = f"tag-preflight-test-{os.getpid()}"
+        state = Path(f"/tmp/farnet-validation-{run_id}/basebackup-consumer")
+        helper = str(HELPER_ROOT / "basebackup_consumer.sh")
+
+        for tag in ("bad-tag", "0", "2147483648", "99999999999"):
+            result = subprocess.run(
+                ["bash", helper, "start", run_id, "/prefix", "5", "10", tag, "4", "524288"],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertFalse(state.exists())
 
     def test_only_peer_postgres_stop_allows_missing_data(self):
         config = RunConfig("test", "transport-acceptance", "current-source", "dpus",
