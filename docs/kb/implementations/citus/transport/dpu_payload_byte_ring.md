@@ -1,6 +1,6 @@
 # DPU Payload Byte-Ring: Wrap Protocol, Mirror, and Invariants
 
-<!-- kb-summary: Current DPU payload byte-ring wrap protocol, mirror geometry, egress parsing, and invariants. -->
+<!-- kb-summary: Current DPU payload byte-ring wrap protocol, per-session pooled staging/landing/source slots, byte-verbatim egress, and invariants. -->
 
 ## Scope
 
@@ -8,8 +8,10 @@
   DPU-offloaded path — the control-block + payload-storage layout, the ring
   **wrap-gap protocol** (physical wrap gaps, distinct from semantic
   fragmentation), the per-direction frontiers, the DPU-local **mirror** of the
-  source ring, and the **reframing** RDMA egress that parses per-record transport
-  headers. It also records a mirror-ring bug and the decided fix.
+  source ring, and the byte-verbatim, position-preserving RDMA egress. Every
+  data-carrying DPU ring is a per-stream pool slot bound at stream open:
+  `MIRROR`, `LANDING`, and, for the two-ring SQL-result relay, `SOURCE`. It also
+  records superseded mirror-ring designs and bugs.
 - **What this doc does NOT cover**: the host-service (non-DPU) service↔service
   byte-ring substrate — see
   [byte_ring_payload_stream_checkpoint.md](byte_ring_payload_stream_checkpoint.md).
@@ -17,8 +19,8 @@
   [cross_node_dpu_migration_checkpoint.md](cross_node_dpu_migration_checkpoint.md).
 - **Primary directory**: `docs/kb/implementations/citus/transport/`
 - **Doc type**: implementation / grounded invariants
-- **Source**: `src/backend/distributed/utils/homer/homer_service_dpu_dma.c`,
-  `.../tuple_sink_service_process.c`
+- **Source**: `src/backend/distributed/utils/homer/homer_dpu_byte_ring_pool.c/.h`,
+  `.../homer_service_dpu_dma.c`, `.../tuple_sink_service_process.c`
 
 ## Why this exists
 
@@ -26,7 +28,7 @@ A byte ring is a continuous head/tail byte stream, but the code carries several
 non-obvious, load-bearing invariants that are only implicit in the source — and
 both an automated refactor and a careful human review got them wrong once (the
 mirror-ring stall below). This doc makes those invariants explicit so future work
-(byte-orienting more paths, removing slots, Part 3.5 tuple two-ring) does not
+(preserving byte-verbatim relaying and pooled per-stream ownership) does not
 re-earn the same bugs.
 
 ## Layout: control block + payload storage
@@ -64,7 +66,7 @@ consulted to decide gap-vs-record. Concretely:
   header at the record cursor even in the gap** so the consumer's fit test always
   has a length to read. The selected-DPU basebackup producer does this by copying
   the real next-record `CitusTupleSinkTransportHeader` into the gap
-  (`homer_client.c:3814-3838`) — which doubly serves the DPU egress's wrap proof.
+  (`homer_client.c:3814-3838`).
 - **Consumer:** detect the gap by geometry only — (1) `contiguousBytes <
   minRecordBytes` ⇒ no record can start here; (2) transport length `recordBytes >
   contiguousBytes` ⇒ the record will not fit before the wrap ⇒ gap. Skip the dead
@@ -73,8 +75,8 @@ consulted to decide gap-vs-record. Concretely:
   producer leaves *stale* bytes in the gap (no readable length header), which forced
   its consumer (`HomerClientDrainResultSinkUntil`) to guess the gap via an
   ordinal/protocol *content-mismatch*. That is the wrong pattern and exists only in
-  the soon-to-be-deleted host-service path. New producers/consumers — basebackup
-  now, the Part 3.5 DPU tuple sink later — are geometry-only.
+  the soon-to-be-deleted host-service path. The selected-DPU basebackup and SQL-result
+  producers/consumers are geometry-only.
 
 Consequences that MUST be preserved:
 
@@ -94,12 +96,14 @@ Consequences that MUST be preserved:
   fragment path, and the CPU reassembler — was then deleted in "P1.6", which also made
   header-ready + the reassembler *reject* any FRAGMENT bit. The `FRAGMENT_FIRST/LAST` ABI
   bits are now reserved and never produced.)
-- **The wrap gap is relayed VERBATIM and skipped by geometry.** Because mirror-1:1
-  makes source ring == peer ring, the egress writes `[absoluteStart, absoluteEnd)` (gap
-  padding included) to matching offsets; the consumer skips the gap by geometry
-  (`recordBytes > contiguousBytes`). The old separate source-skip (`outgoingSourceSkip*`)
-  is gone — one wrap split (`ringBytes - absolute % ringBytes`) now covers it, in the
-  shared helper `HomerByteRingRelayNextChunk`.
+- **The wrap gap is relayed VERBATIM and skipped by geometry.** The logical sender
+  host ring and remote receiver ring are equal per pair; the DPU mirror is only a
+  size-decoupled staging slot. Egress writes `[absoluteStart, absoluteEnd)` (gap
+  padding included) at matching logical offsets, and the consumer skips the gap by
+  geometry (`recordBytes > contiguousBytes`). The old separate source-skip
+  (`outgoingSourceSkip*`) is gone — one wrap split (`ringBytes - absolute % ringBytes`)
+  now covers it, in the shared helper `HomerByteRingRelayNextChunk`. See the current
+  slot-versus-ring contract in [CONTRACTS.md](CONTRACTS.md).
 
 ## Directions and their consumers (now SYMMETRIC — both pure byte relays)
 
@@ -107,26 +111,30 @@ As of July 6 (P1.5, see cross-node checkpoint) both directions are the SAME
 position-preserving, object-agnostic byte relay — no record parse, no re-framing, split
 only at the ring wrap and scheduler/credit limits, sharing `HomerByteRingRelayNextChunk`:
 
-- **host→DPU pull → RDMA egress (sender side, basebackup)** — the DPU pulls the host
-  producer ring into a DPU-local **mirror**, then RDMA-relays the ready mirror range
+- **host→DPU pull → RDMA egress (sender side)** — the DPU pulls the host producer
+  ring into that stream's DPU-local `MIRROR` pool slot, then RDMA-relays the ready range
   `[absoluteStart, absoluteEnd)` verbatim to the peer ring at matching offsets
   (`HomerServicePumpOutgoingDpuMirrorByteRingPayload`). Byte-only; a chunk may end
   mid-record (the no-torn frontend defers until the record is whole; RC write ordering
   puts payload before the tail doorbell).
-- **DPU→host write (receiver side, basebackup relay)** — the same shape over DMA: the far
-  sender RDMA-writes byte ranges into the DPU landing ring and the DPU DMA-relays
+- **DPU→host write (receiver side)** — the same shape over DMA: the far sender
+  RDMA-writes byte ranges into that stream's `LANDING` pool slot and the DPU DMA-relays
   `[writtenTail, publishedTail)` to the host consumer ring, split only at the wrap. No
-  header parse. See `HomerServicePumpIncomingByteRingDpuRelay`.
+  header parse. Basebackup uses its landing ring as the DMA source; the two-ring
+  SQL-result path binds a separate `SOURCE` slot for post-deform output. See
+  `HomerServicePumpIncomingByteRingDpuRelay`.
 
 (Historical note: the sender egress used to be the asymmetric one — it parsed framing
 headers and re-fragmented per record. That reframing was removed; the two directions are
-now genuine mirror images. Routing the receive relay through `HomerByteRingRelayNextChunk`
-and the two-ring tuple path are tracked follow-ups.)
+now genuine mirror images. The per-session pool migration is complete and validated:
+Stage 1 supplies basebackup `MIRROR`/`LANDING` slots, and Stage 2 supplies the
+SQL-result `SOURCE` slot; see
+[dpu_byte_ring_pool_per_session_plan.md](dpu_byte_ring_pool_per_session_plan.md).)
 
 ## The frontend byte-ring sink core (host consumer) — no-torn-object + geometry-only gaps
 
-The FINAL host consumer (basebackup `--homer-receive` now; the Part 3.5 DPU tuple
-sink later) drains WHOLE objects out of the host consumer ring through ONE shared
+The FINAL host consumer (basebackup `--homer-receive` and the selected-DPU SQL-result
+path) drains WHOLE objects out of the host consumer ring through ONE shared
 inline core: `src/include/distributed/homer/homer_byte_ring_sink.h`
 (`HomerByteRingSinkDrain`). It is header-only so it compiles into the external
 client TU (`homer_client.c`, no `postgres.h`) and, later, a backend TU, with no
@@ -242,24 +250,28 @@ multiples. Do not trust power-of-two coincidence for wrap alignment.
 
 ## Other caveats
 
-- **Single active stream (BEING FIXED — per-session byte-ring pool).** The mirror,
-  the receiver landing ring, AND the two-ring tuple source ring are each a **single
-  per-engine buffer** addressed by absolute offset `% ringBytes`, so concurrent
-  streams alias the same storage + control block. This is the confirmed root cause of
-  the concurrent cross-node DPU basebackup reset (two receive streams share
-  `landingRegion.control->consumedHead`, so one session's credit is read as the
-  other's → `observed>posted` → `RECV_CQ_FAILURE`). The fix makes every byte-ring a
-  per-session/per-stream resource bound from a pool — see
+- **⚠ RESOLVED — single active stream (per-session byte-ring pool).** The former
+  engine-owned singleton data rings — `engine->mirrorRing`, singleton use of
+  `engine->landingRegion`, and `engine->tupleSourceRing` — are retired. At stream
+  open, `HomerDpuByteRingBind()` binds a slot keyed by stream and purpose: `MIRROR`
+  for sender egress, `LANDING` for the receive path, and (for `TUPLE_VIEW_BATCH`)
+  `SOURCE` for the two-ring SQL-result relay. `HomerDpuByteRingUnbind()` releases all
+  purposes for that stream during reset. Thus concurrent streams have independent
+  storage and control prefixes rather than aliasing a shared control block. Stage 1
+  (basebackup) and Stage 2 (`SOURCE`) are complete and validated; see
   [dpu_byte_ring_pool_per_session_plan.md](dpu_byte_ring_pool_per_session_plan.md).
-- **Homogeneous byte-ring slots (design assumption).** The pool relies on all
-  byte-ring slots being the SAME size + layout, so any slot serves any purpose
-  (mirror/landing/source). This is true for payload STORAGE today
-  (`mirrorRingBytes == tupleSourceRingBytes == HOMER_PAYLOAD_BYTE_RING_STORAGE_BYTES`,
-  `homer_service_dpu_dma.c:9931-9933`) but NOT for the control block (only landing has
-  an inline one; mirror uses a separate `controlCells` pool, tuple-source has none). The
-  pool makes it uniform BY DESIGN — every slot gets the `landingPayloadOffset` control
-  prefix; landing uses it, mirror/source leave it unused. A future ring purpose needing
-  a different size/control layout must revisit this assumption.
+- **Homogeneous byte-ring slots (current design).** `HomerDpuByteRingPool` makes every
+  slot the same `[control | storage]` layout, so any slot can serve `MIRROR`, `LANDING`,
+  or `SOURCE`. `HomerDpuByteRingPoolInit()` sets `slotStorageBytes` to
+  `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES` (10 MiB), the larger logical-ring class.
+  A slot is a container, not a stream's ring geometry: basebackup's logical
+  `HOMER_PAYLOAD` ring is 8 MiB, while SQL results use the 10-MiB
+  `HOMER_SQL_RESULT` ring. Every slot carries the `landingPayloadOffset` control
+  prefix; `LANDING` uses it and `MIRROR`/`SOURCE` leave it unused. A future purpose
+  needing more storage or a different layout must widen the homogeneous slot or add a
+  typed pool; it must not equate slot size with host/remote logical-ring size. The
+  canonical current invariant is [CONTRACTS.md](CONTRACTS.md)'s “Byte-ring SLOT size
+  vs RING size” entry.
 - **Control-line staging is a DMA source, not a payload slot.** Publishing a
   produced-tail / consumed-head credit word to a *remote* ring's control block is
   a DMA whose source must be DPU-registered memory; a small cache-line-sized
@@ -278,3 +290,7 @@ multiples. Do not trust power-of-two coincidence for wrap alignment.
 - [cross_node_dpu_migration_checkpoint.md](cross_node_dpu_migration_checkpoint.md)
   — cross-node DPU basebackup milestone, close lifecycle, DMA cap, and this
   mirror-ring work in context.
+- [dpu_byte_ring_pool_per_session_plan.md](dpu_byte_ring_pool_per_session_plan.md)
+  — completed and validated per-session `MIRROR`/`LANDING`/`SOURCE` pool migration.
+- [CONTRACTS.md](CONTRACTS.md) — current byte-ring slot-versus-logical-ring geometry
+  and per-pair wire-equality invariants.
