@@ -1,0 +1,563 @@
+<!-- kb-summary: Design plan to merge the two divergent Homer session abstractions — backend RemoteExecutionSession (intent-driven) and frontend HomerClientSession (selected-DPU client) — into ONE frontend-safe portable core + transport vtable + thin backend/frontend adapters, over the kept selected-DPU transport. Carries the verified frontend-safety audit and the reconciliation decisions. Gates S7.2. -->
+
+# Homer unified session core — merging RemoteExecutionSession (①) and HomerClientSession (②)
+
+> ## ⚠ STATUS — read first
+>
+> **DESIGN SETTLED; EXECUTION STARTED (2026-07-18). Now at Stage 1** (see §11.3 / §11.7).
+>
+> **DESIGN NOTE (opened 2026-07-18).** This gates **S7.2** in
+> [`../../../implementations/citus/transport/s7_host_service_retirement_plan.md`](../../../implementations/citus/transport/s7_host_service_retirement_plan.md):
+> S7.2 was about to *delete* the `RemoteExecutionSession` frontend API (its last consumer, the UDF
+> `citus_remote_exec_pgbench_transaction`, is retiring). The owner **paused S7.2** because that API is the
+> *cleaner, intent-driven* design and deleting it would discard design capital the future backend-to-backend
+> COPY re-plumb needs. Decision: instead of deleting ①, **promote its design into a single frontend-safe core
+> that ② also uses.**
+>
+> **Owner COMMITTED to Approach A (true single core), and to BUILDING IT NOW** (2026-07-18): execute Stages 1–4
+> (§11.3); **Stage 5 (COPY producer / backend pooling / reuse activation) is DEFERRED** until the COPY path is
+> actually (re)designed — endpoint of this work = *host-service retirement complete* (end of Stage 4). The two
+> previously-deferred design questions are settled: (1) completion-ownership = **lease + terminal-abandon**
+> ("backend error ⇒ session terminal", §11.1); (2) reuse = **carry the intent seam, build no reuse now**
+> (§11.2/§11.6). All three adversarial-review rounds are complete and their corrections verified in code (§9/§11).
+> See §11.7 for the execution-entry decision record and the Stage-1 grounding.
+>
+> **Verified at citus `e9dd4676c` / postgres `6f969fd0dfd`** (branch `homer-dpu-migration`). The frontend-safety
+> audit (§3) and the "sole-caller"/dead-surface facts (§1) were read in code by the main agent, not inherited.
+>
+> **Relationship to existing docs (this doc does NOT duplicate them):**
+> - Realizes the abstraction in
+>   [`../connection-management/remote_execution_session_control_plane.md`](../connection-management/remote_execution_session_control_plane.md)
+>   (the *WHAT* — intent vs operation split, four semantic facets). ⚠ That doc still cites the pre-refactor
+>   `remote_execution_session.h/.c`; the code has since moved to `homer_frontend.c` / `homer_citus_policy.c` /
+>   `homer_frontend.h` — treat its file pointers as stale, its design as canonical.
+> - Extends [`homer_frontend_service_separation_plan.md`](homer_frontend_service_separation_plan.md)
+>   (the *HOW* — frontend as a separately-linkable component + fixed-width ABI headers). That plan deferred a
+>   `HomerFrontendTransportOps` vtable "until SHM and DMA need to coexist"; unification is precisely when the
+>   vtable becomes necessary (host-SHM + selected-DPU + a future COPY producer all behind one core).
+> - Keeps the typed command/completion plane separate per
+>   [`../data-movement/command_dispatch_completion_plane.md`](../data-movement/command_dispatch_completion_plane.md).
+> - Session identity / peer-pairing decisions interact with
+>   [`session_identity_and_pairing.md`](session_identity_and_pairing.md).
+
+---
+
+## 1. The problem: two divergent session abstractions
+
+There are two parallel "Homer session" types that grew for different consumers:
+
+- **① `RemoteExecutionSession` (backend)** — `struct RemoteExecutionSessionData`
+  (`citus-dbcomm/src/backend/distributed/utils/homer/homer_frontend_internal.h:25`), API in
+  `homer_frontend.c` + spec initializers in `homer_citus_policy.c`, decls `homer_frontend.h`. **Intent-driven**:
+  carries `sessionIntentSpec` (session compatibility/reuse domain) + `operationSpec` (tuple-flow bootstrap).
+  Clean 3-step result consumer (`PollRemoteExecutionCommandResultBatch` → `BorrowNextRemoteTupleView` →
+  `ReleaseBorrowedRemoteTupleView`/`ReleaseRemoteRecvBatch`, `homer_frontend.c:852`/`:1492`/`:1523`/`:1563`).
+  Dispatches through a lower "local service" layer (`homer_frontend_control.c` `*ThroughLocalService`) to
+  host-SHM `CitusTupleSink` OR Tier-2 DMA (`homer_frontend_dma.c`). **Sole surviving external consumer: the UDF**
+  `worker/homer/remote_exec_pgbench_transaction.c` (verified — every one of ①'s API functions, plus the
+  result/recv/borrow APIs and the `homer_citus_policy.c` spec initializers, is called only by that UDF; the one
+  apparent exception, `PollRemoteRecvBatch`, appears outside the UDF only in a doc comment). COPY was ①'s other
+  consumer and is retired/broken. There is also **dormant COPY-sender residue** in `homer_frontend.c`
+  (`TryReserveRemoteSendBatch` `:1172`, statics `WaitForRemoteSendBatchReserve` `:999` /
+  `RemoteExecutionSessionCurrentCopyCommandFailed` `:965`, `FlushRemoteSendStream`, etc.) with **zero callers
+  outside `homer_frontend.c`** — e-COPY (S7.1) removed the COPY *drivers* but left the sender API.
+
+- **② `HomerClientSession` (frontend)** — `remote_execution_client.h:187`, API = the `HomerClient*` functions in
+  `src/bin/homer_client.c` (the client-binary library for pgbench + pg_basebackup). Its header states it
+  *deliberately avoids backend-only APIs (no palloc/ereport)* (`homer_client.c:9`). Drives the **selected-DPU
+  byte-ring** directly (role-1 control, role-6 completion, role-7 result) via the byte-ring sink core
+  (`homer_byte_ring_sink.h`) + `CitusTupleViewContract`. **Fused** result consumer: one
+  `HomerClientPollSqlResultDpuReceive` call (`homer_client.c:3544`) that polls+decodes+releases and returns a
+  scalar + rowcount + EOS. Consumers: the pgbench gate + pg_basebackup.
+
+**Why they diverged** (verified):
+1. **Backend↔frontend linkage wall.** `homer_frontend.c` uses backend idioms (91 `palloc`/`ereport`/`elog`/
+   `TupleTableSlot` sites). `homer_client.c` is a `src/bin/` frontend library (0 such). A frontend binary can
+   *never* link ①; a backend *can* link frontend-safe code. **⚠ This is why the client can't use ① today — but
+   it is NOT a hard architectural blocker** (see §3): the deps are cosmetic + adapter-shaped, not protocol.
+2. **Transport topology.** ① assumes a co-located host-SHM `CitusTupleSink`; ② is on the far side of a cross-node
+   DPU byte-ring relay with credit-line back-pressure. "Poll a local tuple sink" is not expressible on the client.
+3. **Expedient fusing.** ②'s single-call decoder was tuned for the gate's minimal need (extract one `abalance`),
+   collapsing ①'s clean 3-step consumer. This one is a *choice*, not a constraint.
+
+S6 (selected-DPU migration) built the gate on **②** and bypassed **①**. So today the *cleaner* abstraction has
+one retiring user, over a retiring transport, unlinkable by the surviving clients — which is why S7.2 pointed at
+deleting it, and why that felt wrong.
+
+---
+
+## 2. Approach A — one frontend-safe core + transport vtable + thin adapters
+
+```
+                 ┌─────────────────────────────────────────────────────────┐
+   backend       │  PORTABLE FRONTEND-SAFE CORE  (linkable by both)         │   frontend
+   consumers ──▶ │  • session / command / result STATE MACHINES            │ ◀── consumers
+  (UDF today;    │  • fixed-width specs: intent, operation, command         │  (pgbench,
+   COPY re-plumb)│  • RemoteTupleView {Datum*,bool*,count}  (duck-typed)    │   pg_basebackup)
+        │        │  • completion model (ONE — see §5.1)                     │        │
+        │        └───────────────────────┬─────────────────────────────────┘        │
+        ▼                                 ▼ transport vtable                          ▼
+  BACKEND ADAPTER               HomerFrontendTransportOps                    FRONTEND ADAPTER
+  • snapshot live PG state      open/close · start · completion             • explicit options
+    into fixed-width specs        peek/ack · reserve/publish ·              • caller-owned memory
+    (homer_citus_policy.c)        result borrow/release · terminal         • error-string returns
+  • memory context + PG_TRY    ┌──────────┬───────────┬──────────────┐     (homer_client.c today)
+  • ereport / TupleDesc bind   │ host-SHM │  Tier-2   │ selected-DPU │
+                               │ (retire) │  (retire) │   (KEPT)     │
+                               └──────────┴───────────┴──────────────┘
+```
+
+The core holds everything that is already fixed-width and transport-agnostic. Each transport is a vtable impl.
+Backend and frontend differ only in a thin adapter (state acquisition, memory/error idiom, tuple-view binding).
+`homer_client.c` is *already* the frontend adapter — it just doesn't yet sit on a shared core.
+
+---
+
+## 3. Frontend-safety audit — Approach A is sound (VERIFIED)
+
+The load-bearing claim ("nothing in ① is a hard frontend-safety blocker") **survives, but qualified** (see §9
+review): there ARE hard backend deps, all adapter-shaped, none in the session *protocol*. Negative hunt over the
+session protocol (`homer_frontend.c` + `homer_citus_policy.c`): **no SPI, no fmgr/type-cache/output-function, no
+relation open, no `CurrentMemoryContext`.** ⚠ **CORRECTION (review):** the "no catalog lookup" was scoped too
+narrowly — the ①-open path calls `LookupNodeByNodeIdOrError()` via `BuildPeerEndpointFromIntent()`
+(`homer_frontend_control.c:414`, used `:727`/`:817`). It is still adapter-shaped (it immediately snapshots node
+id/host/port into a fixed `CitusRemoteExecPeerEndpoint` at `:421`), so the portable core takes an explicit
+endpoint. ⚠ **CORRECTION (review):** the specs are NOT already frontend-safe — `RemoteExecTupleSinkOperationSpec`
+embeds a backend `TupleDesc` (`homer_frontend.h:143`), and intent/command specs use `Oid`/`Datum`. So the split
+needs a **portable ABI projection** of the specs, not merely moving declarations. Net: no unportable protocol,
+but the extraction boundary is bigger than "header split" (endpoint lookup + tuple-contract construction + a
+portable spec ABI all live in the backend adapter).
+
+| Hard dep (verified `file:line`) | class | disposition in unified design |
+|---|---|---|
+| `GetUserId`/`MyDatabaseId` `homer_citus_policy.c:141-142`; `EnsureDistributedTransactionId`/`GetCurrentDistributedTransactionId` `:104-105`,`:376`,`:439`; `XactIsoLevel`/`BeginXact*` `:391-393`; `GetLocalGroupId`/`MyProcPid` `:448-449`; `BuildCurrentTransactionBeginReplayText` `:398` | **state-snapshot** | backend adapter materializes fixed-width intent/command specs; frontend supplies same values via options (`HomerClientSessionOptions`, `remote_execution_client.h:241-267`) |
+| `MemoryContextAllocZero(TopTransactionContext)` `homer_frontend.c:352`,`:414`; `PG_TRY/PG_CATCH` `:358`,`:432`; `MemoryContextSwitchTo` `:830`; `AmRemoteExecBackendProcess` `:427` | **lifetime/error** | backend wrapper (context + `ereport`); frontend uses caller-owned storage + error-string returns |
+| `TupleDesc`/`TupleTableSlot` at append/decode boundary; `ExperimentalTupleSinkBatchTupleTarget` GUC `:1370`; header includes `postgres.h`/`tuptable.h`/`rel.h` `homer_frontend.h:21-24` | **tuple-view + header split** | core deals only in `CitusTupleViewContract` + `{Datum*,bool*,count}`; batching policy passed as a param; portable types move to a frontend-safe header |
+
+Conclusion: split ① **below its adapters**. Moving `homer_citus_policy.c` or the current `homer_frontend.h`
+wholesale into a frontend-safe library would NOT be sound; extracting the state machines + specs beneath them is.
+
+---
+
+## 4. Retained core vs. transport plumbing (from the exhaustive diff)
+
+**Transport-AGNOSTIC → the retained core:** intent fields, operation kind/direction, typed command spec
+(`RemoteExecutionCommandSpec`, `homer_frontend.h:344`), `serviceSessionId`, monotonic command sequence +
+one-outstanding-START invariant (both structs: `homer_frontend_internal.h:46-47` ≙ `remote_execution_client.h:206-207`;
+enforced `homer_frontend_control.c:1192-1207` ≙ `homer_client.c:4374-4392`), completion state/counts,
+result descriptor + tuple-view contract, explicit terminal/error state, result borrow/consume semantics, **and
+`sessionUID`** (cross-node identity that binds role-7 rings; distinct from the reuse key; client rejects zero,
+`remote_execution_client.h:259`, `homer_client.c:1640` — this is S7.4's "confirm it stays", now a core-identity
+field). ⚠ These are **mostly** fixed-width but NOT all frontend-safe today (§3): the operation spec embeds
+`TupleDesc` and specs use `Oid`/`Datum`, so the retained core needs a portable spec ABI projection.
+
+**Transport-SPECIFIC → per-transport vtable impls:**
+- ① host-SHM/local-service: `serviceSinkId`, tuple-sink handle/key/descriptor, `peerCommandServiceSessionId`,
+  the six `peerCommandCompletionRing*` fields (`homer_frontend_internal.h:30-31`,`:59-76`); local-service
+  dispatch calls; Tier-2 `dpuControlChannel`; `currentSendBatch`/`RemoteExecutionBatchData`.
+- ② selected-DPU: `serviceSessionIndex`, completion epoch/generation/lease, `commandDpuStream`
+  (embedded `HomerClientBaseBackupStream` carrying DOCA handles + role-1/6/7 lines,
+  `remote_execution_client.h:119-147`), byte-ring drain + credit publication.
+
+The vtable surface: open/close, start, completion peek/ack, reserve/publish, result borrow/release, terminal
+query. The core must NOT embed either `CitusTupleSinkHandle` or `HomerClientBaseBackupStream`.
+
+---
+
+## 5. Reconciliation decisions (the "don't drop something useful" list)
+
+Beyond the two known differences (explicit intent lost on ②; fused vs 3-step result), the diff surfaced four
+substantive divergences. Each is a design decision for this doc + adversarial review.
+
+### 5.1 Completion-ownership model — DEFERRED (owner, decide here)
+- **②: observe → apply → ACK lease.** Peek copies the event into a session lease without freeing role-1
+  (`homer_client.c:4576-4629`); ACK validates epoch + `completionSessionGeneration` before releasing role-1 for
+  the terminal completion (`:4695-4763`). Repeatable only before ACK.
+- **①: consume-immediately + latch terminal for replay** (`homer_frontend.c:301-314`,`:693-699`); Tier-2 poll
+  releases role-1 inside the poll (`homer_frontend_dma.c:1212-1232`).
+- **⚠ REVIEW REFUTED "lease as canonical, as-is" (VERIFIED, §9).** A terminal ACK is what frees role-1 +
+  clears `outstandingStartCommandSequence` (`homer_client.c:4756-4758`); an `ereport(ERROR)` between peek/apply
+  and ACK **strands the physical role-1 slot**, and close *refuses* to run while role-1 is non-free
+  (`:2127`, comment: "a missed ACK must fail loudly"). Also `completionSessionGeneration` is a **no-op today** —
+  zero-inited at open, never incremented (only read at `:4585`/`:4714`). ①'s immediate-consume+latch is *safer*
+  under backend longjmp (it advances `consumedEpoch` before returning, `homer_frontend.c:301-308`).
+- **✅ CORRECTED by §11.1 (second review):** lease IS canonical, made safe under backend unwind by a
+  `completion_abandon` = **TERMINAL-teardown + service close-drain** (NOT a host force-free-and-reuse, which
+  the DPU-pull-by-ordinal + service in-flight check make unsafe). Semantics: **backend error ⇒ session terminal
+  (no reuse)** — exactly what the existing `sqlSessionTerminal` + close-drain already do. Stale-EVENT freshness
+  comes from the fresh-per-session `serviceSessionId`, not a generation counter. See §11.1.
+
+### 5.2 Reuse/pinning scope — DEFERRED (owner, decide here). ⚠ TWO LAYERS.
+The owner's observation was that resource-level reuse ("the bottom half") already exists — TRUE. **⚠ But the
+review REFUTED the "two clean layers" framing (VERIFIED, §9): a SEMANTIC reuse "top half" ALSO already exists,
+and the kept path BYPASSES it.**
+- **Bottom half (resource pooling), exists:** arena-slot tenancy (release → next tenant), per-session ring
+  runtimes, egress claim state (`homer_service_dpu_dma.c:303`/`:615`/`:656`/`:700`); indexed session-slot claim
+  (`serviceSessionIndex` vs `CITUS_REMOTE_EXEC_CONTROL_MAX_LOCAL_SESSIONS`, `homer_client.c:1957`). ⚠ Arena
+  tenancy is **session-AFFINE, not a fungible pool**: `HomerDpuDmaBindRingSession()` stamps all three rings with
+  one `serviceSessionId` (`homer_service_dpu_dma.c:6444`/`:6478`/`:6545`), bound until full session teardown.
+- **Top half (semantic reuse), ALSO exists:** `HomerServiceSessionKeysBaseCompatible()` (5-field key,
+  `tuple_sink_service_process.c:24033`), `TupleSinkServiceSessionAllowsReuse()` (freshness/post-command/in-flight/
+  clean-placement/exclusive-ownership, `:24610`), `TupleSinkServiceFindReusableSession()` (`:25043`). The
+  **tuple-stream** open path USES it (`:29783`, `:39326`).
+- **The gap:** **selected-DPU COMMAND open BYPASSES the reuse selector** — `TupleSinkServiceProgressCommandOpenAsyncOp`'s
+  `COMMAND_CREATE` phase goes straight to `TupleSinkServiceAllocateSession` + `TupleSinkServiceCreateSession`
+  (`:40280`/`:40288`) and binds the client export 1:1 to the new `serviceSessionId` (`:40327`/`:40334`). So the
+  kept path is deliberately one-export-per-new-session.
+- **Corrected design implication:** unification is NOT "build a top half on the bottom half." It is **reconcile
+  the existing semantic-reuse predicate with the session-affine selected-DPU export**, and decide whether
+  selected-DPU command open should start reusing an existing service session/export or stay one-per-new-session.
+  Resource affinity and semantic reuse currently *meet* at service-session create/teardown.
+- **⚠ CORRECTED by §11.2 (second review):** do NOT wire the command path through `FindReusableSession` now — N
+  pgbench clients share the 5-field base-compat key and would collide on one reused session (each inits sequence
+  at 1; arena is one-export-per-session). **Carry the intent SEAM but keep the selected-DPU command path
+  one-export-per-session;** activating reuse needs owner/export-scoping + sequence arbitration → deferred to COPY.
+  The seam (the intent contract, §5.6) is still designed and frozen now.
+
+### 5.3 Peer-session pairing
+① validates a paired peer/local identity (`peerCommandServiceSessionId`, `homer_frontend.c:278-289`); ② dropped
+it (role-6 validates only its own `serviceSessionId` + sequence, `homer_client.c:4615-4624`). COPY's
+coordinator↔worker may want pairing. Interacts with [`session_identity_and_pairing.md`](session_identity_and_pairing.md).
+Decide whether the core keeps a peer-pair seam.
+
+### 5.4 Error-surfacing gap (fix during the merge)
+②'s `HomerClientPollSqlResultDpuReceive` *detects* SQL result ERROR records but does not surface them
+(`homer_client.c:3660-3665`); ① raises them (`RemoteExecutionRaiseTupleSinkErrorRecord`, `homer_frontend.c:45-84`).
+The unified core closes this gap (error-return in the core; backend adapter re-raises as `ereport`).
+
+### 5.5 Newly-required core primitives (surfaced by review — do NOT ship the vtable without these)
+- **Abandon / force-release** — a vtable op that releases the role-1 slot + session ownership WITHOUT a terminal
+  ACK, for backend `PG_CATCH` unwind (see §5.1). Current close cannot do this (`homer_client.c:2127` refuses).
+- **Generation lifecycle** — mint/increment on session (re)use, define wrap/exhaustion + stale-callback
+  behavior. Today `completionSessionGeneration` is inert (§5.1); the core must make it real to protect
+  slot/object reuse and stale ACKs.
+- **COPY producer export-binding** — the selected-DPU export carries roles 1/6/7 but **no producer payload ring**
+  (`remote_execution_client.h:209`,`:220`). The COPY (ingest, SEND-direction) producer needs an explicit
+  stream/export-binding design; a `reserve/publish` vtable name is not enough.
+- **Producer cancellation** — the reserve/backpressure loop must take an interrupt callback or it becomes
+  unkillable under backpressure (the existing selected-DPU producer needed exactly this, `homer_client.c:3918`/`:3932`).
+
+### 5.6 Intent contract — ✅ SETTLED + APPROVED (owner, 2026-07-18)
+The intent is **already designed, built, and a portable ABI** — not greenfield. `RemoteExecutionSessionIntentSpec`
+(12 fields, `homer_frontend.h:173`) → `BuildControlSessionKeyFromIntent` (`homer_frontend_control.c:311-325`,
+maps ALL 12) → `CitusRemoteExecSessionKey` (13 fixed-width `uint32` fields, `homer_control_abi.h:165`) → reuse.
+The reuse decision deliberately mirrors Citus: base-compat key match + dynamic `TupleSinkServiceSessionAllowsReuse`
+(`tuple_sink_service_process.c:24626`, whose clean-placement rule uses "the same predicate Citus uses in
+`ConnectionAccessedDifferentPlacement()`").
+
+**KEY ARCHITECTURAL PROPERTY (why designing it now is enough):** the 13-field key is the frozen ABI, but the reuse
+*predicate* reads only a subset. So **activating a RESERVED field's reuse role later (for COPY) is a PREDICATE
+change, not an ABI/protocol change.** The ABI is the commitment made now; the predicate is the deferrable behavior.
+
+| intent field | meaning / Citus analog | reuse role TODAY |
+|---|---|---|
+| `destinationNodeId` | target worker node | **LIVE** (base-compat, `HomerServiceSessionKeysBaseCompatible:24040`) |
+| `effectiveUserId` (Oid) | effective user | **LIVE** (base-compat) |
+| `databaseId` (Oid) | database | **LIVE** (base-compat) |
+| `executionLane` | DEFAULT vs REPLICATION | **LIVE** (base-compat) |
+| `freshnessPolicy` | FORCE_FRESH / REQUIRE_CLEAN — Citus freshness/clean-connection | **LIVE** (`AllowsReuse`: FORCE_FRESH⇒no reuse; REQUIRE_CLEAN⇒placement-clean) |
+| `ownershipPolicy` | PIN_EXCLUSIVE / shared — Citus connection claiming | **LIVE** (`AllowsReuse`: PIN_EXCLUSIVE + active sinks⇒no reuse) |
+| `opKind` | SQL_COMMAND / CLIENT_SQL_SESSION / BASE_BACKUP / (COPY) | validation + basebackup pairing (not base-compat) |
+| `accessKind` | placement access SELECT/DML/DDL | **RESERVED** (carried in ABI, not read yet) |
+| `txPolicy` | distributed-txn attach policy | **RESERVED** |
+| `metadataPolicy` | metadata-sync connection | **RESERVED** |
+| `placementScope` | co-location scope (placement safety uses a separate `CitusRemoteExecPlacementAccessDescriptor` today) | **RESERVED** |
+| `transactionCritical` | connection must not be dropped mid-txn | **RESERVED** |
+
+**Settled rules (owner-approved):**
+1. **Freeze the 13-field key as the stable portable ABI. Do NOT prune RESERVED fields** — retrofitting is the ABI
+   change we are avoiding. (Field set may still be *extended* later if COPY needs a facet not present.)
+2. **Activation of a RESERVED field = a predicate change** (extend base-compat / `AllowsReuse`), never an ABI bump.
+3. **pgbench supplies a degenerate intent** (single node/user/db, DEFAULT lane, no FORCE_FRESH); reuse no-op
+   because it holds one session (§5.6-lifecycle: `openHomerSession` once/client at `pgbench.c:8993`). **COPY
+   supplies a real intent** and the same intent→key→reuse path lights up.
+4. **Adapters populate intent differently:** frontend adapter from explicit options (`HomerClientSessionOptions`);
+   backend adapter snapshots live Citus state (`homer_citus_policy.c` initializers).
+
+---
+
+## 6. Interaction with S7 (the retirement plan)
+
+The host-SHM transport, the Tier-2 DMA frontend, and the UDF are retiring under **every** unification outcome —
+so that S7 work is not wasted. What the unification decision changes is only the *fate of ①'s abstraction* after
+its old transport is gone: **promoted into the core (A)** rather than deleted.
+
+- **HOLD S7.2** (UDF + `RemoteExecutionSession` API deletion): it is the one step that would foreclose promotion.
+  The Round-C map is preserved in the S7 plan; resume only after this design settles what is promoted vs deleted.
+- **S7.3 (Tier-2 DMA frontend removal)** can still proceed as a *dead-transport* retirement — it becomes one
+  vtable impl to drop, independent of the core promotion.
+- The dormant COPY-sender residue (§1) is COPY scaffolding; whether it is deleted (S7 §9 Option A) or refactored
+  into the core's send/reserve vtable is now part of *this* decision, not a blind delete.
+
+---
+
+## 7. Next steps
+
+1. Adversarial review of THIS design (codex), told not to defer to framing. Load-bearing claims to attack:
+   (a) "①'s state machines + specs can be extracted into a frontend-safe core with only thin adapters" (the §3
+   audit); (b) "the completion lease model serves backend COPY consumers cleanly" (§5.1); (c) "the top-half
+   reuse layer composes with the existing resource pool without reinventing it" (§5.2).
+2. Settle §5.1 and §5.2 (+ §5.3) with the review results and the COPY re-plumb requirements.
+3. Decide the concrete S7 scope: what deletes now vs. what is carried into the core.
+4. Only then: extraction plan (frontend-safe header split first, per the separation plan; then core + vtable +
+   adapters), staged and validated per the operator runbook.
+
+## 8. Cross-links
+
+- WHAT (abstraction): [`../connection-management/remote_execution_session_control_plane.md`](../connection-management/remote_execution_session_control_plane.md)
+- HOW (component/ABI split + anticipated vtable): [`homer_frontend_service_separation_plan.md`](homer_frontend_service_separation_plan.md)
+- Typed command/completion plane: [`../data-movement/command_dispatch_completion_plane.md`](../data-movement/command_dispatch_completion_plane.md)
+- Session identity/pairing: [`session_identity_and_pairing.md`](session_identity_and_pairing.md)
+- COPY re-plumb surface (the future backend consumer this preserves ① for): [`../../../implementations/citus/transport/copy_path_revival_contract.md`](../../../implementations/citus/transport/copy_path_revival_contract.md)
+- Retirement plan this gates: [`../../../implementations/citus/transport/s7_host_service_retirement_plan.md`](../../../implementations/citus/transport/s7_host_service_retirement_plan.md)
+
+---
+
+## 9. Adversarial review outcome (2026-07-18) — verdict + what changed
+
+A codex-explore review attacked the three load-bearing claims; the main agent then re-verified each in code
+(not inherited). **Verdict: Approach A is still viable, but with a bigger boundary and three hard sub-problems.**
+
+| claim | verdict | what changed (both sides recorded) |
+|---|---|---|
+| §3 core is extractable with thin adapters | **SURVIVES, qualified** | I claimed "no catalog lookup / specs already fixed-width." WRONG on both: `LookupNodeByNodeIdOrError` is in the open path (`homer_frontend_control.c:414`, adapter-shaped — snapshots to a fixed endpoint), and the operation spec embeds `TupleDesc` (`homer_frontend.h:143`). Still no hard *protocol* blocker, but the boundary includes endpoint lookup + tuple-contract construction + a **portable spec ABI projection**, not just a header split. |
+| §5.1 lease as canonical | **REFUTED as-is** | ACK frees role-1 (`homer_client.c:4756`); an `ereport` mid-lease strands the slot and close refuses (`:2127`); generation is a no-op (never incremented). ①'s immediate-consume+latch is safer under longjmp. → lease needs an explicit **abandon/force-release** primitive + a real generation lifecycle, else immediate-consume wins. |
+| §5.2 two clean reuse layers | **REFUTED** | Semantic reuse ALREADY exists (`FindReusableSession`/`AllowsReuse`) and the tuple-stream path uses it, but selected-DPU **command open bypasses it** (`tuple_sink_service_process.c:40280`/`:40288`) and arena tenancy is session-affine. → reconcile with the existing predicate, don't invent a new layer. |
+
+**The three hard sub-problems to settle before S7.2 resumes** (each is now a gating design item, not a detail):
+1. **Backend unwind contract** for the completion model (abandon/force-release + real generation lifecycle), or
+   pick immediate-consume+latch as canonical instead.
+2. **Reuse reconciliation** — ✅ SETTLED (§5.2/§5.6): wire selected-DPU command open through the intent→key→reuse
+   machinery; behavior degenerate for pgbench, live for COPY; RESERVED intent fields carried-in-ABI, activated
+   later by a predicate change. Remaining mechanical question (extraction-time): how the reuse selector composes
+   with session-affine arena tenancy (`HomerDpuDmaBindRingSession`) when reuse actually fires for COPY.
+3. **Portable spec ABI projection** + the COPY producer export-binding + producer cancellation contract (§5.5).
+
+**The review also validated the core thesis:** there is no unportable session *protocol* — the merge is an
+adapter/ABI/lifecycle problem, not a "can't be done" problem. Approach A stands.
+
+---
+
+## 10. Extraction plan (staged) — SETTLED 2026-07-18
+
+Build/link facts (VERIFIED in the Makefiles): `homer_client.c` → `build/homer/homer_client.o` → `libhomer_client.a`
+(`citus-dbcomm/Makefile:16-18,136`), installed to PG `$(libdir)` + headers to `$(includedir_server)` (`:288-316`).
+That archive is linked into **BOTH** the client binaries (`pgbench/Makefile:30-36`; Meson `pg_basebackup`) **AND the
+postgres server** (`backend/Makefile:28` — because `basebackup_homer.c` calls `HomerClient*`). There is an in-tree
+**"compile the same `.c` twice" precedent**: `homer_frontend_dma_lifecycle.c` compiles into `citus.so` via the
+extension wildcard AND standalone (`citus-dbcomm/Makefile:198-207`), and it is `postgres.h`-free. PG's canonical
+model is `src/common` (frontend + frontend-PIC + backend objects).
+
+### 10.1 Build model for the shared core (the load-bearing mechanical decision)
+A new frontend-safe `homer_session_core.c` (+ public header under `src/include/distributed/homer/`), compiled **twice**:
+- into **`citus.so`** via the extension wildcard (PIC extension object), and
+- into **`libhomer_client.a`** via the top-level Citus Makefile (beside `homer_client.o`), which the client binaries
+  and the postgres server already link.
+**⛔ Do NOT embed the existing archive wholesale into `citus.so`** — its objects are built with plain `CFLAGS`, not
+`CFLAGS_SL` (`-fPIC`) (`citus-dbcomm/Makefile:132` vs `Makefile.shlib:102`); compile the core separately for the
+extension. **⛔ The core MUST be STATELESS / caller-owned** — no module globals, no `__thread` state — because it is
+linked into two contexts (postgres executable + `citus.so`) and duplicated mutable state would silently diverge.
+(The client's current `HomerClientCompletionEventsAcked` `:130`, `HomerClientInterruptCheck` `:264`, and `__thread`
+wait-timing `:1371-1374` are diagnostics/callbacks — keep them out of the core, or pass via caller-owned handles.)
+The core public header must be independent of **both** `postgres.h` and `postgres_fe.h` (client TUs include
+`postgres_fe.h` themselves; the archive is compiled with neither).
+
+### 10.2 Piece 1 — portable spec ABI projection (LOW RISK, mostly exists)
+- `CitusRemoteExecSessionKey` (13×`uint32`) and `CitusTupleViewContract` are **already fixed-width, `postgres.h`-free**.
+- `RemoteExecutionSessionIntentSpec`: `Oid`→a portable `uint32` alias (Oid *is* uint32). Trivial.
+- `RemoteExecTupleSinkOperationSpec`: replace `TupleDesc tupleDescriptor` with `CitusTupleViewContract` (the backend
+  adapter already converts both ways: `BuildTupleViewContractFromTupleDesc` `homer_frontend_control.c:330`, reverse
+  `homer_frontend.c:116`); `Oid relationId`→uint32.
+- `RemoteExecutionCommandSpec`: already mostly fixed-width; `Oid`→uint32.
+- Move the projected specs into the frontend-safe core header.
+
+### 10.3 Piece 2 — core / vtable / adapter boundaries
+- **CORE (stateless, frontend-safe):** the caller-owned unified session struct; the command-sequence +
+  one-outstanding-START state machine; the completion-lease state machine (peek/apply/ack/**abandon**/generation);
+  result borrow/release over an opaque batch handle; the error-return convention (no `ereport`).
+- **VTABLE `HomerFrontendTransportOps`:** `open` / `close_dataplane` / `close_session` / `start_command` /
+  `completion_peek` / `completion_ack` / `completion_abandon` / `result_poll_batch` / `result_borrow_next` /
+  `result_release` / `producer_reserve` / `producer_append` / `producer_flush` (COPY future) / `terminal_query`.
+  Impls: **selected-DPU (KEPT)**; host-SHM + Tier-2 (retiring — Tier-2 gone at Stage 0).
+- **BACKEND ADAPTER:** state-snapshot (the `homer_citus_policy.c` initializers → fill portable specs), TupleDesc↔contract
+  binding, memory-context + `PG_TRY`/`ereport` wrapping, `LookupNode`→endpoint (`homer_frontend_control.c:414`),
+  and registers `completion_abandon` in its `PG_CATCH`.
+- **FRONTEND ADAPTER:** options→intent, `malloc`/error-string, caller-owned memory. `homer_client.c` is already this.
+
+> ⚠ **§10.4 and §10.5 below are SUPERSEDED by §11 (second review + owner decisions, 2026-07-18).** The abandon
+> primitive is terminal-teardown (not host-free+reuse); the staging order is **CORE-FIRST, retirement-LAST** —
+> ① stays live as a reference, so S7.2+S7.3+D7′ bundle into the final stage; reuse is not wired in. Read §11.
+
+### 10.4 Piece 3 — abandon primitive + generation lifecycle (closes the §5.1 refutation)
+- **`completion_abandon(session)`** — idempotent: if a lease is active or the role-1 slot is non-free, force the
+  slot state to `FREE`, clear `outstandingStartCommandSequence` + `completionLeaseActive`, **without** a terminal
+  ACK; no-op if nothing is outstanding. The backend adapter calls it from `PG_CATCH` before close, so an `ereport`
+  mid-lease can no longer strand the slot (today close *refuses*, `homer_client.c:2127`).
+- **generation:** mint a fresh monotonic `completionSessionGeneration` at every session **open** (today zero-inited,
+  never incremented — inert). `completion_peek` stamps it into the lease; `completion_ack` rejects a lease whose
+  generation ≠ the session's (stale event after abandon / struct reuse). `uint64` ⇒ no practical wrap.
+
+### 10.5 Piece 4 — staging (each stage ends gate-green; validate per the operator runbook)
+| stage | scope | validation |
+|---|---|---|
+| **0** | **S7.3**: Tier-2 host DMA-frontend + host claimant removal → assert D7′ (DPU sole claimant, all-slots) | gate + 4-role basebackup + **DPU TCP smoke** (spawn/bridge geometry) |
+| **1** | Portable ABI header split (Piece 1); ①/② unchanged, just include the new header | gate + basebackup |
+| **2** | Define `HomerFrontendTransportOps`; wrap the EXISTING selected-DPU paths behind it (no merge yet) | gate + basebackup |
+| **3** | Extract stateless `homer_session_core.c` (compile-twice build); add abandon + generation; reimplement ②'s client on the core (frontend adapter) | gate + basebackup + **DPU TCP smoke** (client transport) |
+| **4** | Reimplement ①'s backend on the core (backend adapter); route selected-DPU command open through reuse; retire ①'s host-SHM path. **S7.2 resolves here** (UDF + old ① API delete-vs-promote) | gate + basebackup |
+| **5** *(future, not now)* | COPY producer export-binding + activate RESERVED intent fields | (COPY re-plumb workload) |
+
+### 10.6 Residual risks (VERIFIED)
+- **`pg_basebackup` Make wiring is Meson-only** (`Makefile` lacks the Homer archive var though `pg_basebackup.c`
+  calls `HomerClient*`) — a *pre-existing* gap; Stage 3 must not assume Make-built `pg_basebackup` links the core.
+- **Duplicate mutable state** if the core carries globals → §10.1 stateless rule is mandatory, not stylistic.
+- **No explicit archive-rebuild dependency** in `pgbench/Makefile:35` / `meson.build:43` — a stale-archive trap;
+  Stage 3 should add the dependency or document a forced clean.
+- Hard-coded installed archive paths (`HOMER_CLIENT_LIB ?=`).
+
+---
+
+## 11. Second review outcome (2026-07-18) — three VERIFIED breaks + the corrected plan
+
+The §10 extraction plan was refuted; the main agent re-verified each break in code. **Approach A and the core
+thesis still stand; the mechanics and staging change.**
+
+### 11.1 Abandon is TERMINAL-TEARDOWN, not host-free-and-reuse (was §5.1 "lease + abandon", §10.4)
+**VERIFIED break:** the DPU pulls the depth-1 role-1 slot by *ordinal frontier*, independent of host slot state
+(`homer_service_dpu_dma.c:1997-2008`); a host-only `FREE`+overwrite races that DMA. AND the service rejects a
+second command while `commandInFlight` / `completionEventCount > 0` (`tuple_sink_service_process.c:44793-44808`),
+so a host-only free does not even clear the service's in-flight view. The old command stays live and can still
+publish role-6.
+**Corrected contract:** `completion_abandon` = **mark the session TERMINAL + run the service-coordinated
+close-drain** (`tuple_sink_service_process.c:44211-44268`/`43593-43633`); **no slot reuse.** On a backend
+`ereport` mid-lease, the session DIES (it does not resume) — which is exactly what the existing
+`sqlSessionTerminal` latch + close-drain already do. So the lease model IS safe under backend unwind, via
+terminal-teardown-on-error, not via a reuse-enabling abandon. **Net: "backend error ⇒ session terminal" is the
+accepted semantics.**
+**Generation:** stale-EVENT protection already comes from the **fresh-per-session `serviceSessionId`**
+(`tuple_sink_service_process.c:5727-5765`), not a generation counter; generation only guards stale lease
+HANDLES. Making it wire-visible would be a role-6 ABI change (`homer_dpu_bridge_abi.h:260-275`) — out of scope.
+Drop "generation as stale-event protection."
+
+### 11.2 Reuse cannot be WIRED into the command path now — even degenerately (was §5.2 "wire through now", §10.5 Stage 4)
+**VERIFIED break:** pgbench opens one session **per client**, but N clients share the SAME 5-field base-compat
+key (same db/user/node/lane). An idle zero-sink session is reusable, so routing command-open through
+`FindReusableSession` could hand **two clients one service session** — and each client inits its command sequence
+at 1 while the service requires one monotonic sequence per reused session (`homer_client.c:4484-4497` vs
+`tuple_sink_service_process.c:44826-44840`) ⇒ collision. Arena binding is one-export-per-session
+(`homer_service_dpu_dma.c:6601-6640`).
+**Corrected:** **carry the intent SEAM (the key is built, the predicate exists) but keep the selected-DPU command
+path ONE-EXPORT-PER-SESSION — do NOT call `FindReusableSession` for it.** Activating reuse requires
+owner/export-scoping + shared-sequence arbitration, deferred to the COPY re-plumb. (This restores "seam now,
+behavior deferred" and corrects §5.2: even *wiring* is deferred, not just behavior.)
+
+### 11.3 Staging order: CORE FIRST (keep ① live), retirement LAST (owner, 2026-07-18)
+**VERIFIED break:** ①'s command-session open dispatches through Tier-2 (`HomerFrontendDmaOpenCommandSession`,
+`homer_frontend_control.c:806`), so removing Tier-2 (S7.3) breaks ①'s only consumer, the UDF.
+**Owner decision:** **keep ① a LIVE reference until the core lands.** Consequence (resolved tension): keeping ①
+runnable ⇒ Tier-2 stays live ⇒ the two-claimant window persists ⇒ **the D7 partition, S7.3, and the D7′ all-slots
+assertion all defer to the FINAL retirement stage**, bundled with ①'s deletion. The core is built on ②'s base
+while ① runs alongside as a working comparison; ①'s *design* (§5.6 + the diff + git) guides the build.
+| stage | scope | validation |
+|---|---|---|
+| **1** | Portable ABI header split — **NOT header-only**: operation spec carries `CitusTupleViewContract`; the backend adapter rebuilds a local `TupleDesc` for `OpenCitusTupleSink` (`homer_frontend.c:439-447`). ① + ② both stay live. | gate + basebackup |
+| **2** | `HomerFrontendTransportOps` vtable over the surviving selected-DPU path (②). ① + ② live. | gate + basebackup |
+| **3** | Extract stateless `homer_session_core.c` (compile-twice) from ② + frontend adapter; add lease + **terminal-abandon** lifecycle; carry the intent seam (one-export-per-session). ② now on the core; ① still live as reference. | gate + basebackup + DPU TCP smoke |
+| **4 — FINAL RETIREMENT** | **S7.2 (delete UDF + old ① API surface + dormant COPY-sender) + S7.3 (Tier-2 removal) + assert D7′ (all-slots)**, all together now that the core has landed and ① is no longer needed as a reference. | gate + basebackup + DPU TCP smoke |
+| **5** *(future)* | Backend adapter on the core + COPY producer export-binding + **activate reuse (owner/export-scoped)** + reserved intent fields | COPY re-plumb workload |
+**⚠ Cost of this order (owner-accepted):** carries the ① stack (UDF + API + Tier-2 + dormant COPY-sender) as
+dead-end reference code through Stages 1-3, and defers the D7′ assertion to Stage 4. Benefit: ① stays a runnable
+comparison for the core's behavior until the replacement is proven.
+
+### 11.4 Also corrected / confirmed
+- **Stateless core SURVIVES** with one constraint: the DOCA device can't be opened twice per process, so the
+  caller-owned transport context must share one device across concurrent sessions (`homer_client.c:868-873`).
+- **Stage 4 validation must include a backend-① exerciser** IF any ① consumer still exists at that point — but
+  since Stage 0 deletes the UDF, there is no backend-① consumer until COPY (Stage 5), so the gate (②) suffices.
+
+### 11.6 What "reuse" actually is, and the plan NOW (owner-settled, 2026-07-18)
+Grounded in the pooled-vs-respawned lifecycle:
+
+| resource | across opens | evidence |
+|---|---|---|
+| RDMA connection | **POOLED** (free-list, stays established) | `tuple_sink_service_process.c:25264` "stays established for one-step reuse" |
+| Arena slot | **POOLED** (slot handed to next backend) | `:25272` "so the DPU can hand it to the next backend" |
+| Byte-rings | **POOLED** (8-slot pool) | gate 8-client cap |
+| **Socketless backend PROCESS** | **RE-SPAWNED per open** (fork+exec+attach + txn re-attach) | per-session `TupleSinkServiceBeginDpuBackendSpawn`; `launchedBackendPid` per-session, cleared on reset `:25283` |
+| Session object | destroyed/recreated per open | `TupleSinkServiceResetSession` memset `:25277` |
+
+**Terminology (owner):** temporal "many commands on one held session" is **persistent-session usage, NOT reuse**;
+concurrent sharing of a command session is **illegal, NOT reuse**. **Reuse = cross-open** (release → a *different*
+open reclaims). Its real payload is **keeping the backend process alive** (the only expensive thing not already
+pooled) — i.e. **backend pooling.**
+
+**Command sessions are SINGLE-TENANT** (the session *is* the tenant unit — one command sequence, one role-1/6/7,
+one backend txn; no per-operation sink to isolate owners, unlike a multi-tenant tuple compatibility session whose
+tenants each get their own `serviceSinkId`). ⇒ command-session reuse is **sequential-only, claim-enforced**.
+
+**THE PLAN NOW (Stages 1-4): carry the seam, build no reuse.**
+- Intent carried in portable specs + recorded as `sessionKey` on the session (data present, nothing matches on it).
+- **Command-open stays allocate-fresh** (today's `FindReusableSession` bypass) — inherently single-tenant-safe, so
+  **no claim bit needed yet**. Resource pooling (RDMA/slot/rings) unchanged. Tuple-stream reuse machinery untouched.
+- **Defensive guard:** a comment at the command-open site + a CONTRACTS `ENFORCES` line — "command-open allocates
+  fresh by design; do NOT route through `FindReusableSession` until COPY-era backend-pooling + claim/release land."
+- pgbench (persistent-session, backend spawned once/client, pooled resources) is **already optimal — nothing to build.**
+
+**DEFERRED to COPY (the real reuse):** retain-session-on-close → **backend pooling** + claim/ownership +
+release-to-pool + sequence continuation (OPEN-response ABI addition) + result-routing UID re-targeting, then wire
+COPY's open through the claim-checked selector. Justified there because frequent open/close makes the per-open
+backend re-spawn the cost worth eliminating.
+
+### 11.5 Reopened decisions for the owner
+1. **S7.2 timing** — delete ①'s code at **Stage 0** (clean tree, smaller extraction surface; design preserved in
+   KB + git) vs. **keep ① as a live reference** until the core lands and delete at the end (safety net, but
+   carries dead host-coupled code through the extraction — the tax §9 Option A rejected). *Recommend Stage 0.*
+2. **Abandon semantics** — confirm **"backend error ⇒ session terminal (no reuse)"** is acceptable (it matches
+   current behavior). *Recommend yes.*
+
+---
+
+## 11.7 Execution-entry decision record + Stage-1 grounding (2026-07-18)
+
+### Decisions taken this session (resolves §11.5 + scopes the build)
+- **§11.5 #1 (S7.2 timing) — RESOLVED: keep ① as a live reference, retire at Stage 4.** The Stage-0-delete
+  *recommendation* in §11.5 was NOT taken; the owner had already chosen "keep ① live until the core lands"
+  (the core is built on ②'s base, ①'s *design* is preserved in this doc + git, so ①'s later deletion forecloses
+  nothing). §11.3's core-first / retire-last staging stands.
+- **§11.5 #2 (abandon) — RESOLVED: yes**, "backend error ⇒ session terminal (no reuse)".
+- **Scope — BUILD THE CORE NOW; DEFER COPY.** The owner considered the alternative (skip the core, do a minimal
+  host-service retirement now — delete UDF+①+Tier-2+host-SHM, flip D7′ — and rebuild the core from this doc when
+  COPY is picked up) and chose to **build the unified core now (Stages 1–4)**. Stage 5 (COPY producer /
+  backend pooling / reuse activation) is deferred until the COPY path is (re)designed. Recorded trade-off: through
+  Stages 1–4 the core has a single live consumer (②) and its intent/reuse machinery is carried **inert** (pgbench
+  exercises only the degenerate intent), so that machinery is compile-covered but not runtime-exercised until COPY.
+  Accepted because building the extraction while ① is still a runnable reference is cheaper than reconstructing it
+  later, and it lands the ② cleanups (the §5.4 error-surfacing gap; clean lease/terminal semantics) now.
+
+### Stage-1 grounding — VERIFIED in code this session (citus `e9dd4676c`)
+The Stage-1 spec projection is **lower-risk than "NOT header-only" suggests**, because the postgres-typed fields
+split cleanly along the live/dead boundary:
+- `OpenRemoteExecutionSession` branches at
+  [`homer_frontend.c:338`](../../../implementations/citus/transport/../../../../src/backend/distributed/utils/homer/homer_frontend.c):
+  **live UDF path = `REMOTE_EXEC_OP_SQL_COMMAND` / `REMOTE_EXEC_OP_CLIENT_SQL_SESSION`** (command session via
+  `OpenCommandSessionThroughLocalService`, `dataPlaneClosed=true`, **never touches the operation spec's
+  `TupleDesc`**). The **only reader** of `RemoteExecTupleSinkOperationSpec.tupleDescriptor` is the **retired
+  tuple-sink/COPY branch** at `homer_frontend.c:446` (`OpenCitusTupleSink`), deleted in Stage 4 anyway.
+- Consequences: the intent-spec **`Oid → uint32`** projection (`effectiveUserId`, `databaseId`) is a **binary
+  no-op** on the live path (`Oid` ≡ `unsigned int`); the operation-spec **`TupleDesc → CitusTupleViewContract`**
+  projection touches **dead code only**. A contract→`TupleDesc` reverse builder already exists and is in
+  production on the result path (`RemoteExecutionBuildTupleDescFromContract`, `homer_frontend.c:116`; synthesizes
+  `column%u` names, comment `:113-114` states the sink layer needs no real attnames), so the round-trip is
+  known-good if the dead branch is ever revived. `CitusTupleViewContract` (`homer_tuple_abi.h:121`) carries
+  atttypid/typmod/collation/attlen/attbyval/attalign/dropped/generated + natts — everything the sink binds on
+  (no attname; not needed).
+
+### Stage-1 tactical refinement — DECIDED (pending final surface map for site-completeness)
+Whether to (a) project `RemoteExecTupleSinkOperationSpec` (TupleDesc→contract) per the plan's letter, or
+(b) leave the tuple-sink operation spec in the backend header as ①-tuple-sink-only retiring code and move only
+the **core-relevant** portable specs (enums + `RemoteExecutionSessionIntentSpec` + `RemoteExecutionCommandSpec`
+family) into the new frontend-safe header. Leaning **(b)**: ② and the future core use options→intent, never the
+host-SHM tuple-sink operation spec; projecting a doomed struct is churn on Stage-4-delete code. Final call is
+recorded once the surface map confirms no core-relevant / live consumer of the operation spec. Either way the new
+frontend-safe header (`homer_session_spec_abi.h`, `postgres.h`/`postgres_fe.h`-free) holds the portable specs and
+`homer_frontend.h` re-includes it so ① compiles unchanged.

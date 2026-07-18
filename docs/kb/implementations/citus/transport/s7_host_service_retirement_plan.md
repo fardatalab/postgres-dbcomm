@@ -251,7 +251,24 @@ invocations, 0 crashes, `gate_check` 20/20 decoded + `spawn_pairs=8`, 3×1200/12
   GUT-then-RESERVE (do NOT shrink) the completion-bitmap wire fields in the spawn ABI to avoid a bridge-ABI change
   ⇒ no DPU TCP smoke. RISK VERDICT (verified): clean bounded deletion, no hidden DPU dependency on the region /
   ready-bitmap / published heartbeat.
-- **Round C = S7.2** UDF removal + (e-API) frontend API removal (finding 3). Validation: gate + basebackup.
+- **Round C = S7.2 ⏸ PAUSED (owner, 2026-07-18) — pending the UNIFICATION design.** Original scope: UDF removal +
+  (e-API) frontend API removal (finding 3). **Round-C map completed and VERIFIED in code (citus `e9dd4676c`):**
+  the dead surface is LARGER than "UDF + 6 API funcs" — the UDF is the sole external caller of the *whole* ①
+  frontend API surface (the 6 command funcs + result/recv/borrow APIs `homer_frontend.c:852`/`:1492`/`:1523`/
+  `:1563` + the 5 command-spec initializers in `homer_citus_policy.c`), AND e-COPY left **dormant COPY-sender
+  residue** in `homer_frontend.c` (`TryReserveRemoteSendBatch:1172`, statics `WaitForRemoteSendBatchReserve:999`
+  / `RemoteExecutionSessionCurrentCopyCommandFailed:965`, `FlushRemoteSendStream`, …) with zero callers outside
+  the file. A literal "delete UDF + 6 funcs" would NOT compile (the residue still calls
+  `PollRemoteExecutionCommandCompletion`). **DROP FUNCTION decision (owner): source-only, no explicit DROP**
+  (remove the `#include` from `sql/citus--13.1-1--13.2-1.sql:5` + delete `latest.sql`; the rig reinstalls).
+  **Why paused:** deleting the `RemoteExecutionSession` API would discard the intent-driven design the future
+  backend COPY re-plumb needs. Instead we PROMOTE ① into a unified frontend-safe core — see
+  [`../../../future-directions/citus/transport/homer_unified_session_core_plan.md`](../../../future-directions/citus/transport/homer_unified_session_core_plan.md).
+  S7.2 resumes only after that design settles. ⚠ **CORRECTED (2nd review, 2026-07-18): S7.3 is NOT independent** —
+  ①'s command session opens through Tier-2 (`HomerFrontendDmaOpenCommandSession`), so removing Tier-2 breaks the
+  UDF. Under the owner's "keep ① live as reference until the core lands" decision, **S7.2 + S7.3 + the D7′
+  all-slots assertion all BUNDLE into the FINAL retirement stage of the unification track (Stage 4)**, after the
+  core is built. Sequencing + rationale: unification doc §11.3.
 - **Round D = diagnostic-gate cleanup.** Validation: gate.
 
 **KEEP-SET that MUST survive Round A** (verified load-bearing): `EnableExperimentalTupleSinkRouting` +

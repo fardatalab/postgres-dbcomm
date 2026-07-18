@@ -47,6 +47,47 @@ the call site. If it is not on the list, **it has not been checked.**
   sizing in `HomerServiceEnsureLocalReceiveByteRing()`; `HomerServiceFillPayloadStreamQueueDescriptor()`;
   `TupleSinkServiceCompleteStreamOpenAsyncOp()`; and `TupleSinkServiceStartServiceResultPeerOpen()`.
 
+## `CitusRemoteExecSessionKey` — 13-field REUSE/RENDEZVOUS key; base-compat reads only a 5-field SUBSET; 6 fields are RESERVED-in-ABI
+
+- **MEANS:** the 13 fixed-width `uint32` reuse-compatibility key (`homer_control_abi.h:165`) built from all 12
+  `RemoteExecutionSessionIntentSpec` fields by `BuildControlSessionKeyFromIntent()` (`homer_frontend_control.c:311`).
+  It is the connection-compatibility domain, mirroring Citus connection selection.
+- **DOES NOT MEAN:** (1) a UNIQUE session identity — it is **NON-unique by design** (four pgbench clients on one
+  db/user/node share ONE key). **THREE DISTINCT IDENTITIES, do not confuse them:**
+  - **`sessionKey`** (this) — *non-unique* compatibility/rendezvous key; answers "may these two sessions be
+    reused for each other?"; **never** an identity or a binding key.
+  - **`serviceSessionId`** — *node-local UNIQUE*, minted monotonically per session on that node
+    (`tuple_sink_service_process.c:5727-5765`); answers "which session on THIS node?"; it is what rejects a stale
+    role-6 event after slot re-tenancy (fresh id per session).
+  - **`sessionUID`** — *cross-node UNIQUE*, client-minted, threaded through open/peer-open and **stamped on
+    `HomerDpuBridgeRingDescriptor`**; the ONLY correct key to **bind a ring** to one specific live session.
+  ⇒ **never bind a ring by `sessionKey` or by `serviceSessionId`; use `sessionUID`.** (2) that all 13 fields gate
+  reuse — **base-compat (`HomerServiceSessionKeysBaseCompatible:24040`, the SINGLE base-compat definition) reads
+  only 5**: `protocolVersion`, `destinationNodeId`, `effectiveUserId`, `databaseId`, `executionLane`.
+- **CONTRACT:** reuse decision = base-compat (5-field subset) **AND** `TupleSinkServiceSessionAllowsReuse:24626`
+  (dynamic: `freshnessPolicy` FORCE_FRESH/REQUIRE_CLEAN, `ownershipPolicy` PIN_EXCLUSIVE, post-command terminal
+  state, command-in-flight, placement-access clean-history). The other 6 key fields — `opKind` (used for
+  validation/basebackup pairing, not base-compat), `accessKind`, `txPolicy`, `metadataPolicy`, `placementScope`,
+  `transactionCritical` — are **carried in the wire ABI but NOT read by the reuse predicate today (RESERVED for
+  the future COPY re-plumb).** Activating one is a **PREDICATE change (extend base-compat/`AllowsReuse`), NEVER an
+  ABI change** — the 13-field key is frozen.
+- **TEMPTING WRONG MOVE:** (a) pruning a "dead" reserved field — it is a wire-ABI field; deleting it breaks the
+  protocol. **Keep all 13.** (b) ⛔ **routing the selected-DPU COMMAND open through `FindReusableSession`.** It
+  BYPASSES reuse by design — `TupleSinkServiceProgressCommandOpenAsyncOp` `COMMAND_CREATE` allocates a fresh
+  session (`tuple_sink_service_process.c:40280`), one-export-per-open; only the **tuple-stream** path reuses
+  (`:39326`). **WHY it must stay bypassed:** a command session is **SINGLE-TENANT** (it *is* the tenant unit — one
+  command sequence, one role-1/6/7, one backend txn; no per-op sink to isolate owners, unlike a multi-tenant tuple
+  compatibility session). N clients share the 5-field base-compat key, so `FindReusableSession` could hand two
+  live clients one session ⇒ colliding sequence-1 commands. And there is **no retained command-session pool**
+  anyway (close destroys via `TupleSinkServiceResetSession` memset `:25277`; the backend is re-spawned per open),
+  so the call would only ever return a live-held session. **Command-open allocates fresh; do NOT wire it through
+  `FindReusableSession` until COPY-era backend-pooling + claim/release + sequence-continuation land** (design:
+  unified-session-core plan §11.6). (c) binding a ring by sessionKey/serviceSessionId instead of `sessionUID`.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** `BuildControlSessionKeyFromIntent` (all 12 intent→key, keep in sync
+  with the struct); `HomerServiceSessionKeysBaseCompatible` (the 5-field subset — the sole base-compat def);
+  `TupleSinkServiceSessionAllowsReuse`; `TupleSinkServiceFindReusableSession` callers (`:29783`/`:39326`/`:40711`).
+- **Design that promotes this to a unified core:** [`../../../future-directions/citus/transport/homer_unified_session_core_plan.md`](../../../future-directions/citus/transport/homer_unified_session_core_plan.md) §5.6.
+
 ## Byte-ring SLOT size vs RING size — **slots are HOMOGENEOUS (DOCA arena); the wire equality is PER-PAIR host==remote / source==host, NOT slot==host**
 
 - **MEANS:** the pool sizes every slot at `slotStorageBytes` = `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES`
