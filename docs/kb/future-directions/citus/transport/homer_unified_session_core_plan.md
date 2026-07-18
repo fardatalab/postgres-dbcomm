@@ -1,10 +1,19 @@
-<!-- kb-summary: Design plan to merge the two divergent Homer session abstractions — backend RemoteExecutionSession (intent-driven) and frontend HomerClientSession (selected-DPU client) — into ONE frontend-safe portable core + transport vtable + thin backend/frontend adapters, over the kept selected-DPU transport. Carries the verified frontend-safety audit and the reconciliation decisions. Gates S7.2. -->
+<!-- kb-summary: Design plan to merge the divergent Homer session abstractions (backend RemoteExecutionSession + frontend HomerClientSession + basebackup) into ONE intent-driven frontend-safe portable core with typed per-kind handles (compile-time op legality) over a link-time transport module seam, on the kept selected-DPU transport. Authoritative plan = §12 (build) + §13 (interface); §1–§11 are design evolution. Gates S7.2. -->
 
 # Homer unified session core — merging RemoteExecutionSession (①) and HomerClientSession (②)
 
 > ## ⚠ STATUS — read first
 >
-> **DESIGN SETTLED; EXECUTION STARTED (2026-07-18). Now at Stage 1** (see §11.3 / §11.7).
+> **AUTHORITATIVE CURRENT PLAN = §12 (build plan) + §13 (the unified interface).** §1–§11 record the design's
+> *evolution* (problem → Approach A → the audit + three review rounds that refined it); read them for rationale and
+> rejected approaches, not as the current spec. In particular, where §1–§11 say **"vtable"** that was the earlier
+> dispatch mechanism — the current decision is a **link-time module seam (core↔transport) + typed opaque handles
+> (core↔caller, compile-time op legality)**, vtable deferred to COPY (§12.1, §13.1).
+>
+> **EXECUTION: Stage 1 DONE + validated + committed** (frontend-safe `homer_session_spec.h`; citus `5cadf1c9c`+
+> `265b6630d`, postgres `dc750a261b2`). **Next: Stage 2** (in-`homer_client.c` SQL transport facade). Full staging
+> in §12.4/§12.5/§12.5b: Stage 2 facade → Stage 3 intent-driven core (SQL) → **Stage 3.5 basebackup migration
+> (multi-consumer proof, before retirement)** → Stage 4 final retirement → Stage 5 COPY (deferred).
 >
 > **DESIGN NOTE (opened 2026-07-18).** This gates **S7.2** in
 > [`../../../implementations/citus/transport/s7_host_service_retirement_plan.md`](../../../implementations/citus/transport/s7_host_service_retirement_plan.md):
@@ -733,14 +742,6 @@ shared sink-lease from Stage 3), and the BASE_BACKUP operation-open spec (direct
 `launchDiscriminatorTag`, SEND peer endpoint). basebackup terminal keeps its FAILED(credit-line)/CLOSED split
 (§13.4). Design is grounded in the VERIFIED basebackup map (§13). **Validation: four-role basebackup (the
 mandatory transport-acceptance workload) + gate + DPU TCP smoke.**
-
-### 12.6 What this corrects in earlier sections (cross-reference for a reader who lands there first)
-- §2 / §10.3 "vtable" → link-time MODULE SEAM now, function-pointer vtable deferred to COPY (§12.1).
-- §11.4 "shared caller-owned device" → correct as the GOAL; current code is per-session; Stage 3 builds the shared
-  process-owned context (§12.3).
-- Producer + bulk-consume ops: NO `HomerClientSession` implementation, but they ARE designed (against the real
-  basebackup code, §13) and land at **Stage 3.5** (basebackup migration), not deferred to COPY. COPY (Stage 5)
-  then reuses these planes.
 
 ---
 
