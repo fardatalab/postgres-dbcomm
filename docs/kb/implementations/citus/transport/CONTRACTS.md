@@ -205,6 +205,27 @@ the call site. If it is not on the list, **it has not been checked.**
 - **COST:** the setup-close finalizer was defeated by the `descriptor->serviceSessionId` bug (first entry). Node
   A leaked **100%** of its selected sessions. Audit §44–§45.
 
+## `homer_mode` / `homer_dpu_selected_command` / `homer_dpu_result_relay` — every pgbench Homer session is selected-DPU
+
+- **MEANS:** `--homer` enables Homer semantics, while `--homer-dpu` or `--homer-dpu-command` selects the only
+  surviving client command plane. Both selected spellings imply the role-7 SQL-result relay.
+- **DOES NOT MEAN:** plain `--homer` selects a dormant host-service fallback. S7.1 retired the host control,
+  named-mailbox, and host result-sink client APIs and state; option validation rejects plain `--homer` before
+  any session opens.
+- **CONTRACT:** `homer_mode` implies `homer_dpu_selected_command`, which implies `homer_dpu_result_relay`.
+  `openHomerSession()` unconditionally calls `HomerClientOpenSqlSessionSelectedDpu()`; command completion drains
+  only through `HomerDrainPendingDpuResultRelay()` and `HomerClientPollSqlResultDpuReceive()` into role 7.
+  Selected session close remains guarded by `commandDpuStreamOpen` so a partially opened session cannot run the
+  semantic close protocol against an absent export.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** option fail-close in
+  `/data/dbcomm/postgres-citus/src/bin/pgbench/pgbench.c:~8610`; session open/close and relay drain in
+  `openHomerSession()`, `finishHomerSession()`, and `HomerDrainPendingResultSink()` in the same file; selected-only
+  command/completion guards in `/data/dbcomm/citus-dbcomm/src/bin/homer_client.c` at
+  `HomerClientStartCommandWithCompletionFlags()`, `HomerClientPeekNextCompletionEvent()`,
+  `HomerClientTryCommandCompletion()`, and `HomerClientWaitCommandCompletion()`.
+- **TEMPTING WRONG MOVE:** do not recreate a host-shm result fallback when role-7 setup or drain fails. That would
+  make intended-path proof ambiguous and reintroduce APIs whose ownership/lifetime was deleted in S7.1(a).
+
 ## `HOMER_SERVICE_LOG(...)` and the stats macros — **COMPILED OUT of a perf build**
 
 - **MEANS:** verbose development logging. `HOMER_SERVICE_VERBOSE_LOGGING` **defaults to 0**.

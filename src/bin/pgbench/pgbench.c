@@ -324,64 +324,35 @@ static uint32 homer_peer_port = 0;
 static int32 homer_peer_node = 1;
 
 /*
- * Part 3.5 (step 6): --homer-dpu opts the measured SQL RESULT path off the
- * passive host-shm result sink and onto the DPU two-ring deform relay. The
- * command/completion control path is unchanged; only result-tuple delivery
- * differs (a client-exported role-7 DPU->host ring drained per command to its
- * in-band EOS). It requires --homer, a remote peer, and -M simple.
+ * --homer-dpu selects the surviving selected-DPU command plane and its SQL
+ * result relay. Result tuples arrive through a client-exported role-7 DPU->host
+ * ring and are drained per command through the in-band EOS. It requires
+ * --homer, a remote peer, and -M simple.
  */
 static bool homer_dpu_mode = false;
 
 /*
- * Command-plane S1a: --homer-dpu-command opens the SQL COMMAND session against the
- * client's LOCAL DPU (a role-1 control slot exported over the DPU setup TCP socket)
- * instead of a mapped host-service control region. No host Homer service takes part in
- * the command open.
+ * --homer-dpu-command is the explicit spelling for the selected-DPU SQL command
+ * plane (a role-1 control slot exported to the client's local DPU).
  *
- * Was deliberately a SEPARATE flag from --homer-dpu (for bisection): pre-S4, per-command execution still needed the
- * host-shm command mailbox, which the DPU-native opener does not create (the backend lives on another node), so
- * folding it into --homer-dpu would have broken that path. S6 Track A (2026-07-17) DID the fold: S4 is complete
- * (B.1's -c1 --homer-dpu-command gate carried commands+completions over the DPU end to end), so native --homer-dpu
- * now adopts this command plane via homer_dpu_selected_command (below). This flag is kept ONE cycle as a deprecated
- * alias, then deleted.
- *
- * STALE AS OF P3 (July 11, 2026) -- the paragraph that used to live here said "expect the run
- * to fail at the first transaction with 'invalid arguments while starting ...' (session->control
- * is NULL by design); that is the intended S1a stopping point". That has not been true since the
- * P2 cross-node command/completion bridges closed: the command now executes on a DPU-spawned
- * backend on the far node and its completion comes back. Kept as a note because the old text is
- * quoted in older KB sections.
+ * S6 folded native --homer-dpu onto this same command plane; this flag remains
+ * as the explicit command-plane spelling.
  */
 static bool homer_dpu_command_mode = false;
 
 /*
- * S6 Track A fold: the derived command-plane predicate -- TRUE under EITHER flag. S4 (pgbench --homer-dpu-command
- * end to end) is now complete (validated by B.1's -c1 gate), so native --homer-dpu adopts the selected-DPU command
- * plane -- exactly the fold the homer_dpu_command_mode comment above anticipated ("Once S4 ... folds into
- * --homer-dpu"). --homer-dpu-command is kept one cycle as a deprecated alias, then deleted. Derived once at
- * option-validation time; used at the two command-selection sites (host-control guard + selected opener).
+ * S6 Track A fold: the derived command-plane predicate is true under either
+ * selected-DPU spelling. S7.1 retired the host-service alternative, so every
+ * accepted Homer run uses this command plane.
  */
 static bool homer_dpu_selected_command = false;
 
 /*
  * P3 hop 6: does this run need the DPU RESULT relay (client-exported role-7 DPU->host ring)?
  *
- * True under EITHER flag, but for different reasons -- and the --homer-dpu-command half is an
- * IMPLICATION, not a coincidence:
- *
- *   --homer-dpu          the user explicitly asked for DPU result delivery while the COMMAND
- *                        plane stays on the host service (the pre-P3 v17/v18 shape).
- *   --homer-dpu-command  the command session runs against the local DPU, so the backend is
- *                        spawned BY the far DPU -- and such a backend has NO host-shm result
- *                        sink at all. Its only result egress is the arena role-5 byte ring,
- *                        which only the DPU can drain and relay. So the result relay is
- *                        STRUCTURALLY MANDATORY here, not an option the user may decline.
- *                        Before this, --homer-dpu-command alone left the backend publishing
- *                        result bytes into role-5 that nobody consumed, and the node-B service
- *                        correctly refused to start a result peer-open the client never asked
- *                        for -- which read as a service bug (validation run 20) but was really
- *                        this missing client gate. See KB dpu_crossnode_command_completion_
- *                        bridges_design.md section 10f.
+ * True under either selected-DPU spelling. The far-DPU-spawned backend publishes
+ * into the arena role-5 byte ring, so the DPU relay into the frontend's role-7
+ * ring is structurally mandatory rather than an optional result path.
  *
  * Derived once in the option-validation block below rather than repeating the disjunction at
  * each of its four use sites, so the rule is stated in exactly one place.
@@ -738,17 +709,13 @@ typedef struct
 {
 	PGconn	   *con;			/* connection handle to DB */
 	HomerClientSession homer_session;	/* external-service SQL session */
-	HomerClientResultSink homer_result_sink;	/* reusable tuple result mapping */
 	bool		homer_session_open;
-	bool		homer_result_sink_open;
 	bool		homer_transaction_attached;
 	bool		homer_command_pending;
 	bool		homer_pending_result_sink_bound;
 	uint32		homer_pending_command_kind;
-	uint32		homer_pending_result_mode;
 	uint64		homer_pending_command_sequence;
 	uint64		homer_pending_drained_rows;
-	HomerClientResultDrainTarget homer_pending_drain_target;
 	const char *homer_pending_operation_name;
 
 	/*
@@ -764,13 +731,11 @@ typedef struct
 	 */
 	pg_time_usec_t homer_pending_started_us;	/* stamped when the command is issued */
 	uint32		homer_pending_poll_count;	/* not-ready polls since last deadline check */
-	bool homer_stable_result_binding_valid;
-	uint64 homer_stable_result_drained_tail;
 	/*
 	 * DPU result relay state. When homer_dpu_result_relay is on (--homer-dpu, or
 	 * --homer-dpu-command which implies it -- P3 hop 6), the measured command's RESULT
 	 * tuples arrive through the session's role-7 DPU->host ring
-	 * (role 7 in session.commandDpuStream) rather than a host-shm result sink. The
+	 * (role 7 in session.commandDpuStream). The
 	 * per-command tuple-view contract is captured from the command completion
 	 * (see HomerApplyCommandCompletion) so the DPU drain can finalize each
 	 * decoded tuple; homer_last_abalance holds the most recently decoded first
@@ -850,8 +815,6 @@ typedef struct
 
 	int64		throttle_trigger;	/* previous/next throttling (us) */
 	FILE	   *logfile;		/* where to log, or NULL */
-	HomerClientControl homer_control;	/* thread-local service control map */
-	bool		homer_control_open;
 
 	/* per thread collected stats in microseconds */
 	pg_time_usec_t create_time; /* thread creation time */
@@ -1025,7 +988,7 @@ static void addScript(const ParsedScript *script);
 static THREAD_FUNC_RETURN_TYPE THREAD_FUNC_CC threadRun(void *arg);
 static void finishCon(CState *st);
 static void finishHomerSession(CState *st);
-static bool openHomerSession(TState *thread, CState *st);
+static bool openHomerSession(CState *st);
 static bool validateHomerScriptSupport(void);
 static void printLatencyPercentiles(TState *threads);
 static void freeLatencySamples(TState *threads);
@@ -1243,8 +1206,7 @@ usage(void)
 		   "  --homer                  submit simple SQL through the Homer service\n"
 		   "  --homer-dpu              deliver --homer SQL results via the DPU deform relay\n"
 		   "  --homer-dpu-command      open the --homer SQL command session on the local DPU\n"
-		   "                           (implies --homer-dpu: a DPU-spawned backend has no\n"
-		   "                           host-shm result sink, so results must use the relay)\n"
+		   "                           (results use the mandatory selected-DPU relay)\n"
 		   "  --homer-client-cpu=CPU   alias for --client-cpu\n"
 		   "  --homer-database-oid=OID database OID for --homer sessions\n"
 		   "  --homer-peer-host=HOST   remote Homer backend-node service host\n"
@@ -3598,7 +3560,7 @@ HomerSqlLooksRowProducing(const char *sql)
  * clearHomerPendingCommand drops the per-client in-flight command metadata
  * after a terminal completion. The command itself is owned by the external
  * service and backend; pgbench only keeps enough state to match the pushed
- * completion and drain any result sink tied to this command.
+ * completion and drain the selected-DPU relay tied to this command.
  */
 static void
 clearHomerPendingCommand(CState *st)
@@ -3606,10 +3568,8 @@ clearHomerPendingCommand(CState *st)
 	st->homer_command_pending = false;
 	st->homer_pending_result_sink_bound = false;
 	st->homer_pending_command_kind = 0;
-	st->homer_pending_result_mode = CITUS_REMOTE_EXEC_SQL_RESULT_NONE;
 	st->homer_pending_command_sequence = 0;
 	st->homer_pending_drained_rows = 0;
-	memset(&st->homer_pending_drain_target, 0, sizeof(st->homer_pending_drain_target));
 	st->homer_pending_operation_name = NULL;
 	/*
 	 * The tuple-view contract is a per-command fact (published in that command's
@@ -3617,110 +3577,6 @@ clearHomerPendingCommand(CState *st)
 	 * reset: it is a client-level "last decoded value" kept across commands.
 	 */
 	st->homer_pending_result_contract_valid = false;
-}
-
-/*
- * Stage 4b pre-arm cache management.
- *
- * A stable result binding is not a prediction that the next query is small. It
- * is a proof that pgbench already has the same descriptor/contract mapped and
- * that the previous result generation reached EOS at a known byte-ring tail.
- * The next SQL_EXECUTE tuple result can then be bound to commandSequence and
- * that tail before STARTED arrives. STARTED is still published in Stage 4b and
- * is used to validate the pre-armed binding before the event is ACKed.
- */
-static void HomerInvalidateStableResultBinding(CState *st)
-{
-	st->homer_stable_result_binding_valid = false;
-	st->homer_stable_result_drained_tail = 0;
-}
-
-static bool HomerQueueDescriptorSamePhysicalSink(const CitusTupleSinkQueueDescriptor *left,
-												 const CitusTupleSinkQueueDescriptor *right)
-{
-	return left != NULL && right != NULL && left->protocolVersion == right->protocolVersion &&
-		   left->byteRingBytes == right->byteRingBytes && left->maxRecordBytes == right->maxRecordBytes &&
-		   left->slotReservedPrefixBytes == right->slotReservedPrefixBytes && left->direction == right->direction &&
-		   left->descriptorFlags == right->descriptorFlags &&
-		   memcmp(left->queueShmName, right->queueShmName, sizeof(left->queueShmName)) == 0;
-}
-
-static bool HomerQueueDescriptorSamePhysicalAttachment(const CitusTupleSinkQueueDescriptor *left,
-													   const CitusTupleSinkQueueAttachment *right)
-{
-	return left != NULL && right != NULL && left->protocolVersion == right->protocolVersion &&
-		   left->byteRingBytes == right->byteRingBytes && left->maxRecordBytes == right->maxRecordBytes &&
-		   left->slotReservedPrefixBytes == right->slotReservedPrefixBytes && left->direction == right->direction &&
-		   left->descriptorFlags == right->descriptorFlags &&
-		   memcmp(left->queueShmName, right->queueShmName, sizeof(left->queueShmName)) == 0;
-}
-
-static bool HomerPrearmedResultBindingMatchesCompletion(CState *st, const CitusRemoteExecCommandCompletion *completion)
-{
-	const HomerClientResultSink *resultSink = &st->homer_result_sink;
-
-	if (completion == NULL || (completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) == 0)
-		return true;
-
-	if (!st->homer_pending_result_sink_bound || !st->homer_result_sink_open || !resultSink->open)
-		return true;
-
-	return HomerQueueDescriptorSamePhysicalSink(&resultSink->queueDescriptor, &completion->resultQueueDescriptor) &&
-		   memcmp(&resultSink->tupleViewContract, &completion->resultTupleViewContract,
-				  sizeof(resultSink->tupleViewContract)) == 0 &&
-		   resultSink->resultGeneration == completion->resultQueueDescriptor.resultGeneration &&
-		   resultSink->startByteTail == completion->resultQueueDescriptor.startByteTail;
-}
-
-static bool HomerPrearmedResultBindingMatchesCompletionView(CState *st, const HomerClientCompletionView *completionView)
-{
-	const HomerClientResultSink *resultSink = &st->homer_result_sink;
-
-	if (completionView == NULL ||
-		(completionView->hot.resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) == 0)
-		return true;
-
-	if (!st->homer_pending_result_sink_bound || !st->homer_result_sink_open || !resultSink->open)
-		return true;
-
-	if (completionView->descriptor == NULL)
-		return false;
-
-	return HomerQueueDescriptorSamePhysicalAttachment(&resultSink->queueDescriptor,
-													  &completionView->descriptor->queueAttachment) &&
-		   memcmp(&resultSink->tupleViewContract, &completionView->descriptor->tupleViewContract,
-				  sizeof(resultSink->tupleViewContract)) == 0 &&
-		   resultSink->resultGeneration == completionView->hot.resultGeneration &&
-		   resultSink->startByteTail == completionView->hot.resultStartByteTail;
-}
-
-static void HomerRememberStableResultBinding(CState *st, const CitusRemoteExecCommandCompletion *completion)
-{
-	const HomerClientResultSink *resultSink = &st->homer_result_sink;
-
-	if (completion == NULL || st->homer_pending_command_kind != CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE ||
-		st->homer_pending_result_mode != CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE ||
-		(completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) == 0 ||
-		!st->homer_pending_result_sink_bound || !st->homer_result_sink_open || !resultSink->open ||
-		!resultSink->eosSeen)
-	{
-		return;
-	}
-
-	/*
-	 * Only remember a descriptor after the real completion descriptor has been
-	 * validated against the currently bound sink. The next command may then
-	 * reuse the same physical sink and start at the drained byte tail.
-	 */
-	st->homer_stable_result_binding_valid = true;
-	st->homer_stable_result_drained_tail = resultSink->consumedHead;
-}
-
-static bool HomerCanTryPrearmStableResultBinding(CState *st, uint32 commandKind, uint32 resultMode)
-{
-	return commandKind == CITUS_REMOTE_EXEC_COMMAND_SQL_EXECUTE && resultMode == CITUS_REMOTE_EXEC_SQL_RESULT_TUPLE &&
-		   st->homer_stable_result_binding_valid && st->homer_result_sink_open && st->homer_result_sink.open &&
-		   st->homer_result_sink.eosSeen && st->homer_result_sink.consumedHead == st->homer_stable_result_drained_tail;
 }
 
 #ifndef HOMER_CLIENT_COMMAND_RESERVATION_DIAG
@@ -3756,40 +3612,6 @@ static void HomerLogCommandSqlPreview(CState *st, const char *label, uint32 comm
 #endif
 }
 
-static bool HomerTryPrearmStableResultBinding(CState *st, uint32 commandKind, uint32 resultMode, uint64 commandSequence,
-											  const char *operationName)
-{
-	char errorMessage[HOMER_CLIENT_ERROR_BYTES];
-
-	if (commandSequence == 0 || !HomerCanTryPrearmStableResultBinding(st, commandKind, resultMode))
-	{
-		return false;
-	}
-
-	/*
-	 * Pre-arm only changes the command-local binding of an already mapped,
-	 * already validated result sink. Avoid synthesizing a full legacy
-	 * completion just to drive this hot path.
-	 */
-	if (!HomerClientRebindResultSink(&st->homer_result_sink, st->homer_result_sink.descriptorVersion, commandSequence,
-									 st->homer_stable_result_drained_tail, 0, errorMessage, sizeof(errorMessage)))
-	{
-		/*
-		 * Pre-arm is an optimization predicate. A miss must fall back to the
-		 * normal STARTED descriptor path, not fail a command that is already
-		 * in flight. Invalidate so later commands re-learn from a real event.
-		 */
-		pg_log_debug("client %d could not pre-arm Homer result sink for %s: %s", st->id, operationName, errorMessage);
-		HomerInvalidateStableResultBinding(st);
-		return false;
-	}
-
-	st->homer_result_sink_open = true;
-	pg_log_debug("client %d pre-armed Homer result sink for %s sequence=%llu tail=%llu", st->id, operationName,
-				 (unsigned long long)commandSequence, (unsigned long long)st->homer_stable_result_drained_tail);
-	return true;
-}
-
 typedef enum HomerCompletionApplyResult
 {
 	HOMER_COMPLETION_APPLIED_CONTINUE = 0,
@@ -3800,9 +3622,8 @@ typedef enum HomerCompletionApplyResult
 } HomerCompletionApplyResult;
 
 /*
- * HomerDrainPendingDpuResultRelay is the --homer-dpu counterpart of
- * HomerDrainPendingResultSink. Instead of a host-shm result sink it advances the
- * session's role-7 DPU->host result ring (in session.commandDpuStream): result
+ * HomerDrainPendingDpuResultRelay advances the selected-DPU session's role-7
+ * DPU->host result ring (in session.commandDpuStream): result
  * tuples land as WHOLE decoded records that HomerClientPollSqlResultDpuReceive
  * delivers once per call, finalizing each tuple against the per-command
  * tuple-view contract (captured in HomerApplyCommandCompletion) and reporting
@@ -3863,7 +3684,6 @@ HomerDrainPendingDpuResultRelay(CState *st, const char *operationName, bool term
 			pg_log_error("client %d failed to drain Homer DPU result relay for %s: %s", st->id, operationName,
 						 errorMessage);
 			st->estatus = ESTATUS_OTHER_SQL_ERROR;
-			HomerInvalidateStableResultBinding(st);
 			clearHomerPendingCommand(st);
 			return HOMER_COMPLETION_APPLY_FATAL;
 		}
@@ -3921,78 +3741,20 @@ HomerDrainPendingDpuResultRelay(CState *st, const char *operationName, bool term
 }
 
 /*
- * HomerDrainPendingResultSink advances the command-local result sink without
- * spinning inside the client library. For terminal completions, NOT_READY or
- * VISIBILITY_PENDING means pgbench must keep the leased completion unacked and
- * retry from the normal state-machine loop.
+ * All Homer commands use the selected-DPU role-7 relay after the S7.1
+ * host-service retirement. Keep this wrapper so completion and interim-drain
+ * callers share one dispatch point.
  */
 static HomerCompletionApplyResult HomerDrainPendingResultSink(CState *st, const char *operationName,
-															  bool terminalCompletion)
+																  bool terminalCompletion)
 {
-	char errorMessage[HOMER_CLIENT_ERROR_BYTES];
-	HomerClientResultDrainStatus drainStatus = HOMER_RESULT_DRAIN_NOT_READY;
-	HomerClientResultDrainTarget drainTarget;
-	HomerClientResultDrainBudget drainBudget;
-
-	/*
-	 * The DPU result relay delivers RESULT tuples through the DPU two-ring relay, not
-	 * the host-shm result sink. Divert to the DPU relay drain, which keeps the same
-	 * apply-result control-flow contract the caller expects.
-	 *
-	 * P3 hop 6: keyed on homer_dpu_result_relay, not homer_dpu_mode -- under
-	 * --homer-dpu-command the backend is DPU-spawned and has no host-shm sink to drain,
-	 * so the relay drain is the ONLY correct path there too.
-	 */
-	if (homer_dpu_result_relay)
-		return HomerDrainPendingDpuResultRelay(st, operationName, terminalCompletion);
-
-	memset(&drainBudget, 0, sizeof(drainBudget));
-	if (terminalCompletion)
-		drainTarget = st->homer_pending_drain_target;
-	else
-		memset(&drainTarget, 0, sizeof(drainTarget));
-
-	if (!HomerClientDrainResultSinkUntil(&st->homer_result_sink, &drainTarget, &drainBudget, &drainStatus,
-										 &st->homer_pending_drained_rows, errorMessage, sizeof(errorMessage)))
-	{
-		pg_log_error("client %d failed to drain Homer result sink for %s: %s", st->id, operationName, errorMessage);
-		st->estatus = ESTATUS_OTHER_SQL_ERROR;
-		HomerClientCloseResultSink(&st->homer_result_sink, false);
-		st->homer_result_sink_open = false;
-		HomerInvalidateStableResultBinding(st);
-		clearHomerPendingCommand(st);
-		return HOMER_COMPLETION_APPLY_FATAL;
-	}
-
-	if (!terminalCompletion)
-	{
-		return HOMER_COMPLETION_APPLIED_CONTINUE;
-	}
-
-	if (drainStatus == HOMER_RESULT_DRAIN_COMPLETE)
-	{
-		return HOMER_COMPLETION_APPLIED_CONTINUE;
-	}
-	if (drainStatus == HOMER_RESULT_DRAIN_NOT_READY || drainStatus == HOMER_RESULT_DRAIN_PROGRESS ||
-		drainStatus == HOMER_RESULT_DRAIN_VISIBILITY_PENDING)
-	{
-		return HOMER_COMPLETION_NOT_APPLIED_RETRY;
-	}
-
-	pg_log_error("client %d Homer result sink for %s returned unexpected drain status %u", st->id, operationName,
-				 (unsigned int)drainStatus);
-	st->estatus = ESTATUS_OTHER_SQL_ERROR;
-	HomerClientCloseResultSink(&st->homer_result_sink, false);
-	st->homer_result_sink_open = false;
-	HomerInvalidateStableResultBinding(st);
-	clearHomerPendingCommand(st);
-	return HOMER_COMPLETION_APPLY_FATAL;
+	return HomerDrainPendingDpuResultRelay(st, operationName, terminalCompletion);
 }
 
 /*
  * HomerApplyCommandCompletion consumes one command completion observed either
- * as the immediate START_COMMAND response or as a later pushed completion from
- * the service-to-client mailbox. STARTED means that a command is still in
+ * as the immediate START_COMMAND response or as a later role-6 selected-DPU
+ * completion. STARTED means that a command is still in
  * flight, but it may already expose a tuple sink descriptor. COMPLETED is the
  * only point where pgbench advances its command state and updates the
  * transaction attachment flag.
@@ -4002,8 +3764,6 @@ static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
 															  const HomerClientCompletionView *completionView,
 															  bool *commandComplete)
 {
-	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
-	HomerClientResultSink *resultSink = &st->homer_result_sink;
 	const char *operationName = st->homer_pending_operation_name ?
 		st->homer_pending_operation_name : "unknown";
 
@@ -4021,12 +3781,10 @@ static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
 			/*
 			 * DPU result relay (P3 hop 6: either --homer-dpu or --homer-dpu-command;
 			 * see homer_dpu_result_relay): the RESULT tuples for this command are relayed
-			 * through the session's role-7 DPU->host ring, NOT a host-shm result sink. So
-			 * do not open/rebind/pre-arm a shm sink here. Instead, when this
+			 * through the session's role-7 DPU->host ring. When this
 			 * command's completion first exposes a tuple result (TUPLE_SINK_READY),
 			 * capture the per-command tuple-view contract -- the same contract the
-			 * shm path reads via HomerClientOpenResultSinkFromCompletionView, i.e.
-			 * completionView->descriptor->tupleViewContract. The DPU drain needs it
+			 * completion view publishes in descriptor->tupleViewContract. The DPU drain needs it
 			 * to finalize each decoded tuple. On the immediate START_COMMAND response
 			 * completionView is NULL, so fall back to the equivalent field carried in
 			 * the full completion (resultTupleViewContract).
@@ -4075,82 +3833,6 @@ static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
 					return HOMER_COMPLETION_APPLY_FATAL;
 			}
 		}
-		else
-		{
-		if (completionView == NULL && (completion->resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0 &&
-			!HomerPrearmedResultBindingMatchesCompletion(st, completion))
-		{
-			pg_log_error("client %d Homer pre-armed result binding for %s did not match STARTED descriptor", st->id,
-						 operationName);
-			st->estatus = ESTATUS_OTHER_SQL_ERROR;
-			HomerInvalidateStableResultBinding(st);
-			clearHomerPendingCommand(st);
-			return HOMER_COMPLETION_APPLY_FATAL;
-		}
-		if (completionView != NULL &&
-			(completionView->hot.resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0 &&
-			!HomerPrearmedResultBindingMatchesCompletionView(st, completionView))
-		{
-			pg_log_error("client %d Homer pre-armed result binding for %s did not match STARTED descriptor view",
-						 st->id, operationName);
-			st->estatus = ESTATUS_OTHER_SQL_ERROR;
-			HomerInvalidateStableResultBinding(st);
-			clearHomerPendingCommand(st);
-			return HOMER_COMPLETION_APPLY_FATAL;
-		}
-
-		if (!st->homer_pending_result_sink_bound &&
-			(completion->resultFlags &
-			 CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
-		{
-			bool opened = false;
-
-			if (completionView != NULL &&
-				(completionView->hot.resultFlags & CITUS_REMOTE_EXEC_RESULT_FLAG_TUPLE_SINK_READY) != 0)
-			{
-				opened = HomerClientOpenResultSinkFromCompletionView(completionView, resultSink, errorMessage,
-																	 sizeof(errorMessage));
-			}
-			else
-			{
-				opened = HomerClientOpenResultSink(completion, resultSink, errorMessage, sizeof(errorMessage));
-			}
-			if (!opened)
-			{
-				pg_log_error("client %d failed to open Homer result sink for %s: %s",
-							 st->id, operationName, errorMessage);
-				st->estatus = ESTATUS_OTHER_SQL_ERROR;
-				clearHomerPendingCommand(st);
-				return HOMER_COMPLETION_APPLY_FATAL;
-			}
-
-			/*
-			 * The mapping is reusable across later result-producing commands
-			 * from the same remote session. Keep the descriptor attached to the
-			 * client until session finish, but track command-local binding so a
-			 * terminal completion is not opened twice.
-			 */
-			st->homer_result_sink_open = true;
-			st->homer_pending_result_sink_bound = true;
-		}
-
-		if (st->homer_pending_result_sink_bound)
-		{
-			bool		requireEos =
-				(completion->commandState ==
-				 CITUS_REMOTE_EXEC_COMMAND_STATE_COMPLETED);
-			HomerCompletionApplyResult drainResult = HomerDrainPendingResultSink(st, operationName, requireEos);
-
-			if (drainResult == HOMER_COMPLETION_NOT_APPLIED_RETRY)
-			{
-				return HOMER_COMPLETION_NOT_APPLIED_RETRY;
-			}
-			if (drainResult == HOMER_COMPLETION_APPLY_FATAL)
-			{
-				return HOMER_COMPLETION_APPLY_FATAL;
-			}
-		}
-		}						/* end non-DPU (host-shm result sink) path */
 	}
 
 	if (completion->commandState == CITUS_REMOTE_EXEC_COMMAND_STATE_STARTED ||
@@ -4171,7 +3853,6 @@ static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
 		pg_log_debug("client %d Homer %s completed: rows=%llu",
 					 st->id, operationName,
 					 (unsigned long long) completion->processedRowCount);
-		HomerRememberStableResultBinding(st, completion);
 		clearHomerPendingCommand(st);
 		*commandComplete = true;
 		return HOMER_COMPLETION_APPLIED_TERMINAL_SUCCESS;
@@ -4184,12 +3865,6 @@ static HomerCompletionApplyResult HomerApplyCommandCompletion(CState *st,
 					 completion->detail[0] != '\0' ?
 					 completion->detail : "<backend did not provide details>");
 		st->estatus = ESTATUS_OTHER_SQL_ERROR;
-		if (st->homer_result_sink_open)
-		{
-			HomerClientCloseResultSink(resultSink, false);
-			st->homer_result_sink_open = false;
-		}
-		HomerInvalidateStableResultBinding(st);
 		clearHomerPendingCommand(st);
 		return HOMER_COMPLETION_APPLIED_TERMINAL_FAILURE;
 	}
@@ -4214,12 +3889,8 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 {
 	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
 	uint64		commandSequence = 0;
-	uint64 predictedCommandSequence = 0;
-	uint32 commandFlags = 0;
 	CitusRemoteExecCommandCompletion completion;
 	bool		commandComplete = false;
-	bool resultBindingPrearmed = false;
-	bool directCommandReserved = false;
 
 	if (st->homer_command_pending)
 	{
@@ -4230,60 +3901,25 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 		st->estatus = ESTATUS_OTHER_SQL_ERROR;
 		return false;
 	}
-
-	if (HomerCanTryPrearmStableResultBinding(st, commandKind, resultMode) &&
-		HomerClientReserveDirectCommand(&st->homer_session, &predictedCommandSequence, errorMessage,
-										sizeof(errorMessage)))
-	{
-		directCommandReserved = true;
-		HomerLogCommandSqlPreview(st, "reserved", commandKind, resultMode, predictedCommandSequence, operationName,
-								  sql);
-		if (HomerTryPrearmStableResultBinding(st, commandKind, resultMode, predictedCommandSequence, operationName))
-		{
-			commandFlags |= CITUS_REMOTE_EXEC_COMMAND_FLAG_RESULT_BINDING_PREARMED;
-			resultBindingPrearmed = true;
-		}
-		else
-		{
-			HomerClientAbortDirectCommandReservation(&st->homer_session);
-			directCommandReserved = false;
-		}
-	}
-
-	HomerLogCommandSqlPreview(st, resultBindingPrearmed ? "start-prearmed" : "start", commandKind, resultMode,
-							  predictedCommandSequence, operationName, sql);
-	if (!HomerClientStartCommandWithCompletionFlags(&st->homer_session, commandKind, commandFlags, NULL, sql,
+	HomerLogCommandSqlPreview(st, "start", commandKind, resultMode, 0, operationName, sql);
+	if (!HomerClientStartCommandWithCompletionFlags(&st->homer_session, commandKind, 0, NULL, sql,
 													resultMode, &commandSequence, &completion, errorMessage,
 													sizeof(errorMessage)))
 	{
 		pg_log_error("client %d failed to start Homer %s: %s",
 					 st->id, operationName, errorMessage);
 		st->estatus = ESTATUS_OTHER_SQL_ERROR;
-		if (resultBindingPrearmed)
-			HomerInvalidateStableResultBinding(st);
-		if (directCommandReserved)
-			HomerClientAbortDirectCommandReservation(&st->homer_session);
-		return false;
-	}
-	if (resultBindingPrearmed && commandSequence != predictedCommandSequence)
-	{
-		pg_log_error("client %d Homer %s command sequence changed after pre-arm: predicted=%llu got=%llu", st->id,
-					 operationName, (unsigned long long)predictedCommandSequence, (unsigned long long)commandSequence);
-		st->estatus = ESTATUS_OTHER_SQL_ERROR;
-		HomerInvalidateStableResultBinding(st);
 		return false;
 	}
 
 	st->homer_command_pending = true;
-	st->homer_pending_result_sink_bound = resultBindingPrearmed;
+	st->homer_pending_result_sink_bound = false;
 	st->homer_pending_command_kind = commandKind;
-	st->homer_pending_result_mode = resultMode;
 	st->homer_pending_command_sequence = commandSequence;
 	st->homer_pending_drained_rows = 0;
 	/* Arm the completion-wait deadline (see the CState field comment). */
 	st->homer_pending_started_us = pg_time_now();
 	st->homer_pending_poll_count = 0;
-	memset(&st->homer_pending_drain_target, 0, sizeof(st->homer_pending_drain_target));
 	st->homer_pending_operation_name = operationName;
 
 	switch (HomerApplyCommandCompletion(st, &completion, NULL, &commandComplete))
@@ -4314,7 +3950,7 @@ HomerStartCommand(CState *st, uint32 commandKind, const char *sql,
 #define HOMER_PENDING_DEADLINE_CHECK_INTERVAL	4096
 
 /*
- * receiveHomerCommand checks the per-session pushed-completion mailbox for the
+ * receiveHomerCommand checks the per-session role-6 completion event for the
  * currently in-flight command. A false commandComplete return is not an error:
  * it means the backend has not published terminal completion yet and pgbench
  * should give other runnable clients a chance before checking again.
@@ -4393,8 +4029,7 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 			/*
 			 * Drain producer-visible rows while the command is still running.
 			 * This keeps larger future result streams from filling the sink and
-			 * blocking backend completion behind a frontend that is waiting only
-			 * on the completion mailbox.
+			 * blocking backend completion behind a frontend waiting only on role 6.
 			 */
 			if (drainResult == HOMER_COMPLETION_APPLY_FATAL)
 			{
@@ -4418,7 +4053,7 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 		lease->completion.commandSequence != st->homer_pending_command_sequence)
 	{
 		/*
-		 * The mailbox is an ordered session event stream. With one command in
+		 * Role 6 is an ordered session event stream. With one command in
 		 * flight per pgbench Homer session, a mismatched head event is a
 		 * protocol violation; do not skip or acknowledge it.
 		 */
@@ -4431,8 +4066,6 @@ receiveHomerCommand(CState *st, bool *commandComplete)
 		clearHomerPendingCommand(st);
 		return false;
 	}
-
-	st->homer_pending_drain_target = lease->resultDrainTarget;
 	applyResult = HomerApplyCommandCompletion(st, &lease->completion, &lease->view, commandComplete);
 	if (applyResult == HOMER_COMPLETION_NOT_APPLIED_RETRY)
 	{
@@ -4643,8 +4276,8 @@ validateHomerScriptSupport(void)
 				}
 				/*
 				 * START_COMMAND may return the initial STARTED completion with a
-				 * result-sink descriptor. After opening/draining what is currently
-				 * available, continue by polling below; reusing the same STARTED
+				 * result-relay contract. After draining what is currently available,
+				 * continue by polling below; reusing the same STARTED
 				 * completion would spin forever and never observe terminal EOS.
 				 */
 			}
@@ -8095,9 +7728,8 @@ printResults(StatsData *total,
 	/*
 	 * The "transport:" line is the run's INTENDED-PATH confirmation -- it is what a
 	 * validation log is grepped for to prove which stack actually ran. It must therefore
-	 * name every mode combination distinctly. Before P3 hop 6 a --homer-dpu-command run
-	 * printed a bare "homer", i.e. it was indistinguishable in the log from a plain
-	 * host-service Homer run. Name all four combinations.
+	 * name every selected-DPU spelling distinctly. Plain "homer" is retained only
+	 * as a defensive formatting fallback; option validation rejects it in S7.1.
 	 */
 	printf("transport: %s\n",
 		   !homer_mode ? "libpq" :
@@ -8962,9 +8594,8 @@ main(int argc, char **argv)
 	}
 
 	/*
-	 * --homer-dpu is a delivery variant layered on top of --homer: it only
-	 * changes how RESULT tuples come back (DPU deform relay -> client role-7 ring
-	 * instead of the host-shm result sink). It therefore requires --homer itself.
+	 * --homer-dpu selects the DPU deform relay into the client role-7 ring and
+	 * therefore requires --homer itself.
 	 * The remote-peer and -M simple requirements are enforced inside the --homer
 	 * block below.
 	 */
@@ -8972,6 +8603,13 @@ main(int argc, char **argv)
 		pg_fatal("--homer-dpu requires --homer");
 	if (homer_dpu_command_mode && !homer_mode)
 		pg_fatal("--homer-dpu-command requires --homer");
+	/*
+	 * The host-service (plain --homer) client path was retired in S7.1;
+	 * only the selected-DPU command plane remains.
+	 */
+	if (homer_mode && !homer_dpu_mode && !homer_dpu_command_mode)
+		pg_fatal(
+			"--homer now requires --homer-dpu or --homer-dpu-command; the host-service command path is retired (S7.1)");
 
 	if (homer_mode)
 	{
@@ -9013,10 +8651,8 @@ main(int argc, char **argv)
 		}
 
 		/*
-		 * P3 hop 6: derive the result-relay predicate ONCE, here, where both flags have
-		 * just been validated. --homer-dpu-command IMPLIES the DPU result relay because a
-		 * DPU-spawned backend has no host-shm result sink -- see homer_dpu_result_relay's
-		 * declaration for the full rationale. Both flags require a remote peer (checked
+		 * P3 hop 6: derive the result-relay predicate once, here, where both
+		 * selected-DPU spellings have just been validated. Both flags require a remote peer (checked
 		 * just above), so the relay's own remote-peer precondition is already satisfied
 		 * whichever flag turned it on, and needs no separate check.
 		 */
@@ -9185,7 +8821,6 @@ main(int argc, char **argv)
 		initRandomState(&thread->ts_throttle_rs);
 		initRandomState(&thread->ts_sample_rs);
 		thread->logfile = NULL; /* filled in later */
-		thread->homer_control_open = false;
 		thread->latency_late = 0;
 		initStats(&thread->stats, 0);
 		initLatencySamples(&thread->latency_samples);
@@ -9348,45 +8983,14 @@ threadRun(void *arg)
 	/* STEADY */
 	if (homer_mode)
 	{
-		char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
-
 		/*
-		 * S7.0: the host-service control region is opened ONLY for the host-service
-		 * command path.
-		 *
-		 * The control region is created by citus_tuple_sink_service and is merely
-		 * MAPPED here (HomerClientOpenControl -> shm_open with no O_CREAT,
-		 * homer_client.c:400).  It is consumed by exactly one caller:
-		 * HomerClientOpenSqlSession() in openHomerSession() below.  The selected-DPU
-		 * command path calls HomerClientOpenSqlSessionSelectedDpu() instead, which
-		 * does NOT take a control region -- its command plane lives on the DPU.
-		 *
-		 * So under --homer-dpu-command this mapping was pure dead weight, and it was
-		 * the ONLY thing forcing a host service to be running on the client host for
-		 * a run that never touches one.  That dependency was actively harmful: it is
-		 * what let gate runs 13-16 "pass" against a STALE control region left behind
-		 * by a previous session, with no host service alive at all (see the gate's
-		 * trap 2 in CLAUDE.md).  Removing the mapping makes the anti-fallback property
-		 * STRUCTURAL -- with no control region open, a silent fall back to the
-		 * host-service arm cannot even be expressed.
-		 *
-		 * This is also the real precondition for S7 (retire the host-service paths):
-		 * the host service cannot be deleted while the DPU gate's own client still
-		 * boots through a region only that service creates.
+		 * S7.1: every Homer client session now opens directly against the selected
+		 * local DPU. There is no thread-local host-service control mapping.
 		 */
-		if (!homer_dpu_selected_command)
-		{
-			if (!HomerClientOpenControl(&thread->homer_control,
-										errorMessage,
-										sizeof(errorMessage)))
-				pg_fatal("could not open Homer control region in thread %d: %s",
-						 thread->tid, errorMessage);
-			thread->homer_control_open = true;
-		}
 
 		for (int i = 0; i < nstate; i++)
 		{
-			if (!openHomerSession(thread, &state[i]))
+			if (!openHomerSession(&state[i]))
 				pg_fatal("could not create Homer session for client %d",
 						 state[i].id);
 		}
@@ -9651,12 +9255,6 @@ done:
 	}
 
 	disconnect_all(state, nstate);
-	if (thread->homer_control_open)
-	{
-		HomerClientCloseControl(&thread->homer_control);
-		thread->homer_control_open = false;
-	}
-
 	if (thread->logfile)
 	{
 		if (agg_interval > 0)
@@ -9685,9 +9283,8 @@ finishCon(CState *st)
 
 /*
  * finishHomerSession tears down the persistent external-service SQL session
- * owned by one pgbench client. It is intentionally separate from thread-local
- * control-region cleanup, because a client session is the unit that maps to a
- * remote backend and must be closed before the thread unmaps service control.
+ * owned by one pgbench client. The selected-DPU session owns the complete
+ * command/completion/result export and closes it as one lifecycle.
  */
 static void
 finishHomerSession(CState *st)
@@ -9724,27 +9321,12 @@ finishHomerSession(CState *st)
 		st->homer_transaction_attached = false;
 	}
 
-	if (st->homer_result_sink_open)
-	{
-		/*
-		 * Result sink mappings are reused across commands for performance. The
-		 * socketless backend closes the service-owned result sink before the
-		 * session lifecycle close returns, so the frontend only drops its local
-		 * mapping here and never unlinks the queue by name.
-		 */
-		HomerClientCloseResultSink(&st->homer_result_sink, false);
-		st->homer_result_sink_open = false;
-		HomerInvalidateStableResultBinding(st);
-	}
-
 	/*
-	 * Command-plane S1a: a selected-DPU command session has no host-service control
-	 * region and no backend mailboxes, so HomerClientCloseSession's shared-memory close
-	 * path does not apply.
+	 * A selected-DPU command session owns the role-1/6/7 export as one lifecycle.
 	 *
 	 * P5: the ENTIRE selected-DPU close order now lives inside
 	 * HomerClientCloseSqlSessionSelectedDpu -- semantic CLIENT_SQL_SESSION_CLOSE on the
-	 * direct mailbox, then the role-7 result-ring unbind, then the control-slot
+	 * role-1 control slot, then the role-7 result-ring unbind, then the lifecycle
 	 * CLOSE_SESSION, then the DPU setup-close + DOCA teardown.  pgbench used to unbind
 	 * the role-7 ring HERE, immediately before this call, which put the child ring's
 	 * unbind BEFORE the session's semantic close and left the remote backend running
@@ -9759,11 +9341,6 @@ finishHomerSession(CState *st)
 			pg_log_error("client %d could not close selected-DPU Homer SQL session: %s",
 						 st->id, errorMessage);
 	}
-	else if (!HomerClientCloseSession(&st->homer_session,
-									  errorMessage,
-									  sizeof(errorMessage)))
-		pg_log_error("client %d could not close Homer session: %s",
-					 st->id, errorMessage);
 
 	st->homer_session_open = false;
 }
@@ -9776,7 +9353,7 @@ finishHomerSession(CState *st)
  * execution.
  */
 static bool
-openHomerSession(TState *thread, CState *st)
+openHomerSession(CState *st)
 {
 	HomerClientSessionOptions sessionOptions;
 	char		errorMessage[HOMER_CLIENT_ERROR_BYTES];
@@ -9796,7 +9373,7 @@ openHomerSession(TState *thread, CState *st)
 	/*
 	 * Tell the service (via the OpenSession request) that this SQL session's result
 	 * tuples must be relayed through the DPU two-ring deform path into our
-	 * client-exported role-7 ring, not the passive host-shm result sink. This flag must
+	 * client-exported role-7 ring. This flag must
 	 * be set BEFORE the session is opened so the peer provisions the relay.
 	 *
 	 * P3 hop 6: keyed on homer_dpu_result_relay, so --homer-dpu-command implies it. The
@@ -9832,52 +9409,23 @@ openHomerSession(TState *thread, CState *st)
 	}
 
 	/*
-	 * Command-plane S1a: --homer-dpu-command opens the command session against the
+	 * S7.1: every Homer mode opens the command session against the
 	 * client's LOCAL DPU (role-1 control slot, exported over the DPU setup TCP socket)
-	 * rather than through the mapped host-service control region. No HomerClientControl
-	 * is passed, and no backend mailboxes are mapped -- see the flag's comment above for
-	 * why the run is expected to stop at the first transaction.
+	 * with no host-service control mapping or named backend mailboxes.
 	 */
-	if (homer_dpu_selected_command)
+	if (!HomerClientOpenSqlSessionSelectedDpu(&sessionOptions,
+											  &st->homer_session,
+											  errorMessage,
+											  sizeof(errorMessage)))
 	{
-		if (!HomerClientOpenSqlSessionSelectedDpu(&sessionOptions,
-												  &st->homer_session,
-												  errorMessage,
-												  sizeof(errorMessage)))
-		{
-			pg_log_error("client %d could not open selected-DPU Homer SQL session: %s",
-						 st->id, errorMessage);
-			return false;
-		}
-		pg_log_info("client %d opened selected-DPU Homer SQL command session id=%llu index=%u",
-					st->id,
-					(unsigned long long) st->homer_session.serviceSessionId,
-					st->homer_session.serviceSessionIndex);
-	}
-	/*
-	 * S7.0: this fork and the HomerClientOpenControl() fork in threadRun() are the
-	 * SAME condition (homer_dpu_selected_command, after the S6 Track A fold) and must stay in lockstep: only this
-	 * branch consumes the control region, and it is only mapped for this branch.
-	 * Fail loudly rather than hand HomerClientOpenSqlSession() an unopened region --
-	 * that would be a use of a zeroed HomerClientControl, which reads as a bogus fd.
-	 */
-	else if (!thread->homer_control_open)
-	{
-		pg_log_error("client %d: host-service Homer SQL session requested but no control region is open "
-					 "(dpu_selected_command=%d) -- the control-region fork and the session-open fork disagree",
-					 st->id, homer_dpu_selected_command ? 1 : 0);
-		return false;
-	}
-	else if (!HomerClientOpenSqlSession(&thread->homer_control,
-									   &sessionOptions,
-									   &st->homer_session,
-									   errorMessage,
-									   sizeof(errorMessage)))
-	{
-		pg_log_error("client %d could not open Homer SQL session: %s",
+		pg_log_error("client %d could not open selected-DPU Homer SQL session: %s",
 					 st->id, errorMessage);
 		return false;
 	}
+	pg_log_info("client %d opened selected-DPU Homer SQL command session id=%llu index=%u",
+				st->id,
+				(unsigned long long) st->homer_session.serviceSessionId,
+				st->homer_session.serviceSessionIndex);
 
 	st->homer_session_open = true;
 
@@ -9886,12 +9434,8 @@ openHomerSession(TState *thread, CState *st)
 	 * after binding the SQL session kind's complete ring set (roles 1, 6, and 7).
 	 * There is deliberately no later result-ring bind or setup handshake here.
 	 */
-	memset(&st->homer_result_sink, 0, sizeof(st->homer_result_sink));
-	st->homer_result_sink.fileDescriptor = -1;
-	st->homer_result_sink_open = false;
 	st->homer_transaction_attached = false;
 	clearHomerPendingCommand(st);
-	HomerInvalidateStableResultBinding(st);
 
 	/*
 	 * Regular pgbench creates persistent libpq connections before bench_start.

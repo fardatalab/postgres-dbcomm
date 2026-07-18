@@ -14,7 +14,39 @@
 > — "native `--homer-dpu` still uses the host arm" — is dissolved). **RE-GROUNDED at citus `3d5047146` / postgres
 > `58af2f7c5a3`**: the `file:line` anchors below were scoped at the older `7e08343f2` and have DRIFTED — see the
 > **"## ⟳ RE-GROUNDING 2026-07-17"** section immediately below for the current S7.1 map + FOUR material
-> corrections. Implementation itself is **NOT STARTED.**
+> corrections.
+>
+> **S7.1(a) COMPLETE — VALIDATED PASS (2026-07-17).** Pgbench fail-closes plain `--homer`; every surviving Homer
+> session opens selected-DPU and drains SQL results through role 7. Deleted from both repos: the client-side host
+> control region, named-mailbox/direct-command, and host result-sink APIs/state (incl. the stable-binding prearm
+> optimization). Shape: postgres pgbench.c +110/-540 (host arms + result-sink + stable-binding), basebackup_homer.c
+> -12 (dead host control state); citus homer_client.c ~-3230 + remote_execution_client.h -180 (host
+> command/control/mailbox/result-sink APIs + types/fields + the `-Wunused` direct-command / host-control-helper tail).
+> **Executed as ONE folded gut+delete + ONE scoped validation round (owner decisions).** Validation: build
+> (Citus→PG relink) CLEAN ⇒ no orphaned refs; selected-DPU gate PASS (transport line + DPU-spawn `HOMER_EVENT`
+> begin/complete, `gate_check` 5tx/1spawn/5 decoded, 3×800/800 repeats, `peer_host_spawn_retired` absent);
+> four-role basebackup PASS (44,362 laps, `published_tail==consumed_head` closure); positive retirement check =
+> plain `--homer` exits 1 with the S7.1 fatal. Disclosed gap: `teardown_checks` INCONCLUSIVE — its
+> stage2b/mirror/control/dma ledger families are absent for this *client-surface* workload (not a defect; the DMA
+> teardown paths are untouched by (a), and alarm/frontier checks + tail-closure are clean). Env-repair provenance:
+> the interrupted prior attempt left stale DPU services + shm, cleaned and re-preflighted clean before the candidate.
+> S7.1(b-e) and S7.2+ remain unimplemented.
+>
+> **KEY VERIFIED FINDINGS (S7.1(a) — recorded so (b-e) don't re-derive them):**
+> - **Plain `--homer` MUST be fail-closed at parse** (pgbench.c main option-validation, after the two existing
+>   `--homer-dpu*` require-`--homer` checks): plain `--homer` was a valid host-service invocation, so deleting the
+>   host arms without the fail-close would leave it hitting deleted code. The fail-close makes
+>   `homer_mode ⟹ homer_dpu_selected_command ⟹ homer_dpu_result_relay` an INVARIANT — which is what makes the
+>   arm-collapse provably safe. Contract: `CONTRACTS.md` "homer_mode / homer_dpu_selected_command / ...".
+> - **Relay-vs-host field split (the entanglement trap):** the host result-sink + stable-binding machinery is INERT
+>   on the relay path but shares per-command state with the KEPT relay drain. KEEP
+>   `homer_pending_result_contract(_valid)`, `homer_pending_result_sink_bound`, `homer_pending_command_kind`/`sequence`,
+>   `homer_pending_drained_rows`, `homer_last_abalance`; DELETE `homer_result_sink*`, `homer_stable_result_*`, and
+>   (codex-flagged, main-agent-verified write-only-after-retirement) `homer_pending_result_mode` +
+>   `homer_pending_drain_target`.
+> - **Guards:** the 3 `session->control`-validity guards (Start/Peek/Try) collapse by dropping the
+>   `session->control == NULL &&` conjunct → `... !session->commandDpuStreamOpen`; `HomerClientWaitCommandCompletion`
+>   collapses to `if (session == NULL)`; `HomerClientAckCommandCompletion` never carried the conjunct.
 >
 > **✅ DECISION SETTLED (owner, 2026-07-17): DELETE the Homer COPY scaffolding** (§9, Option A). §3.4 is the
 > final DELETE set. What settled it: the re-plumb reuses the DPU transport substrate/API (KEEP bucket, §4),
@@ -206,8 +238,18 @@ Both were written at S3-era HEAD (~10 stages ago) and are now stale. **Strike th
 - `HomerClientCloseSession` — def `homer_client.c:1702`; host caller `pgbench.c:9746`.
 - `HomerClientOpenBaseBackupStream` (legacy **host-control** opener, distinct from the SelectedDpu one) — def
   `homer_client.c:2786`; **no caller at HEAD** — dead, delete.
-- After the arms go: remove `HomerClientControl` struct `remote_execution_client.h:32` and its host-only session
-  fields `:129`, `:241`.
+- After the arms go: remove `HomerClientControl` struct `remote_execution_client.h:32` and its host-only fields
+  (`HomerClientSession.control` `:241`, `HomerClientBaseBackupStream.control` `:129`). **⚠ NOT mechanical
+  (codex-flagged + main-agent-verified 2026-07-17 by reading the guards):** `session->control` is still read on the
+  SELECTED-DPU-reachable path — as a validity CO-condition `(session->control == NULL && !session->commandDpuStreamOpen)`
+  in the arg-guards of the shared command fns `HomerClientStartCommandWithCompletionFlags` (`homer_client.c:6381-6382`,
+  and the gate calls it via `pgbench.c:4255`), `HomerClientPeekNextCompletionEvent` (`:6696-6697`),
+  `HomerClientTryCommandCompletion` (`:7019-7020`). The real host/selected discriminant there is `commandDpuStreamOpen`,
+  NOT `control` (each guard even keeps an "Original host-only guard" comment showing the pre-migration `control == NULL`
+  form). So SEQUENCE within (a): first retire host session-creation so `control` is universally NULL, simplify those
+  three guards (drop the `session->control == NULL &&` conjunct → just `!session->commandDpuStreamOpen`), and gut the
+  §5 host subarms these fns carry, THEN delete the field/type. `HomerClientBaseBackupStream.control` is read only in the
+  dead legacy close branch (`homer_client.c:5828`, deleted with the basebackup-close host arm §5).
 
 ### 3.2 Host spawn claimant
 - `TupleSinkServiceSubmitBackendSpawnRequest` — **delete wholesale** (def `tuple_sink_service_process.c:22889`;
@@ -438,7 +480,8 @@ APIs — useless as a working template. The re-plumb instead reuses the DPU tran
 ## 12. Per-sub-item deletion checklist (feeds the gut-first → delete-later pattern)
 
 - **S7.0** ✅ DONE (postgres `22a8f9951e6`).
-- **S7.1** — gut then remove: (a) client host surface §3.1; (b) host spawn claimant §3.2 + its call-site arms
+- **S7.1** — gut then remove: **(a) client host surface §3.1 ✅ DONE — VALIDATED PASS 2026-07-17 (folded whole-surface incl. result-delivery; see STATUS block)**;
+  (b) host spawn claimant §3.2 + its call-site arms
   §5 — ⟳ **the two PEER arms are ALREADY gut (Track A); only the two LOCAL callers + the peer-shell/commented
   deletion remain**; (c) daemon control region + host pump arms §3.3 (**after** gutting local-control/heartbeat,
   §1 — ⟳ note `LOCAL_CONTROL` is ALSO in `STARTUP_WAIT`, not just the main loop, and confirm it is host-only

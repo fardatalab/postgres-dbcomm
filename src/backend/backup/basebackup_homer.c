@@ -36,9 +36,7 @@ typedef struct bbsink_homer
 {
 	bbsink		base;
 	char	   *target_detail;
-	HomerClientControl control;
 	HomerClientBaseBackupStream stream;
-	bool		control_open;
 	bool		stream_open;
 	bool		record_reserved;
 	uint32		payload_capacity;
@@ -471,11 +469,6 @@ bbsink_homer_end_backup(bbsink *sink, XLogRecPtr endptr, TimeLineID endtli)
 	mysink->stream_open = false;
 	/* Graceful close completed: disarm the FATAL-path abort backstop. */
 	bbsink_homer_backstop_sink = NULL;
-	if (mysink->control_open)
-	{
-		HomerClientCloseControl(&mysink->control);
-		mysink->control_open = false;
-	}
 	bbsink_end_backup(sink->bbs_next, endptr, endtli);
 }
 
@@ -512,11 +505,6 @@ bbsink_homer_cleanup(bbsink *sink)
 		pfree(mysink->scratch_buffer);
 		mysink->scratch_buffer = NULL;
 		mysink->scratch_buffer_length = 0;
-	}
-	if (mysink->control_open)
-	{
-		HomerClientCloseControl(&mysink->control);
-		mysink->control_open = false;
 	}
 	bbsink_cleanup(sink->bbs_next);
 }
