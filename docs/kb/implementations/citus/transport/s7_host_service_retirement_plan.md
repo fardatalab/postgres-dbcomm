@@ -213,7 +213,9 @@ invocations, 0 crashes, `gate_check` 20/20 decoded + `spawn_pairs=8`, 3×1200/12
   checks in `remote_execution_backend_bridge.c:3332-3374`, KEEP the enum type + `SELECTED_DPU_DMA` +
   range-agnostic scan) + dead host slot constants + adjacency-comment rewrite + COPY-only scaffolding per finding
   2. Validation: gate + 4-role basebackup.
-- **Round B = (c)** isolated (finding 1). Retires the host control-region protocol on BOTH ends together:
+- **Round B = (c) — VALIDATED PASS 2026-07-18 (gate 20/20 decoded, spawn_pairs=4, basebackup 44,363 laps, DPU
+  setup listener live across the workload + peer reconnect, ~71-74 tps, no regression).** isolated (finding 1).
+  Retires the host control-region protocol on BOTH ends together:
   the DAEMON side (`TupleSinkServiceMapControlRegion`/unmap, `LOCAL_CONTROL` in both pump masks, progress-registry
   `controlState` wiring, `ActiveReadyBitmapControlRegion` global, region ABI) AND the BACKEND side
   (`remote_execution_backend_bridge.c`: the now-dead `if (!selectedDpuBackendChannel)` `RemoteExecMapControlRegion`
@@ -226,6 +228,29 @@ invocations, 0 crashes, `gate_check` 20/20 decoded + `spawn_pairs=8`, 3×1200/12
   commits. It is safe to leave one round (unreachable, commented; the selected-DPU path already tolerated
   `controlRegion==NULL` pre-Round-A). KEEP the shared dispatcher + DPU staged path + the Tier-2 named-mailbox
   branch. Validation: gate + basebackup; confirm the DPU setup listener stays live.
+  **⟳ (c) MAPPED + VERIFIED 2026-07-18 (codex-explore map; KEEP-claims re-verified in code by main agent) — THREE
+  scope refinements:** (i) **the control-region ABI is NOT wholesale-deletable** — `CitusRemoteExecControlSlot` +
+  `CITUS_REMOTE_EXEC_CONTROL_PROTOCOL_VERSION` are SHARED with the DPU DMA protocol (`homer_service_dpu_dma.c`
+  sizes command descriptors from the slot + checks the version, `:2307`/`:2487`/`:6044+`) → **KEEP**; only the
+  region AGGREGATE `CitusRemoteExecControlRegion`, the POSIX name `/citus_remote_execution_control_v27`, and the
+  ready-bitmap line are deletable. (ii) **`ServiceHeartbeatState.servicePass` is the DPU-result pass clock**
+  (`streamEntry->dpuResultPeerBoundServicePass` at `:11131`/`:30352`/`:42044`; machine-baseline collector) → KEEP
+  the per-pass increment (`HomerServiceBeginProgressPass`); delete ONLY the heartbeat PUBLICATION
+  (`HomerServicePublishHeartbeat`'s write to `controlRegion->heartbeatCounter`). (iii) **full region/name deletion
+  is COUPLED to S7.3** (like e-API↔S7.2): after (c) removes the DAEMON servicing + the BACKEND dead arm,
+  `CitusRemoteExecControlRegion` is still referenced only by the Tier-2 host-SHM frontend (`homer_frontend_shm.c/.h`
+  + its `homer_frontend_control.c` open/START/POLL fallback arms). ⇒ **(c) SCOPE = daemon control-region servicing
+  removal + backend dead-arm removal, KEEPING the region type/name + the Tier-2 host-SHM frontend; the
+  aggregate/name/ready-bitmap-line + `homer_frontend_shm.c` DELETE moves to S7.3.** ⚠ CORRECTED (validated 2026-07-18): (c) ALSO
+  removes `citus_remote_execution_control_v27` from the DAEMON binary — combined with (a) removing it from pgbench +
+  libhomer_client, the runbook agreement-probe's three greps now expect EMPTY; the name persists ONLY in `citus.so`
+  (Tier-2 host-SHM frontend) until S7.3. Runbook probe + shm-cleanup pattern (`citus_remote_exec_res_v*`) updated in
+  the (c) commit. **Execution is NOT purely mechanical:** the
+  DPU staged-command path reuses the local-control async scheduler machinery — GUT its SHM-owner arms (keep DPU/
+  service-result owners; `TupleSinkServiceProgressLocalControlAsyncOp` already ignores `controlState`); and
+  GUT-then-RESERVE (do NOT shrink) the completion-bitmap wire fields in the spawn ABI to avoid a bridge-ABI change
+  ⇒ no DPU TCP smoke. RISK VERDICT (verified): clean bounded deletion, no hidden DPU dependency on the region /
+  ready-bitmap / published heartbeat.
 - **Round C = S7.2** UDF removal + (e-API) frontend API removal (finding 3). Validation: gate + basebackup.
 - **Round D = diagnostic-gate cleanup.** Validation: gate.
 

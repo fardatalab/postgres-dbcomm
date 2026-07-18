@@ -146,10 +146,19 @@ On this Meson installation, the extension object is
 `/data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so`; do not use the stale path without the
 `postgresql/` component in receipt or diagnostic scripts.
 
+⚠ **Post S7.1(a)+(c) (2026-07-18): `citus_remote_execution_control_v27` is RETIRED from these three binaries.** The
+host-service client (pgbench, libhomer_client) went in S7.1(a) and the daemon's control-region servicing
+(`citus_tuple_sink_service`) went in S7.1(c), so all three greps below now return **EMPTY** — that is the expected,
+correct result, not a build-parity failure. The name persists ONLY in `citus.so`, via the still-present Tier-2
+host-SHM frontend (`homer_frontend_shm.c`), until S7.3 retires it. For build-agreement/stale-binary detection use a
+still-shared ABI marker instead — e.g. `HOMER_DPU_BRIDGE_PROTOCOL_VERSION` (currently `5U`) or the spawn region
+`citus_remote_exec_backend_spawn_v15`.
+
 ```sh
-strings /data/dbcomm/pg-citus/bin/pgbench | grep citus_remote_execution_control
-strings /data/dbcomm/pg-citus/bin/citus_tuple_sink_service | grep citus_remote_execution_control
-strings /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/libhomer_client.a | grep citus_remote_execution_control
+strings /data/dbcomm/pg-citus/bin/pgbench | grep citus_remote_execution_control            # expect EMPTY (S7.1a)
+strings /data/dbcomm/pg-citus/bin/citus_tuple_sink_service | grep citus_remote_execution_control  # expect EMPTY (S7.1c)
+strings /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/libhomer_client.a | grep citus_remote_execution_control  # expect EMPTY (S7.1a)
+strings /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so | grep citus_remote_execution_control  # still PRESENT until S7.3 (Tier-2 host-SHM frontend)
 ```
 
 Record SHA-256 digests of the installed closure and exact build argv/configuration. Matching peer binaries without a
@@ -299,6 +308,8 @@ ssh farnet0 "/tmp/farnet-validation-$RUN_ID/helpers/project_shm_cleanup.sh"
 ```
 
 The owned families are `citus_remote_execution_control_*`, `citus_remote_exec_{cmd,cpl,client_cpl}_*`,
+`citus_remote_exec_res_v*` (the selected-DPU result-queue prefix `CITUS_REMOTE_EXEC_RESULT_QUEUE_SHM_PREFIX`; added
+2026-07-18 after a leftover `citus_remote_exec_res_v15_*` object was found outside the helper's coverage),
 `citus_remote_exec_backend_spawn_v*`, `citus_homer_frontend_arena_*`, and `citus_res_*`. If the backend-spawn region
 is removed after PostgreSQL starts, restart PostgreSQL. Source the current arena name from
 `homer_frontend_agent.h`; never hard-code its version.

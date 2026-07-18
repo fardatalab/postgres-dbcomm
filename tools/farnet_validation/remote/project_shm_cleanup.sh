@@ -6,6 +6,7 @@ for path in /dev/shm/citus_remote_execution_control_* \
             /dev/shm/citus_remote_exec_cmd_* \
             /dev/shm/citus_remote_exec_cpl_* \
             /dev/shm/citus_remote_exec_client_cpl_* \
+            /dev/shm/citus_remote_exec_res_v* \
             /dev/shm/citus_remote_exec_backend_spawn_v* \
             /dev/shm/citus_homer_frontend_arena_* \
             /dev/shm/citus_res_*; do
