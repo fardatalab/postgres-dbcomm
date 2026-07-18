@@ -675,14 +675,14 @@ decode callback (which would invert the dependency and break the seam).
   session the 3 roles already share one buffer/mmap, `:1765`). A single shared-arena mmap (pooling all sessions'
   rings) is an OPTIONAL later optimization, not this cleanup. (Neither pgbench nor the backends pool host export
   buffers today — both allocate per-session; the pooled arena is service-side on the DPU, not the host frontend.)
-- **Transport unification (scope call):** the transport-leaf mechanics are ALREADY shared across the SQL session
-  and both basebackup directions (same `static` helpers). The clean end-state is ONE transport substrate + context
-  serving all host-frontend users, with a small family of SESSION KINDS over it (command-session for SQL/COPY;
-  bulk-stream for basebackup) — **NOT one session API for all** (their semantics differ; a bulk stream has no
-  command/completion plane). Stage 3 builds the shared context for the command sessions and designs it so
-  basebackup CAN adopt it, but **migrating basebackup onto it is OUT of the host-service-retirement scope**
-  (basebackup is the working, mandatory acceptance workload, has no device hazard, differs semantically) — a
-  future cleanup, revisited if the owner chooses to expand scope.
+- **Transport unification (settled — see §13):** the transport-leaf mechanics are ALREADY shared across the SQL
+  session and both basebackup directions (same `static` helpers). The end-state is ONE transport substrate +
+  context serving all host-frontend users, under **ONE intent-driven session abstraction** (§13) whose intent
+  gates which rings bind (§13.2) and which op planes are legal (§13.3). A bulk stream simply has no
+  command/completion plane, so those ops are **compile-time illegal on its typed handle** (§13.1) — that is the
+  unification mechanism, not a reason for a separate session type. Stage 3 builds the shared context for the SQL
+  opKind; **basebackup migrates onto it in Stage 3.5** (§12.5b) as the second, differently-shaped consumer —
+  BEFORE final retirement, while ① is still a live reference — the multi-consumer proof, not a deferred cleanup.
 
 ### 12.4 Stage 2 — a SYMBOL-boundary transport FACADE inside `homer_client.c` (behavior-preserving)
 Stage 2 is a symbol-boundary facade, **NOT a file/module move**: the transport leaf helpers are shared with both
