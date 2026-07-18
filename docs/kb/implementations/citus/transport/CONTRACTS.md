@@ -88,6 +88,34 @@ the call site. If it is not on the list, **it has not been checked.**
   `TupleSinkServiceSessionAllowsReuse`; `TupleSinkServiceFindReusableSession` callers (`:29783`/`:39326`/`:40711`).
 - **Design that promotes this to a unified core:** [`../../../future-directions/citus/transport/homer_unified_session_core_plan.md`](../../../future-directions/citus/transport/homer_unified_session_core_plan.md) §5.6.
 
+## `homer_session_spec.h` — FRONTEND-SAFE (postgres-free) in-process intent spec; a COMPILE-TWICE header, so `_t` types ONLY
+- **MEANS:** the frontend-safe header (created in unified-core Stage 1) that owns the **in-process** session-intent
+  enums (`RemoteExecOpKind` … `RemoteExecPlacementScope`) + `RemoteExecutionSessionIntentSpec`. It includes only
+  `<stdint.h>`/`<stdbool.h>` so it can be compiled into **both** link contexts of the future unified core (the
+  postgres server via `citus.so` AND the standalone client library `libhomer_client.a`). `homer_frontend.h`
+  re-includes it, so ① compiles unchanged.
+- **DOES NOT MEAN:** it is the wire ABI. **Three near-neighbors, do not confuse:**
+  - `RemoteExecutionSessionIntentSpec` (here) — *in-process*, enum-typed; backend adapter fills it from live PG
+    state, frontend adapter from explicit options.
+  - `CitusRemoteExecSessionKey` (`homer_control_abi.h:165`) — the fixed-width `uint32_t` **wire** reuse key this
+    intent projects INTO via `BuildControlSessionKeyFromIntent`.
+  - `CITUS_REMOTE_EXEC_*` value macros (`homer_control_abi.h:55+`) — the wire-facing enum-value **mirror** the
+    standalone service reads; the service does **not** include this header. Keep the mirror tracking these enums.
+- **CONTRACT / THE RULE (money line):** a header linked into both link contexts (this one, and the `homer_*_abi.h`
+  family) MUST use `<stdint.h>`/`<stdbool.h>` types ONLY — **NEVER** the PostgreSQL `c.h` aliases `uint32` /
+  `int32` / `uint64` / `int64` / `Oid` / char-based `bool`. Those aliases live in postgres `c.h`; using even one
+  **drags in `postgres.h` and silently destroys frontend-safety**. (`Oid` IS `unsigned int`, so `Oid`→`uint32_t`
+  is value-lossless.) **Test = a standalone TU that includes only the header must compile with neither `postgres.h`
+  nor `postgres_fe.h`, and `gcc -H` must show no postgres header in its include tree.** Learned this session: the
+  tentative "`Oid`→`uint32`" projection was wrong; it must be `uint32_t`.
+- **SCOPE (as of Stage 1):** only the intent spec + enums live here. The tuple-sink `RemoteExecTupleSinkOperationSpec`
+  (dead host-SHM code, deleted Stage 4) and the `RemoteExecutionCommandSpec` family (deferred to Stage 3, core
+  representation undetermined) intentionally stay in the PostgreSQL-facing `homer_frontend.h`.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** any new type added to a compile-twice header — run the standalone
+  postgres-free compile test above; `homer_frontend.h` must keep re-including this; the service's
+  `CITUS_REMOTE_EXEC_*` macro mirror must track these enum values.
+- **Design:** [`../../../future-directions/citus/transport/homer_unified_session_core_plan.md`](../../../future-directions/citus/transport/homer_unified_session_core_plan.md) §10.1/§11.7.
+
 ## Byte-ring SLOT size vs RING size — **slots are HOMOGENEOUS (DOCA arena); the wire equality is PER-PAIR host==remote / source==host, NOT slot==host**
 
 - **MEANS:** the pool sizes every slot at `slotStorageBytes` = `HOMER_SQL_RESULT_BYTE_RING_STORAGE_BYTES`

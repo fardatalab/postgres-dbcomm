@@ -269,6 +269,11 @@ invocations, 0 crashes, `gate_check` 20/20 decoded + `spawn_pairs=8`, 3×1200/12
   UDF. Under the owner's "keep ① live as reference until the core lands" decision, **S7.2 + S7.3 + the D7′
   all-slots assertion all BUNDLE into the FINAL retirement stage of the unification track (Stage 4)**, after the
   core is built. Sequencing + rationale: unification doc §11.3.
+  - **UPDATE 2026-07-18 — EXECUTION STARTED.** The unification design is settled and the owner chose to BUILD
+    THE CORE NOW (Stages 1–4; Stage 5/COPY deferred). So Round C = S7.2 is no longer just "paused pending
+    design"; it lands as **unification Stage 4** once the core is built. **Stage 1 (frontend-safe intent-spec
+    header split — `homer_session_spec.h`) is implemented and under validation.** Track progress in the
+    unification doc §11.3/§11.7.
 - **Round D = diagnostic-gate cleanup.** Validation: gate.
 
 **KEEP-SET that MUST survive Round A** (verified load-bearing): `EnableExperimentalTupleSinkRouting` +

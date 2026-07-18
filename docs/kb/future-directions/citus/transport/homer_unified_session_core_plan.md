@@ -552,12 +552,39 @@ split cleanly along the live/dead boundary:
   atttypid/typmod/collation/attlen/attbyval/attalign/dropped/generated + natts — everything the sink binds on
   (no attname; not needed).
 
-### Stage-1 tactical refinement — DECIDED (pending final surface map for site-completeness)
-Whether to (a) project `RemoteExecTupleSinkOperationSpec` (TupleDesc→contract) per the plan's letter, or
-(b) leave the tuple-sink operation spec in the backend header as ①-tuple-sink-only retiring code and move only
-the **core-relevant** portable specs (enums + `RemoteExecutionSessionIntentSpec` + `RemoteExecutionCommandSpec`
-family) into the new frontend-safe header. Leaning **(b)**: ② and the future core use options→intent, never the
-host-SHM tuple-sink operation spec; projecting a doomed struct is churn on Stage-4-delete code. Final call is
-recorded once the surface map confirms no core-relevant / live consumer of the operation spec. Either way the new
-frontend-safe header (`homer_session_spec_abi.h`, `postgres.h`/`postgres_fe.h`-free) holds the portable specs and
-`homer_frontend.h` re-includes it so ① compiles unchanged.
+### Stage-1 tactical refinement — DECIDED (b), and NARROWED (command spec deferred too)
+Choice **(b)**, confirmed by the surface map: leave `RemoteExecTupleSinkOperationSpec` (with its `TupleDesc`) in
+the backend header as ①-tuple-sink-only retiring code — the map found its initializers
+(`InitRemoteTupleSinkSend/ReceiveOperationSpec`) have **no call sites in either tree**, i.e. the operation spec
+is already dead; projecting it would be churn on Stage-4-delete code (and would drag in the dropped-column
+round-trip hazard below). Also **narrowed** vs §10.2: the `RemoteExecutionCommandSpec` family is **deferred to
+Stage 3**, not moved now — its core representation (in-process spec vs the already-portable wire
+`CitusRemoteExecStartCommandRequest`) is undetermined, and it is live (the UDF issues SQL_EXECUTE/TX_*), so
+moving it now is speculative churn on live code. Stage 1 therefore moves only the **enums + the intent spec**, the
+one seam the core unambiguously needs (§11.6).
+
+### Stage-1 IMPLEMENTED (2026-07-18) — pending validation
+- **New** `src/include/distributed/homer/homer_session_spec.h` (frontend-safe; `<stdint.h>`+`<stdbool.h>` only):
+  the 8 session-intent enums + `RemoteExecutionSessionIntentSpec`, projected `int32`→`int32_t`, `Oid`→`uint32_t`,
+  `bool`→stdbool `bool` (enum fields unchanged). **Proven frontend-safe**: a standalone TU including only this
+  header compiles+links and its full include tree contains **no postgres header** (correction-1 followed — `_t`
+  types, never the c.h `uintNN`/`Oid` aliases, which would drag in `postgres.h`).
+- **Edited** `homer_frontend.h`: removed those enums + the intent spec, `#include`s the new header; retains the
+  operation spec, command specs, completion, and the ① API. `RemoteExecTupleSinkDirection` stays (it belongs to
+  the retained operation spec).
+- **Edited** `homer_control_abi.h`: refreshed the stale "mirrored from homer_frontend.h" comment to point at
+  `homer_session_spec.h` (which is now itself frontend-safe; the wire macros predate it and remain the mirror).
+- **Verified**: all 8 backend TUs including `homer_frontend.h` compile with real flags; all intent-spec users
+  reach the new header via the include chain; **② (`homer_client.c`) is binary-identical** (does not include any
+  changed header); postgres-citus (pgbench/pg_basebackup/basebackup_homer) has zero references and is unaffected.
+- **NO .c changes.** The Stage-1 change is compile-time only; ①'s runtime behavior is byte-identical (width-
+  identical types, verbatim enums). Validation = clean full build in BOTH link contexts + selected-DPU gate as a
+  regression net; basebackup not required (non-transport, ②-identical).
+
+### Known hazard recorded for Stage 3 / COPY (NOT a Stage-1 regression)
+The existing `RemoteExecutionBuildTupleDescFromContract` (`homer_frontend.c:116`) — the contract→`TupleDesc`
+reverse builder used on the live result path — **breaks on DROPPED columns**: a dropped attribute carries
+`atttypid = InvalidOid`, and `TupleDescInitEntry(InvalidOid)` errors on the type-cache lookup. The current result
+path works only because result contracts do not carry dropped attributes. This is pre-existing and out of Stage
+1's path (Stage 1 does not touch this rebuild), but the core/COPY work in Stage 3+ that leans on TupleDesc↔contract
+must handle dropped attributes (skip/placeholder) before it can carry arbitrary relation schemas.
