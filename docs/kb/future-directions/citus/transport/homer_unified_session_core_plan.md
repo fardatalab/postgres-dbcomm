@@ -841,6 +841,23 @@ identities together (transport advances the carrier ordinal via a transport op; 
 resets both, mirroring today's fused `HomerClientSqlResultAdvanceCommandIdentity` `:3487`) → `release` → once-per-pass
 `credit_flush`. Tri-state applies to BOTH the envelope-validate and the batch-decode.
 
+Re-review resolutions on the result-consume contract:
+- **accept is INFALLIBLE** — the "advance both identities" step is pure single-consumer counter work (ordinal++ /
+  reset + command-seq++ / reset, keyed on the retained `header->flags` EOS bit `:3487`); no I/O, no allocation, no
+  failure path between core capture and the two increments (today `:3686-3699` has none). This prevents a split
+  where one counter advanced and the other did not.
+- **`credit_flush` runs once-per-pass on ANY `consumedHead` movement**, INCLUDING trailer-only progress with no
+  delivered record — matching today's "publish if the head moved" (`:3813`); it is NOT gated on an accepted
+  record. (borrow can advance the head over a trailer and then return pending.)
+- **ERROR-body leniency PRESERVED (not a behavior change):** Stage 3 keeps the current ERROR handling — accept the
+  record, read `errorCode` only if the fixed body is present, surface the command-error, advance+EOS, release
+  (`:3610-3630`). Adding fatal-malformed validation of the ERROR body (min-size/protocol, as the retired tuple
+  path did) is a behavior change, OUT of scope.
+- **fatal-malformed batch decode is bounded by the existing cursor:** `HomerDecodedTupleCursorNext` has no
+  per-tuple bounds checks (`homer_decoded_tuple_abi.h:180-220`), so tri-state fatal-malformed covers the
+  currently-DETECTABLE malformations (envelope, cursor-init, command-seq mismatch); full per-tuple bounds
+  validation is a PRE-EXISTING cursor gap, out of Stage-3 scope.
+
 **Terminal-abandon** (§11.1) — refined from refutation:
 - Triggered at EVERY unknowable/broken-state edge, not just the `:5022` timeout: post-publish transport/identity/
   protocol failure (`:4779`), ACK correlation failure (`:4875`), and fatal-malformed result decode. All take the
@@ -859,15 +876,31 @@ resets both, mirroring today's fused `HomerClientSqlResultAdvanceCommandIdentity
 -wrong-kind is a COMPILE error (owner decision, §13.1). Zero runtime cost. Frontend adapter holds/deals in the
 typed handle; basebackup's typed handles come in 3.5.
 
-**D. Transport module + thin adapter.** Physically move the Stage-2 `SqlTransport*` facade + the transport-leaf
-helpers into a transport module presenting the §12.2 interface; the core calls it. `homer_client.c`'s SQL entry
-points become the thin **frontend adapter**: options→intent projection, `malloc`, error-string, typed-handle
-open/close. The shared leaves the module now owns are still basebackup's — basebackup keeps calling them (carrier
-shared) until 3.5.
+**D. Transport interface + thin adapter.** The transport "module" is a LOGICAL seam for Stage 3 — the §12.2
+interface HEADER that the core calls — whose IMPLEMENTATION (the Stage-2 `SqlTransport*` facade + the transport-leaf
+helpers) STAYS in `homer_client.c` (NOT hoisted to a separate file/`.o` this stage; see the D-scope note under F).
+`homer_client.c`'s SQL entry points become the thin **frontend adapter**: options→intent projection, `malloc`,
+error-string, typed-handle open/close. The shared leaves stay basebackup's too — basebackup keeps calling them
+(carrier shared) until 3.5. Physically hoisting transport into its own file is a later, optional cleanup.
 
 **E. Process-shared DOCA device CONTEXT.** Replace per-carrier `dpuDocaDev` (`:125`) with ONE process-owned
 device (the current sole opener is `HomerClientDpuOpenDevice:794`→`HomerDpuFrontendOpenDevice:875`; per-session
-acquisition at SQL `:1945`, BB-send `:2566`, BB-recv `:2941`). Requirements (VERIFIED sites):
+acquisition at SQL `:1945`, BB-send `:2566`, BB-recv `:2941`).
+
+**SCOPE (re-review resolution): the context governs ONLY the client-session-export path** (the
+`HomerClientBaseBackupStream` streams — SQL + BB send/recv). The **frontend agent's device ownership is SEPARATE
+and UNCHANGED**: it keeps its explicit `HomerDpuFrontendOpenDevice → N mmaps → CloseDevice` lifetime
+(`homer_frontend_agent.c:1545`/`:1772-1786`) — the public `OpenDevice`/`CloseDevice` primitives and their
+explicit-owner contract are NOT altered (converting the agent to mmap-refs would make its trailing `CloseDevice` a
+double-free). The context is a NEW layer that USES the device-scoped primitives internally, not a replacement of
+their semantics. **Acquisition switches from the combined opener to the device-scoped variant:** today
+`HomerClientDpuExportMmap:1016` calls `HomerDpuFrontendExportRegion` (opens+closes a device per call, and closes
+the device directly on export failure `:853-861`); the context instead opens the shared device once
+(`HomerDpuFrontendOpenDevice`) and exports each session's region via `HomerDpuFrontendExportRegionOnDevice` (the S2
+API `:319-334`, exactly as the agent does), so a per-session mmap-create failure destroys only that mmap and
+releases the constructing hold through the context (never a direct device close).
+
+Requirements (VERIFIED sites):
 - process-wide (not per-thread — pgbench `-j` opens N×/process today, the DOCA-undefined hazard this fixes);
 - **refcount = one ref per live OR intentionally-retained mmap** (`dpuDocaMmap` stays PER-SESSION, `:126`).
   **PLUS a transient "constructing" hold (refutation):** `HomerDpuFrontendOpenDevice` returns a live device with
@@ -877,8 +910,9 @@ acquisition at SQL `:1945`, BB-send `:2566`, BB-recv `:2941`). Requirements (VER
   the ref cannot be "per-mmap" alone or the open-but-no-mmap window has no owner;
 - **failed-close retains the FULL resource set, not just a ref (refutation):** the unacked-CLOSE path (`:4450-4460`)
   returns before mmap-destroy/dev-close/buffer-free, and the exported buffer must stay mapped until mmap-destroy
-  (`remote_execution_client.h:330`). The retained set = mmap + its `dpuExportBuffer` + the DOCA export blob + the
-  device ref. **Accept that this is a process-lifetime tombstone:** the SQL adapter clears `commandDpuStreamOpen`/
+  (`remote_execution_client.h:330`). The retained set = mmap + its `dpuExportBuffer` + `dpuSetupPayload` + the DOCA
+  export blob + the device ref (the failed-close return at `:4450` precedes BOTH `free(dpuSetupPayload)` and
+  `free(dpuExportBuffer)` at `:4470-4471`). **Accept that this is a process-lifetime tombstone:** the SQL adapter clears `commandDpuStreamOpen`/
   identity even on dataplane-close failure (`:2404-2411`) with no library-owned later reclaim (current code
   delegates to process teardown, `:4450-4460`), so the tombstone pins the shared device open for the process. That
   is benign and matches today's per-session leak-to-teardown — NOT a new leak, just shared;
