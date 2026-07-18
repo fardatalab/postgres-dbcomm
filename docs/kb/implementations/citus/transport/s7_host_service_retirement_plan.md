@@ -189,11 +189,20 @@ invocations, 0 crashes, `gate_check` 20/20 decoded + `spawn_pairs=8`, 3×1200/12
   accept sites + collapsed guard), `tuple_sink_service_process.c` (`TupleSinkServiceSubmitBackendSpawnRequest`
   deleted wholesale + local OPEN/START fail-close), `remote_execution_backend_protocol.h` (`HOST_SLOT_*` removed,
   `DPU_SLOT_*` + 32-slot ABI + range-agnostic scan kept, D7' comment).
-- **e-COPY DEFERRED** — CANNOT land until the latent SQL-result memory bug is localized (bounded probes on the
-  backend result-sink handle handoff: creation `RemoteExecEnsureSessionResultQueue` → reserve
-  `RemoteExecSqlResultReserveBatch` → append `TryAppendTupleViewToCitusTupleSinkBatch`) and fixed. The full
-  reviewed e-COPY work is preserved at `scratchpad/roundA_full.patch` for re-application (as Round A'') after the
-  fix. `teardown_checks` INCONCLUSIVE both runs = pre-existing log-content gap, not a defect.
+- **Round A'' = e-COPY + the latent-bug fix — VALIDATED PASS 2026-07-18, LANDED.** The latent bug was LOCALIZED
+  (revert-bisect + codex-explore static analysis, mechanism verified in code) to an **uninitialized
+  `RemoteExecSqlResultDestReceiver.currentBatchHandle`**: `InitRemoteExecSqlResultDestReceiver` `memset`s only up
+  to `offsetof(..., resultQueueDescriptor)` (to skip clearing the ~33KB embedded contract), and neither Init nor
+  `RemoteExecSqlDestStartup` sets `currentBatchHandle`; `RemoteExecSqlResultReserveBatch` skips reserving when it
+  sees a non-NULL handle, so an uninitialized garbage pointer flowed into `TryAppendTupleViewToCitusTupleSinkBatch`
+  → segfault in `TupleSinkCheckBatchWritable`/`Direction`. The deleted `publishContext` stack local had
+  accidentally zeroed that frame region. **Fix:** explicit NULL-init of the receiver's whole trailing pointer tail
+  in Init (`remote_execution_backend_bridge.c`; see the CONTRACTS entry
+  `RemoteExecSqlResultDestReceiver.currentBatchHandle`). With the fix, full Round A (e-COPY, `publishContext`
+  gone) PASSES: the exact `SELECT abalance` statement decodes 20/20, no segfault, gate + basebackup clean, ~71 tps
+  (== the b+d-only run). ⇒ **S7.1(a)–(e) are COMPLETE except the (e-API) `RemoteExecutionSession` frontend API
+  deletion, which stays coupled to S7.2 (Round C).** `teardown_checks` INCONCLUSIVE across all runs = pre-existing
+  log-content gap, not a defect.
 
 ### Round structure (SUPERSEDES the "b–e in one pass" reading; owner-approved 2026-07-17)
 

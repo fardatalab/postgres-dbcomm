@@ -259,6 +259,28 @@ the call site. If it is not on the list, **it has not been checked.**
   caused on one node and observed on the other). A present alarm = the doorbell was not attached before OPEN = the
   run is contaminated, **NOT a pass**.
 
+## `RemoteExecSqlResultDestReceiver.currentBatchHandle` — **MUST be NULL-initialized; the receiver's Init memset is PARTIAL.**
+
+- **MEANS:** the backend's currently-reserved SQL result-sink batch. `RemoteExecSqlResultReserveBatch`
+  (`remote_execution_backend_bridge.c`) reserves a new batch ONLY when this is `NULL`; a **non-NULL value means
+  "reservation already held, reuse it"** and it returns without reserving, handing the pointer straight to
+  `TryAppendTupleViewToCitusTupleSinkBatch` → `TupleSinkCheckBatchWritable`/`TupleSinkCheckDirection`.
+- **DOES NOT MEAN:** a field that Init or Startup zero for you. `InitRemoteExecSqlResultDestReceiver` `memset`s
+  ONLY `offsetof(RemoteExecSqlResultDestReceiver, resultQueueDescriptor)` bytes (deliberately, to skip clearing
+  the ~33KB embedded `resultTupleViewContract`). `RemoteExecSqlDestStartup` writes `resultQueueDescriptor` /
+  `resultTupleViewContract` / `resultSinkHandle` / `resultCopySlot` on the row path but **NOT** the rest of the
+  trailing tail — `currentBatchHandle`, `resultCopyTupleDesc`, `completionMailbox` are written by neither.
+- **CONTRACT / ENFORCES:** `InitRemoteExecSqlResultDestReceiver` MUST explicitly initialize the ENTIRE trailing
+  pointer tail after `resultQueueDescriptor` (it now NULLs all five). **TEMPTING WRONG MOVE:** trusting "the
+  partial memset plus Startup writes it before use" — Startup does not write `currentBatchHandle`. **Any NEW
+  pointer field added after `resultQueueDescriptor` MUST be NULL'd in Init too**, or it inherits stack garbage.
+- **THE BUG THIS PREVENTS (fixed 2026-07-18, S7.1 e-COPY round):** the uninitialized `currentBatchHandle` fed a
+  garbage pointer into the codec → hard segfault on the first row-producing command (`SELECT abalance`). It stayed
+  DORMANT for months only because an adjacent large stack local (`RemoteExecCompletionPublishContext
+  publishContext`, `memset` each iteration) happened to zero that frame region; deleting it (host-service COPY
+  retirement) removed the accidental cushion. ⚠ The crash site (`TupleSinkCheckDirection`/`BatchWritable`) is the
+  VICTIM, not the bug — the defect is the uninitialized INPUT. Found by revert-bisect + static localization.
+
 ---
 
 ## `signalCommandWrite` / `TupleSinkServiceClientSqlCommandWriteShouldSignal` — **a REAL decision since Stage 2c: terminal ‖ pool ‖ transport. Most command writes are UNSIGNALLED.**
