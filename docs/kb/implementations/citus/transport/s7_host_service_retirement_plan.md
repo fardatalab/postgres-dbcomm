@@ -91,8 +91,10 @@ STARTUP_WAIT finding was read directly). Each site is still re-confirmed at impl
 3. **§3.3 pump — `LOCAL_CONTROL` is in TWO pump modes, not just MAIN_LOOP (wrong-neighbor trap).**
    `TUPLE_SINK_SERVICE_PUMP_LOCAL_CONTROL` (`:2807`) is in **both** `..._PUMP_MAIN_LOOP` (`:2816-2822`) **and**
    `..._PUMP_STARTUP_WAIT` (`:2824-2827`, used `:24419-24420`); `HEARTBEAT` (`:2812`) is main-loop-only. So
-   dropping the host-control pump arm must handle the STARTUP_WAIT path too — and S7.1 must FIRST confirm
-   STARTUP_WAIT's local-control is host-role-only (the control region is host-private) before removing it.
+   dropping the host-control pump arm must handle the STARTUP_WAIT path too. ⚠ **CORRECTED (see the "S7.1(b–e)
+   MAPPED" section above, finding 1): the control region is NOT host-role-private — `main()` maps and pumps it
+   for BOTH roles.** It is merely FUNCTIONALLY inert on the DPU role (DPU commands flow via DMA-pulled staged
+   slots, sharing only the dispatcher function). (c) is therefore a live-DPU-daemon scheduler edit, its own round.
    `TupleSinkServicePumpOnce` is now progress-policy/ready-set based (`:52280-52443`), collecting local-control
    whenever `controlState != NULL` (`:52323-52334`); ready-set collector arms local-control `:15858-15865`,
    heartbeat `:15937-15942`. Daemon: `TupleSinkServiceMapControlRegion` def `:25828`; `main` maps `:52672-52673`,
@@ -111,6 +113,120 @@ STARTUP_WAIT finding was read directly). Each site is still re-confirmed at impl
 source caller (dead, delete). **§6:** DPU slot translation still present — `HOMER_SERVICE_DPU_SPAWN_MAX_PENDING`
 DPU-slot-based (`homer_service_dpu_spawn.h:95`), assignment starts at the DPU partition
 (`homer_service_dpu_spawn.c:230`).
+
+---
+
+## ⟳ S7.1(b–e) MAPPED + ROUND STRUCTURE 2026-07-17 (codex-explore map, MAIN-AGENT VERIFIED in code)
+
+Verified at citus `effd2678d` / postgres `108c918d80a` (after S7.1(a) landed). A codex-explore pass mapped
+(b–e); the main agent then VERIFIED every load-bearing claim by reading the code (and caught TWO gaps the map
+missed — findings 1 and 2). Result: **the rest of S7.1 is NOT one round.** Four findings overturn the earlier
+scoping; the round plan below SUPERSEDES any "one folded pass for b–e" reading.
+
+### The four verified findings
+
+1. **(c) — the control region is NOT host-role-private (§3.3 / RE-GROUNDING-pt3 were wrong to imply "host-only
+   ⇒ simple pump-arm gut").** `main()` maps `/citus_remote_execution_control_v27` UNCONDITIONALLY
+   (`tuple_sink_service_process.c:52673`, AFTER the `dpuDmaState.enabled` branch), wires `controlState` into the
+   peer request context (`:52676`) and progress registry (`:52714`), sets the global
+   `ActiveReadyBitmapControlRegion` (`:25906`), and pumps `LOCAL_CONTROL` in BOTH `MAIN_LOOP` (`:52727`) and
+   `STARTUP_WAIT` (`:2824-2827`). So the DPU service maps/pumps/registers it. **BUT it is FUNCTIONALLY INERT on
+   the DPU role** (VERIFIED): DPU commands arrive by DMA-pulled staged slots and share only the dispatcher
+   FUNCTION `TupleSinkServiceDispatchLocalControlSlot` (`:45000`), NOT the SHM region — the `:47727-47731`
+   comment states this outright ("pulled by DMA, rather than through a host-service SHM control region"); the
+   `ActiveReadyBitmapControlRegion` reads are stats (`:9458`) + guarded no-op clears (`:14979`). ⇒ (c) IS
+   removable in S7.1, but it is a live-DPU-daemon scheduler edit (map/unmap, LOCAL_CONTROL in both masks,
+   registry wiring, ready-bitmap global, region ABI, heartbeat which writes into the region) — KEEPING the shared
+   dispatcher + DPU staged path. **Its own round (B); exact sites re-mapped at Round B execution.**
+
+2. **(e) — `EnableExperimentalTupleSinkRouting` is REPURPOSED and now GATE-LOAD-BEARING (§1b/§3.4 "delete the
+   GUC + backing var" is WRONG — the name says COPY, the meaning is "SQL result substrate is on").** The backend
+   bridge FORCE-SETS it true so the socketless SQL backend materializes row results via the tuple-sink substrate
+   (`remote_execution_backend_bridge.c:1383-1392` with the explaining comment, and `:2009`);
+   `ExperimentalTupleSinkBatchTupleTarget` is likewise read by the bridge (`:1487`) and frontend
+   (`homer_frontend.c:1371`). ⇒ KEEP both vars. Deletable in (e-COPY): the user-visible GUC REGISTRATION
+   (`shared_library_init.c:2540`), the COPY error-hint/getter (`homer_tuple_queue_frontend.c:843`/`:995-1000`),
+   the COPY frontend hooks in `multi_copy.c`, `homer_citus_xact.c` + its `transaction_management.c` call sites,
+   and the backend-bridge COPY-ingest arm `case CITUS_REMOTE_EXEC_COMMAND_COPY_INGEST_FROM_TUPLE_SINK:`
+   (`remote_execution_backend_bridge.c:3150-3163`) + `worker_tuple_sink_insert.c` — **keep the enum VALUE**
+   (removing it renumbers the bridge ABI ⇒ Rule 10; an unhandled kind falls to the existing `default:` error).
+
+3. **(e-API) — the `RemoteExecutionSession` frontend API is STILL CALLED by the S7.2 UDF**
+   (`remote_exec_pgbench_transaction.c:114-117` → `StartRemoteExecutionCommand` +
+   `WaitForRemoteExecutionCommandCompletion`). ⇒ its deletion (§3.4) CANNOT happen in (e); it MIGRATES INTO the
+   7.2 round (round C), together with the UDF removal. Also KEEP the API DEFS in `homer_frontend.c` until then.
+
+4. **(b)+(d) are coupled.** The host CAS §6 targets is INSIDE `TupleSinkServiceSubmitBackendSpawnRequest`
+   (deleted wholesale by (b)); the host slot constants `HOST_SLOT_FIRST`/`HOST_SLOT_COUNT` become dead only once
+   (b) removes their reader. ⇒ (d) is (b)'s tail; fold together. KEEP `DPU_SLOT_*`, all DPU translations, the
+   32-slot ABI cardinality, and the range-agnostic postmaster scan until S7.3.
+
+### ⚠ ROUND A OUTCOME — SPLIT into A' (LANDED) + deferred e-COPY (2026-07-18)
+
+Round A was executed as one folded (b)+(d)+(e-COPY) deletion (citus, 20 files, −2967) and reviewed clean (self +
+independent codex-explore: KEEP-SET, base-COPY-vs-pre-Homer-ancestor `2545ab065^`, orphan sweep — all clean).
+**Validation FAILED**: a reproducible segfault in the DPU-spawned backend's SQL-result-WRITE path
+(`TupleSinkCheckDirection`/`TupleSinkCheckBatchWritable`, `homer_tuple_queue_frontend.c:701`/`:761`, dereferencing
+a GARBAGE tuple-sink handle) on the `SELECT abalance` statement, plus a *secondary* DPU
+`memcpy task_kind=8` (= `HOMER_DPU_DMA_TASK_KIND_BACKEND_COMPLETION_CONTROL_READ`, role 3) I/O failure. The
+four-role basebackup PASSED.
+
+**Root cause — NOT a Round A logic defect (trace + bisect, VERIFIED).** A codex-explore trace refuted the
+direct-cause theories: the deleted tx-finalization path never touched the backend's `RemoteExecBackendSessionState`
+/result-sink (the handle is allocated in `TopMemoryContext`, survives `CommitTransactionCommand`); `task_kind=8`
+reads host completion-control into a DPU-local buffer and cannot write backend heap, so the DPU failure is
+secondary to the backend's death. The ONLY Round A change *inside* the crashing function is e-COPY's removal of
+the dead COPY-only `RemoteExecCompletionPublishContext publishContext` STACK local from
+`ExecuteRemoteExecBackendCommand` — semantically inert for SQL, but it **shifts the stack frame layout**, exposing
+a **PRE-EXISTING latent stack overwrite / use-after-scope** in the SQL result path that S7.1(a) was merely lucky
+with. **Bisect CONFIRMED (2026-07-18)**: reverting e-COPY (keeping only b+d) makes the gate PASS cleanly (7
+invocations, 0 crashes, `gate_check` 20/20 decoded + `spawn_pairs=8`, 3×1200/1200 repeats ~71 tps, basebackup
+44,362 laps + `frontier_checks` PASS); the crash reproduces only with e-COPY applied.
+
+**Decision (owner-approved 2026-07-18): land Round A' = (b)+(d) now; DEFER e-COPY.**
+- **Round A' = (b)+(d)** — host spawn claimant retirement + dead D7 host constants — **VALIDATED PASS 2026-07-18**.
+  3-file citus diff: `remote_execution_backend_bridge.c` (backend channel-mode = `SELECTED_DPU_DMA`-only at both
+  accept sites + collapsed guard), `tuple_sink_service_process.c` (`TupleSinkServiceSubmitBackendSpawnRequest`
+  deleted wholesale + local OPEN/START fail-close), `remote_execution_backend_protocol.h` (`HOST_SLOT_*` removed,
+  `DPU_SLOT_*` + 32-slot ABI + range-agnostic scan kept, D7' comment).
+- **e-COPY DEFERRED** — CANNOT land until the latent SQL-result memory bug is localized (bounded probes on the
+  backend result-sink handle handoff: creation `RemoteExecEnsureSessionResultQueue` → reserve
+  `RemoteExecSqlResultReserveBatch` → append `TryAppendTupleViewToCitusTupleSinkBatch`) and fixed. The full
+  reviewed e-COPY work is preserved at `scratchpad/roundA_full.patch` for re-application (as Round A'') after the
+  fix. `teardown_checks` INCONCLUSIVE both runs = pre-existing log-content gap, not a defect.
+
+### Round structure (SUPERSEDES the "b–e in one pass" reading; owner-approved 2026-07-17)
+
+- **Round A ⚠ SPLIT at validation → A' landed, e-COPY deferred (see "ROUND A OUTCOME" above).** Original scope was
+  (b) + (d) + (e-COPY). Host spawn claimant (fn + 2 LOCAL callers `:40276`/`:44304`; KEEP the two
+  peer fail-close guards `:44713`/`:44935`, drop only their commented history `:44696`/`:44920`; remove the host
+  arm from `TupleSinkServiceFillBackendSpawnRequest` + the `HOST_SERVICE_SHM` acceptance/host-invalid-arena
+  checks in `remote_execution_backend_bridge.c:3332-3374`, KEEP the enum type + `SELECTED_DPU_DMA` +
+  range-agnostic scan) + dead host slot constants + adjacency-comment rewrite + COPY-only scaffolding per finding
+  2. Validation: gate + 4-role basebackup.
+- **Round B = (c)** isolated (finding 1). Retires the host control-region protocol on BOTH ends together:
+  the DAEMON side (`TupleSinkServiceMapControlRegion`/unmap, `LOCAL_CONTROL` in both pump masks, progress-registry
+  `controlState` wiring, `ActiveReadyBitmapControlRegion` global, region ABI) AND the BACKEND side
+  (`remote_execution_backend_bridge.c`: the now-dead `if (!selectedDpuBackendChannel)` `RemoteExecMapControlRegion`
+  arm ~:2751, the dead completion-ready-bitmap validation ~:2710-2720, the `controlRegion`/`controlFileDescriptor`
+  locals ~:2653-2656, the session-state assignment ~:2875 and cleanup ~:3179/:3221, plus
+  `RemoteExecBackendMarkCompletionReady` + the completion-bitmap fields — these are the SAME ready-bitmap protocol
+  as the daemon global, so they co-retire). ⚠ **Round A intentionally LEAVES the backend-side dead arm** (decision
+  2026-07-18): it became unreachable as a side-effect of Round A's host-CHANNEL removal, but per §12 the
+  control-region arms are (c)'s scope, and cleaning only the backend half would split one protocol across two
+  commits. It is safe to leave one round (unreachable, commented; the selected-DPU path already tolerated
+  `controlRegion==NULL` pre-Round-A). KEEP the shared dispatcher + DPU staged path + the Tier-2 named-mailbox
+  branch. Validation: gate + basebackup; confirm the DPU setup listener stays live.
+- **Round C = S7.2** UDF removal + (e-API) frontend API removal (finding 3). Validation: gate + basebackup.
+- **Round D = diagnostic-gate cleanup.** Validation: gate.
+
+**KEEP-SET that MUST survive Round A** (verified load-bearing): `EnableExperimentalTupleSinkRouting` +
+`ExperimentalTupleSinkBatchTupleTarget` vars (gate SQL result substrate); the `RemoteExecutionSession` API DEFS
+(7.2 UDF); the `CITUS_REMOTE_EXEC_COMMAND_COPY_INGEST_FROM_TUPLE_SINK` enum VALUE; the two peer fail-close
+guards; `TupleSinkServiceDispatchLocalControlSlot` + the DPU staged path; base Citus COPY
+(`multi_copy.c`/`local_multi_copy.c` core machinery); the client-SQL branch of
+`TupleSinkServiceConsumeCompletionMailbox` (`:23363-23375`); `HomerServicePersistentSendCompletionCallbacks`
+(the F7 neighbor of the deleted `TupleSinkServicePublishPeerCommandCompletion`).
 
 ---
 
@@ -189,8 +305,9 @@ a guess.
 
 **Seed list already surfaced** (delete when their readers go; verify unreferenced first):
 - `HomerClientControl` struct + host-only fields — `remote_execution_client.h:32`/`:129`/`:241` (§3.1).
-- GUC backing vars — `EnableExperimentalTupleSinkRouting` (`homer_tuple_queue_frontend.c:45`),
-  `EnableExperimentalHomerDpuFrontend` (`homer_frontend_dma.c:67`).
+- GUC backing vars — `EnableExperimentalHomerDpuFrontend` (`homer_frontend_dma.c:67`, Tier-2/S7.3).
+  ⚠ **`EnableExperimentalTupleSinkRouting` is NOT deletable** — REPURPOSED as the gate's SQL result substrate
+  flag (see "S7.1(b–e) MAPPED" finding 2); only its user-visible GUC *registration* + COPY-only readers go.
 - Tier-2 `dpuControlChannel` state — `homer_frontend_internal.h:23` (§3.6).
 - The `HOST_SERVICE_SHM` spawn-mode enum **arm** (§5, `:22444`) — remove the arm; **keep the enum type**
   (native DPU uses its siblings).

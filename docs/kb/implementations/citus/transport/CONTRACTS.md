@@ -252,7 +252,9 @@ the call site. If it is not on the list, **it has not been checked.**
 - **⚠ WHY `exit(1)` IS SAFE (both reachability paths checked, plan §1.4.1):** the peer-START crash is
   **unreachable for pgbench** (a failed command is non-retryable → `CSTATE_ABORTED`, so the client never re-STARTs
   on the long-lived session); the peer-OPEN cold-start crash **replaces a pre-gut SILENT HANG** (the old arm fell
-  through to a DPU `shm_open` no postmaster reads, `:22940`/`:22879`).
+  through to the host-service `TupleSinkServiceSubmitBackendSpawnRequest` `shm_open` that no postmaster reads; that
+  submitter + its two LOCAL callers are now DELETED wholesale in S7.1(b), so this fail-close is the only surviving
+  behavior on that peer arm).
 - **ENFORCES:** every healthy validation run must assert this alarm is **ABSENT in BOTH DPU logs** (it can be
   caused on one node and observed on the other). A present alarm = the doorbell was not attached before OPEN = the
   run is contaminated, **NOT a pass**.
