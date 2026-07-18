@@ -698,6 +698,69 @@ open-close-wait-and-free (`:1508`) contract that breaks if casually generalized.
    consolidation (that is a behavior change → Stage 3). Strictly behavior-preserving indirection.
 - **Validation: gate + basebackup** (② shares transport leaves with basebackup — prove basebackup unaffected).
 
+**Concrete Stage-2 facade — SEAM VERIFIED IN CODE 2026-07-18** (each A/B cut re-read line-by-line in `src/bin/homer_client.c` by the main agent AND cross-checked by an independent codex-explore seam map; divergences resolved below). SIX in-file `static` entry points, frontend-safe signatures, all declared ABOVE the untouched shared leaves; the SQL A-logic in Start/Peek/Ack/Close is redirected through them:
+
+| entry point | wraps (current lines) | callers | notes |
+|---|---|---|---|
+| `SqlTransportControlSlotAvailable(session, *outSlotState)` | slot-state atomic load `== FREE` (`:4380`) | Start (`:4379`), Close-readiness (`:2127`) | A keeps its own `outstandingStartCommandSequence` check; B answers only the physical slot word, and writes the observed state out for A's diagnostic. Handles NULL slot (→ `UINT32_MAX`, false) to also serve Close's `:2131` NULL-guarded read |
+| `SqlTransportPublishStart(session, timeoutMs, cmdName, err…)` | fire-and-forget submit `…,retainRole1=true,…` (`:4491`) | Start | thin: preserves the `true` dual-contract arg of `HomerClientDpuSubmitControlRequest`. Request CONSTRUCTION (`:4413`–`:4483`) stays inline in Start (A writes into the B slot) — moving it behind a portable_command_spec is Stage 3 |
+| `SqlTransportPollCompletion(session, expectedEpoch, *classification, *copiedCompletion, err…)` | role-6 read + epoch classify + transport-identity + COPY (`:4586`–`:4627`) | Peek | classification enum uses ONLY the statuses Peek actually emits: NOT_READY/READY/OVERRUN/MISMATCH (NOT `BODY_VISIBILITY_PENDING`, which Peek never emits — adding it would be a behavior change). Copies straight into `&session->completionLease.completion` (zero extra copy); A keeps `slotIndex=0` (`:4626`), `BuildCompletionViewFromLegacy` (`:4628`), semantic validation (`:4631`–`:4648`), terminal latch (`:4650`–`:4687`) |
+| `SqlTransportReleaseStartSlot(session)` | atomic store slot→FREE (`:4756`) | Ack | correlation decision (`:4728`) + `outstandingStartCommandSequence=0` stay A |
+| `SqlTransportLifecycleClose(session, timeoutMs, err…)` | build CLOSE_SESSION + wait-and-free submit `…,false,…` (`:2202`–`:2224`) | Close step 2 | A owns the readiness gate (`:2127`–`:2146`, reusing `SqlTransportControlSlotAvailable` for the physical bit) + step ordering. Called only when A has decided `lifecycleControlSlotReady` |
+| `SqlTransportDataplaneClose(session, err…)` | thin wrapper over shared `HomerClientCloseBaseBackupStream(&session->commandDpuStream,…)` (`:2235`) | Close step 3 | shared leaf UNTOUCHED; wrapper only names the SQL call site |
+
+**Divergences from the codex-explore map, resolved toward minimal indirection (main-agent decision, verified in code):**
+- **`publish_start` granularity.** Codex proposed a fuller `publish_start` that builds the request internally AND reorders semantic validation before the slot write (to delete the error-path releases). REJECTED for Stage 2: §12.4 scopes it as behavior-preserving indirection with A-logic inline; the portable-command-spec + validation-reorder is the Stage-3 core→transport shape. Stage 2 keeps construction inline and wraps only the submit.
+- **Error-path `HomerClientReleaseControlSlot` (`:4457`/`:4467`/`:4481`).** VERIFIED these are DEFENSIVE NO-OPS: between the FREE-check (`:4380`) and the error paths nothing sets the slot non-FREE (state only changes inside `HomerClientDpuSubmitControlRequest:1492`), and the helper (`:388`) just stores FREE. §12.2 already marks them "to remove" (Stage 3, with the reorder). So they are NOT a facade op — they stay inline; the 7th wrapper is dropped.
+- **`lifecycle_close` consolidation.** Codex proposed folding the readiness POLICY into the transport op via a result enum. REJECTED: §12.2 says A owns close-readiness policy. The op wraps only build+submit (`:2202`–`:2224`); A keeps the readiness gate.
+- **Open + `arm_initial_result_credit`.** Codex maps `transport_open`/`arm_initial_result_credit` cuts; per the Open-deferral decision below they are NOT extracted in Stage 2 (Open's B ops are one linear bootstrap sequence, not state-machine-dispatched; Stage 3 restructures Open wholesale, so wrapping now is throwaway).
+
+**DECISION (owner-improvised, recorded 2026-07-18): Open's bootstrap is NOT wrapped in Stage 2 — deferred to Stage 3.**
+`HomerClientOpenSqlSessionSelectedDpu` (`:1560`–`:1985`) is ~320 lines of LINEAR transport bootstrap
+(layout → `posix_memalign` → 3 ring descriptors → mmap export → setup-TCP → OPEN submit → id read-back → arm
+credit). It DOES call B leaves (the OPEN `HomerClientDpuSubmitControlRequest`; the initial role-7 credit arm), but
+as one linear setup sequence, not as ops dispatched from an interleaved A state machine the way Start/Peek/Ack are
+— from the caller's/state-machine's view "open" is a single atomic step.
+Its embedded A-state (intent→`sessionKey` projection `:1918`–`:1937`; id read-back `:1948`; `commandDpuStreamOpen`
+latch `:1966`; `init_decode_identity` `:1981` + `arm_initial_result_credit` `:1982`) moves WITH open in Stage 3,
+where the core-open / transport-open split, `sessionUID` stamping, and the `memset(session,0)` fix (`:1658`, the
+op §12.2 says `transport_open` must NOT do) happen together. Rationale: wrapping a linear block in Stage 2 only to
+re-cut it in Stage 3 is churn with no seam value; the Stage-2 win is the command-plane + close cuts, which ARE
+genuine A↔B call seams and are exactly what proves basebackup-shared leaves stay untouched. (Options considered:
+(a) wrap all of open now — rejected, double-extraction churn; (b) this — deferred to Stage 3; both keep behavior
+identical. Revisit only if Stage 3 finds it needs the open seam earlier.)
+
+**Adversarial refutation result (codex-explore, 2026-07-18) — IMPLEMENTED + reviewed.** The 6-facade diff was
+attacked op-by-op against the pre-facade line map. Verdict: NO state-machine, wire-protocol, shared-leaf, or
+missing-side-effect regression; Peek/Ack/publish/lifecycle/dataplane confirmed byte-identical; NULL-slot readiness
+cases exactly preserved. One BENIGN, intentional difference: Start's one-outstanding check and Close's readiness
+gate now take ONE coherent slot-state snapshot, where the pre-facade code re-read the atomic in the condition and
+again in each diagnostic — so under an async DPU state change the old code could LOG differing `slot_state` values.
+Accept/reject logic is unchanged; the single snapshot is if anything cleaner. Documented at the Start readiness
+comment and the facade block header.
+
+**VALIDATION: PASS (2026-07-18, working tree on citus `265b6630d`).** Gate + four-role basebackup, per §12.4.
+- Gate (`pgbench --homer --homer-dpu`, 4 clients): debug 20/20 with 20 DISTINCT decoded `abalance` values; 3
+  measured repeats 8000/8000, 0 failed. Transport `homer-dpu` confirmed; DPU spawn events (legacy + `HOMER_EVENT`)
+  agree; `gate_check`/`alarm_check` PASS over every bracketed interval; `peer_host_spawn_retired` and all
+  alarm/fatal anchors ABSENT. All six facade ops exercised (24k+ completions read via `SqlTransportPollCompletion`).
+- Basebackup (four-role, mandatory transport acceptance): `full_laps=44364` (byte-ring WRAP proven), delivered
+  bytes match, full drain, `teardown_checks`/`frontier_checks` balanced on both DPUs → the SQL-side indirection
+  leaves the SHARED transport leaves unaffected (the whole point of the gate+basebackup pairing).
+- Perf: INCONCLUSIVE — no current-SHA `-c4` reference band exists in `farnet_diagnostics_and_baselines.md` (only
+  `-c1` bands + one flagged-non-comparable `-c4`). Behavior-preserving indirection expects no perf change; 3
+  repeats agree within ~1.3% (~71–72 tps `-c4`). Not an acceptance criterion for this stage.
+- **One non-reproducing anomaly, MECHANISTICALLY EXCLUDED from this change:** one measured-repeat attempt
+  ("repeat-2b", run against residual state with no clean-baseline restart) saw all 4 clients time out on
+  `sql_execute` seq-5 completion (0/8000). Root cause is DPU-SIDE: the farnet1 DPU stalled at `PROGRESS
+  POLICY-ADMISSION DROPS` and never published the seq-5 completion — although it HAD landed peer commands 1–5 and
+  finalized the result stream, proving the host START publishes (`SqlTransportPublishStart`) all worked. A
+  host-frontend-only change (DPU source + bridge `5U` unchanged) cannot make the DPU not publish. The host-side
+  `CLOSE_SESSION blocked … slot_state=2` ALARM is my refactored close-readiness gate firing CORRECTLY (seq-5 START
+  never ACKed → role-1 stayed REQUEST_READY=2 → close refuses lifecycle-close loudly, as designed). Did NOT
+  reproduce after a clean-baseline restart (retry 8000/8000). See `farnet_diagnostics_and_baselines.md` for the
+  observed DPU admission-drop shape.
+
 ### 12.5 Stage 3 — extract the stateless core, the transport module, and the shared device context
 Realizes the **SQL opKind** of the unified intent-driven interface in §13 (typed opaque handles; one core).
 1. Add `homer_session_core.c` (stateless, POSTGRES-INDEPENDENT, caller-owned) holding the A state machine (§12.2)

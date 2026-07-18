@@ -95,6 +95,26 @@ The positive `remote exec backend: bound frontend arena slot=<N>` line is **comp
 selected-DPU backend cannot exist without a successful bind: both the attach and `BindArenaSlot` are
 FATAL-on-failure *before* the command loop.
 
+### 1.4 `PROGRESS POLICY-ADMISSION DROPS` → completion never publishes (observed ONCE, non-reproducing, July 18 2026)
+
+Observed once during Stage-2 facade validation (a gate `-c4` measured repeat run against RESIDUAL state — no
+clean-baseline restart after an orphaned prior attempt). Shape, so it stays recognisable:
+
+- **Host symptom:** all clients `timed out after 30 s waiting for Homer completion of sql_execute (kind=6
+  sequence=5)`, then `Homer session is terminal (backend exited)`, then `ALARM lifecycle CLOSE_SESSION blocked
+  because semantic close still owns role 1 ... slot_state=2`, and `0/N` processed / `Run was aborted`.
+- **DPU cause (farnet1 spawn DPU):** the service HAD `landed peer command` seq 1–5 and `finalized pending DPU
+  result stream sequence=5`, started P3 result peer-open + byte-ring bind, then logged `PROGRESS
+  POLICY-ADMISSION DROPS` and went quiet — it **never published the seq-5 completion** back to the host.
+- **Reading it:** the host-side ALARM is the close-readiness gate firing CORRECTLY — an un-ACKed terminal START
+  leaves role-1 `REQUEST_READY` (state 2), so `CLOSE_SESSION` refuses loudly. It is a downstream SYMPTOM of the
+  DPU non-publication, NOT a host bug. The failure is DPU admission-scheduler side.
+- **Non-reproducing:** a full clean-baseline restart (both DPU services restarted, backends reaped, project shm
+  removed, PostgreSQL restarted) cleared it; the identical retry completed `8000/8000`. Consistent with the
+  standing rule that a run against residual state is diagnostic-only — restart from a clean baseline. If this
+  recurs on a CLEAN baseline it becomes a real DPU-side admission bug worth localizing; the one observation to
+  date does not establish that.
+
 ---
 
 ## 2. Network / RDMA diagnostic battery
