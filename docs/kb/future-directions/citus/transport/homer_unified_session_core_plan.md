@@ -795,6 +795,128 @@ Realizes the **SQL opKind** of the unified intent-driven interface in §13 (type
    `meson.build:47`).
 - **Validation: gate + basebackup + DPU TCP smoke** (client transport + the device-model change).
 
+### 12.5a Stage-3 CONCRETE DESIGN — grounded in code 2026-07-18 (main agent reads + codex-explore inventory, reconciled)
+
+Six components. Build order (internal; validated once per the owner's "one push"): A (sink-lease) → B (core) →
+C (typed handle) → D (transport module + adapter) → E (device context) → F (archive). The **carrier
+`HomerClientBaseBackupStream` stays shared with basebackup** (Stage 3 does NOT dissolve it; 3.5 does its half).
+
+**A. Shared sink-lease** (`homer_byte_ring_sink.h`). Split the fused drain at the callback boundary (verified
+seam: framing `:256`/`:281`/`:297`/`:318` is pure geometry; delivery is callback `:327` + advance `:338`):
+- `HomerByteRingSinkBorrow(control, byteStorage, producedTail, min/maxRecordBytes, *lease) -> {PROGRESS+lease |
+  NOT_READY | VISIBILITY_PENDING}`: runs the framing loop, SKIPS fully-published wrap-gap trailers internally
+  (advancing `consumedHead` past dead bytes — never leased, idempotent), returns the next WHOLE fully-published
+  record `{recordBuffer, recordBytes}` WITHOUT the callback and WITHOUT advancing past the record.
+- `HomerByteRingSinkRelease(control, *lease)`: the `:338` release-store (`consumedHead += recordBytes`). Called
+  only after the consumer's decode succeeds — preserves "credit must not advance before decode validates, or the
+  DPU reuses the bytes." **GUARD (refutation): assert `consumedHead == lease.recordStart` before the store** so a
+  duplicate/stale release cannot advance over a *following* record. Release does NOT accumulate bytes itself; it
+  exposes `lease.recordBytes` and the CALLER adds it to its own accumulator (SQL `receiveDeliveredObjectBytes`
+  `:3809`, BB `:3308`) — Release's signature carries no accumulator.
+- Keep `HomerByteRingSinkDrain` as a COMPATIBILITY wrapper so nothing else breaks mid-stage. **Its contract must
+  reproduce the current status EXACTLY (refutation):** it loops borrow → callback → (release + accumulate) and
+  tracks `madeProgress` = any `consumedHead` advance in the pass (trailer-skip inside borrow OR a release), so a
+  trailer-skip-then-pending pass still returns `PROGRESS` (matching `:226`/`:264`/`:318`); on an accepted
+  **EOS** record it releases + accumulates + sets `sawEos` + returns `PROGRESS` immediately (the `:340-345` stop
+  rule); a callback-false with no prior progress returns `VISIBILITY_PENDING` (or the borrow's `NOT_READY`). The
+  consumer decode result becomes TRI-STATE: success/release, visibility-pending/no-release, fatal-malformed/
+  no-release (fixes the current conflation where every callback-false → VISIBILITY_PENDING forever, `:327-332`).
+  Both SQL result-consume AND basebackup bulk-consume (3.5) use borrow/release verbatim.
+
+**B. `homer_session_core.c`** (NEW, POSTGRES-INDEPENDENT — `_t`/stdbool only, per Stage-1 rule). Holds the SQL
+opKind A-state machine. Core struct = the A fields (`serviceSessionId/Index`, completion-lease quartet, sequence
+pair, `sqlSessionTerminal`, session-open flag) + **NEW retained `sessionUID` + intent** (today discarded after
+open, `:2100`) + **`receiveExpectedCommandSequence` moved out of the carrier** (`:177`; SQL command-local decode
+identity). `completionSessionGeneration` is carried but stays **VESTIGIAL (0)** in Stage 3 (never minted today,
+`:4767`/`:4877`; 0==0 always passes — minting for stale-lease rejection is a Stage-5/reuse item). Core functions
+call the §12.2 transport interface via DIRECT link-time calls: open-orchestration, `start`, `poll_completion`,
+`ack`, close-orchestration, and result-consume.
+
+**Result-consume layering (RESOLVED from refutation — the ordinal is NOT purely B):** the SQL decode reads AND
+advances `receiveExpectedOrdinal` (`:3560`/`:3487`), so the split layers rather than partitions:
+`borrow`(transport framing) → **envelope-validate + ordinal** (proto/kind/headerBytes/`recordOrdinal` vs
+`receiveExpectedOrdinal`/reserved — TRANSPORT-owned, B, `receiveExpectedOrdinal` stays in the carrier) → **batch
+decode + command-seq + capture + ERROR** (core, A, vs `receiveExpectedCommandSequence`) → **accept** advances BOTH
+identities together (transport advances the carrier ordinal via a transport op; core advances command-seq; EOS
+resets both, mirroring today's fused `HomerClientSqlResultAdvanceCommandIdentity` `:3487`) → `release` → once-per-pass
+`credit_flush`. Tri-state applies to BOTH the envelope-validate and the batch-decode.
+
+**Terminal-abandon** (§11.1) — refined from refutation:
+- Triggered at EVERY unknowable/broken-state edge, not just the `:5022` timeout: post-publish transport/identity/
+  protocol failure (`:4779`), ACK correlation failure (`:4875`), and fatal-malformed result decode. All take the
+  same transition.
+- Abandon = **mark `sqlSessionTerminal` ONLY; it PRESERVES outstanding ownership** — it does NOT clear
+  `outstandingStartCommandSequence` or release role-1 (the START may still be in flight; the DPU could still touch
+  the slot). Close then correctly refuses lifecycle-CLOSE while ownership remains and falls to the safe
+  setup-close/DOCA teardown (`:2300-2331`), exactly as today.
+- Core `start` must **check `sqlSessionTerminal` and refuse** (today it does not, `:4531`; no-reuse depends on
+  pgbench suppressing commands `:9297` — the core makes it robust regardless).
+- The raw-result lease is a pointer INTO `byteStorage`, which dataplane-close frees (`:4462-4472`); the core must
+  hold no outstanding borrow across close/abandon (it is borrow→decode→release within one poll, so this is an
+  assertion, not a new mechanism).
+
+**C. Typed handle** `HomerSqlSession` (opaque, aliases the core). Thin typed forwarders cast to the core; wrong-op
+-wrong-kind is a COMPILE error (owner decision, §13.1). Zero runtime cost. Frontend adapter holds/deals in the
+typed handle; basebackup's typed handles come in 3.5.
+
+**D. Transport module + thin adapter.** Physically move the Stage-2 `SqlTransport*` facade + the transport-leaf
+helpers into a transport module presenting the §12.2 interface; the core calls it. `homer_client.c`'s SQL entry
+points become the thin **frontend adapter**: options→intent projection, `malloc`, error-string, typed-handle
+open/close. The shared leaves the module now owns are still basebackup's — basebackup keeps calling them (carrier
+shared) until 3.5.
+
+**E. Process-shared DOCA device CONTEXT.** Replace per-carrier `dpuDocaDev` (`:125`) with ONE process-owned
+device (the current sole opener is `HomerClientDpuOpenDevice:794`→`HomerDpuFrontendOpenDevice:875`; per-session
+acquisition at SQL `:1945`, BB-send `:2566`, BB-recv `:2941`). Requirements (VERIFIED sites):
+- process-wide (not per-thread — pgbench `-j` opens N×/process today, the DOCA-undefined hazard this fixes);
+- **refcount = one ref per live OR intentionally-retained mmap** (`dpuDocaMmap` stays PER-SESSION, `:126`).
+  **PLUS a transient "constructing" hold (refutation):** `HomerDpuFrontendOpenDevice` returns a live device with
+  ZERO mmaps (`:875-900`; the frontend agent holds exactly that before its first export,
+  `homer_frontend_agent.c:1545`), so the acquire path must hold a device ref DURING open-device+first-mmap-create,
+  converting it to the mmap ref on success and RELEASING it (closing the device if last) on mmap-create failure —
+  the ref cannot be "per-mmap" alone or the open-but-no-mmap window has no owner;
+- **failed-close retains the FULL resource set, not just a ref (refutation):** the unacked-CLOSE path (`:4450-4460`)
+  returns before mmap-destroy/dev-close/buffer-free, and the exported buffer must stay mapped until mmap-destroy
+  (`remote_execution_client.h:330`). The retained set = mmap + its `dpuExportBuffer` + the DOCA export blob + the
+  device ref. **Accept that this is a process-lifetime tombstone:** the SQL adapter clears `commandDpuStreamOpen`/
+  identity even on dataplane-close failure (`:2404-2411`) with no library-owned later reclaim (current code
+  delegates to process teardown, `:4450-4460`), so the tombstone pins the shared device open for the process. That
+  is benign and matches today's per-session leak-to-teardown — NOT a new leak, just shared;
+- **mmap-destroy failure must NOT drop the last ref / close the device (refutation):** current code ignores
+  `doca_mmap_destroy` results (`:988`/`:4462`); the "all mmaps before device" invariant means a failed destroy
+  keeps its ref (device stays open) rather than closing the device with a live mmap under it;
+- per-session close becomes **mmap-only** (`:4462-4464` stays; `:4466` dev-close MOVES to the context's
+  last-ref transition);
+- thread-safe COLD path only (serialize device/mmap create+destroy+ref transitions+last-close as ONE sync domain;
+  VERIFIED no client data-path use of `dpuDocaDev` — poll/credit use mapped ring pointers `:3767-3815` — so the
+  DATA path stays lock-free);
+- import-safe (DPU import keys on generation/client/export-id on its OWN device — no host-device identity on the
+  wire), so ONE host device serving N sessions changes nothing the DPU sees.
+
+**F. Multi-object archive** (`citus-dbcomm/Makefile`). `libhomer_client.a` archives only `homer_client.o`
+(`:136-137`, `ar rcs $@ $<` = first prereq only). Add `homer_session_core.o` as a SEPARATE member (compile rule
+mirrors `:118-134`; archive rule must enumerate BOTH objects, not `$<`). **CORRECTION (refutation): object
+separation does NOT isolate the core from the backend.** The backend references basebackup symbols from
+`homer_client.o` (`basebackup_homer.c:273`/`:299`/`:353`/`:465`) and links the archive; once Stage-3 SQL functions
+in that same `homer_client.o` call external core symbols, the linker resolves them by pulling `homer_session_core.o`
+into PostgreSQL too. So the core WILL link into the backend (as dead code until Stage 4) — which is why the core
+being **postgres-INDEPENDENT is MANDATORY, not optional** (VERIFIED achievable: the intent header, completion
+lease/view, completion ABI, and decoded-tuple ABI are all `_t`/stdbool-only, no c.h aliases). Separate objects are
+still worth it for build clarity, but the isolation is provided by postgres-independence, not by the object split.
+
+**D scope note (refutation):** the "transport module" is a LOGICAL seam — the §12.2 interface header — whose
+IMPLEMENTATION STAYS in `homer_client.c` for Stage 3 (only the CORE moves to a new file). This keeps the stage to
+two archive objects (`homer_client.o` ↔ `homer_session_core.o`, which cross-reference each other — static linking
+resolves the cycle) and avoids a third transport `.o` that F would otherwise have to enumerate. Physically hoisting
+transport into its own file is a later, optional cleanup.
+
+**Traps to honor (codex-verified):** `completionLease.slotIndex` (`:66`) is B-token leakage in an A object
+(hardcoded 0 `:4790`) — core drops it; `serviceSessionId`/`commandDpuStreamOpen` are transport-SOURCED but
+core-OWNED (origin ≠ ownership); the completion timeout (`:5022`) currently returns false without latching
+terminal — abandon fixes it; the carrier's `receiveExpectedOrdinal`(B)/`receiveExpectedCommandSequence`(A) are
+advanced TOGETHER today (`HomerClientSqlResultAdvanceCommandIdentity`), so the split fn updates one field on each
+side of the boundary.
+
 ### 12.5b Stage 3.5 — migrate basebackup onto the unified session (the multi-consumer proof) (owner, 2026-07-18)
 Migrate `pg_basebackup` (RECEIVE client) + `basebackup_homer.c` (SEND backend) onto the unified core/interface
 (§13) as the SECOND, differently-shaped consumer — **before final retirement, while ① is still a live reference.**
