@@ -588,3 +588,228 @@ reverse builder used on the live result path — **breaks on DROPPED columns**: 
 path works only because result contracts do not carry dropped attributes. This is pre-existing and out of Stage
 1's path (Stage 1 does not touch this rebuild), but the core/COPY work in Stage 3+ that leans on TupleDesc↔contract
 must handle dropped attributes (skip/placeholder) before it can carry arbitrary relation schemas.
+
+---
+
+## 12. Implementation plan — module seam, transport interface, Stage 2/3 detail (2026-07-18)
+
+Grounded in a VERIFIED codex map of ②'s structure + a refutation pass, both re-checked in code by the main agent
+(per-line re-verification of each op is repeated when that op is implemented). Structural facts that shape this
+plan: no dispatch seam exists today (`HomerClientSession` has no ops pointer); the A (session-logic) /
+B (transport-mechanics) split runs THROUGH each function (`open`/`start`/`peek`/`ack`/`close` are each mixed); the
+result poll is fused (drain + decode + credit); the DOCA device is opened PER-SESSION today; producer ops belong
+only to the separate `HomerClientBaseBackupStream`, not to `HomerClientSession`.
+
+### 12.1 Dispatch mechanism — a link-time MODULE SEAM now; function-pointer vtable deferred to COPY
+The transport boundary is a **link-time module interface** — a header of transport ops + exactly ONE
+implementation (selected-DPU), called **directly** by the core; the linker binds it. **Not** a function-pointer
+vtable, **not** a template — zero polymorphism now. Reason: after Stage 4 there is exactly ONE live transport;
+runtime dispatch has nothing to choose over until COPY (Stage 5). **Upgrade path:** if COPY needs runtime
+per-session transport selection, promote the interface to a function-pointer vtable — a LOCALIZED change (add
+`const HomerSessionTransportOps *ops` to the session, set it in each adapter). The **A/B separation** (the value,
+and the paving for COPY) lands now; only the dispatch mechanism defers. (This is the current decision; §2/§10.3's
+earlier "vtable" wording is superseded here.)
+
+**Op-legality is enforced at COMPILE TIME via typed opaque handles (owner, 2026-07-18):** one internal core
+`HomerSession` + DISTINCT opaque handle types per kind (`HomerSqlSession`, `HomerBaseBackupSend`, …) all aliasing
+the core; each op takes its kind's handle, so a wrong-op-on-wrong-kind (e.g. `result_borrow` on a basebackup-send
+session) is a COMPILE error, at zero runtime cost. This is a SEPARATE boundary from the module seam above: the
+module seam is core↔transport; the typed handles are core↔caller. Full interface: §13.
+
+### 12.2 The selected-DPU transport interface (the pure-B op surface the core calls)
+DOCA/byte-ring types stay INTERNAL to the impl (frontend-safe signatures). Each op carries the status returns,
+correlation inputs, and opaque tokens needed so the A/B cut does NOT leak:
+
+| op | contract | ② source |
+|---|---|---|
+| `transport_open(sessionUID, intent-ids…) -> status` | `sessionUID` is an INPUT (stamped into 3 descriptors + open request); must NOT `memset` the whole session (that wipes A state the core owns); returns transport status/identity | `HomerClientOpenSqlSessionSelectedDpu:1560`; sessionUID `:1813`/`:1846`/`:1874`/`:1920`; offending memset `:1658` |
+| `arm_initial_result_credit()` | B post-open: publish the first role-7 consumed credit (distinct from the core's `init_decode_identity` at `:1980`) | `:1982` |
+| `publish_start(minted_sequence, portable_command_spec) -> status` | B owns the request slot and rejects physical-busy internally (or exposes `control_slot_available`); A finishes semantic validation BEFORE B touches the slot | one-outstanding reads logical+physical `:4379`; publish `:4491`; A-side slot pokes to remove `:4457`/`:4467`/`:4481` |
+| `poll_completion() -> {classification, copied_completion}` | classification = not-ready / overrun / identity-mismatch / visibility-pending / ready; returns a COPIED immutable completion AFTER transport identity passes; semantic validation stays in the core | role-6 read `:4589`; transport identity `:4615`; semantic `:4631`/`:4639`; opaque token replaces `slotIndex` `remote_execution_client.h:66`/`:4626` |
+| `release_start_slot(correlation_sequence) -> status` | releases the retained role-1 START slot only when the terminal completion sequence == the correlation sequence (role-6 has no host consumed word — hence "start slot", not "completion slot") | `:4749`/`:4756`; correlation `:4727` |
+| `lifecycle_close() -> status` / `dataplane_close()` | SEPARATE ops; the core owns terminal policy + semantic-close ordering; close-readiness returns WHICH predicate blocked | today fused: semantic-close `:2072` + CLOSE_SESSION `:2202` + teardown `:2234`; readiness `:2127` |
+| `result_borrow_next` / `result_release` / `result_credit_flush` | the split of the fused result poll — see §12.5 step 3 | fused poll `:3544` |
+
+Open question to settle at impl time: timeout policy = core-policy vs transport-config (today `getenv` inside
+start, `:4394`).
+
+**A state machine → the core (§12.5):** command sequence + one-outstanding-START invariant (`:4374`/`:4484`);
+completion lease observe/apply/ack (`:4576`/`:4695`) + terminal latch (`:4657`); intent (the seam); `sessionUID`
+(NEW core-retained field — today options/descriptors only); result DECODE including the decoded command-sequence
+identity (`receiveExpectedCommandSequence:3490`). The transport-record ordinal (`receiveExpectedOrdinal:3390`)
+stays B. The one-way **core→transport** dependency requires the raw-lease result API (§12.5 step 3), NOT an inline
+decode callback (which would invert the dependency and break the seam).
+
+### 12.3 DOCA device + the transport context — ONE shared device per process
+- **Host-side DOCA device is real** (not DPU-only): the host opens a `doca_dev` to EXPORT host memory
+  (`doca_mmap`) for the DPU to DMA the byte-rings (roles 1/6/7). The DPU opens its own device for the DMA.
+- **Intended design = ONE device per process, shared across regions** (`homer_client.c:868-873`: the
+  `HomerDpuFrontendOpenDevice` split exists so "one exporter can publish several disjoint regions against a SINGLE
+  device -- opening the same PCI device twice from one process is not something DOCA promises"; Tier-2 shared one
+  device across four exports).
+- **CURRENT state = per-SESSION device** (`:853` via `:1765`). The hazard is **multi-session-per-process = pgbench
+  only** (`-j` threads → N sessions/process → N device opens). pg_basebackup and `basebackup_homer` are
+  one-stream/process → no hazard. The gate passes at 4 clients today, but on undefined-by-DOCA behavior.
+- **FIX (Stage 3): a process-owned transport CONTEXT holds ONE shared `doca_dev`.** Requirements:
+  - NOT embedded in `HomerClientSession`; owned by an explicit process/context owner.
+  - thread-safe cold-path lifecycle (pgbench is multithreaded; concurrent opens `pgbench.c:8983`/`:8991`) — a
+    per-thread context would still open the device N×/process, so it must be process-wide.
+  - refcount ONE reference per live OR intentionally-retained mmap (rule "all mmaps before device",
+    `remote_execution_client.h:330`); the failed-close path deliberately RETAINS a live mmap/device when DPU
+    setup-close is unacked (`:4280`) — the context must hold that ref, not close the device under it.
+  - per-session close (`:4296`) becomes **mmap-only**; device close is owned by the context.
+  - DOCA concurrent mmap create/destroy thread-safety is unproven → serialize lifecycle in the cold path; the data
+    path stays lock-free.
+  - device sharing is import-safe: the DPU wire ABI carries NO host-device identity (import keyed by
+    generation/client/export-id on the DPU's own device, `homer_service_dpu_dma.c:8872`/`:8967`).
+- **mmap granularity:** one DEVICE throughout, one `doca_mmap` PER session (a device supports many mmaps; within a
+  session the 3 roles already share one buffer/mmap, `:1765`). A single shared-arena mmap (pooling all sessions'
+  rings) is an OPTIONAL later optimization, not this cleanup. (Neither pgbench nor the backends pool host export
+  buffers today — both allocate per-session; the pooled arena is service-side on the DPU, not the host frontend.)
+- **Transport unification (scope call):** the transport-leaf mechanics are ALREADY shared across the SQL session
+  and both basebackup directions (same `static` helpers). The clean end-state is ONE transport substrate + context
+  serving all host-frontend users, with a small family of SESSION KINDS over it (command-session for SQL/COPY;
+  bulk-stream for basebackup) — **NOT one session API for all** (their semantics differ; a bulk stream has no
+  command/completion plane). Stage 3 builds the shared context for the command sessions and designs it so
+  basebackup CAN adopt it, but **migrating basebackup onto it is OUT of the host-service-retirement scope**
+  (basebackup is the working, mandatory acceptance workload, has no device hazard, differs semantically) — a
+  future cleanup, revisited if the owner chooses to expand scope.
+
+### 12.4 Stage 2 — a SYMBOL-boundary transport FACADE inside `homer_client.c` (behavior-preserving)
+Stage 2 is a symbol-boundary facade, **NOT a file/module move**: the transport leaf helpers are shared with both
+basebackup directions and mostly `static` (export `:1016`, layout `:1116`, setup-TCP `:1285`, role-1
+publish/wait/free `:1460`, receive-credit `:2578`, close body `:4190`, drain), and
+`HomerClientDpuSubmitControlRequest:1476` has a dual START-fire-and-forget (retains role-1, `:1503`) /
+open-close-wait-and-free (`:1508`) contract that breaks if casually generalized. Steps:
+1. Declare the §12.2 transport ops as narrow SQL-specific entry-point functions IN `homer_client.c`, wrapping the
+   existing selected-DPU blocks (frontend-safe signatures; DOCA stays internal).
+2. Redirect ONLY the SQL A-logic through those entry points; A-logic stays inline (no core yet). The fused result
+   poll stays a ② function for Stage 2 (split in Stage 3).
+3. Leave the shared leaf helpers + `HomerClientBaseBackupStream` + basebackup callers UNTOUCHED; NO device
+   consolidation (that is a behavior change → Stage 3). Strictly behavior-preserving indirection.
+- **Validation: gate + basebackup** (② shares transport leaves with basebackup — prove basebackup unaffected).
+
+### 12.5 Stage 3 — extract the stateless core, the transport module, and the shared device context
+Realizes the **SQL opKind** of the unified intent-driven interface in §13 (typed opaque handles; one core).
+1. Add `homer_session_core.c` (stateless, POSTGRES-INDEPENDENT, caller-owned) holding the A state machine (§12.2)
+   for the SQL opKind: sequence + one-outstanding invariant, completion lease + terminal latch, intent,
+   `sessionUID`, result decode/borrow/release. The core is opened via a typed `HomerSqlSession` handle (§13.1) and
+   calls the §12.2 transport interface via DIRECT link-time calls.
+2. Physically move the selected-DPU transport mechanics out of the Stage-2 facade into a transport module (the
+   shared helpers change anyway now); ② becomes the thin **frontend adapter** (options→intent, `malloc`,
+   error-string).
+3. **Split the fused result poll into borrow/release + batched credit:** `result_borrow_next -> {ptr,bytes,token}
+   | non-record-progress | none` (B derives record bounds from the transport header `homer_byte_ring_sink.h:271`/
+   `:281`, skips wrap-gap trailer bytes `:256`/`:304`); the core DECODES; `result_release(token)` advances the
+   local consumed head AFTER decode (credit must not advance before decode validates, `:327`/`:338`, or the DPU
+   reuses the bytes); `result_credit_flush()` publishes the DPU credit once per pass (preserve the batch-coalescing
+   `:3637`/`:3642`). The decoder result is **TRI-STATE** (success/release, visibility-pending/no-release,
+   fatal-malformed/no-release) plus a separately-surfaced semantic **command-ERROR** — this closes §5.4 AND the
+   bigger "malformed record retries forever" gap (`:3385`/`:3437`/`:3470`/`:3490`; ERROR detected `:3440`, not
+   returned `:3660`). The raw-result lease NESTS inside the completion lease (`pgbench.c:3637`/`:4070`): a result
+   failure must not ACK completion / release role-1 before terminal-abandon. **This same lease-aware
+   `HomerByteRingSinkDrain` refactor (borrow-without-advancing) is what basebackup RECEIVE also needs (§13.3), so
+   build it as the shared sink-lease mechanism — one refactor, two consumers (SQL result-consume + BB bulk-consume).**
+4. Add the completion lease + **TERMINAL-ABANDON** (§11.1): the core owns the lease; the frontend adapter's
+   abandon = mark terminal (no reuse), matching current `sqlSessionTerminal`; the backend adapter (Stage 5)
+   registers abandon in `PG_CATCH`.
+5. The shared DOCA device CONTEXT (§12.3): process-owned, refcounted, thread-safe; per-session close becomes
+   mmap-only; device close owned by the context.
+6. **BUILD:** give `libhomer_client.a` a MULTI-OBJECT recipe — add `homer_session_core.o` as a SEPARATE member
+   (today `citus-dbcomm/Makefile:136` archives only `homer_client.o`). Separate objects keep the (backend-linked)
+   archive from making the unreferenced core a backend consumer. The core is frontend-USED only through Stage 4
+   but must be postgres-INDEPENDENT, because the backend already links the archive (`basebackup_homer.c` →
+   `libhomer_client.a`, `basebackup_homer.c:273`/`:299`/`:353`/`:465`; `src/backend/Makefile:28`/`:42`,
+   `meson.build:47`).
+- **Validation: gate + basebackup + DPU TCP smoke** (client transport + the device-model change).
+
+### 12.5b Stage 3.5 — migrate basebackup onto the unified session (the multi-consumer proof) (owner, 2026-07-18)
+Migrate `pg_basebackup` (RECEIVE client) + `basebackup_homer.c` (SEND backend) onto the unified core/interface
+(§13) as the SECOND, differently-shaped consumer — **before final retirement, while ① is still a live reference.**
+This proves the abstraction generalizes across workload kinds (client + backend, command + bulk stream), not just
+SQL. Realizes the **BASE_BACKUP opKind**: adds the typed `HomerBaseBackupSend`/`HomerBaseBackupRecv` handles, the
+**producer plane** (reserve/commit, role-4) and the **bulk-consume plane** (borrow/release/credit, role-7, on the
+shared sink-lease from Stage 3), and the BASE_BACKUP operation-open spec (direction, geometry,
+`launchDiscriminatorTag`, SEND peer endpoint). basebackup terminal keeps its FAILED(credit-line)/CLOSED split
+(§13.4). Design is grounded in the VERIFIED basebackup map (§13). **Validation: four-role basebackup (the
+mandatory transport-acceptance workload) + gate + DPU TCP smoke.**
+
+### 12.6 What this corrects in earlier sections (cross-reference for a reader who lands there first)
+- §2 / §10.3 "vtable" → link-time MODULE SEAM now, function-pointer vtable deferred to COPY (§12.1).
+- §11.4 "shared caller-owned device" → correct as the GOAL; current code is per-session; Stage 3 builds the shared
+  process-owned context (§12.3).
+- Producer + bulk-consume ops: NO `HomerClientSession` implementation, but they ARE designed (against the real
+  basebackup code, §13) and land at **Stage 3.5** (basebackup migration), not deferred to COPY. COPY (Stage 5)
+  then reuses these planes.
+
+---
+
+## 13. The unified intent-driven session interface (designed against SQL + basebackup, 2026-07-18)
+
+Grounded in the VERIFIED ② and basebackup codex maps. §12 is the *build plan*; this section is *what* the stages
+build toward. The owner's design intent: **one Homer session abstraction — the intent declaratively says what the
+user will do, and gates which rings bind and which ops are legal.** SQL is the first consumer (Stage 3), basebackup
+the second (Stage 3.5), COPY the third (Stage 5).
+
+### 13.1 Model — one core, typed opaque handles, two-part open (intent + operation spec)
+- **One internal core `HomerSession`** (the implementation) + **DISTINCT opaque handle types per kind**
+  (`HomerSqlSession`, `HomerBaseBackupSend`, `HomerBaseBackupRecv`, later `HomerCopy*`), all aliasing the core.
+  Each op takes its kind's handle → wrong-op-wrong-kind is a COMPILE error (owner decision); thin typed forwarders
+  cast to the core; zero runtime cost. Unified implementation + compile-time legality.
+- **Two-part open (①'s design, INDEPENDENTLY VALIDATED by basebackup):** a compat **INTENT**
+  (`RemoteExecutionSessionIntentSpec`, the reuse/compat domain, `opKind` ∈ {SQL_COMMAND, CLIENT_SQL_SESSION,
+  BASE_BACKUP, COPY_*}) **+ a per-kind OPERATION-OPEN spec** (per-op bootstrap: direction, payload/max-record
+  geometry, `launchDiscriminatorTag`, peer endpoint). The intent gates reuse/compat; the operation spec bootstraps
+  the concrete rings. basebackup's needs (direction/geometry/tag; SEND peer, RECEIVE none —
+  `homer_client.c:2303`/`:2673`) ARE this operation spec, and `homer_session_spec.h:120` already states bootstrap
+  identity belongs OUTSIDE the compat intent. (This generalizes ①'s `RemoteExecutionOperationSpec` union beyond
+  its current tuple-sink-only member — a NEW frontend-safe per-kind spec, not ①'s dead tuple-sink struct.)
+
+### 13.2 Ring binding by opKind + direction (VERIFIED)
+| kind / direction | rings bound | source |
+|---|---|---|
+| SQL command/result | role-1 (control) + role-6 (completion) + role-7 (result) | `homer_client.c:1795`/`:1828`/`:1856` |
+| BASE_BACKUP SEND | role-1 (lifecycle) + role-4 (host→DPU payload) | `:2422`/`:2442` |
+| BASE_BACKUP RECEIVE | role-1 (lifecycle) + role-7 (DPU→host payload) | `:2797`/`:2818` |
+| COPY (future) | reuses the SQL command/result + producer planes | — |
+
+**role-1 is COMMON** (every kind binds it for synchronous OPEN/CLOSE, `:1460`/`:1508`; SQL additionally uses it for
+fire-and-forget START). **role-6 (completion) is SQL/COPY-only.** The open path binds the ring SET selected by
+`opKind`+direction.
+
+### 13.3 Op planes, gated by intent (compile-time via the typed handle)
+| plane | ops | legal for | notes |
+|---|---|---|---|
+| lifecycle | `open` / `lifecycle_close` / `dataplane_close` | ALL | role-1 synchronous; close-readiness reports which predicate blocked |
+| command | `publish_start` / `poll_completion` / `release_start_slot` | SQL, COPY | role-1 START (fire-and-forget) + role-6 completion; one-outstanding invariant |
+| result-consume | `result_borrow_next` / `result_release` / `result_credit_flush` + core decode | SQL, COPY-result | role-7; the shared sink-lease drain |
+| producer | `producer_reserve` / `producer_commit` (append = caller `memcpy`) | BB-send, COPY-ingest | role-4; one reservation at a time (`:3788`), commit publishes immediately (`:4167`) |
+| bulk-consume | `consume_borrow_next` / `consume_release` / `consume_credit_flush` | BB-recv | role-7; **SAME shared sink-lease drain as result-consume** |
+
+**result-consume and bulk-consume share ONE lease-aware `HomerByteRingSinkDrain` refactor** (borrow without
+advancing `consumedHead`) — built once in Stage 3, reused in Stage 3.5. Today both are fused poll/validate/
+discard-or-decode/credit (SQL `:3544`, BB-recv `:3095`) and cannot withhold the consumed cursor (`:327`/`:338`).
+
+### 13.4 Terminal model — common concept, kind-specific realization
+"Terminal ⇒ no reuse" is the shared contract. **SQL:** a persistent `sqlSessionTerminal` latch after completion
+application (`remote_execution_client.h:228`). **basebackup:** direction-specific FAILED via the credit line
+(`homer_client.c:3199`/`:3209`), immediate and drain-independent; CLOSED is drain-gated success (`:3218`). The core
+exposes a common `terminal` query; terminal-abandon (§11.1) is per-kind (SQL: mark latch; BB: FAILED/ABORT_RESET
+path `:4190`/`:4236`).
+
+### 13.5 Shared vs kind-specific (from the A/B maps)
+- **SHARED transport (B), one context** (Stage 3): the DOCA device (§12.3), byte-ring mechanics, role-1 lifecycle,
+  setup/mmap, epochs. `HomerClientBaseBackupStream` is ALREADY a shared carrier for SQL+BB transport state — its
+  own header calls the name a misnomer (`remote_execution_client.h:209`) — Stage 3 cleans it into the shared
+  context.
+- **KIND-SPECIFIC core (A):** SQL = command sequence + completion lease + result decode; BB = record
+  sequence/ordinal (`nextSequence`/`submittedSequence`/`receiveExpectedOrdinal`). These live in per-kind core
+  state tagged by `opKind`, not the shared carrier.
+
+### 13.6 Deferred / not now
+- **COPY (Stage 5):** `opKind` reserved; reuses command + result-consume (result) + producer (ingest) planes; op
+  shapes finalized against COPY's real code when implemented.
+- **`blackhole` target mode:** currently inconsistent (PG parsing accepts `mode=blackhole`
+  `basebackup_homer.c:179`, but both selected-DPU openers reject non-RDMA `homer_client.c:2303`/`:2678`;
+  pg_basebackup's blackhole opens RDMA and discards `pg_basebackup.c:2403`/`:2428`). A pre-existing wart — noted,
+  out of scope, do NOT fold a fix into this work.
