@@ -23,7 +23,11 @@
   singleton) — ✅ LANDED (2026-07-19) as S6 Stage 2 (citus `a5e7d2fdb` + `3d5047146`).** Both prior residuals are
   now ✅ CLOSED (2026-07-19): the mirror-cache "cleanup" is SUPERSEDED (the cache is a live, load-bearing egress
   short-circuit — see its note in Progress below; KEEP AS-IS), and the connection-binding-fix disposition is FINAL
-  (KEPT as fault-isolation hardening — see its section). **This plan is functionally complete.** Plan mirror
+  (KEPT as fault-isolation hardening — see its section). ⛔ **This plan's STAGES are complete, but its GOAL is NOT
+  met: the Capstone MIXED run (concurrent basebackup + `--homer-dpu`) FAILED on 2026-07-19
+  (`candidate-20260719-190447`) — and did not even reach byte-ring contention. Each half works ALONE; only the
+  combination fails. See the Capstone section. Do NOT cite stage completion as evidence of concurrent coexistence.**
+  Plan mirror
   file was `~/.claude/plans/here-s-a-snippet-on-linked-papert.md`; this doc is canonical.
 - **Progress:**
   - **Stage 0a — DONE + validated (single-session, byte-identical).** New module
@@ -947,8 +951,52 @@ command-pull, byte-ring pull and PE drain for EVERY session on that DPU (see
   failed|fatal error state|PE drain failed|peer-open failed`; `gate_check` keys on pgbench's client log + `DPU
   backend spawn` records (basebackup emits none); `basebackup_check` keys on basebackup's own sender/consumer logs
   (pgbench does not write there). The workloads are therefore separable from one interleaved DPU log.
-- **Tooling gap:** no script composes the two concurrently, and no runner profile exists. Orchestration is MANUAL
-  per the operator runbook (live runner execution remains prohibited).
+- **Tooling gap:** no script composes the two concurrently, and no runner profile exists. Orchestration was MANUAL
+  for the first attempt; `tools/farnet_validation/remote/basebackup_sender.sh` (backgroundable sender) +
+  `tools/farnet_validation/mixed_workload.sh` (orchestrator, budget guard, `MIXED_OVERLAP` verdict) were added
+  afterwards and are NOT yet exercised.
+
+### ⛔ RESULT — attempt 1 FAILED, and it did NOT exercise the mixed property (run `candidate-20260719-190447`)
+
+**Verdict FAIL. Diagnostic-only** (ended in a forced teardown). citus `31f0e958f` (the R3-validated commit; no code
+under test). ⚠ **Read the scope carefully before drawing conclusions: byte-ring coexistence was NEVER TESTED.**
+
+- **The basebackup never reached the DPU relay at all.** The consumer opened (`consuming basebackup stream node=2
+  db=5 user=10 requested_slots=4 bytes=524288 tag=...`), but **ZERO byte-ring binds (LANDING or MIRROR) appeared on
+  EITHER DPU log** for it. The sender printed only `initiating base backup, waiting for checkpoint to complete` and
+  produced nothing further for **458 s** (≈7 s standalone), while its server-side walsender busy-spun at ~100 % CPU
+  (`state=R`, `wchan=0` ⇒ spinning in USERSPACE, not kernel-blocked).
+- **The gate stalled too:** `0/4000` processed, 0 failed. All four clients timed out at 30 s on the SAME step —
+  `sql_execute kind=6 sequence=5`, i.e. the first `SELECT` after `BEGIN`+`UPDATE`, in the FIRST transaction (so the
+  transaction count was not the variable).
+- **NO pool exhaustion, NO engine-fatal, NO semantic-validation failure during the workload.** The slot budget was
+  only 9/16. `frontier_checks` and `teardown_checks` PASSED on both DPUs. The 4 `alarm_check` hits on farnet1
+  (`arena unbind found NO import ... LEAKED`) were emitted **during the forced teardown**, i.e. cleanup artifacts.
+- ⇒ **Since the basebackup never bound a byte-ring slot, tuple/bulk contention on the shared pool was never
+  exercised.** The slot budget above is neither confirmed nor refuted by this run.
+- **A control came free:** a discarded first attempt in the SAME candidate ran the basebackup ALONE (accidentally
+  sequential) and it **completed cleanly in ~7 s, byte-conserving**. So basebackup-alone works on these binaries.
+  Combined with `-c4` gate-alone passing in `candidate-20260719-161556` (20/20), **each half works alone; only the
+  combination fails.**
+- **⚠ Environment finding (independent of the failure):** peer-host binary parity was STALE before the run — a
+  `--checksum` rsync found real CONTENT differences in farnet0's `pgbench`, `pg_basebackup`, `postgres`,
+  `citus_tuple_sink_service` and `citus.so` (farnet0 was running an older build). Repaired + SHA-256 re-verified
+  before the candidate, so this run is parity-clean — but earlier runs may not have been.
+- **NOT the previously-fixed post-gate stream-open stall** ([`post_gate_basebackup_open_stall.md`](./post_gate_basebackup_open_stall.md)):
+  that failed at stream open with a 15 s timeout and zero log lines; this spins for 458 s at an earlier point.
+
+**Working frontier (hypothesis, NOT established):** the failing step looks like *the DPU never servicing the
+basebackup's stream-open while SQL sessions are active* — the client's "waiting for checkpoint" is likely stale
+output masking a later Homer wait. This system has a documented bug class of that shape (a setup listener that "a
+live arena import starved forever",
+[`../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md`](../../../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md)
+§0/0b/0c, fixed once via the S3.1b poll-due-obligation). **Not localized to a log line — no fix until it is.**
+In flight: a code trace of the basebackup DPU stream-open path + its schedulability, and a **`-c1` mixed** run (one
+SQL session + one basebackup) to remove client concurrency as a variable.
+
+⇒ **RETRACTION: this plan is NOT "functionally complete."** Its stages are individually done and validated, but its
+stated GOAL — concurrent basebackup and `--homer-dpu` sessions coexisting — is now **known-broken at the workload
+level and unproven at the byte-ring level.** Do not cite the stage completions as evidence the goal is met.
 
 ## Connection-binding fix disposition
 
