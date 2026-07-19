@@ -999,6 +999,51 @@ the call site. If it is not on the list, **it has not been checked.**
 - **ENFORCES:** the core decode reads `core->receiveExpectedCommandSequence`; `HomerSqlTransportResultAcceptAndRelease`
   is the only writer of `carrier->receiveExpectedOrdinal` on the SQL path.
 
+## `g_homerSharedDevice` (`homer_client.c`) — ONE process-shared, refcounted host `doca_dev` for ALL carrier exports (Stage-3 Push-2 / component E)
+
+- **MEANS:** a file-static singleton `{pthread_mutex_t lock; void *device; char pci[64]; int refcount;}` holding ONE
+  host `doca_dev` shared across every client-session mmap (SQL + basebackup send/recv). `HomerClientDpuExportMmap`
+  opens-or-reuses it and exports the carrier's region against it; teardown destroys the mmap and releases the ref.
+  `refcount` = number of live-OR-retained per-carrier mmaps. **INVARIANT: `device != NULL` iff a device is open**
+  (a device may sit open with `refcount==0` ONLY after a failed last `doca_dev_close(IN_USE)` — pinned, awaiting reuse).
+- **DOES NOT MEAN** one device per process GLOBALLY: it governs ONLY the client-session-export carriers. The frontend
+  agent (`homer_frontend_agent.c`) and the legacy `HomerFrontendDmaOpenDocaDevice` own SEPARATE devices, UNCHANGED.
+  Converting the agent to context refs would double-free its trailing `CloseDevice`.
+- **DOES NOT MEAN** the hot path may touch it: `device`/the mutex are COLD-PATH ONLY. The data path reads only
+  `dpuExportBuffer`-relative pointers, so it stays lock-free. The mutex serializes the WHOLE cold-path DOCA lifecycle
+  (open + mmap create/export; mmap destroy + ref transition + last dev-close) because `doca_mmap_destroy` is
+  NOT thread-safe and distinct-mmap concurrency on one device is unproven.
+- **DOES NOT MEAN** open is gated on `refcount==0`: it is gated on **`device==NULL`**, so a pinned-open leaked device
+  (IN_USE last-close) is REUSED, never re-opened (a 2nd handle to the same PCI is the hazard component E removes).
+- **ENFORCES:** the refcount decrements ONLY on a successful `doca_mmap_destroy` (so a failed destroy → FULL-retain
+  tombstone: no free/memset, ref held, `HomerClientSetError` + `return false`; a re-close retries, never double-frees).
+  A failed last `doca_dev_close` RETAINS `device` (never nulled) + logs loudly post-unlock; per-session close still
+  SUCCEEDS (session-close success ≠ device-singleton health). PCI is NOT compared on reuse (commit to safety rule 9).
+
+## `HomerClientBaseBackupStream.dpuDocaMmap` — the carrier's ONLY DOCA handle; **`!= NULL` PROVES it holds one `g_homerSharedDevice` ref** (Push-2)
+
+- **MEANS:** the carrier keeps its per-session `doca_mmap` (one mmap/session). A non-NULL `dpuDocaMmap` is the proof
+  this carrier holds exactly one device ref in `g_homerSharedDevice`; teardown's mmap-destroy is what releases it.
+- **DOES NOT MEAN** the carrier owns a device: the old per-carrier `dpuDocaDev` field was **REMOVED** — the device is
+  the singleton's, closed only on the last-ref transition. (Struct shrank 656→648 B; a coordinated both-tree recompile.)
+- **DOES NOT MEAN** a carrier may be re-opened while live: the three open paths `memset` the carrier BEFORE export, so
+  re-opening a still-live carrier would ERASE its mmap pointer and LEAK its ref permanently (the device never closes).
+  CALLER-DISCIPLINE invariant (not runtime-enforced): open each carrier once per lifetime. Current callers obey it.
+- **ENFORCES:** `dpuDocaMmap` is set only by `HomerClientDpuExportMmap` (which took the ref) and cleared only by
+  `HomerClientCloseBaseBackupStreamInternal` (which releases it) — the two sites keep `!=NULL ⇔ holds-one-ref` true.
+
+## Setup-ACK LOSS ⇒ ambiguous DPU import (`HomerDpuFrontendSendSetup`/`SendClose`, `homer_client.c`) — **PRE-EXISTING hazard; host mmap can be destroyed while the DPU import is live**
+
+- **MEANS:** the DPU imports the setup payload (`homer_service_dpu_setup_tcp.c`) BEFORE it writes the setup ACK. If the
+  client's ACK read fails, open falls to ordinary close — but a missing ACK leaves `bridgeGeneration==0`, so
+  `HomerDpuFrontendSendClose` returns true WITHOUT contacting the DPU, and the host mmap/buffer is destroyed despite a
+  possibly-live DPU-side import (stale-export DMA risk).
+- **DOES NOT MEAN** component E introduced or worsened it: E does not touch the setup/close protocol; sharing the
+  device makes it marginally SAFER (a co-tenant ref keeps the device alive). Recorded here as a discovered PRE-EXISTING
+  correctness hazard for a separate fix decision — NOT a Push-2 blocker.
+- **ENFORCES:** nothing yet — this is an OPEN trap. A fix would make the ambiguous-import path either confirm the DPU
+  detach or defer host-memory reclaim; until then treat a setup-ACK read failure as an unknowable-detach state.
+
 ---
 
 ## Related

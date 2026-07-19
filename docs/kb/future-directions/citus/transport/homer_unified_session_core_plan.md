@@ -1232,6 +1232,309 @@ behavior-neutral). Original deferral record follows.
 - **OPERATIONAL FIX — now lives in the OPERATOR RUNBOOK + HAZARDS, not here** (it is a runner-facing procedure, not part of this design): operator runbook §"DPU services" (the frontend-agent ⇄ DPU-service co-arming invariant) + §"Selected-DPU command gate" (the gate-readiness precondition), with the incident rationale in `farnet_operational_hazards.md` §11. In one line: whenever a DPU service is (re)started, recycle the farnet1 frontend-agent PostgreSQL (5433 only) so it re-exports, and verify the doorbell is attached with a generation matching the DPU's accepted import before the gate.
 - **PUSH-1 VALIDATION COMPLETE — GREEN (2026-07-19, re-run under corrected co-arming).** Gate re-run `pgbench --homer --homer-dpu -c4 -j4 -t5` (20 tx) PASSED all four proofs: transport line present; 20/20 processed, 0 failed; 4 correlated `DPU backend spawn begin/COMPLETED` pairs (bridge_generation matching the agent's export `4157110881348830`); `peer_host_spawn_retired` ABSENT; 20 distinct decoded `abalance` values; `gate_check`→PASS `{transactions:20, spawn_pairs:4, decoded_values:20}`, `alarm_check`→PASS. The readiness precondition confirmed the frontend agent's export+doorbell both at gen `4157110881348830` matched the DPU's accepted import — proving the diagnosis + fix by construction (arming ORDER changed, zero code changed). Combined with attempt#1's smoke PASS + four-role basebackup PASS (same build/deploy, run `candidate-20260719-004251`), **all three required Push-1 workloads are green against the same artifacts.** Push 1 is CLEARED to commit (citus code + postgres pgbench + KB).
 
+#### 12.5a-E-impl — Component E CONCRETE IMPL DESIGN (Push 2, 2026-07-19, grounded in current tree post-cleanup `f92d39025`)
+
+Re-grounded against HEAD (codex-explore inventory + main-agent verification of every load-bearing site). The
+§12.5a "E" REQUIREMENTS stand; this section is the concrete realization. **All client-tree line numbers below are
+CURRENT** (the §12.5a "E" numbers predate Push 1's −1309-line cleanup and are stale — see the site-map correction
+at the end).
+
+**Two grounding findings that shrink the design vs the §12.5a "E" sketch (both VERIFIED in code):**
+1. **The status-returning destroy is a LOCAL change, not a helper resignature.** Per-session teardown destroys the
+   mmap and closes the device INLINE — `doca_mmap_destroy` at `homer_client.c:4240`, `doca_dev_close` at `:4244`,
+   both results discarded — NOT via `HomerDpuFrontendDestroyRegionExport` (`:990`, mmap-only, `void`) or the unused
+   combined `HomerDpuFrontendDestroyExport` (`:1006`). So "the context needs a status-returning destroy" = capture
+   the return of the EXISTING inline `doca_mmap_destroy` at `:4240`. No `HomerDpuFrontend*` signature change. (The
+   §12.5a "E" note calling `:988` the "combined destroy" was doubly wrong: `:990` is mmap-only and the teardown
+   doesn't call it at all.)
+2. **All three carriers switch AT ONCE via two SHARED functions** — the acquire wrapper
+   `HomerClientDpuExportMmap` (`:1018`, called by SQL open `:2039`, BB-send open `:2494`, BB-recv open `:2869`) and
+   the teardown body `HomerClientCloseBaseBackupStreamInternal` (`:4136`, reached by SQL via `DataplaneClose:1805`
+   and by both BB directions directly). Changing these two is the WHOLE switch. **DECISION (owner-improvised,
+   recorded): E covers all three carriers in Push 2** (matches the §12.5a "E" scope). Rationale beyond the plan's:
+   SQL-only would require FORKING the shared exporter/teardown — MORE work than all-three, not less; and four-role
+   basebackup is already the required Push-2 workload that covers the BB carriers. basebackup gains no *sharing*
+   benefit (one stream/process) but a uniform one-device-per-process model and the death of the last combined
+   open+close-per-call caller. BB's core/session migration remains a SEPARATE concern (Stage 3.5); Push 2 switches
+   only BB's device ACQUISITION, not its session shape.
+
+**⚠ ROUND-0 DESIGN REJECTED by refutation (2026-07-19, codex-explore refuting; all 4 blockers VERIFIED by me in
+code + vendor headers). Both sides recorded.** The round-0 design (a narrow `Acquire`(open+`refcount++`)/`Release`
+(`refcount--`+close) pair with a "transient constructing hold," mmap create/destroy OUTSIDE the lock, and
+"frees+memset unchanged") was UNSAFE:
+1. **Lock too narrow** — `doca_mmap_destroy` is "not thread safe even if thread safety is enabled"
+   (`/opt/mellanox/doca/include/doca_mmap.h:109`) and distinct-mmap concurrent create/destroy on one device is
+   NOT promised. Round-0 left the mmap create (`:948-971`) and destroy (`:4240`) OUTSIDE the lock. The plan
+   (`:924`) requires serializing the WHOLE mmap lifecycle, not just the ref transitions. FIX: hold the mutex across
+   the ENTIRE export wrapper body and the ENTIRE teardown device/mmap block.
+2. **Destroy-failure frees live memory** — a failed `doca_mmap_destroy` returns `NOT_PERMITTED` when "memory
+   deregistration failed" (`doca_mmap.h:118`), i.e. the mapping is STILL LIVE. Round-0 kept the ref but still ran
+   `free(dpuExportBuffer)` (`:4247`) + `memset` (`:4248`) → live mapping over freed memory + lost handle. FIX: on
+   destroy failure take the FULL-retain tombstone (no free, no memset, keep mmap+buffers+ref), report failure.
+3. **Partial-export cleanup can leak an untracked mmap** — `HomerDpuFrontendExportRegionOnDevice` destroys its
+   partial mmap but DISCARDS the result (`:977`); if that failed and this was the sole opener, an unconditional
+   device close would run with a live mmap under it. FIX: checked device-close on the export-failure path; retain
+   the device on `IN_USE`.
+4. **Last-close failure forgotten** — `doca_dev_close` can return `DOCA_ERROR_IN_USE` (`doca_dev.h:192`); the DPU
+   engine treats exactly this as a leaked device (`homer_service_dpu_dma.c:16189`). Round-0 nulled `device`/
+   `refcount` after close unconditionally → a later `Acquire` opens a SECOND handle. FIX: check `doca_dev_close`;
+   on failure RETAIN the device pointer, and gate device-open on **`device == NULL`** (not `refcount == 0`) so a
+   pinned-open leaked device is REUSED, never re-opened.
+
+Two SIMPLIFICATIONS fall out of the wider lock: (a) the "transient constructing hold" DISAPPEARS — with the whole
+body locked, nothing interleaves, so `refcount` only ever counts SUCCESSFUL live mmaps and is incremented AFTER a
+successful export; (b) no separate `Acquire`/`Release` helpers — the export wrapper and the teardown block lock the
+singleton directly around their whole DOCA sequence.
+
+**The context (file-static process singleton in `homer_client.c`, guarded by `HOMER_CLIENT_DPU_WITH_DOCA`):**
+```c
+/* Component E: ONE host doca_dev per process, shared across all CLIENT-SESSION-EXPORT
+ * mmaps (SQL + BB send/recv carriers). NOT global: the frontend agent and the legacy
+ * HomerFrontendDmaOpenDocaDevice own SEPARATE devices (out of scope). refcount = #
+ * live-or-retained per-session mmaps. INVARIANT: device != NULL iff a device is open
+ * (a device may sit open with refcount==0 ONLY after a failed last doca_dev_close,
+ * pinned awaiting reuse/process-exit). Cold-path serialized; hot data path never
+ * touches the device (VERIFIED: no dpuDoca* ref outside acquire :1021 / teardown :4238-4244). */
+typedef struct HomerClientSharedDevice {
+    pthread_mutex_t lock;         /* held across the WHOLE open+export / destroy+close sequence */
+    struct doca_dev *device;      /* non-NULL iff a device is open */
+    char            pci[64];      /* diagnostic: PCI the open device serves (mismatch => WARN, not reject) */
+    int             refcount;     /* # live-or-retained per-session mmaps */
+} HomerClientSharedDevice;
+static HomerClientSharedDevice g_homerSharedDevice = { PTHREAD_MUTEX_INITIALIZER, NULL, {0}, 0 };
+```
+`#include <pthread.h>` is added (absent today; include block starts `:25`). `PTHREAD_MUTEX_INITIALIZER` needs no
+init fn; pthread is linked in both consumers (pgbench + postgres backend).
+
+**Acquire wrapper (`HomerClientDpuExportMmap:1018`) — REWRITTEN; WHOLE BODY under the lock:**
+```c
+static bool HomerClientDpuExportMmap(stream, devPci, err, errBytes) {
+    bool ok = false;
+    pthread_mutex_lock(&g.lock);
+    if (g.device == NULL) {                                  /* gate on device==NULL, NOT refcount==0 */
+        if (!HomerDpuFrontendOpenDevice(devPci, &g.device, err, errBytes)) { unlock; return false; }
+        snprintf(g.pci, sizeof g.pci, "%s", devPci ? devPci : "");   /* DIAGNOSTIC ONLY (no reuse compare) */
+    }
+    /* NO PCI compare on reuse (round-2 resolution): the context EMBODIES "one local DPU per
+     * process" (safety rule 9); the public SQL adapter pins the PCI (:2327); a differing devPci
+     * is either a DOCA spelling alias (doca_dev.h:357, harmless) or an out-of-contract multi-DPU
+     * violation. A warn-and-reuse would be wrong for a genuine A!=B; a strcmp reject would false-
+     * reject an alias -- so we do NEITHER and simply commit to the invariant. CAVEAT (diff-refutation
+     * correction, was WRONG before): a genuine different-PCI request is SILENTLY served by the
+     * already-open device -- the setup wire carries NO host-PCI identity (homer_dpu_comch_abi.h), so
+     * NOTHING detects the mismatch at runtime. Undefined; ruled out ONLY by safety rule 9. */
+    if (HomerDpuFrontendExportRegionOnDevice(g.device, stream->dpuExportBuffer, stream->mappingBytes,
+                                             &stream->dpuDocaMmap, &stream->dpuMmapExport,
+                                             &stream->dpuMmapExportBytes, err, errBytes)) {
+        g.refcount++; ok = true;                            /* one ref for this live mmap */
+    } else if (g.refcount == 0) {                           /* WE opened it just now and export failed */
+        if (doca_dev_close(g.device) == DOCA_SUCCESS) { g.device = NULL; g.pci[0] = 0; }
+        /* else IN_USE (e.g. the partial mmap :977 leaked, untracked) -> RETAIN g.device for reuse;
+         * never a 2nd handle. refcount==0 counts only TRACKED carrier mmaps; an untracked partial-
+         * export leak is not counted and is backstopped by this IN_USE-retain (round-2 finding 2). */
+    }
+    pthread_mutex_unlock(&g.lock);
+    return ok;
+}
+```
+
+**Teardown (`HomerClientCloseBaseBackupStreamInternal`, `:4238-4245`) — REWRITTEN; device/mmap block under the lock,
+inline dev-close removed:**
+```c
+if (stream->dpuDocaMmap != NULL) {
+    pthread_mutex_lock(&g.lock);
+    doca_error_t rc = doca_mmap_destroy((struct doca_mmap *)stream->dpuDocaMmap);
+    if (rc != DOCA_SUCCESS) {                 /* mmap STILL live (doca_mmap.h:118) */
+        pthread_mutex_unlock(&g.lock);
+        /* HomerClientSetError (NOT bare fprintf) so the caller's error buffer is populated -- pgbench
+         * :9331 / backend basebackup_homer.c:465 print it on a false return (round-2 finding 3). */
+        HomerClientSetError(err, errBytes, "shared device mmap_destroy failed: %s", HomerClientDpuDocaError(rc));
+        return false;   /* FULL-retain tombstone: skip frees+memset, keep mmap+buffers+ref, report failure */
+    }
+    stream->dpuDocaMmap = NULL;
+    bool devLeaked = false;
+    /* underflow guard (trace, not libc assert -- Push-1 de-assert rule): refcount>0 expected here */
+    if (--g.refcount == 0) {
+        if (doca_dev_close(g.device) == DOCA_SUCCESS) { g.device = NULL; g.pci[0] = 0; }
+        else { devLeaked = true; /* IN_USE -> RETAIN g.device (refcount 0, device!=NULL); next Acquire REUSES it */ }
+    }
+    pthread_mutex_unlock(&g.lock);
+    if (devLeaked)   /* deferred (post-unlock) loud log -- never write stderr under g.lock (round-2 finding 5) */
+        fprintf(stderr, "homer client: *** shared device doca_dev_close failed (IN_USE) -- device leaked to "
+                        "process teardown; session close still SUCCEEDS ***\n");
+}
+```
+**dev-close-failure POLICY (round-2 finding 6e, RESOLVED):** a per-session close returns SUCCESS even if the
+last-ref `doca_dev_close` failed. Rationale: the SESSION closed correctly (its mmap destroyed, buffers freed, DPU
+told); a failed device close is a PROCESS-singleton health issue, not a per-session-close failure, and the leak is
+benign (device pinned open, reused by the next Acquire or reclaimed at process exit). It is made OBSERVABLE by the
+loud deferred `fprintf` (mirroring the DPU engine's P2-i alarm severity, `homer_service_dpu_dma.c:16194`). The
+UNVERIFIED risk (DOCA does not promise a failed-close handle stays valid for later mmap-create, `doca_dev.h:183`)
+is near-unreachable (it requires the partial-export-destroy corner) and degrades to a CLEAN export failure on reuse,
+never corruption.
+/* dpuDocaDev block DELETED. Reached only when mmap was NULL (tombstone/2nd close) or destroy succeeded. */
+free(stream->dpuSetupPayload); free(stream->dpuExportBuffer); memset(stream, 0, sizeof(*stream)); return ok;
+```
+
+**Carrier field change:** `dpuDocaMmap` (`remote_execution_client.h:143`) STAYS (one mmap/session). `dpuDocaDev`
+(`:142`) is **DROPPED** — the context is sole device owner; `dpuDocaMmap != NULL` is the proof the carrier holds a
+context ref. Removing it kills the wrong-neighbor trap (a future reader closing `carrier->dpuDocaDev` under the
+shared device) at the source. Grep-VERIFIED referenced ONLY at acquire `:1021` + teardown `:4242-4244` + decl
+`:142`, all rewritten. Shrinks the shared carrier; a coordinated both-tree recompile (Push 2 does anyway).
+
+**Double-close is release-safe (finding C — my round-0 "no re-entry" rationale was WRONG, but the conclusion holds
+via a DIFFERENT mechanism, VERIFIED):** BB-SEND DOES re-enter close — `bbsink_homer_end_backup`'s graceful close
+failure raises ERROR (`basebackup_homer.c:468`, before `stream_open=false:469`), so `PG_FINALLY`→
+`bbsink_homer_cleanup` calls `HomerClientAbortBaseBackupStream` on the SAME carrier (`:500`). Release-safety comes
+from **`refcount` decrementing ONLY on a SUCCESSFUL `doca_mmap_destroy`** + the carrier field tracking liveness:
+(a) unacked-close first return (`:4236`) leaves the carrier intact → 2nd close retries cleanly; (b) a first close
+that reached teardown either succeeded-destroy+`memset` (2nd close sees `dpuDocaMmap==NULL` → no-op) or
+failed-destroy+FULL-retain (2nd close retries the destroy on the still-valid handle — a retry, not a double-free).
+No path decrements twice. SQL/BB-RECV do not retry (`homer_session_core.c:530`, `pg_basebackup.c:2444/2463` are
+fatal).
+
+**Threading (VERIFIED):** device is cold-path-only — hot path reads only `dpuExportBuffer`-relative pointers
+(control slot `:1602`, completion `:1699`, result ring `:3409/:3473`, credit `:3587/:3590`, BB publish `:4113`), so
+the wider mutex still leaves the DATA path lock-free. It IS the only lock in the acquire/teardown domain (no
+lock-ordering risk). pgbench `-j N` = N worker threads opening their assigned clients concurrently
+(`pgbench.c:8978/:8980` → SQL open `:9407`); `-c4 -j4` = 4 sessions / 4 threads / 4 concurrent opens = 4
+devices/process TODAY. Framing correction: per-process device count tracks `-c`, not `-j`; `-j` only makes opens
+CONCURRENT. Each carrier is opened+closed by a SINGLE owning thread (pgbench: one `CState`/thread; BB:
+single-threaded) — the mutex protects only CROSS-carrier device sharing, not same-carrier concurrent close (which
+does not occur).
+
+**Documented caller-discipline assumptions (refutation, not enforced at runtime):**
+- **No reopen on a live carrier:** the three opens `memset` the carrier before export (`:1936/:2437/:2811`), so a
+  second public open on a live carrier would erase its mmap/ref (leak a ref, pin the device). Current callers open
+  once per carrier lifetime. A runtime guard would sit before the memset at 3 sites — not added; recorded in
+  CONTRACTS.md as an invariant.
+- **fork:** no `pthread_atfork`. Safe for current callers (pgbench does not fork after threads start; backends fork
+  from a postmaster that never touches the singleton — VERIFIED: postmaster only registers the agent bgworker
+  `remote_execution_backend_bridge.c:2878-2892`; the agent opens its device inside `HomerFrontendAgentMain`). A
+  future fork holding the lock would give the child a locked mutex — documented limitation.
+- **PCI mismatch = NO compare (round-2 resolution):** reuse the open device unconditionally; `pci[]` is
+  diagnostic-only. A warn-and-reuse is wrong for a genuine A!=B (exports against the wrong device); a strcmp reject
+  false-rejects a DOCA spelling alias (`doca_dev.h:357`). Both wrong, so do neither — commit to "one local DPU per
+  process" (safety rule 9; the public SQL adapter pins the PCI `:2327`). CAVEAT (diff-refutation correction): an
+  out-of-contract multi-DPU request is SILENTLY served by the already-open device — the setup wire carries NO
+  host-PCI identity (`homer_dpu_comch_abi.h`), so nothing detects it at runtime. Undefined; ruled out ONLY by
+  safety rule 9 (an earlier "fails cleanly at DPU import" claim here was WRONG).
+
+**Warn primitive (VERIFIED 2026-07-19):** `homer_client.c` uses `fprintf(stderr, ...)` (5+ sites) and
+`HOMER_DPU_P2_DIAG`-gated traces (3 sites); it has ZERO `HOMER_EVENT` uses and does not include `homer_event.h`.
+So the two E warnings use `fprintf(stderr)` (bounded, allocation-free, cold path — one-shot per session close, NOT
+a hot/retry loop), matching the TU. Today's device teardown (`:4240/:4244`) emits NOTHING (silently discards
+results), so even a bare `fprintf` is strictly more observable. `HOMER_EVENT` is a backend/DPU-service API, not
+used in this frontend client lib; not introduced here.
+
+**Import-safety (VERIFIED, unchanged):** DPU import keys on generation/client/export-id on its OWN device — no
+host-device identity on the wire — so one host device serving N sessions changes nothing the DPU sees.
+
+**Frontend agent + legacy frontend-DMA — UNTOUCHED (VERIFIED):** `HomerFrontendAgentMain` keeps its own explicit
+open(`homer_frontend_agent.c:1546`)→N exports(`:1556/:1568`)→destroys(`:1775/:1781`)→close(`:1786`) lifetime and
+never uses the `static` carrier wrapper; the legacy `HomerFrontendDmaOpenDocaDevice` (`homer_frontend_dma.c:1435/
+:1462`) is a THIRD separate host-device owner. So "one device per process" is true ONLY for the carrier path — the
+context is a NEW internal LAYER over the device-scoped primitives, not a replacement of their explicit-owner
+semantics (converting the agent to context refs would double-free its trailing `CloseDevice`).
+
+**Validation (per §12.5 step 5):** gate + four-role basebackup + DPU TCP smoke. The gate (`-c4 -j4`) is the
+DIRECT proof of shared-device correctness under concurrent opens; basebackup covers the BB acquire/teardown switch;
+smoke covers the host↔DPU DMA net. **Perf:** device open/close moves off the per-session path onto per-process
+first-open/last-close — a COLD-path win only; no hot-path change expected.
+
+**Current site-map (VERIFIED HEAD, supersedes §12.5a "E" stale numbers):** carrier fields
+`remote_execution_client.h:142`(`dpuDocaDev`, TO DROP)/`:143`(`dpuDocaMmap`, STAYS); primitives
+`HomerClientDpuOpenDevice:796`, `HomerDpuFrontendOpenDevice:877`, `HomerDpuFrontendCloseDevice:907`, combined
+exporter `HomerDpuFrontendExportRegion:838` (open `:855`, on-device `:859`, close-on-fail `:862`), device-scoped
+`HomerDpuFrontendExportRegionOnDevice:921` (mmap-create `:948`, partial-destroy-on-fail `:977`), mmap-only destroy
+`HomerDpuFrontendDestroyRegionExport:990` (void, discards `:994`), unused combined `HomerDpuFrontendDestroyExport:1006`,
+carrier wrapper `HomerClientDpuExportMmap:1018` (calls combined `:1021`); acquisitions SQL `:2039` / BB-send `:2494`
+/ BB-recv `:2869`; teardown body `:4136` (unacked-close early return `:4236`, inline mmap-destroy `:4240`, inline
+dev-close `:4244`, frees `:4246/:4247`, memset `:4248`).
+
+**REFUTATION ROUND 2 → design SETTLED (2026-07-19; corrected mechanisms attacked; all findings VERIFIED by me,
+then resolved). Both sides recorded.** Round 2 CONFIRMED sound: the widened lock covers every shared-object DOCA
+call in export (`:808/:817/:822/:825/:948-971/:977`) and teardown (`:4238/:4242`); the export blob copy outside the
+lock is safe (blob lifetime tied to the live mmap, `:916`); ordinary two-export interleaving balances; the underflow
+claim holds (`dpuDocaMmap` set only at `:1022`, destroyed only at `:4238`); `homer_event.h` is source-level
+frontend-safe. Remaining findings + resolutions:
+- **REAL FIX (finding 3):** the destroy-failure `return false` must populate `errorMessage` via `HomerClientSetError`
+  (pgbench `:9331` / backend `:465` print it) — not a bare `fprintf`. APPLIED in the pseudocode above.
+- **PCI (findings 6b/6c) RESOLVED → no compare** (see the wrapper + assumption note): warn-and-reuse is wrong for
+  a genuine A!=B; strcmp-reject false-rejects a DOCA alias. Commit to safety-rule-9 instead.
+- **dev-close IN_USE (finding 6e) RESOLVED → policy** (see the dev-close-failure POLICY note): per-session close
+  SUCCEEDS; the device leak is a separately-logged process concern; reuse-after-IN_USE is a documented near-
+  unreachable UNVERIFIED risk that degrades to a clean failure.
+- **warn primitive (finding 5) RESOLVED:** `HOMER_EVENT` is frontend-safe but (a) not frequency-bounded, (b) does a
+  `write` that must NOT run under `g.lock`, (c) would need a `Makefile:124` prereq add. So E uses `HomerClientSetError`
+  (contract) + a DEFERRED post-unlock `fprintf` (operator visibility) — matching the TU (0 `HOMER_EVENT` uses today).
+
+**OUT-OF-SCOPE / pre-existing hazards DISCOVERED by the refutation (recorded; NOT Push-2 blockers — E does not
+introduce or worsen them):**
+- **Setup-ACK loss ⇒ ambiguous DPU import (finding 6a) — a genuine PRE-EXISTING correctness hazard.** The DPU
+  imports the setup payload (`homer_service_dpu_setup_tcp.c:586`) BEFORE writing the ACK (`:750`); if the client
+  read fails, open falls to ordinary close, but a missing ACK leaves `bridgeGeneration==0` so
+  `HomerDpuFrontendSendClose` returns true WITHOUT contacting the DPU (`homer_client.c:1258`) — host mmap destroyed
+  despite a possibly-live DPU import. E does NOT touch the setup/close protocol; sharing the device makes it
+  marginally SAFER (a co-tenant ref keeps the device alive). Recorded for a separate fix decision; see the CONTRACTS
+  entry.
+- **Partial-export-destroy-failure untracked mmap (finding 2):** `HomerDpuFrontendExportRegionOnDevice` discards its
+  partial `doca_mmap_destroy` (`:977`); a failure leaves an untracked mmap. Backstopped by the acquire-path
+  IN_USE-retain; realistically unreachable (a freshly-created never-DMA'd mmap destroys cleanly). Documented.
+- **Reopen-on-live-carrier (finding 4):** caller-discipline invariant (the 3 opens `memset` before export); current
+  callers open once/carrier. In CONTRACTS.md, not enforced at runtime.
+- **Public combined `HomerDpuFrontendExportRegion` (finding 6d):** after the rewrite it has NO in-tree caller but
+  stays exported (`remote_execution_client.h:263`) and opens its OWN device (`:855`) — a bypass of the context. Add
+  a definition-site comment warning it must not be used for carrier exports; leave the symbol (public API).
+
+**The Component-E design is SETTLED — sound to implement.** Refutation arc: round-0 (4 hard blockers, REJECTED) →
+round-1 (widened lock + checked destroy/close + device==NULL gate) → round-2 (1 real fix + policy resolutions +
+out-of-scope discoveries) = genuine convergence.
+
+**IMPLEMENTATION + DIFF REFUTATION (2026-07-19, codex-explore on the actual diff; findings VERIFIED by me).**
+Component E implemented in the citus tree (`homer_client.c` + `remote_execution_client.h`, +183/−9). Diff-refutation
+verdict: **"no ordinary lock leak, double-free, or double-decrement exists"** — lock released on every exit path;
+the double-close state machine sound in all three cases (success+memset → 2nd close sees zeroed `selectedDpu`;
+destroy-fail tombstone → retry decrements at most once; unacked-close early return → retries retained state); return
+contract correct for all callers; ABI shrink 656→648 B with NO wire/`sizeof`/`offsetof` dependency (contained
+recompile). Fixes applied from the diff refutation:
+- **Underflow-branch `fprintf` was UNDER the lock** — inconsistent with the deferred-log policy 2 lines below;
+  latched to a post-unlock log (a `refcountBug` flag beside `devLeaked`).
+- **LYING comments corrected** (the money fixes — a lie here writes the next bug): the bypass comment claimed
+  `HomerDpuFrontendExportRegion` is "kept for the frontend agent" — FALSE (the agent uses `OpenDevice` +
+  `ExportRegionOnDevice`; the combined helper has NO caller); my PCI comment claimed a genuine mismatch "fails
+  cleanly at DPU import" — FALSE (the setup wire carries no host-PCI identity, so it is SILENTLY served — corrected
+  in code AND above); stale line-number refs (`:855`/`:977`) and "Acquire" terminology (no Acquire helper) reworded
+  to be symbol-based / stale-proof.
+- **Documented (not fixed, VERIFIED pre-existing / near-unreachable):** the partial-export-destroy-failure corner
+  (`ExportRegionOnDevice` discards its partial `doca_mmap_destroy`; pre-existing, backstopped by the IN_USE-retain)
+  and the `INVALID_VALUE` mmap-destroy classification (degrades safely — retry re-fails → leak-to-teardown).
+The Component-E CODE is settled — ready to build + validate.
+
+**PUSH-2 VALIDATION COMPLETE — GREEN (2026-07-19, run `candidate-20260719-031152`; base citus `f92d39025` +
+postgres `d386a2ecbef` + the uncommitted host-only E diff).** All three required tiers PASS against one freshly
+built+installed both-tree artifact set (Citus first → PostgreSQL relink; SHA-256 peer parity; run-scoped DPU
+snapshot of the UNCHANGED DPU source — no bridge/ABI bump, version still 5):
+- **DPU TCP smoke — PASS** (both ends `ok`; drain `outstanding=0 fatal=false`).
+- **Four-role selected-DPU basebackup — PASS** (delivered 23,259,553,812 B; `full_laps=44364` wrap proven;
+  `published_tail==consumed_head` fully drained; `basebackup_check` PASS; frontier `posted==retired+flushed` and
+  `teardown-ledgers` balanced on BOTH DPUs) — the BB send/recv carriers exercised through the shared device.
+- **Selected-DPU command GATE — PASS at BOTH shapes:** `-c1 -t5` (5/5, 5 distinct abalance, `gate_check`+
+  `alarm_check` PASS) AND **`-c4 -j4 -t5` = the shared-device concurrency proof** (20/20 processed, 0 failed; 4
+  Homer SQL sessions opened CONCURRENTLY (ids 2,3,4,5) sharing ONE host `doca_dev`; 4 distinct launched PIDs;
+  `spawn_pairs=4`, `decoded_values=20`; `peer_host_spawn_retired` ABSENT).
+- **ALL component-E stderr markers ABSENT** across every log (no `doca_dev_close(IN_USE)`, no `refcount BUG`, no
+  `mmap_destroy` failure, no session-OPEN failure across the 1+4 concurrent sessions) — the shared-device paths
+  behaved exactly as designed.
+- Co-arming: the pre-recycle stale generation produced the documented transient `status=4` (hazards §11), then the
+  recycled frontend agent's fresh generation was accepted with ZERO rejects — the Push-1 lesson held by
+  construction. DPU setup listener (:9727) confirmed LIVE post-workload with the agent attached throughout.
+- Perf: NOT quoted (debug/contended-CPU correctness run; component E is a COLD-path change — no hot-path effect
+  expected). Foreign 5432 (pid 1308997) untouched throughout.
+
+**⇒ Component E is validated. Stage 3 (the SQL opKind of the unified core) is COMPLETE after this commit.** Next:
+Stage 3.5 (basebackup onto the unified core).
+
 ### 12.5b Stage 3.5 — migrate basebackup onto the unified session (the multi-consumer proof) (owner, 2026-07-18)
 Migrate `pg_basebackup` (RECEIVE client) + `basebackup_homer.c` (SEND backend) onto the unified core/interface
 (§13) as the SECOND, differently-shaped consumer — **before final retirement, while ① is still a live reference.**
