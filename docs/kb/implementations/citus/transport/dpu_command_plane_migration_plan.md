@@ -6,6 +6,28 @@
 > data-plane *ring ownership*. This doc owns the *command plane*. Stages here are numbered
 > independently — cite them as "command-plane S1a", etc.
 
+> ## ✅ CURRENT STATUS (2026-07-19) — read THIS box first; the July-13 box below is now HISTORY for S6/S7.
+>
+> **S0–S5 DONE. S7 (host-service retirement) COMPLETE. S6 is the remaining open stage of this plan.**
+>
+> - **S7 — ✅ COMPLETE + VALIDATED.** S7.0 (postgres `22a8f9951e6`) + S7.1(a–e) (citus `effd2678d` / `96112ddc6` /
+>   `e9db38781` / `e9dd4676c`) landed, then S7.2 (delete the ① `RemoteExecutionSession` API) + S7.3 (delete the
+>   Tier-2 DMA frontend) executed as the s7-plan §13 "Stage 4" R1/R2/R3 (citus `39bed1051` / `a12c48667` /
+>   `31f0e958f`; final run `candidate-20260719-161556`, first-spawn `slot=0` proving **D7 → D7′**: the DPU is now the
+>   SOLE backend-spawn claimant across the whole region). Detail:
+>   [`s7_host_service_retirement_plan.md`](./s7_host_service_retirement_plan.md) §13; the ①-promotion detour it
+>   triggered reached its endpoint —
+>   [`../../future-directions/citus/transport/homer_unified_session_core_plan.md`](../../future-directions/citus/transport/homer_unified_session_core_plan.md).
+> - **S6 (native `--homer-dpu` bring-up + per-command latency) — IN PROGRESS, the active frontier.** Landed: Track A
+>   fail-close of the peer host-spawn arms (citus `81ce2577c`); Track B default-off DPU-local discovery-latency spans
+>   (citus `f5f4480f3`); Stage 2 per-session DPU SOURCE ring, retiring the `tupleSourceRing` singleton (citus
+>   `a5e7d2fdb` + `3d5047146` — this is also byte-ring-pool-plan Stage 2); and Stage 2c send-CQE selective signalling
+>   / coalescing (citus `7e08343f2`), the "measure the intended system" prerequisite the owner sequenced BEFORE the
+>   S6 number. NOT yet closed: end-to-end native `--homer-dpu` bring-up and the attributable S6 latency measurement.
+>   Detail: [`s6_native_homer_dpu_and_latency_plan.md`](./s6_native_homer_dpu_and_latency_plan.md).
+> - **Still DEFERRED:** unified-core Stage 5 (COPY as the third dispatcher consumer + backend pooling / reuse), until
+>   the COPY path is actually (re)designed.
+>
 > ## ⚠ CURRENT STATUS (July 13, 2026) — the July-10 paragraph below is HISTORY. Read this box first.
 >
 > **S0–S5 are ✅ DONE. The cross-node DPU gate (`pgbench --homer --homer-dpu-command`) PASSES** and is the

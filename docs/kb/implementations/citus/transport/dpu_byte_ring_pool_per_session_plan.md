@@ -19,9 +19,9 @@
   DPU: two `purpose=0` binds slot 0 / slot 1; receiver DPU: two `purpose=1` binds
   slot 0 / slot 1), with NO `RECV_CQ_FAILURE` / `observed>posted` / `DISCONNECT` /
   `ambiguous receive-relay resolve`. The original reset-before-any-byte-moved bug is
-  fixed. Remaining: the deferred mirror-cache cleanup, Stage 2 (tuple-source for
-  concurrent `--homer-dpu`) — **RE-GROUNDED + UNBLOCKED 2026-07-17, see its STATUS section** — and the
-  connection-binding-fix disposition. Plan mirror
+  fixed. **Stage 2 (per-session tuple/DPU SOURCE ring for concurrent `--homer-dpu`, retiring the `tupleSourceRing`
+  singleton) — ✅ LANDED (2026-07-19) as S6 Stage 2 (citus `a5e7d2fdb` + `3d5047146`).** Remaining: the deferred
+  mirror-cache cleanup and the connection-binding-fix disposition. Plan mirror
   file was `~/.claude/plans/here-s-a-snippet-on-linked-papert.md`; this doc is canonical.
 - **Progress:**
   - **Stage 0a — DONE + validated (single-session, byte-identical).** New module
