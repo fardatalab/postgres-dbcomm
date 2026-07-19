@@ -23,8 +23,13 @@
 >   (citus `f5f4480f3`); Stage 2 per-session DPU SOURCE ring, retiring the `tupleSourceRing` singleton (citus
 >   `a5e7d2fdb` + `3d5047146` — this is also byte-ring-pool-plan Stage 2); and Stage 2c send-CQE selective signalling
 >   / coalescing (citus `7e08343f2`), the "measure the intended system" prerequisite the owner sequenced BEFORE the
->   S6 number. NOT yet closed: end-to-end native `--homer-dpu` bring-up and the attributable S6 latency measurement.
->   Detail: [`s6_native_homer_dpu_and_latency_plan.md`](./s6_native_homer_dpu_and_latency_plan.md).
+>   S6 number. **The functional native `--homer-dpu` path is WORKING end-to-end and validated** — Track A folded
+>   `--homer-dpu-command` onto native `--homer-dpu` (pgbench.c:336-342), both imply the DPU result relay, and every
+>   gate run (incl. R3's `candidate-20260719-161556`, transport line `homer-dpu (implies dpu result relay)`, 5/5+20/20
+>   decoded abalance through the role-7 DPU→host ring) exercises it. **NOT yet closed: only Track B — the attributable
+>   per-command S6 LATENCY NUMBER** (the same-host-clock discovery-echo-marker measurement; spans landed default-off in
+>   `f5f4480f3`, but the measurement campaign is the open payoff), plus formal S6 closure. This is analysis, not a
+>   functional gap. Detail: [`s6_native_homer_dpu_and_latency_plan.md`](./s6_native_homer_dpu_and_latency_plan.md).
 > - **Still DEFERRED:** unified-core Stage 5 (COPY as the third dispatcher consumer + backend pooling / reuse), until
 >   the COPY path is actually (re)designed.
 >
