@@ -679,6 +679,9 @@ The parent plan's "Stage 4" = the FINAL host-service retirement, executed now th
   `multi_copy.c` hooks, `homer_citus_xact.c` — **VERIFIED absent from the main tree**).
 - **LEFT for Stage 4:** S7.2 (UDF + old opaque ① `RemoteExecutionSession` API + dormant COPY sender residue) +
   S7.3 (Tier-2 DMA frontend) + D7→D7′. These are what §13.1 below sequences.
+- **⟳ ROUND 1 DONE (citus `39bed1051`, validated 2026-07-19):** the executable EDGES of the retiring Tier-2 command
+  path are gutted (see §13.2-R1 RESULT). The cluster `.c`/headers still exist and still WILDCARD-compile — Round 2
+  (§13.3) deletes them. Round 2 is the FIRST file/API deletion → **checkpoint the user before it.**
 - **⚠ Grep hygiene:** a stale pre-S7 agent worktree `.claude/worktrees/agent-a4b43596e72023cf3/` still contains the
   removed files (control-region mappers, COPY hooks, etc.). **It is NOT the main tree — exclude `.claude/worktrees/`
   from every grep** or it produces false "still present" hits (it fooled the first grounding pass).
@@ -716,6 +719,32 @@ Round 1 = only:
 - `tuple_sink_service_process.c:23471`: fix the now-stale ① comment (the only ① reference left in a KEPT file).
 - **NOTHING in `homer_frontend.h`, `homer_shm_channel_abi.h`, `worker_protocol.h`, or the `.sql` yet** — deferred to
   Round 2 (they hold types/externs the wildcard-compiled cluster still needs).
+
+### 13.2-R1 RESULT — EXECUTED + VALIDATED GREEN (citus `39bed1051`, 2026-07-19)
+Round 1 landed exactly as scoped above. Three files changed (`shared_library_init.c`,
+`remote_execution_backend_bridge.c`, `tuple_sink_service_process.c`; **−199/+75**), NO file/API/header/ABI/DPU change.
+- **What landed:** legacy Tier-2 arm (per-session named-shm mailboxes + shm_open'd result queue, `arenaSlotIndex==INVALID`)
+  replaced by an `ereport(FATAL)` fail-fast (this is BOTH the edge removal AND the NULL-deref defense); legacy result arm
+  removed (`else if (…&&arenaBackend)`→`if (arenaBackend)`); 6 legacy mailbox locals + their dead munmap/close in both
+  exit paths removed; orphaned static `RemoteExecFormatMailboxNames` removed (SHM prefixes KEPT); experimental GUC
+  `enable_experimental_homer_dpu_frontend` de-registered (backing var stays in still-compiled `homer_frontend_dma.c`);
+  one stale ① doc-comment reworded.
+- **Refutation of the diff (codex-explore, every claim main-agent VERIFIED):** 5/5 load-bearing claims SOUND (NULL-deref
+  safety, build-safety = no shared-decl trim, no new unused-`-Werror` orphans, gate/basebackup drive only the arena arm,
+  removed cleanup was a no-op for arena). It caught ONE real MISSED edge — the now-dead per-session-fd munmap/close arm in
+  **`RemoteExecCleanupSessionResultQueue`** (`remote_execution_backend_bridge.c:~709`; `resultQueueFileDescriptor` is only
+  ever `-1` after the legacy arm is gone) — plus 3 stale comments (incl. a "used to name `OpenRemoteExecutionSession()`"
+  slip that reintroduced the deleted symbol name in a kept file); all fixed, recompiled clean.
+- **⚠ Documented assumption (not a defect):** the arena arm's NULL-deref safety is NOT purely function-local — it also
+  relies on the postmaster arena-slot bounds check (`remote_execution_backend_bridge.c:~2640`) and the fact that the only
+  in-tree launcher copies that validated index into the child. An out-of-tree caller of exported `StartRemoteExecBackend()`
+  could bypass it; none exists in-tree. (See CONTRACTS entry for the arena-required invariant.)
+- **Validation** (run `candidate-20260719-133850`, full acceptance set, manual runbook): **PASS** on all three.
+  GATE 5/5 decoded abalance / 0 failed; DPU-arena spawn ran (`slot=16`, real `launched_pid`, `bridge_generation
+  4663012762262649`); **the new fail-fast string NEVER fired** and `peer_host_spawn_retired` alarm ABSENT → surviving arena
+  arm ran, retired arm not reached. Four-role basebackup PASS (23.26 GB, `full_laps=44365`, past wrap). DPU TCP smoke PASS
+  (6 legs). Perf `-c1 -t2000` stripped: 307.7/309.9/306.1 tps vs 290–299 band → no regression. Co-arming + Rule 12 honored;
+  teardown ledgers balanced; clean preflight before/after.
 
 ### 13.3 Round 2 — DELETE the cluster + trim its now-dead decls, ALL AT ONE BOUNDARY. No behavior change (unreachable). Validate: build + gate.
 Deleting the `.c` files drops them from the wildcard, so the decl/ABI/extern trims are now safe **only here**:

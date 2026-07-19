@@ -328,6 +328,31 @@ the call site. If it is not on the list, **it has not been checked.**
   caused on one node and observed on the other). A present alarm = the doorbell was not attached before OPEN = the
   run is contaminated, **NOT a pass**.
 
+## `ExecuteRemoteExecBackendCommand` `!arenaBackend` — **the selected-DPU backend REQUIRES a valid DPU-arena slot; the legacy Tier-2 arm is RETIRED (fail-fast).**
+
+- **MEANS:** the socketless selected-DPU command backend (`remote_execution_backend_bridge.c`) has exactly ONE live
+  arm — the **DPU-arena arm** (`arenaBackend` = a valid `arenaSlotIndex`), whose command/completion mailboxes + role-5
+  result ring live inside the DPU-chosen frontend-arena slot. `arenaSlotIndex == INVALID` (`!arenaBackend`) now
+  **`ereport(FATAL)`s** ("remote exec backend received a retired legacy Tier-2 selected-DPU request"; S7 Round 1, citus
+  `39bed1051`).
+- **DOES NOT MEAN:** that both arms are still supported. The surviving `if (arenaBackend)` guards (mailbox setup,
+  result-ring wiring) are **defensive-only** — `!arenaBackend` already fail-fasted above them, so they never take a
+  false branch. The old `else` (per-session named-shm `shm_open` of command/completion mailboxes) and the
+  `!arenaBackend` result-queue arm are GONE; do NOT "restore symmetry" by re-adding a non-arena arm.
+- **CONTRACT — the fail-fast is ALSO the NULL-deref defense:** channel mode is proven `SELECTED_DPU_DMA` first; after
+  that, `!arenaBackend` was the ONLY path that left `commandMailbox == NULL` before the command loop dereferences
+  `commandMailbox->consumedEpoch`. Removing the `else` arm WITHOUT the fail-fast crashes. They are one edit. The
+  now-dead per-session-fd munmap/close in `RemoteExecCleanupSessionResultQueue` was removed with it
+  (`resultQueueFileDescriptor` is only ever `-1`; the arena role-5 ring is a borrowed arena mapping, never a standalone fd).
+- **⚠ Safety is NOT function-local (documented assumption):** it also relies on the postmaster arena-slot bounds check
+  (`ProcessSpawnRequestSlot`, `remote_execution_backend_bridge.c`) and on the only in-tree launcher copying that
+  validated index into the forked child. An out-of-tree caller of exported `StartRemoteExecBackend()` could still pass a
+  poisoned index; none exists in-tree.
+- **ENFORCES:** every healthy gate run must show the arena arm ran (`dpu_spawn` begin/complete + a real `launched_pid`)
+  AND the fail-fast string **ABSENT** from the peer PostgreSQL server log — its presence = a legacy/INVALID producer
+  reached the child = contamination, NOT a pass. The only producer that sends INVALID is the retiring UDF/Tier-2 path
+  (`homer_frontend_dma_lifecycle.c`), deleted whole in Round 2.
+
 ## `RemoteExecSqlResultDestReceiver.currentBatchHandle` — **MUST be NULL-initialized; the receiver's Init memset is PARTIAL.**
 
 - **MEANS:** the backend's currently-reserved SQL result-sink batch. `RemoteExecSqlResultReserveBatch`
