@@ -900,6 +900,56 @@ validated.
    handle), not a single engine mmap — the whole point of multi-region. The mirror engine-side
    `Find` vs the landing/source explicit-param seam is deliberate; comment both.
 
+## Capstone: the MIXED concurrent workload (pgbench + basebackup) — plan
+
+**Why this exists.** This plan's stated purpose is that *"multiple concurrent cross-node DPU sessions (basebackup
+first, then `--homer-dpu` tuple/pgbench) stop cross-wiring each other's ring state."* Stage 1 proved the
+**basebackup** half (2 concurrent backups) and Stage 2 built the **pgbench** half (per-session SOURCE rings), but
+**the two have never been run TOGETHER on the selected-DPU path** — so the plan's actual goal is undemonstrated.
+(Mixed pgbench+basebackup *was* validated in the retired host-service/RDMA era; that evidence does not transfer.)
+Every acceptance run to date is SEQUENTIAL: gate → basebackup → smoke.
+
+### Slot budget (grounded 2026-07-19; this is the thing that can bite)
+
+Pool geometry is **per DPU**: `HOMER_DPU_BYTE_RING_POOL_REGIONS` (2) × `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (8)
+= **16 slots** (`homer_service_dpu_dma.h:40-42`). ⚠ Slots/region was raised **4 → 8 in `a5e7d2fdb` (S6 Stage 2)`**
+— older docs saying "4 × 2 = 8" are stale.
+
+Per-stream binds (`tuple_sink_service_process.c`): **LANDING** every receive stream (`:19069`); **SOURCE**
+additionally *only* for `HOMER_PAYLOAD_OBJECT_FAMILY_TUPLE_VIEW_BATCH` (`:19100-19107` — the tuple/pgbench relay;
+"basebackup is a single landing==source ring and is not TUPLE_VIEW_BATCH"); **MIRROR** on the sender/egress side
+(`:19491`).
+
+| workload | receiver DPU | sender DPU |
+|---|---|---|
+| one `--homer-dpu` pgbench client session | **2** (LANDING + SOURCE) | 1 (MIRROR) |
+| one basebackup session | **1** (LANDING only) | 1 (MIRROR) |
+
+⇒ **`-c4` pgbench (8) + one four-role basebackup (1) = 9 of 16 on the busiest DPU — 7 slots of headroom.** Matches
+the in-code note *"16 slots support -c4"* (`homer_service_dpu_dma.h:41`). `-c6` (12+1=13/16) would also fit but is
+not the first shape to try.
+
+⚠ **Why headroom is non-negotiable here:** pool exhaustion does NOT degrade gracefully. A session that loses the
+race takes the **whole DMA engine** with it (`engine->fatalError = true`, `homer_service_dpu_dma.c:13296`), killing
+command-pull, byte-ring pull and PE drain for EVERY session on that DPU (see
+[`dpu_gate_concurrency_limits.md`](./dpu_gate_concurrency_limits.md), whose own slot arithmetic is pre-S6/stale).
+
+### Design
+
+- **Shape:** `-c4` gate pgbench (native `--homer-dpu`) running CONCURRENTLY with one four-role selected-DPU
+  basebackup. Start the basebackup first (it is long-running), then launch the gate so their live windows overlap;
+  wait for BOTH and capture BOTH exit codes.
+- **Acceptance:** gate transactions all processed / 0 failed AND basebackup byte-conserving to completion AND — the
+  point of the exercise — **no byte-ring exhaustion or engine-fatal on EITHER DPU** across the union interval.
+- **Bracketing:** mark each DPU log BEFORE the first workload starts and AFTER the last finishes; checkers run over
+  that **union** interval.
+- **Checkers need no change** (verified): `alarm_check` already matches `pool exhausted|semantic validation
+  failed|fatal error state|PE drain failed|peer-open failed`; `gate_check` keys on pgbench's client log + `DPU
+  backend spawn` records (basebackup emits none); `basebackup_check` keys on basebackup's own sender/consumer logs
+  (pgbench does not write there). The workloads are therefore separable from one interleaved DPU log.
+- **Tooling gap:** no script composes the two concurrently, and no runner profile exists. Orchestration is MANUAL
+  per the operator runbook (live runner execution remains prohibited).
+
 ## Connection-binding fix disposition
 
 **Status: ✅ CLOSED (2026-07-19). KEPT, committed with Stage 0a. Reclassified as

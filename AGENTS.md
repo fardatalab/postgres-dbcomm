@@ -87,10 +87,13 @@ reading its incident.
 | Local `pgbench --homer` | Diagnostic-only | Local host-service control path; no cross-node/DPU acceptance |
 | Remote host-service `pgbench --homer` | Broken; scheduled for removal | Never an acceptance gate |
 | Backend-to-backend COPY | Broken; scheduled for removal | Never an acceptance gate; do not revive during validation |
-| `pgbench --homer-dpu` without DPU command mode | Never completed end to end | Not the selected-DPU command gate |
+| **MIXED: gate pgbench CONCURRENT with four-role basebackup** | **MANDATORY FOR BYTE-RING POOL / CONCURRENCY CHANGES** | The only workload proving tuple and bulk sessions COEXIST on one shared byte-ring pool; sequential runs cannot show contention |
+| `pgbench --homer-dpu` (native) | Folded onto the command plane in S6 | Equivalent to the gate — it implies the DPU result relay; not a separate broken shape |
 
 If only one observation is possible, lead with the gate; a full transport verdict still requires basebackup. The gate
-moves small results and does not validate byte-ring wrap. Host-service paths do not substitute for either.
+moves small results and does not validate byte-ring wrap. Host-service paths do not substitute for either. **Sequential
+gate+basebackup does NOT substitute for the mixed workload**: only the concurrent run exercises byte-ring pool
+contention between tuple and bulk sessions.
 
 For any transport change:
 
@@ -98,12 +101,22 @@ For any transport change:
 2. run the selected-DPU gate;
 3. run four-role basebackup;
 4. add the DPU TCP smoke for DPU DMA, byte-ring, or bridge/ABI changes;
-5. include at least one workload with the frontend agent enabled and prove the DPU setup listener remains live
+5. add the MIXED concurrent workload for byte-ring pool, slot-accounting, or session-concurrency changes;
+6. include at least one workload with the frontend agent enabled and prove the DPU setup listener remains live
    afterwards.
 
 The gate uses no host `citus_tuple_sink_service`. Keep client CPUs, DPU service CPUs, and socketless-backend CPUs
-disjoint and sized to the client count. The current byte-ring pool caps the gate at eight clients; prefer four for
-headroom. Scan both DPU logs, because the failure can be observed on one node and caused on the other.
+disjoint and sized to the client count. Scan both DPU logs, because the failure can be observed on one node and caused
+on the other.
+
+**Byte-ring slot budget (the mixed workload's binding constraint).** The pool is **per DPU**:
+`HOMER_DPU_BYTE_RING_POOL_REGIONS` (2) × `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (8) = **16 slots**
+(`homer_service_dpu_dma.h:40-42`; slots/region was raised 4→8 in S6 Stage 2 — older "4 × 2 = 8" text is stale). One
+pgbench session takes **2** receiver slots (LANDING+SOURCE); one basebackup session takes **1** (landing==source).
+So `-c4` + one basebackup = 9/16. **Prefer `-c4`**: exhaustion does not degrade gracefully — a losing session sets
+`engine->fatalError` and kills command-pull, byte-ring pull and PE drain for EVERY session on that DPU. Always run
+`alarm_check` (it matches `pool exhausted` / `fatal error state`, which are NOT tagged `ALARM`) over a candidate
+interval spanning the **union** of both workloads.
 
 ## Measurement and verdict rules
 

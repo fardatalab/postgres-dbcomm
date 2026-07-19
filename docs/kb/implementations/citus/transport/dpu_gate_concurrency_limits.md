@@ -6,7 +6,23 @@
 time the DPU gate was ever run above one client.** Decision: **cap the gate at 8 clients**, raise the knob if we
 need more. The engine-fatal that appears above the cap is **gated behind the cap** and is deliberately parked.
 
-## The limit
+> ## ⚠ RE-GROUNDED 2026-07-19 — THE ARITHMETIC BELOW IS PRE-S6 AND STALE. Read this first.
+>
+> **S6 Stage 2 (`a5e7d2fdb`) changed BOTH sides of the equation**, so the numbers below no longer describe the code:
+> - slots/region was raised **4 → 8**, so the pool is now `HOMER_DPU_BYTE_RING_POOL_REGIONS` (2) ×
+>   `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (8) = **16 slots per DPU** (`homer_service_dpu_dma.h:40-42`), not 8;
+> - a `--homer-dpu` session now takes **TWO** receiver slots, not one: **LANDING + SOURCE**
+>   (`tuple_sink_service_process.c:19069` + `:19100-19107`), because the per-session SOURCE ring retired the
+>   `tupleSourceRing` singleton. A **basebackup** session still takes **ONE** (landing==source, not TUPLE_VIEW_BATCH).
+>
+> ⇒ The client cap coincidentally stayed ~8 (16 ÷ 2), but **the reasoning below is wrong** — do not re-derive from
+> it. Current budget + the mixed pgbench/basebackup workload it constrains:
+> [`dpu_byte_ring_pool_per_session_plan.md`](./dpu_byte_ring_pool_per_session_plan.md) "Capstone" section.
+>
+> **Everything below about the engine-fatal blast radius and the two parked defects remains ACCURATE and is why
+> headroom still matters.**
+
+## The limit (⚠ pre-S6 arithmetic — see the re-grounding box above)
 
 **Each client SQL session consumes ONE DPU byte-ring slot** for its result relay. There are exactly
 `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (**4**, `homer_service_dpu_dma.h:41`) × 2 regions = **8**.
