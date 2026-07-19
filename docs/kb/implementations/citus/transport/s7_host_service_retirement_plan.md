@@ -682,8 +682,10 @@ The parent plan's "Stage 4" = the FINAL host-service retirement, executed now th
 - **⟳ ROUND 1 DONE (citus `39bed1051`, validated 2026-07-19):** the executable EDGES of the retiring Tier-2 command
   path were gutted (see §13.2-R1 RESULT).
 - **⟳ ROUND 2 DONE (citus `a12c48667`, validated 2026-07-19):** the Tier-2 cluster + UDF are DELETED and the dead
-  decl/ABI/Makefile/SQL trimmed (see §13.3-R2 RESULT). What's LEFT for Stage 4 = **Round 3 (D7→D7′, §13.4)** only:
-  the DPU spawn allocator still range-limits to slots[16..31]; with no second claimant left it collapses to 0..31.
+  decl/ABI/Makefile/SQL trimmed (see §13.3-R2 RESULT).
+- **✅ ROUND 3 DONE + VALIDATED (2026-07-19, run `candidate-20260719-161556`; see §13.4-R3 RESULT):** the DPU
+  spawn allocator was widened from slots[16..31] to the whole 0..31 region (`DPU_SLOT_FIRST/COUNT` + `CLIENT_OWNED`
+  deleted, translations collapsed to identity, capacity 16→32). Proven live by first-spawn `slot=0`. **STAGE 4 COMPLETE.**
 - **⚠ Grep hygiene:** a stale pre-S7 agent worktree `.claude/worktrees/agent-a4b43596e72023cf3/` still contains the
   removed files (control-region mappers, COPY hooks, etc.). **It is NOT the main tree — exclude `.claude/worktrees/`
   from every grep** or it produces false "still present" hits (it fooled the first grounding pass).
@@ -826,6 +828,98 @@ no CAS; `HomerFrontendAgentBindArenaSlot` is an ARENA-slot CAS, a native KEEP ne
   `:6573`, before reaching spawn — so all-32 changes capacity/storage, not gate behavior. all-32 avoids the neutral-16
   under-spec where absolute-assign/reverse-translate/remote-address `:230`/`:7584`/`:12597` must agree on a physical subset.)
 - assert D7′ (exactly one claimant = the DPU).
+
+### 13.4-GROUNDED — concrete rebase at HEAD `a12c48667` (grep-authoritative, 2026-07-19)
+Re-grounded by grep on the actual constants; the §13.4 line numbers above were pre-R2 estimates and drifted. The
+**two index spaces** are the key: `spawnSlotIndex` (uint32_t, `homer_service_dpu_spawn.h:145`) is the GLOBAL index into
+the HOST's 32-slot `region->slots[]` — it addresses host memory at `homer_service_dpu_dma.c:12594`
+(`hostRingAddress + spawnSlotIndex*slotBytes`); `localBufferIndex` is the DPU-LOCAL index into `engine->spawnSlots[]` +
+the local spawn buffers. Today `localBufferIndex = spawnSlotIndex - DPU_SLOT_FIRST(16)` because the DPU owns only the
+UPPER HALF. **D7′ gives the DPU the whole region ⇒ `spawnSlotIndex` widens to 0..31 and the map becomes the IDENTITY
+`localBufferIndex = spawnSlotIndex`.**
+
+**Design decision (improvised, recorded):** KEEP `localBufferIndex` as an explicit identity alias
+(`localBufferIndex = spawnSlotIndex`), do NOT collapse the variable. It is SEMANTICALLY correct (host vs DPU-local
+address spaces that now coincide numerically, not the same thing) and minimizes blast radius (downstream
+`engine->spawnSlots[localBufferIndex]` / `HomerDpuDmaSpawnBufferForIndex(...,localBufferIndex)` untouched).
+
+**Two roles of the removed constants** (this is why the rebase is mechanical, not a redesign):
+- `DPU_SLOT_FIRST` (=16) is a BASE OFFSET for the global↔local map ⇒ becomes 0 ⇒ every `- DPU_SLOT_FIRST` and
+  `DPU_SLOT_FIRST +` term vanishes (identity); every `spawnSlotIndex < DPU_SLOT_FIRST` lower-bound is `< 0` on a uint
+  (always false) ⇒ drop it, keep only the upper bound.
+- `DPU_SLOT_COUNT` (=16) is a genuine CAPACITY ⇒ becomes `CITUS_REMOTE_EXEC_BACKEND_SPAWN_SLOT_COUNT` (32).
+
+**Exact edit set (grep-complete at HEAD; excl. `.claude/worktrees/`):**
+- `remote_execution_backend_protocol.h`: remove `DPU_SLOT_FIRST`/`DPU_SLOT_COUNT` (`:66`/`:67`) + their `#if`
+  static-assert (`:68-71`); remove `CITUS_REMOTE_EXEC_BACKEND_SPAWN_SLOT_CLIENT_OWNED = 1` (`:115`) — REQUEST_READY=2 /
+  RESPONSE_READY=3 stay explicitly numbered so the wire ABI is byte-identical (value 1 becomes a retired gap); refresh
+  the D7′ comment block (`:42-65`) to "widening DONE, DPU owns the whole 0..31 space". KEEP `SPAWN_SLOT_COUNT 32U`
+  (`:37`) + the arena-slot + mailbox constants.
+- `homer_service_dpu_spawn.h:95`: `HOMER_SERVICE_DPU_SPAWN_MAX_PENDING = …SPAWN_SLOT_COUNT` (was `…DPU_SLOT_COUNT`) →
+  `entries[]` (`:172`) grows to 32. Fix the `:145` "16..31" comment → "0..31".
+- `homer_service_dpu_spawn.c:230`: `entry->spawnSlotIndex = entryIndex` (was `DPU_SLOT_FIRST + entryIndex`). Fix the
+  `:218` busy-error string + `:226-229` "owns absolute slot 16+i" comment.
+- `homer_service_dpu_dma.c`: `spawnSlots[…SLOT_COUNT]` (`:974`); loops/alloc `…SLOT_COUNT` (`:1713`/`:14855`/`:14968`);
+  bounds `localBufferIndex < …SLOT_COUNT` (`:9893`/`:11644`/`:11791`). The 9 translation guards
+  (`:7577-79`/`:7757-59`/`:7909-11`/`:8014-16`/`:8128-30`/`:8231-33`/`:8266-68`/`:8300-02`/`:12580-82`): drop the
+  `< DPU_SLOT_FIRST` lower bound + rewrite the upper to `spawnSlotIndex >= …SLOT_COUNT`. The 9 translations
+  (`:7584`/`:7765`/`:7916`/`:8021`/`:8135`/`:8237`/`:8273`/`:8306`/`:12587`): `localBufferIndex = spawnSlotIndex`. The
+  consistency check `:11792`: `spawnSlotIndex == localBufferIndex` (was `== DPU_SLOT_FIRST + localBufferIndex`). The
+  host-address `:12594` uses the GLOBAL `spawnSlotIndex` UNCHANGED — it now addresses host slots 0..31 (the whole point).
+- **KEEP (verified range-agnostic):** the postmaster scan (`remote_execution_backend_bridge.c`, scans all
+  `SPAWN_SLOT_COUNT`, dispatches on `state`) + the 32-slot wire descriptor check (`homer_service_dpu_dma.c:12543`).
+- **NOTE — plan sites that grep did NOT confirm:** `homer_service_dpu_spawn.c:326/:353/:449/:467/:512` do NOT touch the
+  range constants (they loop in local entry-index space already) ⇒ no rebase there. The §13.4 estimate over-counted.
+
+**Load-bearing SAFETY claim (must refute):** D7′ correctness rests ENTIRELY on "no second claimant writes
+`region->slots[0..15]`". R2 deleted the host frontend cluster (the old CAS producer). Round 3 must PROVE nothing else
+still writes the lower half before the DPU widens into it — a stale producer would reintroduce the exact race D7′ forbids.
+
+### 13.4-R3 RESULT — EXECUTED + REFUTED CLEAN; VALIDATION PENDING (citus working tree on `a12c48667`, 2026-07-19)
+Round 3 landed as the grep-grounded identity rebase. **5 files, +86/−146** (net −60), citus-only, DPU-side spawn
+allocator. NOT yet committed — held for the full acceptance set (live-path change).
+- **What landed:** `remote_execution_backend_protocol.h` — deleted `DPU_SLOT_FIRST`/`DPU_SLOT_COUNT` + their `#if`
+  static-assert; retired `CLIENT_OWNED = 1` (kept `REQUEST_READY=2`/`RESPONSE_READY=3` explicit ⇒ wire ABI byte-identical);
+  reworded the single-claimant block. `homer_service_dpu_dma.c` — 9 bounds checks collapsed
+  `< FIRST || >= FIRST+COUNT` → `>= SPAWN_SLOT_COUNT` (the `< FIRST` lower bound was dead on a uint once FIRST=0); 9
+  translations `spawnSlotIndex - FIRST` → identity `spawnSlotIndex`; consistency check `== FIRST + local` → `== local`;
+  capacity sites (`spawnSlots[]`, facts loop, alloc, `SpawnBufferForIndex` bound, callback/retire bounds) `DPU_SLOT_COUNT`
+  → `SPAWN_SLOT_COUNT` (16→32). `homer_service_dpu_spawn.{c,h}` — `MAX_PENDING`/`entries[]` → 32, `spawnSlotIndex = entryIndex`,
+  comment/error-string fixes. `remote_execution_backend_bridge.c` — sparsified R1's verbose S7/Stage-4/Tier-2 comments
+  (comment + diagnostic-text only; the fail-fast `ereport` message reworded, no logic/control-flow change).
+- **Design decision (improvised, recorded):** kept `localBufferIndex` as an explicit identity alias
+  (`= spawnSlotIndex`) rather than collapsing the variable — it is semantically correct (host `region->slots[]` index vs
+  DPU-local `spawnSlots[]`/buffer index, two address spaces that now coincide numerically) and minimizes blast radius.
+- **KEPT (verified):** `SPAWN_SLOT_COUNT 32U`; the host `region->slots[]` was ALREADY 32 — R3 just lets the DPU use all
+  of it; the range-agnostic postmaster scan; the 32-slot wire descriptor check (`homer_service_dpu_dma.c:12524`); the
+  arena constants `ARENA_SLOT_COUNT`/`HOMER_FRONTEND_ARENA_SLOT_COUNT = 16` (a DISTINCT capacity — name-scoped rebase
+  never touched them; tree-wide sweep confirms).
+- **Diff refutation (codex-explore continuation, every claim main-agent VERIFIED):** arithmetic equivalence SOUND for all
+  9 bodies (uint predicate reduces to `< 32`; identity == hypothetical `−0`; accepting `0..15` is intentional, not a
+  dropped rejection); capacity coherence SOUND; host-address uses the global index UNCHANGED; ABI/wire layout unchanged;
+  the sole-claimant SAFETY proof holds (DPU writes REQUEST_READY+FREE, postmaster writes only RESPONSE_READY,
+  `EnsureSpawnRegionMapped` is create-once so slots 0..15 start FREE — see §13.4-GROUNDED). It caught 5 stale-COMMENT
+  issues (no logic): "all 16" API comment, my off-by-one `0..SLOT_COUNT` wording, and 3 R2-residue "host producer /
+  host-service submitter" mentions (incl. `dma.c` release comment that directly contradicted the sole-claimant
+  invariant). ALL FIVE FIXED + re-verified; final residue sweep clean (remaining "host producer" hits are the byte-ring
+  data path — a valid, current, different concept).
+- **VALIDATION: PASS** (run `candidate-20260719-161556`, full acceptance set, both ARM DPUs rebuilt+redeployed to the R3
+  snapshot). Protocol versions unchanged (backend `16U`, bridge `5U`) — matches the no-ABI-bump premise.
+  - **R3 SIGNATURE PROVEN:** first-allocated `spawnSlotIndex = 0` in BOTH the human line
+    (`DPU backend spawn begin/COMPLETED ... slot=0 ... launched_pid=1196021`) and the structured
+    `HOMER_EVENT component=dpu_spawn event=begin/complete ... slot=0`. Under the retired R2 binary this reads `slot=16`;
+    `slot=0` is direct proof the R3 widened-range allocator is the live binary (also a redeploy-provenance check). The
+    4-client repeat produced 4 more spawn/complete pairs, all `slot=0` (each freed before the next).
+  - **Sole-claimant invariant held under load:** the second-claimant alarm ("a second claimant is writing the DPU-owned
+    spawn region") was ABSENT on BOTH DPU logs over the bracketed candidate interval.
+  - GATE: 5/5 decoded abalance / 0 failed (1c debug), 20/20 / 0 failed (4c); `gate_check`+`alarm_check` PASS both.
+    Four-role basebackup PASS (`full_laps=44365`, past wrap thousands of times). DPU TCP smoke PASS (both ends `ok`).
+    Co-arming verified (bridge_generation matched, no `ATTACH rejected`); host-service absent via `/proc/PID/exe`; clean
+    preflight before/after; teardown ledgers balanced.
+  - **Runbook fix (R2 residue surfaced here):** the build command listed the `frontend-dma-smoke` target R2 DELETED
+    (a12c48667); removed from `farnet_operator_runbook.md` build list in this KB commit.
+- **Stage 4 is now COMPLETE** (R1+R2+R3 all landed+validated). The host-service retirement is done; the DPU is the sole
+  backend-spawn claimant across the whole region.
 
 ### 13.5 D7′ slot count — RESOLVED: all-32 (USER, 2026-07-19). (Rationale + blast radius folded into §13.4.)
 

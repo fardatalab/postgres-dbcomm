@@ -103,7 +103,7 @@ after that final Citus build may Citus install the archive/shared object and Pos
 cd /data/dbcomm/citus-dbcomm
 sudo -n -u dbcomm make -B -j8 all service-bin client-bin \
   dpu-comch-transport-smoke-bin dpu-tcp-transport-smoke-bin \
-  frontend-dma-smoke service-dpu-dma-smoke tuple-deform-smoke \
+  service-dpu-dma-smoke tuple-deform-smoke \
   service-dpu-dma-doca-smoke service-dpu-comch-smoke-bin \
   CPPFLAGS='-D_GNU_SOURCE'
 
