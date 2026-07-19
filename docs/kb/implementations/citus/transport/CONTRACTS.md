@@ -1061,6 +1061,38 @@ the call site. If it is not on the list, **it has not been checked.**
   external callers (`basebackup_homer.c`, `pg_basebackup.c`) were migrated to the typed API (grep-verified).
 - **ENFORCES:** the two migrated callers use only the typed API; a wrong-kind handle fails to compile.
 
+## `HomerClientOpenSelectedDpuOperation` + `HomerOpenLayouts` + `HomerOpenOps` — the ONE selected-DPU operation-open (Stage-3.5 Push B); adding a consumer kind = data row + op set, NEVER a spine edit
+
+- **MEANS:** the single dispatcher (`homer_client.c`) that opens EVERY selected-DPU session kind. It runs the shared
+  cold-setup spine ONCE (offset math → generation mint → `posix_memalign` → wire carrier pointers → bridge header →
+  `HomerClientDpuExportMmap` → build+validate+send setup → build descriptor[0]/payload → submit OPEN) and defers the
+  per-kind differences to two things only: an immutable DATA row `HomerOpenLayouts[kind]`
+  (`{ringCount, ringStorageBytes, payloadRingIndex, payloadDescriptorIndex, hasCompletionEvent, payloadDirection,
+  payloadDescriptorRole, byteRingFlags}`) and a 5-member op set `HomerOpenOps`
+  (`{opLabel, mint_identity, finalize_descriptors, build_open_request, validate_and_activate}`). The three public
+  functions (`HomerSqlTransportOpen`, `HomerClientOpenBaseBackupStreamSelectedDpu`,
+  `HomerClientOpenBaseBackupReceiveStreamSelectedDpu`) are THIN ADAPTERS: kind-specific input validation → populate
+  `HomerOpenCtx` → call the dispatcher. Behavior-preserving vs the pre-Push-B three openers (validated behavior-identical).
+- **DOES NOT MEAN** it unifies the HANDLE/CORE representation: it unifies only the OPEN path. `HomerSqlSession` stays
+  opaque-heap; `HomerBaseBackupSend`/`Recv` stay by-value carrier wrappers (see the entries above). Adding COPY as the
+  4th consumer = one `HomerOpenOpKind` + one `HomerOpenLayouts` row + one `HomerOpenOps` set; the shared spine and the
+  three cleanup tiers are NOT to be edited.
+- **DOES NOT MEAN** the shared spine may grow `if (kind==…)` branches: exactly ONE presence-conditional is allowed
+  (wiring `dpuFrontendCompletionEvent`, a field meaningful only for SQL/COPY). A monolith-with-branches is the REJECTED
+  naive switch — divergence belongs in the layout row or an op, never the spine. `mint_identity` fills three ctx values
+  (`controlDescriptorSessionUID`, `payloadDescriptorSessionUID`, `payloadDescriptorSinkId`) so the shared descriptor
+  builder stays generic (SQL 0/0 stream identity but role-7 sink `gen^0x5a5a…1`; SEND/RECV `gen`/`gen^…`; RECV role-7
+  UID = `gen`).
+- **DOES NOT MEAN** the `fail:` label always issues a transport close: cleanup is STAGED by `bufferAllocated`.
+  Pre-`posix_memalign` failures (input validation in the adapter; the `mappingBytes` overflow guard) leave the carrier
+  reset (`memset` + `fd=-1`), NO close; every POST-alloc failure runs `HomerClientCloseBaseBackupStream`. This
+  reproduces the pre-Push-B per-opener tiers. (The SQL overflow guard is DEAD on 64-bit — `size_t` never truncates the
+  ~10 MiB value — and its post-Push-B full-carrier-zero is unobservable, the caller `free`s the core without reading it.)
+- **ENFORCES:** `validate_and_activate` sets `stream->open` (SQL false, BB true — AFTER the echo-check) + `serviceSinkId`
+  + `queueDescriptor.direction` per kind: all three feed the shared close's tuple-sink CLOSE gate/route
+  (`homer_client.c` `if (open && serviceSessionId && serviceSinkId)` + `request->direction = queueDescriptor.direction`).
+  SQL's initial result credit is NOT armed here — the core calls `HomerSqlTransportArmInitialResultCredit` after open.
+
 ---
 
 ## Related

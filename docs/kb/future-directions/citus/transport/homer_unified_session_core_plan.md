@@ -1705,6 +1705,154 @@ CORRECTED as an OVERSTATEMENT (both sides recorded): the LAYOUT unifies as data,
 dispatches CLEANLY as a small open-op vtable; only the NAIVE inline-switch reads worse than 3 openers. The user chose
 the clean factoring for §13 fidelity + posterity; the extra cost is churn, not complexity.
 
+**PUSH B — CONCRETE DISPATCHER DESIGN (2026-07-19, grounded against the CURRENT post-Push-A openers: SQL
+`HomerSqlTransportOpen` `homer_client.c:1934`, SEND `HomerClientOpenBaseBackupStreamSelectedDpu` `:2450`, RECV
+`HomerClientOpenBaseBackupReceiveStreamSelectedDpu` `:2819`). All constants/line#s VERIFIED at citus `635d34d1f`.**
+
+The three openers share ~120 lines of near-identical cold-setup and diverge on exactly SIX axes. The factoring keeps
+the divergence in a tiny per-kind op-set + a data layout row; everything else is ONE shared body.
+
+- **ONE entry point** `HomerClientOpenSelectedDpuOperation(HomerOpenCtx *ctx)` (new static in `homer_client.c`)
+  replaces the three opener BODIES. The three existing public functions stay as the entry points but become THIN
+  ADAPTERS: resolve setup endpoint, run kind-specific input validation, populate `HomerOpenCtx`, call the dispatcher.
+  (SQL's `outIdentity` is filled by SQL's activate op via `ctx`.) Callers are unchanged (core `HomerSqlSessionOpen`
+  still calls `HomerSqlTransportOpen`; the Push-A typed wrappers still call the two BB openers).
+
+- **`HomerOpenLayout` (static const, one row per kind) — the DATA axis:**
+  | field | SQL | SEND | RECV |
+  |---|---|---|---|
+  | `ringCount` | 3 (`COMMAND_SETUP`) | 2 (`SETUP`) | 2 |
+  | `ringStorageBytes` | 10 MiB (`SQL_RESULT_…`) | 8 MiB (`PAYLOAD_…`) | 8 MiB |
+  | `payloadRingIndex` | 2 (`SQL_RESULT`) | 1 (`PAYLOAD`) | 1 |
+  | `payloadDescriptorIndex` | 2 | 1 | 1 |
+  | `hasCompletionEvent` | true | false | false |
+  | `payloadDirection` | DPU_TO_HOST | HOST_TO_DPU | DPU_TO_HOST |
+  | `payloadDescriptorRole` | `…DPU_TO_HOST` | `PAYLOAD_BYTE_RING` | `…DPU_TO_HOST` |
+  | `byteRingFlags` | RECEIVER_OWNED | PRODUCER_OWNED | RECEIVER_OWNED |
+
+- **`HomerOpenOps` (per-kind mini-vtable, 5 members) — the PROTOCOL axis:**
+  `{ const char *opLabel; mint_identity; finalize_descriptors; build_open_request; validate_and_activate; }`
+  - **`mint_identity(stream, ctx)`** sets `stream->serviceSessionId` + `stream->serviceSinkId` + THREE ctx descriptor
+    values so the shared descriptor builder stays generic: `ctx->controlDescriptorSessionUID`,
+    `ctx->payloadDescriptorSessionUID`, `ctx->payloadDescriptorSinkId`.
+    · SQL = {sessionId 0, sinkId 0, ctrlUID=ctx->sessionUID, payloadUID=ctx->sessionUID, payloadSinkId=gen^0x5a5a…1}
+      (SQL keeps stream sinkId 0 but the role-7 descriptor still needs gen^0x5a5a…1 — that asymmetry is exactly why
+      payloadDescriptorSinkId is a distinct ctx value, `:2253` vs stream 0 `:2076`).
+    · SEND = {sessionId gen, sinkId gen^0x5a5a…1, ctrlUID 0, payloadUID 0, payloadSinkId=stream->serviceSinkId}.
+    · RECV = {sessionId gen, sinkId gen^0x5a5a…1, ctrlUID 0, payloadUID=gen (`:3054`/`:3107`), payloadSinkId=serviceSinkId}.
+  - **`finalize_descriptors(stream, descriptor, ctx)`** — the ONLY structural per-kind descriptor work.
+    · SQL builds the role-6 completion descriptor at index 1 (`:2208-2227`) + the export layout sanity check (`:2258`).
+    · SEND / RECV = **NULL** (no-op): the shared builder already stamped payload UID/sinkId from ctx, so RECV needs
+      nothing extra and SEND leaves them 0. (This is the payoff of pushing UID/sinkId into ctx.)
+  - **`build_open_request(stream, request, ctx)`** — fills the role-1 OPEN slot: SQL COMMAND_SESSION+relay+peer+SQL
+    sessionKey (`:2292-2317`); SEND TUPLE_SINK+SEND+geometry+peer+sinkKey+placement+tag (`:2686-2727`); RECV
+    TUPLE_SINK+RECEIVE+peerEndpoint.protocolVersion-only+sessionUID=gen+sinkKey+placement+tag (`:3088-3133`).
+  - **`validate_and_activate(stream, response, ctx, err)`** — SQL adopts identity→outIdentity + id/index checks +
+    builds queueDescriptor from scratch (direction RECEIVE) + `open=false` + nextSeq/ordinal (`:2327-2360`); SEND
+    echo-check + copy queueDescriptor + override + producer-seq + `open=true` + `PublishBaseBackupTail(0)` (`:2736-2768`);
+    RECV echo-check + copy queueDescriptor + override + frontier/epoch reset + `open=true` + `PublishReceiveConsumedHead(0)`
+    (`:3142-3182`). Returns false→dispatcher runs the shared `HomerClientCloseBaseBackupStream` + returns false.
+    NB SQL result-credit is armed SEPARATELY by `HomerSqlTransportArmInitialResultCredit` `:2371` (core calls it after
+    both decode identities init) — NOT in activate; preserved.
+
+- **`HomerOpenCtx`** carries: kind, `stream`, `*layout`, `*ops`, resolved endpoint (setupHost/port/timeoutMs/pci), the
+  per-kind inputs (`intent`+`sqlParams`+`sessionUID`+`outIdentity` for SQL; `bbOptions`+`expectedRecordCapacityBytes`
+  for BB), and the three descriptor-identity values mint_identity fills. Fat cold-path ctx (most fields unused per
+  kind) — acceptable, this is a control-path open.
+
+- **Shared prologue body** (dispatcher), the genuinely-unifiable spine, data-driven by `layout`:
+  offsets (control slot → optional completion event → byte-ring control → payload storage → mappingBytes;
+  `hasCompletionEvent` is the ONE conditional) → memset+fd/selectedDpu + mint gen/instanceId → `ops->mint_identity` →
+  (SQL) mappingBytes overflow check → posix_memalign + wire line pointers (incl. completion event iff present) →
+  byteRingControl init (flags from layout) → bridgeHeader (ringCount from layout) → `HomerClientDpuExportMmap` → size
+  + calloc + setup header + memcpy bridgeHeader → build desc[0]=control (sessionUID=ctx->controlDescriptorSessionUID)
+  + desc[payloadDescriptorIndex]=payload (direction/role from layout; sinkId/UID from ctx) → `ops->finalize_descriptors`
+  → mmapExportEntry + memcpy + validate + `HomerClientDpuSendSetupMessage` → `ops->build_open_request` →
+  `HomerClientDpuSubmitControlRequest(…, ops->opLabel, …)` → `ops->validate_and_activate`. Every error leg runs the
+  SAME `HomerClientCloseBaseBackupStream(stream, NULL, 0)` + return false the three openers use today.
+
+- **Behavior-preservation checklist (must hold EXACTLY):** the `open` flag + serviceSinkId gate the shared close's
+  tuple-sink CLOSE at `homer_client.c:4280` (SQL open=false/sinkId=0 ⇒ NO tuple-sink close, uses the separate
+  `HomerSqlTransportLifecycleClose`; SEND/RECV open=true/sinkId=gen^x ⇒ tuple-sink close). Identity direction (SQL
+  adopt-from-response vs BB pre-mint+echo-check). Descriptor sessionUID stamping (SQL all descs = passed-in; RECV
+  role-7 = minted gen; SEND none). RECV's peerEndpoint.protocolVersion-only (`:3097`, else "peer endpoint protocol
+  version mismatch"). SQL's role-7 stays session-owned (serviceSinkId 0 on the stream).
+
+- **Reuse a shared env helper** `HomerClientResolveSetupEndpoint(&host,&port,&timeout,&pci)` for the identical
+  getenv boilerplate (SQL then applies its `openParams->docaDevicePci` override — the only per-kind endpoint diff).
+
+- **Risk:** MEDIUM (touches all 3 open paths). Mitigation: behavior-preserving; validate four-role basebackup
+  (both BB kinds) + gate (SQL) + smoke. **RETROACTIVE-STOP TRIGGER:** if the callbacks turn into "3 openers wearing a
+  trench coat" (shared body full of `if (kind==…)`), stop and bring back to the user — the value is the factoring, and
+  a monolith-with-branches is the rejected naive switch.
+
+**PUSH B — DESIGN REFUTATION #2 (2026-07-19, codex-explore on the CONCRETE design; every claim VERIFIED by me in
+code). Verdict: SOUND, needs the corrections below — NOT a redesign. Both sides recorded.**
+- **Descriptor factoring CONFIRMED sound** (control + payload collapse to shared builder + ctx; only SQL's role-6
+  completion desc + its `:2258` sanity check are per-kind). `ringId`/`ringBytes`/`hostRingOffset` differ but are
+  LAYOUT-DERIVED outputs (ring index + mappingBytes + payloadStorageOffset), not new axes. `finalize_descriptors`
+  NULL-for-BB confirmed sufficient.
+- **CORRECTION 1 — staged cleanup (the "every error leg runs the same close" claim was FALSE).** Current openers use
+  THREE tiers: (a) input validation → plain `return false`, carrier untouched (now in the ADAPTER, pre-dispatch);
+  (b) the mappingBytes overflow check (`:2091`) + `posix_memalign` failure (`:2099`/`:2557`/`:2931`) → `memset(stream,0);
+  stream->fd=-1; return false` WITHOUT close; (c) every POST-alloc failure → `HomerClientCloseBaseBackupStream(stream,
+  NULL,0); return false`. Dispatcher implements (b)/(c) via a `bufferAllocated` flag + single `fail:` label; adapter
+  owns (a).
+- **CORRECTION 2 — SQL zeros `outIdentity` early (`:1990`), before later validation failures.** The SQL adapter must
+  `memset(outIdentity,0)` right after the null-arg check and before the rest of validation, so any validation-failure
+  return leaves it zeroed (current contract). Not an activation-only side effect.
+- **CORRECTION 3 — per-kind diagnostic TEXT.** Alloc/setup-size/setup-alloc/validate error strings differ per kind
+  (`:2101` "SQL" vs `:2559` "basebackup" vs `:2933` "receive"). Preserve distinguishability by TEMPLATING via
+  `ops->opLabel` (e.g. `"could not allocate selected-DPU %s export buffer"`), not by 3× duplication. INTENTIONAL minor
+  wording change (cold-path failure text only); flag in the commit summary.
+- **CORRECTION 4 — teardown-load-bearing state to add to the preservation checklist:** `queueDescriptor.direction`
+  ALSO routes the tuple-sink CLOSE as SEND vs RECEIVE (`:4316`, not just the `open`+ids gate `:4280`); `selectedDpu`
+  (`:4261`), `dpuSetupAck.bridgeGeneration` (`:1364`/`:1396`), `dpuDocaMmap` (`:4350`), `dpuClientInstanceId`
+  (setup-CLOSE payload `:1407`) — all SHARED-prologue state (no per-kind divergence), but must be set before any
+  post-alloc failure so the shared close behaves.
+- **CORRECTION 5 — trench-coat repair (was 4 shared-body branches, over the 1–2 trigger → now 1).** Make the
+  representability/overflow check UNCONDITIONAL (harmless for BB, always fits); model completion bytes as
+  `hasCompletionEvent ? sizeof(HomerDpuBridgeFrontendCompletionEvent) : 0` for a BRANCHLESS offset chain; install
+  non-NULL no-op `finalize_descriptors` for SEND/RECV. Only the completion-EVENT-pointer wiring stays conditional
+  (the field is meaningless for BB) — 1 branch, within trigger. Trench-coat averted; proceed (no user stop).
+- **PRESERVED-AS-IS (current behaviors the refutation surfaced; NOT changed by Push B):** (i) a POST-OPEN response
+  mismatch leaves `open=false`, so cleanup runs setup-close but NOT tuple-sink CLOSE (SEND/RECV set `open=true` only
+  AFTER the echo-check passes, `:2737`→`:2759` / `:3143`→`:3170`) — activate must keep check-then-set ordering;
+  (ii) `HomerClientCloseBaseBackupStream` may fail while deliberately RETAINING the mmap/buffers (`:4326`/`:4350`), and
+  open callers do NOT retry cleanup after an open failure (`basebackup_homer.c:360`, `pg_basebackup.c:2424`; SQL frees
+  its core immediately, `homer_session_core.c:274`) — the dispatcher calls the SAME close, so identical, no worsening.
+- **DOC FIX (refuter caught §13.1 staleness):** §13.1 still said every typed handle aliases one internal
+  `HomerSession`; Push A made the BB handles BY-VALUE carrier wrappers (`remote_execution_client.h`), and Push B
+  unifies operation-OPEN, not the core representation. §13.1 corrected below.
+
+**PUSH B IMPLEMENTED + VALIDATED GREEN (2026-07-19, run `candidate-20260719-113326`, citus `635d34d1f` + the Push-B
+diff — landed as citus `f6f9c1734`; postgres `fc01c8d5268`).** The three openers are now the shared dispatcher `HomerClientOpenSelectedDpuOperation`
+(`homer_client.c:2397`) + the `HomerOpenLayouts` table (`:1983`) + per-kind `HomerOpenOps` sets (SQL/SEND/RECV,
+`:2379-2386`); the three public functions are thin adapters (`HomerSqlTransportOpen:2640`, SEND `:2808`, RECV `:2925`).
+Net **−186 lines** (731 ins / 917 del). ONE presence-conditional survives in the shared spine (completion-event pointer
+wiring, `:2466`) — within the trench-coat trigger. Both refutation passes cleared; every load-bearing field verified
+in code by the main agent. Comment sweep: fixed stale openers-not-yet-written notes + line pointers in
+`homer_session_transport.h` (HomerSqlOpenParams / HomerSqlTransportIdentity / the decl comment) and `homer_session_core.c:232`.
+- **Four-role basebackup — PASS, BEHAVIOR-IDENTICAL** (exercises BOTH refactored BB openers through the dispatcher):
+  `full_laps=44364` EXACT match to the Push-A reference, 7.07 s (vs ~7.05), 23.26 GB, CLOSE_ACK, frontier ledgers
+  balanced on all 6 generations across BOTH DPUs, teardown ledgers balanced both DPUs.
+- **Gate — PASS** (SQL opener through the dispatcher): 5/5, 0 failed, 5 distinct abalance, spawn pair correlated,
+  `peer_host_spawn_retired` absent, no host `citus_tuple_sink_service`, transport line present once (`-c1 -j1 -t5`
+  debug gate). Co-arming precondition met (matching `bridge_generation`, no `ATTACH rejected`).
+- **DPU TCP smoke — PASS on retry** (flaked once on a connect-before-listen listener race — client refused at :9727
+  while the server log's `listening` line landed after the connect; the retry polled `ss -ltn` until the listener was
+  up, then passed within ~100 ms). ROOT-CAUSE (main agent): environment timing, NOT Push B — the smoke is a standalone
+  host↔DPU DMA/TCP binary that does not exercise the openers, and the smoke is only conditional-mandatory for DMA/
+  byte-ring/bridge-ABI changes, none of which Push B is. Foreign 5432 confirmed untouched (postmaster predates the run).
+- **Two intentional/harmless divergences (NOT defects):** (a) the SQL mappingBytes-overflow leg now fully zeroes the
+  carrier via the shared `fail:` label instead of leaving it partially populated — a DEAD branch on 64-bit Linux
+  (`size_t` never truncates the ~10 MiB value) and unobservable (the SQL caller `free`s the core without reading the
+  carrier); (b) diagnostic/submit labels are now templated via `ops->opLabel` ("SQL session"/"basebackup"/"basebackup
+  receive"), so a few error strings drop words ("client"/"stream") — the originals were themselves inconsistent across
+  sites, so exact per-string fidelity was unachievable; the labels stay per-kind distinguishable.
+- **⇒ Stage 3.5 COMPLETE.** The unified session model is proven across THREE consumer op-kinds (SQL command session +
+  basebackup SEND + basebackup RECEIVE), all sharing one operation-open, one close, one transport substrate.
+
 ---
 
 ## 13. The unified intent-driven session interface (designed against SQL + basebackup, 2026-07-18)
@@ -1714,11 +1862,17 @@ build toward. The owner's design intent: **one Homer session abstraction — the
 user will do, and gates which rings bind and which ops are legal.** SQL is the first consumer (Stage 3), basebackup
 the second (Stage 3.5), COPY the third (Stage 5).
 
-### 13.1 Model — one core, typed opaque handles, two-part open (intent + operation spec)
-- **One internal core `HomerSession`** (the implementation) + **DISTINCT opaque handle types per kind**
-  (`HomerSqlSession`, `HomerBaseBackupSend`, `HomerBaseBackupRecv`, later `HomerCopy*`), all aliasing the core.
-  Each op takes its kind's handle → wrong-op-wrong-kind is a COMPILE error (owner decision); thin typed forwarders
-  cast to the core; zero runtime cost. Unified implementation + compile-time legality.
+### 13.1 Model — typed handles, two-part open (intent + operation spec)
+- **DISTINCT typed handle types per kind** → wrong-op-wrong-kind is a COMPILE error (owner decision); thin typed
+  forwarders; zero runtime cost. Unified implementation + compile-time legality.
+- **⚠ HANDLE REPRESENTATION IS NOT UNIFORM (as-built, post-Stage-3/3.5 — corrects the original "all alias one core"):**
+  `HomerSqlSession` is an OPAQUE HEAP handle hiding a genuinely-private `struct HomerSession` (SQL command/completion/
+  result-decode A-state). The BB handles `HomerBaseBackupSend`/`HomerBaseBackupRecv` are BY-VALUE one-field wrappers
+  over the shared `HomerClientBaseBackupStream` carrier (`remote_execution_client.h`) — BB has NO private core to hide
+  (its substrate IS the carrier, public because the SQL core embeds it by value), and its close RE-ENTERS via
+  `PG_FINALLY`, so a heap-Free-in-close would be a UAF (Push-A rationale, §12.5b). So the compile-time op-legality is
+  uniform, but the STORAGE model is per-kind: opaque-heap for SQL, by-value-carrier for BB. **Push B unifies the
+  operation-OPEN path (§12.5b-impl Push B), NOT the handle/core representation** — those stay as Push A left them.
 - **Two-part open (①'s design, INDEPENDENTLY VALIDATED by basebackup):** a compat **INTENT**
   (`RemoteExecutionSessionIntentSpec`, the reuse/compat domain, `opKind` ∈ {SQL_COMMAND, CLIENT_SQL_SESSION,
   BASE_BACKUP, COPY_*}) **+ a per-kind OPERATION-OPEN spec** (per-op bootstrap: direction, payload/max-record
