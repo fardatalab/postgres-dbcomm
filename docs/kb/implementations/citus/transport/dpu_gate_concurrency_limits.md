@@ -22,10 +22,18 @@ need more. The engine-fatal that appears above the cap is **gated behind the cap
 > **Everything below about the engine-fatal blast radius and the two parked defects remains ACCURATE and is why
 > headroom still matters.**
 
-## The limit (⚠ pre-S6 arithmetic — see the re-grounding box above)
+## The limit
 
-**Each client SQL session consumes ONE DPU byte-ring slot** for its result relay. There are exactly
-`HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (**4**, `homer_service_dpu_dma.h:41`) × 2 regions = **8**.
+**CURRENT (post-S6, authoritative):** each client SQL session consumes **TWO** DPU byte-ring slots (LANDING +
+SOURCE) out of `HOMER_DPU_BYTE_RING_POOL_REGIONS` (2) × `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (8) = **16 per DPU**
+⇒ the gate still caps at **8 clients** (16 ÷ 2), and `-c8` is **exactly 16/16 with ZERO headroom**. Full derivation
+(including the mixed pgbench+basebackup case): the `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` entry in
+[`CONTRACTS.md`](./CONTRACTS.md).
+
+> ⚠ **The original sentence read:** *"Each client SQL session consumes ONE DPU byte-ring slot … 4 × 2 regions = 8."*
+> Both halves changed in S6 Stage 2 (`a5e7d2fdb`) — slots/region 4→8 AND per-session 1→2 — so the **cap stayed 8
+> while the arithmetic behind it became wrong.** The `all 8 slots in use` strings quoted below are historical log
+> excerpts from the pre-S6 build; today the same message would read `all 16 slots in use`.
 
 | clients | result |
 |---|---|

@@ -290,7 +290,10 @@ NEXT, in order:
 ALSO OUTSTANDING (unrelated to this doc's two problems):
 - CLAUDE.md's basebackup example `slots=8,bytes=8388608` has been broken since `7a2eaed53` (July 6).
 - COPY hang bisect across `7a2eaed53..a3cdd5f3c` (Problem 2).
-- Byte-ring pool slot budget: raise `SLOTS_PER_REGION` to 8 before any multi-client run (pool plan 2.6).
+- ~~Byte-ring pool slot budget: raise `SLOTS_PER_REGION` to 8 before any multi-client run (pool plan 2.6).~~
+  **✅ DONE in S6 Stage 2 (`a5e7d2fdb`): `SLOTS_PER_REGION` is now 8 ⇒ 16 slots/DPU.** ⚠ The same change also made a
+  tuple session take **2** slots (LANDING+SOURCE), so do NOT read this as "8× more clients". Derivation:
+  the `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` entry in [`CONTRACTS.md`](./CONTRACTS.md).
 
 ### Semantics pass RESULTS (July 9, 2026) — tiling is dead, and the split may be INNOCENT
 

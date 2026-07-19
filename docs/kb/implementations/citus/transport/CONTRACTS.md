@@ -554,8 +554,43 @@ the call site. If it is not on the list, **it has not been checked.**
 - **TELL THEM APART BY HOW THEY FAIL:** session table → `"peer service ran out of free command sessions"`
   *(a peer **response** — **never logged on the DPU**; grep the **client**)*. Machine candidate set → a **30 s
   command timeout**. Selected-session table → `"selected-DPU session table is full"` **on node A**.
-- **NOT 64:** DPU byte-ring pool = **8** (`homer_service_dpu_dma.h:41`); frontend arena = **16** slots; import
-  table = **1024**.
+- **NOT 64:** DPU byte-ring pool = **16 per DPU** (see the derivation entry below); frontend arena = **16** slots;
+  import table = **1024**.
+
+## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
+
+- **MEANS:** the DPU byte-ring pool is a **fixed, per-DPU** set of slots:
+  **`TOTAL = HOMER_DPU_BYTE_RING_POOL_REGIONS × HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` = 2 × 8 = `16`**
+  (`homer_service_dpu_dma.h:40-42`). Every data-carrying byte ring occupies one slot.
+- **DOES NOT MEAN** the number of concurrent *sessions*. Sessions consume a **variable** number of slots by kind —
+  this is the single most-mistaken thing here:
+
+  | consumer | slots on the RECEIVER DPU | slots on the SENDER DPU |
+  |---|---|---|
+  | one `--homer-dpu` pgbench/tuple session | **2** — LANDING (`tuple_sink_service_process.c:19069`) **+** SOURCE (`:19100-19107`, only for `HOMER_PAYLOAD_OBJECT_FAMILY_TUPLE_VIEW_BATCH`) | 1 — MIRROR (`:19491`) |
+  | one basebackup session | **1** — LANDING only (landing==source; NOT `TUPLE_VIEW_BATCH`) | 1 — MIRROR |
+
+- **⇒ THE DERIVATION (use this, do not re-count by hand):** on the DPU that is the **receiver** for your workload,
+  **`slots_needed = 2 × (concurrent pgbench/tuple sessions) + 1 × (concurrent basebackup sessions)`**, and this must
+  stay **< 16** with margin. Worked: `-c4` + one basebackup = `2×4 + 1` = **9 / 16**. `-c8` alone = **16 / 16 — ZERO
+  headroom, do not run it alongside anything.** Prefer `-c4`.
+  ⚠ In the standard two-node topology **farnet0 is the receiver for BOTH** the gate and the basebackup, so it is the
+  DPU that runs out first — budget against farnet0.
+- **RULE IT CARRIES — EXHAUSTION IS NOT GRACEFUL.** A session that finds no free slot does not merely fail: the
+  refusal path sets `engine->fatalError = true` (`homer_service_dpu_dma.c:13296`), which kills command-pull,
+  byte-ring pull and PE drain for **EVERY session on that DPU**. There is no recovery short of a service restart.
+  So the budget is a **hard design constraint**, not a soft target.
+- **RAISING IT:** bump `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` (`homer_service_dpu_dma.h:42`) and **rebuild BOTH
+  DPUs**. ⚠ Raising the cap alone does not fix the blast radius or the unclean-refusal state — see
+  [`dpu_gate_concurrency_limits.md`](./dpu_gate_concurrency_limits.md).
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** the three bind sites above; the refusal + its self-naming error
+  (`homer_dpu_byte_ring_pool.c:195-196`, *"all %u slots in use; raise HOMER_DPU_BYTE_RING_SLOTS_PER_REGION /
+  regions"* — the DPU log names its own knob, so **read the DPU log before the source**); and any validation that
+  sizes a concurrent workload (the MIXED workload in `AGENTS.md`).
+- **⚠ TEMPTING WRONG MOVE:** deriving from older docs that say *"4 slots/region × 2 = 8, one slot per session, cap
+  8 clients."* **Both halves changed in S6 Stage 2 (`a5e7d2fdb`)** — slots/region went 4→8 *and* a tuple session
+  went 1→2 slots — so the client cap coincidentally stayed ~8 while the arithmetic behind it became wrong. Always
+  derive from the two macros + the per-kind table above.
 
 ## Q: "The client failed. Which DPU log do I read?" — **BOTH. ALWAYS.**
 
