@@ -1546,6 +1546,165 @@ shared sink-lease from Stage 3), and the BASE_BACKUP operation-open spec (direct
 (§13.4). Design is grounded in the VERIFIED basebackup map (§13). **Validation: four-role basebackup (the
 mandatory transport-acceptance workload) + gate + DPU TCP smoke.**
 
+#### 12.5b-impl — CONCRETE DESIGN, re-grounded 2026-07-19 (codex-explore basebackup map, current HEADs citus `31cc8edd4` / postgres `db6a17e90ce`)
+
+**Grounding findings that reshaped the scope (all VERIFIED):**
+- BB ALREADY shares the substrate post-Stage-3: the SAME `HomerClientBaseBackupStream` carrier, the SAME cold leaves
+  (`HomerClientDpuExportMmap` [now the Push-2 shared device], setup-TCP `HomerClientDpuSendSetupMessage`, role-1
+  `HomerClientDpuSubmitControlRequest`, dataplane `HomerClientCloseBaseBackupStream`), and the SAME sink `HomerByteRingSinkDrain`.
+- The **producer plane already EXISTS as functions**: `HomerClientReserveBaseBackupRecordForObjectPayload`
+  (`homer_client.c:3804`, rejects a 2nd live reservation) + `HomerClientSubmitBaseBackupRecord` (`:4031`, commit =
+  publish immediately, `nextSequence++`). SEND sets `carrier->serviceSessionId = dpuBridgeGeneration` (`:2553`).
+- The **bulk-consume already drains via the shared sink**: `HomerClientPollBaseBackupReceive` is a FUSED pass
+  (resolve role-7 frontier from the credit line → shared `HomerByteRingSinkDrain` `:3343` → publish consumed-head
+  credit if moved). Terminal split matches §13.4 (FAILED credit-line drain-independent `:3413`; CLOSED drain-gated `:3427`).
+- **⚠ BB-recv is a BLACKHOLE byte-counter** (`HomerClientBaseBackupDeliverReceiveObject:3245` "payload discarded;
+  the real object-byte count is the core's tally") — it validates the envelope + ordinal inline and counts, it does
+  NOT decode/reconstruct. So it needs NO lease-return and NO deferred credit (the reasons SQL needs the split
+  borrow/release plane). The plan's "bulk-consume plane (borrow/release/credit)" for BB is a re-expression of the
+  existing `Drain`, at zero functional gain.
+- Ring binding VERIFIED (§13.2): SQL role-1/6/7 (`:2183/:2216/:2244`); BB-SEND role-1 + role-4 HOST_TO_DPU
+  (`:2634/:2651`); BB-RECV role-1 + role-7 DPU_TO_HOST (`:3010/:3033`). THREE duplicated openers currently determine
+  the ring set. BB handles do not exist yet (`homer_session_core.h:20` names the future tags only).
+
+**SCOPE DECISION (USER, 2026-07-19): Option B = typed-handle WRAP + unified OPERATION-OPEN. The bulk-consume lease
+plane (plan-as-written) is SCOPED OUT.** Both sides recorded:
+- **Chosen (B):** (1) opaque `HomerBaseBackupSend`/`HomerBaseBackupRecv` handles (compile-time op-legality across
+  kinds — a SEND handle cannot call consume ops; a BB handle cannot call SQL command ops); (2) ONE unified two-part
+  operation-open (§13.1 intent + op spec) that binds the ring set by opKind+direction, replacing the 3 duplicated openers.
+- **Scoped OUT (was plan §12.5b "bulk-consume plane"):** splitting BB-recv's fused poll into an explicit
+  borrow/release/credit bracket. REASON: BB-recv decodes NOTHING (blackhole counter), so the lease/deferred-credit
+  machinery buys no function; it only re-expresses the existing `Drain` while touching the most-bug-historied bulk
+  path (run-39 "reject every row forever"). The multi-consumer proof is delivered by the typed handles + unified open;
+  the lease plane is not needed to prove generalization for a command-less bulk consumer. (If a future consumer needs
+  to DECODE the bulk stream — e.g. a real disk-writing pg_basebackup, or COPY in Stage 5 — the split is revisited then.)
+
+**TWO PUSHES (mirrors Stage 3's Push-1/Push-2 split — behavior-preserving first, then the structural change):**
+
+**PUSH A — typed-handle wrap (behavior-preserving). HANDLE MODEL = BY-VALUE DISTINCT-TYPE (USER DECISION
+2026-07-19; supersedes the earlier "opaque heap" framing + the (a)/(b) core sub-decision).** WHY BB differs from
+SQL: SQL's opaque-heap handle hides a genuinely-PRIVATE `struct HomerSession`; BB has NO private struct to hide —
+its "core" is the `HomerClientBaseBackupStream` carrier, which MUST stay in a public header because the SQL core
+embeds it by value (`homer_session_core.c:125`). So opaque-heap for BB would need a header split (to hide a
+carrier that's already public) PLUS the re-entrant-close heap-ownership hazard (finding 2), for near-zero opacity
+payoff. By-value distinct-type gives the SAME compile-time op-legality with none of that.
+- **Model:** two DISTINCT one-field struct wrappers in the public header —
+  `struct HomerBaseBackupSend { HomerClientBaseBackupStream s; }` and
+  `struct HomerBaseBackupRecv { HomerClientBaseBackupStream s; }`. Callers (`bbsink_homer` /
+  `pg_basebackup`'s `RunHomerReceiveConsume`) embed the wrapper BY VALUE exactly where the carrier lives today (NO
+  heap, NO Free contract, NO header split). The re-entrant `PG_FINALLY` close works UNCHANGED (storage persists,
+  freed with the sink's palloc / the stack frame).
+- **Op-legality:** SEND ops take `HomerBaseBackupSend *`, RECV ops take `HomerBaseBackupRecv *` (distinct C types
+  ⇒ wrong-op-wrong-kind is a COMPILE error). Each typed op forwards to the existing carrier-typed logic via `&h->s`.
+  Op-legality is delivered at the CALLER boundary: the two migrated callers (the ONLY external callers, VERIFIED by
+  grep) use the typed API, so a wrong-kind handle fails to compile. The carrier-typed BB logic functions stay as-is
+  (additive Push A — lowest risk); STATIC-izing them to enforce against a (currently non-existent) internal bypass is
+  a deferred hardening, not done here.
+- **Distinct typed close/abort per direction** (`HomerBaseBackupSendClose`/`Abort`, `HomerBaseBackupRecvClose`/`Abort`)
+  forwarding to the shared `HomerClientCloseBaseBackupStreamInternal(&h->s, abortReset,…)`.
+- **Blast radius:** citus `homer_client.c` (add typed wrappers; static-ize the carrier-typed BB logic) +
+  `remote_execution_client.h` (wrapper structs + typed decls) + postgres `basebackup_homer.c`
+  (`bbsink_homer.stream` → `HomerBaseBackupSend`) + `pg_basebackup.c` (`RunHomerReceiveConsume` → `HomerBaseBackupRecv`).
+  The shared carrier struct is UNCHANGED. Preserve: the process-global interrupt hook (do NOT clear on a failed
+  close), the sink's reservation bookkeeping, the blackhole-mode rejection.
+- **Validation:** four-role basebackup (PRIMARY — directly exercises both BB handles) + gate (prove SQL unaffected)
+  + DPU TCP smoke.
+
+**PUSH A IMPLEMENTED + VALIDATED GREEN (2026-07-19, run `candidate-<push-A>` on base citus `31cc8edd4` +
+postgres `db6a17e90ce` + the uncommitted Push-A diff).** By-value typed wrappers as designed; BOTH trees compiled +
+installed clean (citus `make` exit 0; postgres `ninja` recompiled `basebackup_homer.c.o` + `pg_basebackup.c.o` exit 0
+— the mechanical migration is correct). Results:
+- **Four-role basebackup — PASS, BEHAVIOR-IDENTICAL** (the whole point): `full_laps=44364` EXACT match to the last
+  green run (`candidate-20260719-031152`), 7.05s vs ~7.06s, delivered ~23.26 GB, CLOSE_ACK on the receiver, balanced
+  `posted==retired+flushed` frontier + balanced teardown ledgers on BOTH DPUs. Both typed handles' underlying carrier
+  ran the real DMA/byte-ring path (not a fallback). (Delivered-byte delta ~107 KB = live data-dir size variance, NOT
+  a wire invariant.)
+- **Gate — PASS** (SQL unaffected by the BB-side wrap): 5/5, 5 distinct abalance, `spawn_pairs=1`,
+  `peer_host_spawn_retired` absent. Ran `-c1 -j1` (validator's sound call: the `-c4` concurrency proof is Component
+  E's, which Push A does not touch — a behavior-preserving BB wrap needs only the SQL path to still work end-to-end).
+- **DPU TCP smoke — PASS**; Component-E shared-device markers absent throughout; DPU setup listener live post-gate;
+  no DPU/bridge rebuild needed (version still 5). Co-arming produced the documented transient status=4 then clean
+  acceptance (hazards §11).
+- **⇒ Push A is validated; op-legality (compile-time SEND≠RECV) delivered with zero behavior change. Ready to commit.**
+
+**PUSH B — unified operation-open dispatcher (WELL-FACTORED; USER DECISION 2026-07-19).** Replace the 3 duplicated
+openers (`HomerSqlTransportOpen` / `HomerClientOpenBaseBackupStreamSelectedDpu` / `…ReceiveStreamSelectedDpu`) with
+ONE operation-open, structured as **shared prologue + layout table + a per-opKind OPEN-OP set** — NOT a naive inline
+`switch`. Concretely:
+- **Shared PROLOGUE** (the genuinely-unifiable cold setup): `posix_memalign` the export buffer + `HomerClientDpuExportMmap`
+  (Push-2 shared device) + `HomerClientDpuSendSetupMessage` (setup-TCP). One helper, called by all kinds.
+- **Layout TABLE** (data-driven, per opKind+direction): `{roles[], ringBytes, lineCount, hasCompletionEvent,
+  direction}` drives the descriptor-row construction (SQL 1/6/7 + 10 MiB + completion event; SEND 1/4 + 8 MiB;
+  RECV 1/7 + 8 MiB). This layer IS pure data — collapses cleanly.
+- **Per-kind OPEN-OP set** (the irreducibly-per-kind PROTOCOL, dispatched not merged — a small mini-vtable):
+  `{ mint_identity, build_open_request, validate_open_response, activate_post_open }`. SQL = {adopt-from-response
+  (serviceSessionId 0 pre-OPEN), COMMAND_SESSION+relay, validate index + core-adopt, open=false + arm result credit};
+  SEND = {pre-mint from dpuBridgeGeneration, TUPLE_SINK+geometry/dir/sinkId/tag/key/placement, validate echo + copy
+  queue descriptor, init producer seq + open=true + publish tail 0}; RECV = {pre-mint, TUPLE_SINK RECEIVE + role-7
+  binding + peerEndpoint.protocolVersion set, validate echo, init frontier + open=true + publish consumed-head 0}.
+- **DECISION RATIONALE (user):** cleaner for posterity + the true §13 capstone (one operation-open realizing the
+  intent-driven model), and not overly complex given the protocol is already factored into a per-kind op-set. The
+  payoff is architectural (§13 fidelity, one entry point); the naive inline-switch (which reads worse than 3 openers)
+  is explicitly REJECTED — the value is entirely in the factoring.
+- **Risk:** MEDIUM — touches all 3 open paths; the layout table + each open-op must reproduce its opener's CURRENT
+  behavior EXACTLY (identity direction, wire union member, response checks, post-open publication, the `open` flag
+  which gates whether shared close issues the tuple-sink CLOSE `homer_client.c:4280`). Behavior-preserving.
+- **Validation:** four-role basebackup + gate + smoke (all three opKinds flow through the one dispatcher).
+
+**Stale §13 items the grounding corrected (fixed in §13 below):** §13.5's "`receiveExpectedOrdinal` is BB
+kind-specific A-state" — WRONG, Stage-3 code keeps it carrier-resident shared-B (basebackup + SQL share it for
+wrap-gap detection); §13.3's "both are fused" — stale (SQL now borrows/releases directly; BB stays fused via `Drain`);
+§13.5's carrier-name "misnomer" note — stale (the header now calls it "the transport substrate the core embeds").
+
+**DESIGN REFUTATION (2026-07-19, codex-explore on the Push-A/Push-B design; findings VERIFIED by me in code). Both
+sides recorded. Push A SOUND with corrections; Push B BROKEN as scoped.**
+
+Push A corrections (accepted):
+- **Core-sharing (a) is ILLUSORY → use per-kind handles over the CARRIER (was leaning (a) "reuse struct HomerSession").**
+  VERIFIED `HomerSqlSessionOpen`/`Close` are entirely SQL-specific (identity adoption `homer_session_core.c:281`,
+  credit arm `:294`, `CLIENT_SQL_SESSION_CLOSE` `:424`), so reusing the SQL core buys only `malloc` + carries dead
+  SQL fields. BB handles become **distinct opaque tags aliasing the heap-owned `HomerClientBaseBackupStream` carrier
+  directly** (the carrier IS BB's whole substrate; no `struct HomerSession`, no new core). Public ops cast the tag →
+  `HomerClientBaseBackupStream *` inside `homer_client.c` (the carrier layout is PUBLIC there, unlike the private SQL core).
+- **⚠ BLOCKER — retry-aware close ownership (was "Close frees the handle").** VERIFIED `HomerSqlSessionClose` frees
+  UNCONDITIONALLY (`homer_session_core.c:531`, even after a failed dataplane close) — safe ONLY because pgbench never
+  re-enters close. BB is the OPPOSITE: `bbsink_homer_end_backup`'s failed graceful close raises ERROR before
+  `stream_open=false`, so `PG_FINALLY`→`bbsink_homer_cleanup` re-enters `HomerClientAbortBaseBackupStream` on the SAME
+  carrier (`basebackup_homer.c:468/485/500`); and BB close can return false while RETAINING the carrier for retry
+  (unacked CLOSE_ACK `homer_client.c:4326`; the component-E mmap-destroy tombstone `:4361`). So **BB Close must NEVER
+  free.** CONTRACT: Open allocates the carrier + returns the typed handle; the CALLER holds it through the (possibly
+  re-entrant) close lifecycle; a SEPARATE terminal `…Free`/`…Destroy` frees it ONCE, called by the owner AFTER all
+  close/abort attempts (bbsink cleanup / pg_basebackup tail). Copying SQL's free-in-close is a use-after-free here.
+- **Distinct typed close/abort PER DIRECTION** (compile-legality trap): `HomerClientCloseBaseBackupStream`/`Abort`
+  today take one shared carrier type and are called from both directions (`remote_execution_client.h:413/427`).
+  Retyping them to a common handle loses direction op-legality → need `HomerBaseBackupSendClose/Abort` +
+  `HomerBaseBackupRecvClose/Abort`, each forwarding to the shared internal close body.
+- Preserve (finding-6 constraints): the interrupt hook is PROCESS-GLOBAL (`HomerClientSetInterruptCheck`,
+  `basebackup_homer.c:482`) — do NOT clear it on a failed close; the sink's reservation pointer/flag bookkeeping
+  (`basebackup_homer.c:278/311`) stays sink-side; the blackhole-mode rejection (`homer_client.c:2507`) is preserved.
+- Skip-lease rationale SHARPENED: the correct reason is "BB-recv validates + consumes one whole record SYNCHRONOUSLY
+  before the `Drain` callback returns" (`homer_client.c:3245`), NOT "decodes nothing" (it DOES validate the BB header
+  proto/lengths `:3216/:3238`). No lease/deferred-credit is needed because nothing is retained past the callback.
+
+**Push B — "unified open" BROKEN as scoped (VERIFIED; DECISION DEFERRED TO USER).** The 3 openers differ in FAR more
+than the ring set, and none of these fold into "one descriptor table": direction is operation-open state, NOT intent
+(`homer_session_spec.h:120/136`); SQL needs `sessionUID`/`clientSqlResultDpuRelay`/DOCA-PCI (`homer_session_transport.h:188/204`);
+layout differs (SQL 3 lines + completion event + 10 MiB ring vs BB 2 lines + 8 MiB); identity (SQL `serviceSessionId==0`
+adopts from OPEN response vs BB pre-mints from `dpuBridgeGeneration` `:2553/:2927`); `sessionUID` binding (SQL stamps
+all 3 descriptors; RECV mints+stamps role-7; SEND sets none); wire OPEN (SQL `COMMAND_SESSION`+relay vs BB
+`TUPLE_SINK`+geometry/direction/sinkId/tag/key/placement); RECV must still set `peerEndpoint.protocolVersion`
+(`:3076`); response handling (SQL adopts new identity+validates index vs BB validates pre-minted echoes+copies queue
+descriptor); post-open activation (SQL `open=false`+ordinal+core-adopt+arm-credit vs SEND producer-seq+`open`+publish-tail-0
+vs RECV ordinal/frontier+`open`+publish-consumed-0). **⇒ a "unified open" is a shared cold-setup PROLOGUE (allocate +
+export + setup-TCP) plus an irreducible 3-way branch for identity/request/response/activation — NOT a clean
+dispatcher; a monolithic version is "3 openers sharing a prologue," arguably worse than 3 clear openers.** This
+materially changed the value of the user's "unified open" choice → taken back to the user.
+**RESOLVED (USER, 2026-07-19): WELL-FACTORED full dispatch** (shared prologue + layout table + per-kind open-op set;
+see the PUSH B paragraph above). The main-agent's initial "3-way not unifiable / full dispatch not ideal" framing was
+CORRECTED as an OVERSTATEMENT (both sides recorded): the LAYOUT unifies as data, and the PROTOCOL — while per-kind —
+dispatches CLEANLY as a small open-op vtable; only the NAIVE inline-switch reads worse than 3 openers. The user chose
+the clean factoring for §13 fidelity + posterity; the extra cost is churn, not complexity.
+
 ---
 
 ## 13. The unified intent-driven session interface (designed against SQL + basebackup, 2026-07-18)
@@ -1588,11 +1747,16 @@ fire-and-forget START). **role-6 (completion) is SQL/COPY-only.** The open path 
 | command | `publish_start` / `poll_completion` / `release_start_slot` | SQL, COPY | role-1 START (fire-and-forget) + role-6 completion; one-outstanding invariant |
 | result-consume | `result_borrow_next` / `result_release` / `result_credit_flush` + core decode | SQL, COPY-result | role-7; the shared sink-lease drain |
 | producer | `producer_reserve` / `producer_commit` (append = caller `memcpy`) | BB-send, COPY-ingest | role-4; one reservation at a time (`:3788`), commit publishes immediately (`:4167`) |
-| bulk-consume | `consume_borrow_next` / `consume_release` / `consume_credit_flush` | BB-recv | role-7; **SAME shared sink-lease drain as result-consume** |
+| bulk-consume | fused `HomerClientPollBaseBackupReceive` (drain via shared `HomerByteRingSinkDrain`) | BB-recv | role-7; shares the sink FRAMING, NOT the split lease bracket (see below) |
 
-**result-consume and bulk-consume share ONE lease-aware `HomerByteRingSinkDrain` refactor** (borrow without
-advancing `consumedHead`) — built once in Stage 3, reused in Stage 3.5. Today both are fused poll/validate/
-discard-or-decode/credit (SQL `:3544`, BB-recv `:3095`) and cannot withhold the consumed cursor (`:327`/`:338`).
+**Stage-3 SETTLED + 3.5 scope (UPDATED 2026-07-19):** SQL result-consume was split into the lease-aware
+`Borrow`/`Release` bracket in Stage 3 (`homer_client.c` ResultBorrowNext/AcceptAndRelease) because it DECODES tuples
+and must withhold the DPU credit until the decode validates. **BB-recv is NOT getting that split (§12.5b-impl scope
+decision, Option B):** it is a BLACKHOLE byte-counter (`HomerClientBaseBackupDeliverReceiveObject:3245`) — it decodes
+nothing, so it needs no lease-return / deferred credit and stays on the fused `HomerByteRingSinkDrain` (which itself
+loops `Borrow`→callback→`Release` internally, so BB already shares the sink FRAMING primitives, just not the caller-
+visible bracket). The split lease plane is revisited only if a future consumer must DECODE the bulk stream
+(disk-writing pg_basebackup, or COPY in Stage 5).
 
 ### 13.4 Terminal model — common concept, kind-specific realization
 "Terminal ⇒ no reuse" is the shared contract. **SQL:** a persistent `sqlSessionTerminal` latch after completion
@@ -1602,13 +1766,16 @@ exposes a common `terminal` query; terminal-abandon (§11.1) is per-kind (SQL: m
 path `:4190`/`:4236`).
 
 ### 13.5 Shared vs kind-specific (from the A/B maps)
-- **SHARED transport (B), one context** (Stage 3): the DOCA device (§12.3), byte-ring mechanics, role-1 lifecycle,
-  setup/mmap, epochs. `HomerClientBaseBackupStream` is ALREADY a shared carrier for SQL+BB transport state — its
-  own header calls the name a misnomer (`remote_execution_client.h:209`) — Stage 3 cleans it into the shared
-  context.
-- **KIND-SPECIFIC core (A):** SQL = command sequence + completion lease + result decode; BB = record
-  sequence/ordinal (`nextSequence`/`submittedSequence`/`receiveExpectedOrdinal`). These live in per-kind core
-  state tagged by `opKind`, not the shared carrier.
+- **SHARED transport (B), one context** (Stage 3, DONE): the DOCA device (§12.3, Push-2 shared), byte-ring
+  mechanics, role-1 lifecycle, setup/mmap, epochs. `HomerClientBaseBackupStream` is the shared carrier for SQL+BB
+  transport state — its header now describes it as "the transport substrate the core embeds"
+  (`homer_session_transport.h:63`; the older "misnomer" note is gone).
+- **KIND-SPECIFIC core (A):** SQL = command sequence + completion lease + result decode (moved into
+  `struct HomerSession` in Push 1). BB = record `nextSequence` (SEND) — but note (grounding correction) BB's
+  `nextSequence`/reservation fields and `receiveExpectedOrdinal` are CURRENTLY carrier-resident: `receiveExpectedOrdinal`
+  is deliberately SHARED-B (basebackup + SQL both use it for wrap-gap / envelope-ordinal, so it STAYS in the carrier,
+  NOT per-kind A-state), and Push A leaves BB's producer fields carrier-resident (the carrier is BB's own substrate).
+  So "per-kind core A-state" for BB is thin — the typed handle, not a large field migration.
 
 ### 13.6 Deferred / not now
 - **COPY (Stage 5):** `opKind` reserved; reuses command + result-consume (result) + producer (ingest) planes; op

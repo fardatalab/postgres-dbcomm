@@ -1044,6 +1044,23 @@ the call site. If it is not on the list, **it has not been checked.**
 - **ENFORCES:** nothing yet — this is an OPEN trap. A fix would make the ambiguous-import path either confirm the DPU
   detach or defer host-memory reclaim; until then treat a setup-ACK read failure as an unknowable-detach state.
 
+## `HomerBaseBackupSend` / `HomerBaseBackupRecv` — BY-VALUE typed BB handles (Stage-3.5 Push A); NOT opaque-heap like `HomerSqlSession`
+
+- **MEANS:** two DISTINCT one-field struct wrappers `{ HomerClientBaseBackupStream s; }` (`remote_execution_client.h`)
+  that make the BASE_BACKUP SEND and RECEIVE op surfaces compile-time-distinct C types. The typed ops
+  (`HomerBaseBackupSendOpen`/`ReserveObjectPayload`/`Submit`/`Close`/`Abort`, `HomerBaseBackupRecvOpen`/`Poll`/
+  `Close`/`Abort`, `homer_client.c`) are THIN forwarders to the carrier-typed logic via `&h->s` — behavior identical.
+  Passing a `HomerBaseBackupRecv *` to a SEND op (or vice-versa) is a COMPILE error — the multi-consumer op-legality proof.
+- **DOES NOT MEAN** opaque-heap like `HomerSqlSession`: BB has NO private core to hide (its "core" is the carrier,
+  which is PUBLIC because the SQL core embeds it by value), so hiding would need a header split for zero payoff. And
+  BB close RE-ENTERS via `PG_FINALLY` on a failed graceful close, so a heap `Free`-in-close would be a use-after-free.
+  Hence BY-VALUE: callers embed the wrapper where the carrier lived (`bbsink_homer.stream`; `pg_basebackup`'s stack),
+  storage reclaimed with the sink palloc / frame. **The typed Close/Abort NEVER free** — there is nothing to free.
+- **DOES NOT MEAN** the carrier-typed BB functions were removed: they REMAIN (the wrappers + SQL's own DataplaneClose
+  call `HomerClientCloseBaseBackupStreamInternal` etc.); Push A is ADDITIVE. Op-legality holds because the only
+  external callers (`basebackup_homer.c`, `pg_basebackup.c`) were migrated to the typed API (grep-verified).
+- **ENFORCES:** the two migrated callers use only the typed API; a wrong-kind handle fails to compile.
+
 ---
 
 ## Related

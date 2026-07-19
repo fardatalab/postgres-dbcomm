@@ -36,7 +36,14 @@ typedef struct bbsink_homer
 {
 	bbsink		base;
 	char	   *target_detail;
-	HomerClientBaseBackupStream stream;
+	/*
+	 * Stage 3.5 Push A: typed BASE_BACKUP SEND handle (by-value, unified-core plan
+	 * §12.5b-impl).  Embedded exactly as the raw carrier was; the wrapper only makes the
+	 * SEND op surface compile-time-distinct from RECEIVE.  Reclaimed with this palloc'd
+	 * sink (close never frees it -- close re-enters via PG_FINALLY on a failed graceful
+	 * close, so the storage must outlive close).
+	 */
+	HomerBaseBackupSend stream;
 	bool		stream_open;
 	bool		record_reserved;
 	uint32		payload_capacity;
@@ -135,7 +142,7 @@ bbsink_homer_abort_backstop(int code, Datum arg)
 
 	ereport(LOG,
 			(errmsg("Homer base backup target: process exit with the stream still open; issuing abort-close")));
-	(void) HomerClientAbortBaseBackupStream(&mysink->stream, NULL, 0);
+	(void) HomerBaseBackupSendAbort(&mysink->stream, NULL, 0);
 	mysink->stream_open = false;
 }
 
@@ -270,9 +277,9 @@ static void bbsink_homer_reserve_record(bbsink_homer *mysink, uint32 object_kind
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("Homer base backup payload length exceeded uint32")));
 
-	if (!HomerClientReserveBaseBackupRecordForObjectPayload(&mysink->stream, object_kind, name, (uint32)payload_len,
-															&payload, &payload_capacity, &stream_sequence, error,
-															sizeof(error)))
+	if (!HomerBaseBackupSendReserveObjectPayload(&mysink->stream, object_kind, name, (uint32)payload_len,
+												 &payload, &payload_capacity, &stream_sequence, error,
+												 sizeof(error)))
 		bbsink_homer_error(operation, error);
 
 	mysink->current_payload = payload;
@@ -296,16 +303,16 @@ bbsink_homer_submit_reserved_record(bbsink_homer *mysink, uint32 object_kind,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("Homer base backup payload length exceeded uint32")));
 
-	if (!HomerClientSubmitBaseBackupRecord(&mysink->stream,
-										   object_kind,
-										   archive_index,
-										   name,
-										   (uint32) payload_len,
-										   stream_offset,
-										   mysink->total_bytes,
-										   0,
-										   error,
-										   sizeof(error)))
+	if (!HomerBaseBackupSendSubmit(&mysink->stream,
+								   object_kind,
+								   archive_index,
+								   name,
+								   (uint32) payload_len,
+								   stream_offset,
+								   mysink->total_bytes,
+								   0,
+								   error,
+								   sizeof(error)))
 		bbsink_homer_error(operation, error);
 
 	mysink->record_reserved = false;
@@ -350,10 +357,10 @@ bbsink_homer_begin_backup(bbsink *sink)
 	options.userOid = GetUserId();
 	bbsink_homer_apply_detail(&options, mysink->target_detail);
 
-	if (!HomerClientOpenBaseBackupStreamSelectedDpu(&options,
-													&mysink->stream,
-													error,
-													sizeof(error)))
+	if (!HomerBaseBackupSendOpen(&options,
+								 &mysink->stream,
+								 error,
+								 sizeof(error)))
 		bbsink_homer_error("open stream", error);
 	mysink->stream_open = true;
 
@@ -462,9 +469,9 @@ bbsink_homer_end_backup(bbsink *sink, XLogRecPtr endptr, TimeLineID endtli)
 
 	bbsink_homer_submit_reserved_record(mysink, CITUS_REMOTE_BASEBACKUP_OBJECT_END, mysink->archive_index, NULL, 0, 0,
 										"submit end");
-	if (!HomerClientCloseBaseBackupStream(&mysink->stream,
-										  error,
-										  sizeof(error)))
+	if (!HomerBaseBackupSendClose(&mysink->stream,
+								  error,
+								  sizeof(error)))
 		bbsink_homer_error("close stream", error);
 	mysink->stream_open = false;
 	/* Graceful close completed: disarm the FATAL-path abort backstop. */
@@ -497,7 +504,7 @@ bbsink_homer_cleanup(bbsink *sink)
 		 * error.  The graceful close remains exclusively end_backup's, which runs
 		 * only after OBJECT_END was submitted.
 		 */
-		(void)HomerClientAbortBaseBackupStream(&mysink->stream, error, sizeof(error));
+		(void)HomerBaseBackupSendAbort(&mysink->stream, error, sizeof(error));
 		mysink->stream_open = false;
 	}
 	if (mysink->scratch_buffer != NULL)

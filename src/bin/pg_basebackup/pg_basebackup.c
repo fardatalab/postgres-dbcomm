@@ -2395,7 +2395,13 @@ RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots,
 					   uint32 launchDiscriminatorTag)
 {
 	HomerClientBaseBackupStreamOptions options;
-	HomerClientBaseBackupStream stream;
+	/*
+	 * Stage 3.5 Push A: typed BASE_BACKUP RECEIVE handle (by-value, unified-core plan
+	 * §12.5b-impl).  Distinct C type from HomerBaseBackupSend so a SEND op on this handle is
+	 * a compile error.  By-value on the stack, exactly as the raw carrier was; the RECV
+	 * close/abort do not free it.
+	 */
+	HomerBaseBackupRecv stream;
 	char		error[HOMER_CLIENT_ERROR_BYTES];
 	uint64		deliveredTotal = 0;
 	bool		complete = false;
@@ -2415,7 +2421,7 @@ RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots,
 	options.launchDiscriminatorTag = launchDiscriminatorTag;
 
 	error[0] = '\0';
-	if (!HomerClientOpenBaseBackupReceiveStreamSelectedDpu(&options, &stream, error, sizeof(error)))
+	if (!HomerBaseBackupRecvOpen(&options, &stream, error, sizeof(error)))
 		pg_fatal("homer receive: could not open receive-consume session: %s", error);
 
 	/* Stage 1 (D-S1 leg 3): abort-close instead of dying silently on Ctrl-C. */
@@ -2441,14 +2447,14 @@ RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots,
 	{
 		if (homer_receive_interrupted)
 		{
-			(void)HomerClientAbortBaseBackupStream(&stream, NULL, 0);
+			(void)HomerBaseBackupRecvAbort(&stream, NULL, 0);
 			pg_fatal("homer receive: interrupted (delivered=%llu); abort-close issued toward the sender",
 					 (unsigned long long)deliveredTotal);
 		}
 		error[0] = '\0';
-		if (!HomerClientPollBaseBackupReceive(&stream, &deliveredTotal, &complete, error, sizeof(error)))
+		if (!HomerBaseBackupRecvPoll(&stream, &deliveredTotal, &complete, error, sizeof(error)))
 		{
-			(void)HomerClientAbortBaseBackupStream(&stream, NULL, 0);
+			(void)HomerBaseBackupRecvAbort(&stream, NULL, 0);
 			pg_fatal("homer receive: poll failed (delivered=%llu): %s",
 					 (unsigned long long) deliveredTotal, error);
 		}
@@ -2460,7 +2466,7 @@ RunHomerReceiveConsume(int32 nodeId, uint32 dbOid, uint32 userOid, uint32 slots,
 				(unsigned long long) deliveredTotal);
 
 	error[0] = '\0';
-	if (!HomerClientCloseBaseBackupStream(&stream, error, sizeof(error)))
+	if (!HomerBaseBackupRecvClose(&stream, error, sizeof(error)))
 		pg_fatal("homer receive: close failed: %s", error);
 
 	pg_log_info("homer receive: closed (CLOSE_ACK)");
