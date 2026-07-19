@@ -20,8 +20,10 @@
   slot 0 / slot 1), with NO `RECV_CQ_FAILURE` / `observed>posted` / `DISCONNECT` /
   `ambiguous receive-relay resolve`. The original reset-before-any-byte-moved bug is
   fixed. **Stage 2 (per-session tuple/DPU SOURCE ring for concurrent `--homer-dpu`, retiring the `tupleSourceRing`
-  singleton) — ✅ LANDED (2026-07-19) as S6 Stage 2 (citus `a5e7d2fdb` + `3d5047146`).** Remaining: the deferred
-  mirror-cache cleanup and the connection-binding-fix disposition. Plan mirror
+  singleton) — ✅ LANDED (2026-07-19) as S6 Stage 2 (citus `a5e7d2fdb` + `3d5047146`).** Both prior residuals are
+  now ✅ CLOSED (2026-07-19): the mirror-cache "cleanup" is SUPERSEDED (the cache is a live, load-bearing egress
+  short-circuit — see its note in Progress below; KEEP AS-IS), and the connection-binding-fix disposition is FINAL
+  (KEPT as fault-isolation hardening — see its section). **This plan is functionally complete.** Plan mirror
   file was `~/.claude/plans/here-s-a-snippet-on-linked-papert.md`; this doc is canonical.
 - **Progress:**
   - **Stage 0a — DONE + validated (single-session, byte-identical).** New module
@@ -76,12 +78,22 @@
     deadlock — hoist the bind upstream of every consumer. Validation: 3x single-session,
     8-12s (no hang), byte conservation 0.00013% (~23.28 GB), `purpose=0` MIRROR bind on the
     sender DPU + `purpose=1` LANDING on the receiver, no reset/mirror-slot error.
-    **CLEANUP TODO (fold into Stage 1b build):** `HomerDpuDmaResolveMirrorSlot` re-Finds
-    every call (the added `HomerDpuDmaRingRuntime` mirror-slot cache fields are written but
-    never read for short-circuit) and const-casts `engine`/`import` in the egress path to
-    write them; since re-resolving is cheap (O(8 slots)) and actually safer against stale
-    bindings, drop the cache fields + `ClearMirrorSlotCache` and make the resolver a pure
-    non-caching `Find` (removes the const-casts).
+    **CLEANUP TODO — ✅ SUPERSEDED / CLOSED-NO-ACTION (verified 2026-07-19).** Its premise is
+    FALSIFIED by the current code: the mirror-slot cache is NOT write-only. The resolver
+    short-circuits on it (`homer_service_dpu_dma.c:5218` — returns the cached base/bytes/mmap
+    with NO `Find` once `dpuMirrorSlotResolved` and the bound sink match), the pull path
+    establishes it as the authoritative window (`:3512-3527`, comment: *"the production caller
+    pays nothing for the second call"*), and egress reads `dpuMirrorStorageBase`/`Bytes`
+    DIRECTLY as the DMA source (`:5682-5684`). So "make the resolver a pure O(8) `Find` every
+    call" is NOT a free cleanup — it would re-`Find` on every egress borrow (a DPU hot-path
+    regression) and require rewiring the direct egress/pull/guard reads. Staleness is already
+    defended (short-circuit checks `dpuMirrorSlotServiceSinkId == effectiveSinkId`; cleared by
+    `HomerDpuDmaClearMirrorSlotCache` at import teardown `:9568` + the whole-struct tenancy
+    reset — added for the run-41c stale-tenancy bug). The short-circuit is exercised hot (R3
+    basebackup `candidate-20260719-161556` relayed 23.26 GB = thousands of per-stream borrows,
+    all short-circuiting after the first resolve). **KEEP THE CACHE AS-IS.** (Original TODO
+    read: resolver re-Finds every call / cache fields written-but-never-read / drop them — that
+    describes a code state that no longer exists; the short-circuit was wired since.)
   - **Stage 1b — DONE + validated (CONCURRENT ACCEPTANCE GATE PASSED).** Resolver fix:
     `HomerServiceFindPeerBoundReceiveRelayStream` gained a `launchDiscriminatorTag` param;
     it now requires `sessionState->launchDiscriminatorTag == tag` in addition to base
@@ -890,8 +902,12 @@ validated.
 
 ## Connection-binding fix disposition
 
-**Status: KEPT, committed with Stage 0a. Reclassified as fault-isolation hardening, not
-correctness for this bug.**
+**Status: ✅ CLOSED (2026-07-19). KEPT, committed with Stage 0a. Reclassified as
+fault-isolation hardening, not correctness for this bug.** This is the FINAL disposition —
+the ownership scan (`ownerServiceSessionId` + prefer-own / adopt-free / skip-owned-by-other)
+stays as-is: its stated recv-CQ-sharing rationale was falsified by Test 2, but it is retained
+because it cheaply prevents two concurrent same-peer sessions from co-owning one QP/CQ, which
+is worth keeping regardless of the original (wrong) motivation. No further action.
 
 ### How it works
 `outgoingConnections[]` is a 64-slot pool keyed by `(peerNodeId, peerHost, peerControlPort,
