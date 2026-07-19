@@ -146,19 +146,19 @@ On this Meson installation, the extension object is
 `/data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so`; do not use the stale path without the
 `postgresql/` component in receipt or diagnostic scripts.
 
-⚠ **Post S7.1(a)+(c) (2026-07-18): `citus_remote_execution_control_v27` is RETIRED from these three binaries.** The
-host-service client (pgbench, libhomer_client) went in S7.1(a) and the daemon's control-region servicing
-(`citus_tuple_sink_service`) went in S7.1(c), so all three greps below now return **EMPTY** — that is the expected,
-correct result, not a build-parity failure. The name persists ONLY in `citus.so`, via the still-present Tier-2
-host-SHM frontend (`homer_frontend_shm.c`), until S7.3 retires it. For build-agreement/stale-binary detection use a
-still-shared ABI marker instead — e.g. `HOMER_DPU_BRIDGE_PROTOCOL_VERSION` (currently `5U`) or the spawn region
-`citus_remote_exec_backend_spawn_v15`.
+⚠ **Post S7 host-service retirement (2026-07-19): `citus_remote_execution_control_v27` is RETIRED from ALL FOUR
+binaries.** The host-service client (pgbench, libhomer_client) went in S7.1(a); the daemon's control-region servicing
+(`citus_tuple_sink_service`) in S7.1(c); and the last user inside `citus.so` — the Tier-2 host-SHM frontend
+(`homer_frontend_shm.c`) — was DELETED in S7.3 (Stage 4 Round 2). So all four greps below now return **EMPTY** — that
+is the expected, correct result, not a build-parity failure (`citus_remote_execution_control` no longer appears in any
+source file). For build-agreement/stale-binary detection use a still-shared ABI marker instead — e.g.
+`HOMER_DPU_BRIDGE_PROTOCOL_VERSION` (currently `5U`) or the spawn region `citus_remote_exec_backend_spawn_v15`.
 
 ```sh
 strings /data/dbcomm/pg-citus/bin/pgbench | grep citus_remote_execution_control            # expect EMPTY (S7.1a)
 strings /data/dbcomm/pg-citus/bin/citus_tuple_sink_service | grep citus_remote_execution_control  # expect EMPTY (S7.1c)
 strings /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/libhomer_client.a | grep citus_remote_execution_control  # expect EMPTY (S7.1a)
-strings /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so | grep citus_remote_execution_control  # still PRESENT until S7.3 (Tier-2 host-SHM frontend)
+strings /data/dbcomm/pg-citus/lib/x86_64-linux-gnu/postgresql/citus.so | grep citus_remote_execution_control  # expect EMPTY (S7.3 deleted the Tier-2 host-SHM frontend)
 ```
 
 Record SHA-256 digests of the installed closure and exact build argv/configuration. Matching peer binaries without a

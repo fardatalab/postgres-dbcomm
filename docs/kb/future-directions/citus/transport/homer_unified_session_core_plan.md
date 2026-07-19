@@ -10,10 +10,15 @@
 > dispatch mechanism — the current decision is a **link-time module seam (core↔transport) + typed opaque handles
 > (core↔caller, compile-time op legality)**, vtable deferred to COPY (§12.1, §13.1).
 >
-> **EXECUTION: Stage 1 DONE + validated + committed** (frontend-safe `homer_session_spec.h`; citus `5cadf1c9c`+
-> `265b6630d`, postgres `dc750a261b2`). **Next: Stage 2** (in-`homer_client.c` SQL transport facade). Full staging
-> in §12.4/§12.5/§12.5b: Stage 2 facade → Stage 3 intent-driven core (SQL) → **Stage 3.5 basebackup migration
-> (multi-consumer proof, before retirement)** → Stage 4 final retirement → Stage 5 COPY (deferred).
+> **EXECUTION: Stages 1–4 DONE + validated + committed. The plan's defined endpoint — host-service retirement
+> complete — is REACHED (2026-07-19).** Stage 1 frontend-safe `homer_session_spec.h` (citus `5cadf1c9c`+`265b6630d`);
+> Stage 2 in-`homer_client.c` SQL transport facade; Stage 3 intent-driven SQL core behind an opaque `HomerSqlSession`
+> handle (citus `e5b99b832`); Stage 3.5 basebackup migration = the multi-consumer proof (typed by-value BASE_BACKUP
+> handles + the 3-opener→1-dispatcher unification, citus `635d34d1f`+`f6f9c1734`); **Stage 4 final host-service
+> retirement (R1+R2+R3) complete + validated (citus `31f0e958f`, run `candidate-20260719-161556`)** — see
+> [`../../../implementations/citus/transport/s7_host_service_retirement_plan.md`](../../../implementations/citus/transport/s7_host_service_retirement_plan.md)
+> §13. **Only Stage 5 (COPY producer / backend pooling / reuse activation) remains — DEFERRED** until the COPY path is
+> actually (re)designed.
 >
 > **DESIGN NOTE (opened 2026-07-18).** This gates **S7.2** in
 > [`../../../implementations/citus/transport/s7_host_service_retirement_plan.md`](../../../implementations/citus/transport/s7_host_service_retirement_plan.md):

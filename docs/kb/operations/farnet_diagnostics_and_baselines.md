@@ -430,9 +430,10 @@ longer controls producer batching** on the byte-ring basebackup path.
 July 9, 2026 it has **never** completed end to end; see
 `../implementations/citus/transport/byte_ring_slot_capacity_regression.md`.
 
-**Do NOT confuse it** with `citus_remote_exec_pgbench_transaction` +
-`citus.enable_experimental_homer_dpu_frontend` — those are the backend **COMMAND** channel through the DPU, a
-different axis entirely.
+**Do NOT confuse it** with the backend **COMMAND** channel through the DPU (the native selected-DPU command gate,
+`pgbench --homer --homer-dpu-command`) — a different axis entirely. (The old `citus_remote_exec_pgbench_transaction`
+UDF + `citus.enable_experimental_homer_dpu_frontend` GUC that used to drive that command channel were retired in the
+S7 host-service retirement.)
 
 ---
 
