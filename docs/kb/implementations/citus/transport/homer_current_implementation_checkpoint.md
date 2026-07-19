@@ -15,6 +15,14 @@
 > One claim in here is actively DANGEROUS to inherit: that SQL's command spine "lives entirely in the HOST
 > service on both ends". It does not, and a code comment carrying that premise justified a duplicate-session
 > bug for months (design doc §18.7, §20).
+>
+> **S7 update (host-service retirement, Stage 4, 2026-07-19):** the entire host-side frontend cluster this doc
+> describes as "current" was **DELETED**, not merely superseded — `homer_frontend.c`, `homer_frontend_control.c`,
+> `homer_frontend_shm.c`, `homer_citus_policy.c`, `homer_frontend_dma*.c`, the ① `RemoteExecutionSession` API, and
+> the `citus_remote_exec_pgbench_transaction` UDF are gone. The surviving host-side path is the unified session
+> core (`homer_session_core.*`, `homer_client.c`) + the native frontend agent (`homer_frontend_agent.*`). Treat
+> every `homer_frontend*.c`/UDF code pointer below as a dead link; see `CONTRACTS.md` and
+> [`selected_dpu_session_rings_and_lifecycle.md`](selected_dpu_session_rings_and_lifecycle.md).
 
 
 ## Scope

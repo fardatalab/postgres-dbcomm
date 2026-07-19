@@ -680,8 +680,10 @@ The parent plan's "Stage 4" = the FINAL host-service retirement, executed now th
 - **LEFT for Stage 4:** S7.2 (UDF + old opaque ① `RemoteExecutionSession` API + dormant COPY sender residue) +
   S7.3 (Tier-2 DMA frontend) + D7→D7′. These are what §13.1 below sequences.
 - **⟳ ROUND 1 DONE (citus `39bed1051`, validated 2026-07-19):** the executable EDGES of the retiring Tier-2 command
-  path are gutted (see §13.2-R1 RESULT). The cluster `.c`/headers still exist and still WILDCARD-compile — Round 2
-  (§13.3) deletes them. Round 2 is the FIRST file/API deletion → **checkpoint the user before it.**
+  path were gutted (see §13.2-R1 RESULT).
+- **⟳ ROUND 2 DONE (citus `a12c48667`, validated 2026-07-19):** the Tier-2 cluster + UDF are DELETED and the dead
+  decl/ABI/Makefile/SQL trimmed (see §13.3-R2 RESULT). What's LEFT for Stage 4 = **Round 3 (D7→D7′, §13.4)** only:
+  the DPU spawn allocator still range-limits to slots[16..31]; with no second claimant left it collapses to 0..31.
 - **⚠ Grep hygiene:** a stale pre-S7 agent worktree `.claude/worktrees/agent-a4b43596e72023cf3/` still contains the
   removed files (control-region mappers, COPY hooks, etc.). **It is NOT the main tree — exclude `.claude/worktrees/`
   from every grep** or it produces false "still present" hits (it fooled the first grounding pass).
@@ -761,11 +763,12 @@ Deleting the `.c` files drops them from the wildcard, so the decl/ABI/extern tri
 - `worker_protocol.h`: remove the UDF extern (`:57`).
 - `remote_execution_backend_protocol.h:41`: remove `CITUS_REMOTE_EXEC_RESULT_QUEUE_SHM_PREFIX` — now dead (only the
   deleted lifecycle+smoke used it). KEEP the command/completion prefixes (native uses them).
-- SQL/catalog: remove the UDF include from `sql/citus--13.1-1--13.2-1.sql:5`, AND add a concrete
-  `DROP FUNCTION IF EXISTS pg_catalog.citus_remote_exec_pgbench_transaction(...)` in a NEW upgrade step (source deletion
-  alone leaves an installed catalog with the symbol; current version is `13.2-1` per `citus.control:3`, and the existing
-  downgrade `citus--13.2-1--13.1-1.sql` does not drop it — so a new `13.2-1--13.2-2` bump, or the next version's script,
-  must carry the DROP). Decide the exact version bump at implementation time.
+- SQL/catalog: remove the UDF include from `sql/citus--13.1-1--13.2-1.sql:5`. **⟳ DECISION CHANGED at implementation
+  (see §13.3-R2 RESULT): NO version bump / DROP FUNCTION.** The bump-to-`13.2-2`-plus-DROP originally planned here would
+  force `multi_extension` regress maintenance (a new version snapshot + downgrade) for a test the farnet flow never runs,
+  for no deployment benefit — `13.2-1` is a dev-only version, so removing the `#include` is enough: fresh installs never
+  create the UDF, and a pre-existing dev install keeps a dormant `pg_proc` entry nothing calls, cleared on the next fresh
+  (re)create.
 - Makefile: drop the Tier-2 smoke binary wiring (top-level `Makefile:33`/`:55`/`:221`).
 - **Pre-commit doc/comment sweep (refutation #6):** rewrite the `CONTRACTS.md` `CitusRemoteExecSessionKey` entry
   (`:53`/`:86`/`:101`) — the key builder is now Push B's `HomerOpenBuildSqlRequest` (`homer_client.c:2143`/`:2157`), not
@@ -773,6 +776,36 @@ Deleting the `.c` files drops them from the wildcard, so the decl/ABI/extern tri
   "`HomerFrontendDmaOpenDocaDevice` unchanged" entries (both name deleted symbols); update
   `homer_current_implementation_checkpoint.md:105`/`:107` (UDF-as-current-pgbench-wrapper); fix code comments naming
   deleted functions (`homer_client.c:1045`, `remote_execution_client.h:300`, `homer_session_spec.h:22`).
+
+### 13.3-R2 RESULT — EXECUTED + VALIDATED GREEN (citus `a12c48667`, 2026-07-19)
+Round 2 landed as the atomic whole-cluster delete + now-dead decl/ABI/Makefile/SQL trims. **35 files, −8452/+111**,
+citus-only, behavior-neutral (only unreachable code).
+- **What landed:** 15 whole-file deletes (the Tier-2 cluster + UDF + smoke); `homer_frontend.h` trimmed to the 3
+  tuple-substrate externs; `homer_shm_channel_abi.h` dropped the dead control-region aggregate/bitmap/name (KEPT
+  `CitusRemoteExecControlSlot` + states + completion prefixes); `worker_protocol.h`/`remote_execution_backend_protocol.h`
+  dead-decl trims; Makefile smoke-wiring + inert `HOMER_FRONTEND_OBJS` corrected; UDF `#include` removed (no bump).
+- **⟳ Catalog decision (changed from §13.3 plan, owner-approved):** NO `13.2-2` bump / DROP — `#include` removal only.
+  Rationale in the §13.3 SQL bullet above. The diff refutation independently reached the same place (it flagged the
+  bump's missing `multi_extension` coverage + missing downgrade as the cost avoided).
+- **Refutation of the diff (codex, every claim main-agent VERIFIED):** deletion boundary SOUND (no surviving
+  compiled/test caller of any removed symbol/UDF; keep-boundary correct). Caught what a clean build does NOT: stale
+  Makefile `HOMER_FRONTEND_OBJS` membership (inert, corrected) + ~13 stale comments in kept code describing the removed
+  cluster as live (all fixed). A symbol-by-symbol check on `homer_shm_channel_abi.h` also corrected the plan's
+  line-only trim — the completion prefixes (`:26-27`) between the removed name and structs are load-bearing for the
+  native service and were KEPT.
+- **Comment style (owner feedback):** code/SQL/Makefile comments are current-truth first, sparse "formerly", NO
+  stage/tier labels or deleted-file lists; the migration record lives in the KB/commit, not the source.
+- **KB sweep:** CONTRACTS repointed (`CitusRemoteExecSessionKey` builder → `HomerOpenBuildSqlRequest`; the
+  arena-required invariant's INVALID producer is now GONE; `HomerFrontendDmaOpenDocaDevice` refs removed); the
+  "current implementation checkpoint" banner marks the cluster deleted.
+- **Validation** (run `candidate-20260719-150756`, build-clean + THE GATE, manual runbook): **PASS**. Complete-target
+  build + install exit 0; `citus.so` relinks with none of the deleted objects; fresh `CREATE EXTENSION citus` → 13.2-1
+  with the UDF ABSENT (`to_regprocedure(...) IS NULL`). GATE 5/5 decoded / 0 failed; DPU-arena spawn ran (`slot=16`,
+  real `launched_pid`); `peer_host_spawn_retired` ABSENT both DPU logs; gate/alarm/teardown checkers PASS; peer artifact
+  SHA-256 parity. Basebackup+smoke were optional insurance (deletion touches neither path) — not run.
+- **⚠ Operational note:** the native DPU trees were found stale/off-lineage (commits `4a5d189`/`f455568`, far behind
+  HEAD) and were refreshed to this candidate snapshot for the run — a candidate-provenance refresh, NOT an ABI redeploy.
+  (Reinforces the standing DPU-tree-drift hazard; the DPUs are now current as of this candidate.)
 
 ### 13.4 Round 3 — D7 → D7′ (all-32; USER-decided). Validate: gate + basebackup + smoke.
 **Refutation #4 corrections folded in.** The last host spawn CAS died with `homer_frontend_dma_lifecycle.c` in Round 2

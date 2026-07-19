@@ -50,8 +50,10 @@ the call site. If it is not on the list, **it has not been checked.**
 ## `CitusRemoteExecSessionKey` — 13-field REUSE/RENDEZVOUS key; base-compat reads only a 5-field SUBSET; 6 fields are RESERVED-in-ABI
 
 - **MEANS:** the 13 fixed-width `uint32` reuse-compatibility key (`homer_control_abi.h:165`) built from all 12
-  `RemoteExecutionSessionIntentSpec` fields by `BuildControlSessionKeyFromIntent()` (`homer_frontend_control.c:311`).
-  It is the connection-compatibility domain, mirroring Citus connection selection.
+  `RemoteExecutionSessionIntentSpec` fields by the selected-DPU open-request builders (`HomerOpenBuildSqlRequest`,
+  `homer_client.c:2143`, sessionKey fields `:2157-2169`; the basebackup send/recv request builders alongside, `:2188+`).
+  (The old `BuildControlSessionKeyFromIntent()` in `homer_frontend_control.c` was deleted with the Tier-2 cluster in S7
+  Round 2.) It is the connection-compatibility domain, mirroring Citus connection selection.
 - **DOES NOT MEAN:** (1) a UNIQUE session identity — it is **NON-unique by design** (four pgbench clients on one
   db/user/node share ONE key). **THREE DISTINCT IDENTITIES, do not confuse them:**
   - **`sessionKey`** (this) — *non-unique* compatibility/rendezvous key; answers "may these two sessions be
@@ -83,8 +85,9 @@ the call site. If it is not on the list, **it has not been checked.**
   so the call would only ever return a live-held session. **Command-open allocates fresh; do NOT wire it through
   `FindReusableSession` until COPY-era backend-pooling + claim/release + sequence-continuation land** (design:
   unified-session-core plan §11.6). (c) binding a ring by sessionKey/serviceSessionId instead of `sessionUID`.
-- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** `BuildControlSessionKeyFromIntent` (all 12 intent→key, keep in sync
-  with the struct); `HomerServiceSessionKeysBaseCompatible` (the 5-field subset — the sole base-compat def);
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** the open-request builders `HomerOpenBuildSqlRequest` / the BB send+recv
+  builders (`homer_client.c:2143+`, all 12 intent→key, keep in sync with the struct); `HomerServiceSessionKeysBaseCompatible`
+  (the 5-field subset — the sole base-compat def);
   `TupleSinkServiceSessionAllowsReuse`; `TupleSinkServiceFindReusableSession` callers (`:29783`/`:39326`/`:40711`).
 - **Design that promotes this to a unified core:** [`../../../future-directions/citus/transport/homer_unified_session_core_plan.md`](../../../future-directions/citus/transport/homer_unified_session_core_plan.md) §5.6.
 
@@ -92,13 +95,15 @@ the call site. If it is not on the list, **it has not been checked.**
 - **MEANS:** the frontend-safe header (created in unified-core Stage 1) that owns the **in-process** session-intent
   enums (`RemoteExecOpKind` … `RemoteExecPlacementScope`) + `RemoteExecutionSessionIntentSpec`. It includes only
   `<stdint.h>`/`<stdbool.h>` so it can be compiled into **both** link contexts of the future unified core (the
-  postgres server via `citus.so` AND the standalone client library `libhomer_client.a`). `homer_frontend.h`
-  re-includes it, so ① compiles unchanged.
+  postgres server via `citus.so` AND the standalone client library `libhomer_client.a`). Its consumers are the
+  unified session core (`homer_session_core.*`, `homer_client.c`) and the backend bridge. (The opaque ①
+  `RemoteExecutionSession` API that used to re-include it via `homer_frontend.h` was deleted in S7 Round 2;
+  `homer_frontend.h` now only carries the tuple-substrate knobs.)
 - **DOES NOT MEAN:** it is the wire ABI. **Three near-neighbors, do not confuse:**
   - `RemoteExecutionSessionIntentSpec` (here) — *in-process*, enum-typed; backend adapter fills it from live PG
     state, frontend adapter from explicit options.
   - `CitusRemoteExecSessionKey` (`homer_control_abi.h:165`) — the fixed-width `uint32_t` **wire** reuse key this
-    intent projects INTO via `BuildControlSessionKeyFromIntent`.
+    intent projects INTO via the open-request builders (`HomerOpenBuildSqlRequest` / the BB builders, `homer_client.c`).
   - `CITUS_REMOTE_EXEC_*` value macros (`homer_control_abi.h:55+`) — the wire-facing enum-value **mirror** the
     standalone service reads; the service does **not** include this header. Keep the mirror tracking these enums.
 - **CONTRACT / THE RULE (money line):** a header linked into both link contexts (this one, and the `homer_*_abi.h`
@@ -350,8 +355,9 @@ the call site. If it is not on the list, **it has not been checked.**
   poisoned index; none exists in-tree.
 - **ENFORCES:** every healthy gate run must show the arena arm ran (`dpu_spawn` begin/complete + a real `launched_pid`)
   AND the fail-fast string **ABSENT** from the peer PostgreSQL server log — its presence = a legacy/INVALID producer
-  reached the child = contamination, NOT a pass. The only producer that sends INVALID is the retiring UDF/Tier-2 path
-  (`homer_frontend_dma_lifecycle.c`), deleted whole in Round 2.
+  reached the child = contamination, NOT a pass. As of S7 Round 2 the only producer that ever sent an INVALID
+  `arenaSlotIndex` (the Tier-2 `homer_frontend_dma_lifecycle.c`) is DELETED, so NO in-tree producer emits INVALID at
+  all — the fail-fast is now a pure backstop against a future regression or an out-of-tree caller.
 
 ## `RemoteExecSqlResultDestReceiver.currentBatchHandle` — **MUST be NULL-initialized; the receiver's Init memset is PARTIAL.**
 
@@ -1032,8 +1038,9 @@ the call site. If it is not on the list, **it has not been checked.**
   `refcount` = number of live-OR-retained per-carrier mmaps. **INVARIANT: `device != NULL` iff a device is open**
   (a device may sit open with `refcount==0` ONLY after a failed last `doca_dev_close(IN_USE)` — pinned, awaiting reuse).
 - **DOES NOT MEAN** one device per process GLOBALLY: it governs ONLY the client-session-export carriers. The frontend
-  agent (`homer_frontend_agent.c`) and the legacy `HomerFrontendDmaOpenDocaDevice` own SEPARATE devices, UNCHANGED.
-  Converting the agent to context refs would double-free its trailing `CloseDevice`.
+  agent (`homer_frontend_agent.c`) owns a SEPARATE device, UNCHANGED. (The Tier-2 `HomerFrontendDmaOpenDocaDevice`
+  that also owned its own device was deleted in S7 Round 2.) Converting the agent to context refs would double-free
+  its trailing `CloseDevice`.
 - **DOES NOT MEAN** the hot path may touch it: `device`/the mutex are COLD-PATH ONLY. The data path reads only
   `dpuExportBuffer`-relative pointers, so it stays lock-free. The mutex serializes the WHOLE cold-path DOCA lifecycle
   (open + mmap create/export; mmap destroy + ref transition + last dev-close) because `doca_mmap_destroy` is
