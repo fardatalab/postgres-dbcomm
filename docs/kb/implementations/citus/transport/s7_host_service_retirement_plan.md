@@ -664,3 +664,128 @@ APIs — useless as a working template. The re-plumb instead reuses the DPU tran
 - **S7.2** — UDF §3.5; decide on an explicit later-version `DROP FUNCTION`.
 - **S7.3** — Tier-2 DMA frontend §3.6; this removes the **last** host-resident spawn claimant ⇒ **assert D7′**.
 - **S7.4** — confirm `sessionUID` stays (§4); record the confirmation in code + CONTRACTS.
+
+---
+
+## 13. STAGE 4 EXECUTION PLAN — current-HEAD (citus `f6f9c1734` / postgres `53249768c70`), verified 2026-07-19
+
+The parent plan's "Stage 4" = the FINAL host-service retirement, executed now that the unified core has landed
+(Stages 1–3.5). **Re-grounded at current HEAD (codex-explore map + MAIN-AGENT VERIFIED by grep, worktree excluded).**
+
+### 13.0 Verified current state (what's already gone; what's left)
+- **DONE + VALIDATED:** S7.1(a) client host surface; S7.1(b) host spawn claimant; S7.1(c) daemon host servicing
+  (**VERIFIED gone: no `TupleSinkServiceMapControlRegion`/`RemoteExecMapControlRegion` in the main tree** — the §3.3
+  targets no longer exist); S7.1(d) D7 host constants; COPY *integration hooks* (`worker_tuple_sink_insert.c`,
+  `multi_copy.c` hooks, `homer_citus_xact.c` — **VERIFIED absent from the main tree**).
+- **LEFT for Stage 4:** S7.2 (UDF + old opaque ① `RemoteExecutionSession` API + dormant COPY sender residue) +
+  S7.3 (Tier-2 DMA frontend) + D7→D7′. These are what §13.1 below sequences.
+- **⚠ Grep hygiene:** a stale pre-S7 agent worktree `.claude/worktrees/agent-a4b43596e72023cf3/` still contains the
+  removed files (control-region mappers, COPY hooks, etc.). **It is NOT the main tree — exclude `.claude/worktrees/`
+  from every grep** or it produces false "still present" hits (it fooled the first grounding pass).
+
+### 13.1 The COMPILE-DEPENDENCY finding that sets the round order (VERIFIED by grep)
+The old ① API is DEFINED in `homer_frontend.c` and CALLED by three deletable files: the UDF
+(`remote_exec_pgbench_transaction.c`) **and** the Tier-2 files `homer_frontend_control.c` + `homer_frontend_dma.c`
+(`OpenRemoteExecutionSession → OpenCommandSessionThroughLocalService → HomerFrontendDmaOpenCommandSession`). So
+**S7.2 (delete ①) and S7.3 (delete Tier-2) CANNOT be separately-compiling commits** — they are ONE mutually-referencing
+cluster. The ONLY ① reference left in a KEPT file is a stale COMMENT (`tuple_sink_service_process.c:23471`), not a call
+⇒ once the cluster is gone the kept tree builds. Round order therefore = **gut kept→cluster edges, then delete the
+cluster whole, then D7′.** `RemoteExecutionSessionIntentSpec` is KEPT (promoted to the core, `homer_session_spec.h`;
+used by `homer_client.c`/`homer_session_core.c`) — a wrong-neighbor of the deleted `RemoteExecutionSession` handle.
+
+### 13.2 Round 1 — GUT executable edges ONLY (leave ALL shared types intact). Behavior-preserving. Validate: gate + basebackup + smoke.
+**⚠ CRITICAL SEQUENCING (refutation #1, VERIFIED):** the cluster `.c` files are compiled by a Makefile WILDCARD
+(`DIST_EXTENSION_OBJS = patsubst(%.c,%.o, wildcard $(dir)/*.c)`, `src/backend/distributed/Makefile:44`; `OBJS`
+filters out ONLY `HOMER_SERVICE_OBJS`, `:72` — editing `HOMER_FRONTEND_OBJS` does NOTHING). So a cluster file is
+compiled until its `.c` is DELETED. Therefore Round 1 may remove executable EDGES but must **NOT** trim any
+shared TYPE/DECL the still-compiled cluster needs — those trims move to Round 2 (atomic with the `.c` deletes).
+Round 1 = only:
+- `shared_library_init.c`: remove the experimental Tier-2 GUC REG (`citus.enable_experimental_homer_dpu_frontend`,
+  ~`:2562-2568`); KEEP the native agent GUC beside it (~`:2570`). (Safe: the backing var stays defined in the
+  still-compiled `homer_frontend_dma.c`.)
+- `remote_execution_backend_bridge.c` `ExecuteRemoteExecBackendCommand`: gut the legacy named-mailbox branch
+  (~`:2316-2354`) + its named result-queue arm (~`:2374-2429`) **and the associated residue the refutation flagged**:
+  legacy locals (`:2187`), name formatting/logging (`:2249`), exception cleanup (`:2650`), normal cleanup (`:2703`),
+  and the now-unreachable-but-crashing invalid-arena path — after the named arm is gone, an `ARENA_SLOT_INVALID`
+  backend leaves `commandMailbox==NULL` dereferenced at `:2523`; either remove the postmaster's permit of that Tier-2
+  value (`:2757`/`:2764`) or fail-fast on it. KEEP the native arena branch (`:2258-2315`, `:2430`), the shared
+  `SELECTED_DPU_DMA` value + its `arenaBackend` discriminator (`:2528`/`:2634`/`:2678` — native slot release), and the
+  command/completion SHM prefixes (native staging mailboxes still use them, `tuple_sink_service_process.c:21145`/`:21153`/
+  `:21518`/`:40386`/`:40396`). Do NOT touch `RemoteExecFormatMailboxNames`'s DEFINITION (`:1245`) if still referenced —
+  remove only its now-dead callers.
+- `tuple_sink_service_process.c:23471`: fix the now-stale ① comment (the only ① reference left in a KEPT file).
+- **NOTHING in `homer_frontend.h`, `homer_shm_channel_abi.h`, `worker_protocol.h`, or the `.sql` yet** — deferred to
+  Round 2 (they hold types/externs the wildcard-compiled cluster still needs).
+
+### 13.3 Round 2 — DELETE the cluster + trim its now-dead decls, ALL AT ONE BOUNDARY. No behavior change (unreachable). Validate: build + gate.
+Deleting the `.c` files drops them from the wildcard, so the decl/ABI/extern trims are now safe **only here**:
+- Whole-file delete: `homer_frontend.c`, `homer_citus_policy.c/.h`, `remote_exec_pgbench_transaction.c`,
+  `homer_frontend_control.c/.h`, `homer_frontend_dma.c/.h`, `homer_frontend_dma_lifecycle.c/.h`,
+  `homer_frontend_shm.c/.h`, `homer_frontend_internal.h`, `src/bin/homer_frontend_dma_smoke.c`; delete the UDF
+  `sql/udfs/citus_remote_exec_pgbench_transaction/latest.sql`. (Do NOT `rm -r` `worker/homer` or `utils/homer` — KEPT
+  native/COPY-worker files live alongside; the wildcard drops only the removed `.c`.)
+- `homer_frontend.h`: trim the old ①/command/batch/opaque-session decls (`:98`/`:252`/`:350` etc.); KEEP the live
+  tuple-substrate decls (`:30-38`). KEPT includers are only `shared_library_init.c:116` + `remote_execution_backend_bridge.c:55`.
+- `homer_shm_channel_abi.h`: remove the Tier-2 control-region name + aggregate + ready bitmap (`:25`, `:54-80`); KEEP
+  `CitusRemoteExecControlSlot` + states (`:30-47`) — native client/DPU/service still use them (`homer_client.c:1592`/`:1603`,
+  `homer_service_dpu_dma.c:14447`, `tuple_sink_service_process.c:41741`).
+- `worker_protocol.h`: remove the UDF extern (`:57`).
+- `remote_execution_backend_protocol.h:41`: remove `CITUS_REMOTE_EXEC_RESULT_QUEUE_SHM_PREFIX` — now dead (only the
+  deleted lifecycle+smoke used it). KEEP the command/completion prefixes (native uses them).
+- SQL/catalog: remove the UDF include from `sql/citus--13.1-1--13.2-1.sql:5`, AND add a concrete
+  `DROP FUNCTION IF EXISTS pg_catalog.citus_remote_exec_pgbench_transaction(...)` in a NEW upgrade step (source deletion
+  alone leaves an installed catalog with the symbol; current version is `13.2-1` per `citus.control:3`, and the existing
+  downgrade `citus--13.2-1--13.1-1.sql` does not drop it — so a new `13.2-1--13.2-2` bump, or the next version's script,
+  must carry the DROP). Decide the exact version bump at implementation time.
+- Makefile: drop the Tier-2 smoke binary wiring (top-level `Makefile:33`/`:55`/`:221`).
+- **Pre-commit doc/comment sweep (refutation #6):** rewrite the `CONTRACTS.md` `CitusRemoteExecSessionKey` entry
+  (`:53`/`:86`/`:101`) — the key builder is now Push B's `HomerOpenBuildSqlRequest` (`homer_client.c:2143`/`:2157`), not
+  the deleted `BuildControlSessionKeyFromIntent`; fix the `:95` "① compiled through `homer_frontend.h`" and `:1009`
+  "`HomerFrontendDmaOpenDocaDevice` unchanged" entries (both name deleted symbols); update
+  `homer_current_implementation_checkpoint.md:105`/`:107` (UDF-as-current-pgbench-wrapper); fix code comments naming
+  deleted functions (`homer_client.c:1045`, `remote_execution_client.h:300`, `homer_session_spec.h:22`).
+
+### 13.4 Round 3 — D7 → D7′ (all-32; USER-decided). Validate: gate + basebackup + smoke.
+**Refutation #4 corrections folded in.** The last host spawn CAS died with `homer_frontend_dma_lifecycle.c` in Round 2
+(VERIFIED: it was the only spawn-slot CAS `:250`/`:255`; `HomerServiceDpuSpawnBegin` uses a deterministic free-list slot,
+no CAS; `HomerFrontendAgentBindArenaSlot` is an ARENA-slot CAS, a native KEEP neighbor, NOT a spawn claimant). So Round 3 is:
+- Delete the now-unused `CLIENT_OWNED` spawn state (`remote_execution_backend_protocol.h:127`) + host/DPU range constants
+  + adjacency checks; KEEP total ABI cardinality `CITUS_REMOTE_EXEC_BACKEND_SPAWN_SLOT_COUNT` + the range-agnostic
+  postmaster scan (`remote_execution_backend_bridge.c:2844`/`:2850`) + the 32-slot wire descriptor check
+  (`homer_service_dpu_dma.c:12543`).
+- **REWRITE, do NOT delete, the LIVE DPU-range translation sites** (the spawn state machine calls them):
+  `homer_service_dpu_spawn.c` (`:230` absolute assign, `:326`/`:353`/`:449`/`:467`/`:512`) + ~10 sites in
+  `homer_service_dpu_dma.c` (`:7577`/`:7584`/`:7757`/`:7909`/`:8014`/`:8128`/`:8231`/`:8266`/`:8300`/`:11793`/`:12582`/`:12597`)
+  — rebase "DPU owns 16..31" to the whole 0..31 space.
+- **all-32 (USER, 2026-07-19):** grow capacity + local storage to 32 — `HOMER_SERVICE_DPU_SPAWN_MAX_PENDING`
+  (`homer_service_dpu_spawn.h:95`) → total count, `entries[]` (`:172`), runtime `spawnSlots[]` (`homer_service_dpu_dma.c:974`),
+  spawn buffers (`:14857`/`:14970`); remove `DPU_SLOT_FIRST/COUNT`. (Correctness note: the choice does NOT affect the
+  current gate — native spawn acquires one of 16 ARENA slots first, `homer_service_dpu_dma.c:6478`, failing after 16 at
+  `:6573`, before reaching spawn — so all-32 changes capacity/storage, not gate behavior. all-32 avoids the neutral-16
+  under-spec where absolute-assign/reverse-translate/remote-address `:230`/`:7584`/`:12597` must agree on a physical subset.)
+- assert D7′ (exactly one claimant = the DPU).
+
+### 13.5 D7′ slot count — RESOLVED: all-32 (USER, 2026-07-19). (Rationale + blast radius folded into §13.4.)
+
+### 13.6 Validation cadence + KEEP guard
+Rounds 1 and 3 change live-path behavior → full acceptance set (gate + four-role basebackup + DPU TCP smoke). Round 2
+deletes only unreachable code → build-clean + gate (basebackup+smoke optional insurance). KEEP guard for every round:
+the unified core + shared dispatcher (`homer_client.c` `HomerClientOpenSelectedDpuOperation:2397`, `homer_session_core.c`),
+the four-role basebackup typed calls, `TupleSinkServiceDispatchLocalControlSlot`/native spawn, the frontend agent +
+its `enable_homer_dpu_frontend_agent` GUC, byte-ring pool + `HomerByteRingSinkDrain`, `sessionUID`, and
+`HomerServicePersistentSendCompletionCallbacks` (the F7 wrong-neighbor of the deleted COPY publisher).
+
+### 13.7 Refutation record (codex-explore on §13, 2026-07-19; every claim MAIN-AGENT VERIFIED in code)
+- **BLOCKER (fixed): Round 1 header/ABI trims break the WILDCARD-compiled cluster build.** `homer_frontend.h` +
+  `CitusRemoteExecControlRegion` trims moved to Round 2 (atomic with the `.c` deletes). VERIFIED via `Makefile:44`/`:72`
+  (wildcard OBJS; `HOMER_FRONTEND_OBJS` is inert) — the still-compiled UDF/`homer_frontend_shm.c` need those types.
+- **Round 1 bridge gut was incomplete:** added the setup/cleanup/formatting residue (`:2187`/`:2249`/`:2650`/`:2703`) and
+  the invalid-arena crash arm (`commandMailbox==NULL` deref at `:2523` once the named arm is gone). KEEP `arenaBackend`
+  + native SHM prefixes.
+- **Round 2 additions:** dead `CITUS_REMOTE_EXEC_RESULT_QUEUE_SHM_PREFIX` removal; concrete DROP FUNCTION (no existing
+  script drops it); the doc/comment sweep (CONTRACTS `CitusRemoteExecSessionKey`/①/`HomerFrontendDmaOpenDocaDevice`
+  entries, checkpoint doc, code comments).
+- **Round 3 rewording:** the host CAS dies in Round 2 (not a separate delete); the DPU-range translations are LIVE and
+  must be REBASED (not deleted); all-32 does not change gate correctness (arena-slot cap gates first).
+- **Confirmed SOUND:** Round 2 file set is link-complete once trims move; ordering gut→delete-cluster→D7′ is the minimal
+  compile-safe sequence; the DPU is genuinely the sole spawn claimant after Round 2.
