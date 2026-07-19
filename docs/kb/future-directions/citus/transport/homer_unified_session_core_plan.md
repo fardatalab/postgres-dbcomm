@@ -951,6 +951,278 @@ terminal — abandon fixes it; the carrier's `receiveExpectedOrdinal`(B)/`receiv
 advanced TOGETHER today (`HomerClientSqlResultAdvanceCommandIdentity`), so the split fn updates one field on each
 side of the boundary.
 
+#### 12.5a-impl — implementation-phase findings + decisions (2026-07-18, IN PROGRESS)
+
+**Component A (sink-lease) — IMPLEMENTED + refuted-clean + fixed.** `homer_byte_ring_sink.h` now splits the fused
+`HomerByteRingSinkDrain` into `HomerByteRingSinkBorrow` (pure framing, carries the TORN-HEADER PROOF verbatim,
+skips fully-published wrap-gap trailers internally and reports it via `*skippedTrailer`, returns the next whole
+record in a `HomerByteRingSinkLease` without callback/advance) + `HomerByteRingSinkRelease` (the single credit
+release-store, GUARDED by `head == lease->recordStart`), with `HomerByteRingSinkDrain` kept as a byte-for-byte
+compat wrapper (borrow → callback → release; `madeProgress` = trailer-skip ∨ release).
+- **Refutation finding (codex, VERIFIED by me against the old body, FIXED):** the lease's `recordBytes` must be
+  **`uint64_t`, not `uint32_t`.** The pre-split loop computed `recordBytes` as a `uint64_t` local and used it at
+  FULL width for both the `deliveredObjectBytes` accumulate AND the `consumedHead` release-store — it truncated to
+  `uint32_t` ONLY at the `validateAndDeliver` argument. A `uint32_t` lease field silently narrows the
+  accounting/credit for a malformed record advertising `payloadBytes` near `UINT32_MAX`. Unreachable in today's
+  MiB-scale rings (the geom-gap branch defers such a record long before delivery — BB ring is 8 MiB, SQL result
+  ring smaller), but it is a latent trap in this shared primitive and a divergence from the old defined behavior
+  the compat wrapper promises to reproduce. FIX = widen the field to `uint64_t` and cast to `uint32_t` only at the
+  callback call site (exactly as the old code did). NOT the alternative (reject `>UINT32_MAX`) — that is a
+  behavior change §12.5a explicitly scopes out.
+- Refutation also confirmed, per-case, that every requested normal geometry (nothing-new, min/geom-gap
+  skip/pending, no-torn defer, callback-false, accepted non-EOS/EOS, and all trailer-skip/multi-record
+  combinations) matches the old loop byte-for-byte; the Release guard never wrongly no-ops for current callbacks
+  (BB touches only `receiveExpectedOrdinal`; SQL touches identity/capture — neither writes `consumedHead`); the
+  "callback mutates `consumedHead` via ctx → guard no-ops" edge is the guard doing its job and is unreachable.
+
+**DECISION (owner-improvised, recorded): the Stage-3 core EMBEDS the carrier; transport ops take the CARRIER, not
+the session.** The core `HomerSession` struct embeds `HomerClientBaseBackupStream commandDpuStream` as its
+transport substrate (one allocation, exactly like today's `HomerClientSession`), and every §12.2 transport op
+takes `HomerClientBaseBackupStream *carrier` (+ explicit scalar inputs / out-params), NOT the whole session — so
+component B/transport never sees A-state. Rationale: the carrier STAYS shared with basebackup in Stage 3 (§12.5a;
+3.5 dissolves it into the shared context), so embedding-and-passing-carrier is the minimal clean seam. Rejected
+alt: adapter holds the carrier and threads it into core ops — needless indirection when the core is the natural
+owner (mirrors today's embedding).
+
+**DECISION (USER, 2026-07-18): the typed handle is OPAQUE + HEAP-OWNED (literal §13.1), NOT a transparent
+by-value wrapper.** `HomerSqlSession` is a DISTINCT INCOMPLETE struct tag (never defined as a real struct in the
+header); the core `HomerSession` struct is FULLY PRIVATE to `homer_session_core.c`. `HomerSqlSessionOpen()`
+`malloc`s the core and returns the handle; `HomerSqlSessionClose()` frees it. This forced a real design fork,
+surfaced to the user because it touches the GATE harness: **pgbench embeds `HomerClientSession homer_session` BY
+VALUE** in `CState` (`pgbench.c:711`) and passes `&st->homer_session` at every call site (`:3681`/`:3905`/`:3972`/
+`:4077`/`:9338`/`:9416`). Opaqueness and caller-owned-by-value are mutually exclusive in C (an incomplete type has
+no known size), so the literal-§13.1 choice moves pgbench off by-value onto a heap-held `HomerSqlSession *` and
+RESHAPES the public API (open RETURNS a handle instead of filling a caller struct). Rejected alt (transparent
+distinct-type wrapper, caller-owned by-value): smaller gate-harness blast radius and still delivers §13.1's
+compile-time op-legality (distinct type per kind ⇒ wrong-op-wrong-kind is a compile error), but sacrifices
+opaqueness (callers keep seeing/poking core fields) — the user chose the clean opaque end-state over the smaller
+diff. **Consequences to honor:** (a) the core owns its allocation (adapter's "malloc" per step 2 is the session
+alloc) and its free on close; (b) the public API keeps the `HomerClient*` names but is re-typed to
+`HomerSqlSession *` handles (adapter maps public names → core ops; the options→intent projection stays adapter-side);
+(c) pgbench's `CState.homer_session` becomes a pointer, opened via the returned handle and freed at close — a
+mechanical ~7-site change in the validated gate harness that MUST be re-validated by the gate.
+
+**⚠ IDENTITY IS AN EXPLICIT CORE-SUPPLIED ARG, NOT read from the carrier (VERIFIED — corrects an earlier wrong
+assumption).** The transport ops that need the session identity — `poll_completion` (the role-6 identity check +
+error strings, `homer_client.c:1650`) and `lifecycle_close` (stamps `request->serviceSessionId`, `:1698`) — take
+`serviceSessionId` as an EXPLICIT scalar the core passes (`core->serviceSessionId`). They must NOT read it from the
+carrier: in the SQL open path the carrier's `serviceSessionId` is deliberately left **0** (`homer_client.c:1875`;
+the identity is stored only in the session at `:2128`), whereas the BASEBACKUP paths DO set
+`carrier->serviceSessionId = dpuBridgeGeneration` (`:2519`/`:2893`). So `carrier->serviceSessionId` means different
+things per opKind and is 0 for SQL — a `poll_completion` that read it would compare every SQL completion against 0.
+(This strikes the earlier note that claimed the check "comes from `carrier->serviceSessionId (:86)`" — that field
+is basebackup-only.) The result-consume ops need NO serviceSessionId: their identity check is the credit line's
+generation/ringIndex (`:3770`), which IS carrier-resident.
+
+**Result-consume op set — SETTLED (codex refinement, all four corrections VERIFIED in code by me):** a PASS
+BRACKET mirroring the fused poll's once-per-pass structure, because `producedTail` is a per-PASS snapshot (resolved
+once at `:3767`, validated `:3770`/`:3781`), NOT a per-record quantity:
+- `ResultBeginPass(carrier, *pass, err) -> bool`: resolve + validate the acquire-gated produced frontier ONCE;
+  snapshot it (+ consumedHead-at-begin) into the opaque `pass`. false = transport identity/regress failure
+  (`:3778`/`:3786`) → core terminal-abandons.
+- `ResultBorrowNext(carrier, *pass, *lease, err) -> {RECORD | NOT_READY | VISIBILITY_PENDING | FATAL_MALFORMED}`:
+  FOLDS framing (sink `Borrow` over the snapshot) THEN envelope-validate+ordinal internally (both B-owned; a
+  separate op is a per-record cross-call for no boundary gain). Envelope mismatch after a successful (acquire-gated,
+  fully-published) Borrow is DETERMINISTIC → `FATAL_MALFORMED`, not pending (this closes the old "retry-forever on
+  malformed" bug, `:3530`/`:3607`). `VISIBILITY_PENDING` stays for Borrow's partial-record frontier case only. The
+  lease SURFACES the typed transport header (via the embedded `HomerByteRingSinkLease.header`) plus a normalized
+  `lease->eos`. **CORRECTION (2026-07-18, code-verified — an earlier note here was WRONG):** the DATA/EOS/ERROR
+  `recordKind` lives in the TRANSPORT header (`CitusTupleSinkTransportHeader.recordKind`, `homer_tuple_abi.h:238`,
+  confirmed by its own comment `:202-203`), NOT in the payload batch header (`HomerDecodedTupleBatchHeader`,
+  `homer_decoded_tuple_abi.h:67-76`, which carries only `commandSequence`/`tupleCount`/`attributeCount`). So the
+  lease DOES expose `recordKind` — the core branches on it (`:3557`/`:3610`) to pick the DATA/EOS batch-decode path
+  vs the ERROR-record path. Both sides recorded: codex's original draft put `recordKind` in the lease (RIGHT); I
+  rejected it claiming DATA/ERROR is decoded from the batch header (WRONG — that misread which header owns the
+  field). The `eos` bool is a SEPARATE signal, normalized from `header->flags & CITUS_TUPLE_SINK_TRANSPORT_FLAG_EOS`
+  (`:3626`/`:3695`) — the last-record-of-command marker that can ride a DATA, EOS, or ERROR record and drives the
+  identity reset + pass stop; it is distinct from `recordKind == EOS` (a 0-tuple batch, `:3528`).
+- [core decodes the payload batch → command-seq (`:3660`) + capture (`:3686`) + ERROR (`:3610`, short-body LENIENT,
+  accepted not fatal); tri-state, but visibility-pending is UNREACHABLE post-valid-lease so decode is effectively
+  success/fatal-malformed]
+- `ResultAcceptAndRelease(carrier, *lease)`: INFALLIBLE; core advances/resets its command-seq FIRST (nothing
+  between), then this op advances/resets `carrier->receiveExpectedOrdinal` from `lease->eos` and releases
+  consumedHead — merging accept+release makes "release without transport accept" unrepresentable and preserves
+  A-command-seq → B-ordinal → B-release order (`:3694` before `:338`). EOS resets ordinal→0 / command-seq→1 (`:3470`)
+  and the core must STOP the pass after an EOS accept (`:340`), not consume the next command's record.
+- `ResultFinishPass(carrier, *pass, deliveredRecordBytes, *streamState)`: called EXACTLY ONCE after every successful
+  BeginPass (incl. pending/fatal exits, so a trailer-only credit flush is never skipped). Accumulates bytes into
+  the carrier (`:3809`), publishes DPU credit iff consumedHead moved this pass (`:3813`, computed from the pass
+  snapshot — NOT from a remembered skippedTrailer), and returns the B-owned terminal classification
+  {ACTIVE | DRAINED_CLOSED | DRAINED_FAILED} from `dpuLastCreditEpoch != 0 && drained && entryState CLOSED/FAILED`
+  (`:3845`). This B-owned terminal detection was missing from the first op draft.
+
+**Verified current-line map (post Stage-2 `bc4f2d02a`; codex-explore + my struct/facade reads).** Core A-fields
+(all move to core unless noted), `HomerClientSession` (`remote_execution_client.h:187-239`): `serviceSessionId:189`,
+`serviceSessionIndex:190`, `lastConsumedCompletionEpoch:191`, `completionSessionGeneration:197` (VESTIGIAL, no
+writer, always 0), `completionLeaseActive:198`, `completionLease:199` (drop `.slotIndex:66`), `lastIssuedCommandSequence:206`,
+`outstandingStartCommandSequence:207`, `commandDpuStream:225` (STAYS transport — the embedded carrier),
+`commandDpuStreamOpen:226`, `sqlSessionTerminal:238`. Carrier split: `receiveExpectedOrdinal:165` STAYS (B),
+`receiveExpectedCommandSequence:177` MOVES to core (A). `sessionUID` is in options (`:266`), never retained in the
+session — new core field (last open read = OPEN stamp `homer_client.c:2100`; descriptor stamps `:1993/:2026/:2054`).
+The `memset(session,0)` `transport_open` must NOT do is at `homer_client.c:1838`. Facade defs
+`homer_client.c:1574/1595/1613/1674/1686/1717`; call sites Start `:4562/:4675`, Peek `:4779`, Ack `:4919`, Close
+`:2314/:2390/:2405`. Fused result poll `:3714`; deliver callback `:3533` (envelope+ordinal B `:3555/:3560`; ERROR
+`:3610`, cursor `:3640`, command-seq `:3660`, capture `:3686`); ordinal+command-seq reset together `:3470`, advance
+together `:3487`, fused advance called `:3625/:3694`. E device: opener `:794` (`doca_dev_open:820`),
+`HomerDpuFrontendOpenDevice:875`, combined `HomerDpuFrontendExportRegion:836` (opens `:853`, closes-on-fail `:860`,
+transfers `:864`), combined destroy `:1004`, device-scoped `HomerDpuFrontendExportRegionOnDevice:919`, carrier
+`HomerClientDpuExportMmap:1016` (uses combined `:1019`), acquire sites SQL `:1945` / BB-send `:2566` / BB-recv
+`:2941`, per-session teardown mmap-destroy `:4464` + dev-close `:4468`, failed-close return `:4460` before free
+`:4470`. **NEW E requirement (codex, VERIFIED):** `HomerDpuFrontendDestroyRegionExport:988` is `void` and DISCARDS
+`doca_mmap_destroy`'s result (`:992`), so the device context cannot learn whether a destroy failed to decide
+whether to keep its device ref — the context needs a status-returning destroy primitive (or a direct checked
+destroy). Frontend agent's SEPARATE device ownership (UNCHANGED): open `homer_frontend_agent.c:1546`, exports
+`:1554/:1568`, destroys `:1775/:1781`, dev-close `:1786` — never uses the carrier path.
+
+**Header refutation ROUND 1 (2026-07-18, codex-explore; every finding VERIFIED in code by me, then FIXED).** The
+two Stage-3 contract headers (`homer_session_transport.h`, `homer_session_core.h`) were written and then attacked
+before any body. Codex CONFIRMED clean: include closure is frontend-safe (reaches only stdint/stdbool + ABI
+headers; DOCA stays `void *` in the carrier), all named types are reachable, `HomerByteRingSinkLease.header` is a
+typed `CitusTupleSinkTransportHeader *`, the SQL-carrier-`serviceSessionId`-is-0 asymmetry holds, and
+`HomerSqlCommandSpec` matches the START inputs. Defects found + fixed (both sides recorded):
+- **CLOSE CONTRACT WAS WRONG (the important one).** My `HomerSqlSessionClose` doc said a terminal session skips the
+  lifecycle CLOSE. FALSE: only the SEMANTIC close (`CLIENT_SQL_SESSION_CLOSE`, a START) is terminal-gated
+  (`homer_client.c:2251`); the LIFECYCLE `CLOSE_SESSION` is gated on ROLE-1 OWNERSHIP/READINESS (`:2387`), and the
+  prior terminal-skip guard was DELETED at `:2360-2385` precisely because the happy path latches DO_NOT_REUSE→
+  terminal yet MUST still issue lifecycle close to reclaim the service session. Fixed: the two closes documented as
+  distinct gates (terminal ⇒ skip semantic only; role-1 ownership ⇒ gate lifecycle).
+- **Completion-apply + tuple-contract ownership was MISSING (design omission).** pgbench captures the tuple-view
+  contract FROM the completion during apply (`pgbench.c:3800-3803`) and RETAINS it across the ACK (the drain
+  outlives the lease). Fixed: added `HomerSqlSessionApplyCompletion` (latch terminal + capture+retain the
+  per-command contract + report result-stream-bound); `ConsumeResult` now takes NO contract arg (uses core-retained
+  state); `StartCommand` resets the per-command capture.
+- **`serviceSessionIndex` had no accessor** (pgbench logs it at open, `pgbench.c:9428`) → added
+  `HomerSqlSessionServiceSessionIndex` (this was the "first compile break").
+- **`DRAINED_FAILED` was collapsed** into `streamComplete` (transport FinishPass distinguishes it, `:3849`) → added
+  `streamFailed` to `HomerSqlResultOutcome`; `ConsumeResult` terminal-abandons on it.
+- **`errorCode` validity unrepresentable** (fixed body may be absent, `:3621`) → added `haveErrorCode`.
+- **`AcceptAndRelease` "infallible" overclaimed:** `HomerByteRingSinkRelease` silently no-ops when `consumedHead !=
+  recordStart` (`:470-481`). Kept no-failure-return (true for the single-consumer pass discipline) but documented
+  the guard as a stale/dup backstop that the body asserts/traces — not a supported path.
+- **`transport_open` intent-field legality** documented (SQL hardcodes opKind/txPolicy/lane/metadata/scope at
+  `:2105-2116`; projects only the identity fields) and the `docaDevicePci` one-device-per-process rule cross-linked
+  to component E; **credit-arm ordering** strengthened (both `receiveExpectedOrdinal=0` AND
+  `receiveExpectedCommandSequence=1` before `ArmInitialResultCredit`, mirroring `:2161/:2162` before `:1982`).
+- **`slotIndex` B-token (SCOPED OUT, accepted):** the caller-facing `HomerClientCompletionLease` still carries the
+  vestigial hardcoded-0 `slotIndex` (`:66`/`:4790`). "Core drops slotIndex" is honored for the core's INTERNAL
+  state; retyping the caller lease to a slotIndex-free view is churn for a 0 field and deferred (the user chose the
+  clean opaque handle over eliminating every smell this stage). Callers MUST NOT read `lease->slotIndex`.
+
+**Header refutation ROUND 2 (2026-07-18, re-review of the round-1 fixes; all VERIFIED in code by me, then FIXED).**
+Round 1's corrections were themselves unreviewed claims; round 2 caught three MORE blockers, the first serious:
+- **STOP CONDITION WAS WRONG (serious).** My `ConsumeResult` doc said "loop until `streamComplete`." The role-7
+  stream is PERSISTENT — it resets command identity at each in-band EOS and stays active (carrier comment
+  `remote_execution_client.h:171-175`; reset `homer_client.c:3470`/:3482) — so `streamComplete` (whole-stream
+  CLOSED/FAILED) only fires at SESSION close, while the per-command boundary is `sawEos`. pgbench stops on
+  `sawEos || streamComplete` (`pgbench.c:3703`). Looping on `streamComplete` alone SPINS FOREVER on every
+  successful row-producing command. Fixed: `sawEos` documented as the per-command boundary, `streamComplete`/
+  `streamFailed` as whole-stream; stop condition is `sawEos || streamComplete`.
+- **AUTO-ABANDON ON `streamFailed` WAS A NEW DEFECT.** The authoritative result failure is carried by the ROLE-6
+  completion (the service manufactures FAILED/TUPLE_SINK_FAILED, `tuple_sink_service_process.c:45576`/:45586,
+  possibly with the backend still alive `:45704`). Today CLOSED/FAILED collapse into `streamComplete`, the drain
+  finishes, and the completion carries the failure (`pgbench.c:3861`). Abandoning on `streamFailed` would leave the
+  completion unACKed, pin role-1, and suppress close — breaking the designed failure/cleanup path. Fixed:
+  `streamFailed` is INFORMATIONAL; abandon reserved for UNKNOWABLE states (BeginPass failure / FATAL_MALFORMED /
+  timeout / ACK-correlation).
+- **INITIAL-IDENTITY OWNERSHIP contradiction + a FALSE citation of mine.** My transport `ArmInitialResultCredit`
+  doc called `receiveExpectedOrdinal=0` "A-owned," contradicting the A/B split (ordinal is B — transport advances
+  it in AcceptAndRelease). And my `:1982` citation was descriptor GEOMETRY, not the credit arm (VERIFIED: `:1982`
+  is `recordGeometry`; the real init+arm are `HomerClientSqlResultBeginCommandIdentity:2161` then
+  `HomerClientDpuPublishReceiveConsumedHead:2162`). Fixed: ordinal init = B, command-seq init = A, both before the
+  arm; citations corrected to :2161/:2162 in both headers.
+- Also confirmed by round 2: the CLOSE split, by-value contract retention (`CitusTupleViewContract` is pointer-free,
+  `homer_tuple_abi.h:121`/:127; Ack destroys the lease `:4924`), `haveErrorCode`, the index accessor, vestigial-0
+  `slotIndex` (no SQL caller reads it; ACK correlates epoch/generation `:4875`), and the stale-release backstop are
+  all correct. Added: `ApplyCompletion` IDEMPOTENCY under a repeatedly-returned active lease (`:4758`) is now
+  documented (capture guarded, terminal latch monotonic).
+
+**Header refutation ROUND 3 → SETTLED (2026-07-18).** Round 3 VERIFIED all four round-2 substantive corrections
+correct (per-command EOS stop, informational stream-failure, split identity ownership, repeatable Apply) and found
+only THREE stale-WORDING contradictions (leftover "loop until `streamComplete`" text at the outcome-struct header,
+the result-consume section banner, and the Apply doc, contradicting the corrected `sawEos || streamComplete`
+contract; a too-strong Peek ACK-order summary that ignored the STARTED-vs-terminal drain/ACK ordering difference,
+`pgbench.c:3715`/:4024/:4077; and an Apply-idempotency clause that could be read as skipping its `*outResultStreamBound`
+write). All three fixed (pure comment-consistency edits, no semantic change) and re-grepped clean. Round 3's verdict:
+"no further semantic blocker is evident." **The two Stage-3 contract headers (`homer_session_transport.h`,
+`homer_session_core.h`) are SETTLED** — sound to implement bodies against. Refutation arc: 8 → 3 → 3-wording,
+descending severity = genuine convergence.
+
+**DECISION (USER, 2026-07-18): SPLIT the Stage-3 landing into TWO validated pushes** (supersedes the earlier
+"one push" — the split isolates the sole behavior change so a validation failure localizes to one of two things,
+not both):
+- **PUSH 1 — behavior-preserving A/B extraction:** components B (core `homer_session_core.c`) + C (typed handle) +
+  D (transport op bodies extracted into `homer_client.c` + thin adapter rewire) + F (multi-object archive) + the
+  pgbench `CState.homer_session` -> `HomerSqlSession *` pointer migration. The DOCA DEVICE MODEL STAYS UNCHANGED
+  (per-session device, as today -- `transport_open`'s body keeps the current per-session acquisition; NO E
+  consolidation). Validate: gate + four-role basebackup + DPU TCP smoke -> commit.
+- **PUSH 2 -- the behavior change, isolated:** component E (process-shared refcounted DOCA device context;
+  status-returning destroy; device-scoped acquisition; mmap-only per-session close). Validate again -> commit.
+- Execution (REFINED 2026-07-18 during body grounding — supersedes the earlier "core.c first, THEN a D worker for
+  transport bodies+adapter"): **the main agent writes the ENTIRE citus side itself** (core.c + ALL `HomerSqlTransport*`
+  op bodies + the adapter rewire in homer_client.c + the carrier-field move + F), and delegates ONLY the pgbench
+  `CState.homer_session` -> `HomerSqlSession *` migration (postgres-citus repo, fully isolated, cleanly mechanical
+  against the final public API) to a codex-worker; then main-agent refutes that diff. WHY the boundary moved: two
+  reasons surfaced only when the bodies were grounded. (1) **The result-consume pass bracket is ONE decomposition
+  spanning both files** — today's fused `HomerByteRingSinkDrain`+`HomerClientSqlResultDeliverDecoded` splits into
+  BorrowNext (B, envelope-validate) / core-decode (A) / AcceptAndRelease (B, ordinal+release), with the A/B line
+  running THROUGH the old fused body. Splitting its authorship (core's drive vs the four transport pass-bracket op
+  bodies) would put a seam-mismatch risk on the single most bug-historied path in the file (run-39 "reject every row
+  forever"). (2) Keeping all citus-tree writes in one hand sidesteps the Safety-Rule-5 serialization dance entirely
+  (the worker now touches only the postgres-citus tree). The plan's INTENT is preserved (main = design-sensitive +
+  coupled; worker = isolated mechanical); only the file boundary moved.
+
+**PIVOTAL STRUCTURAL FINDING (2026-07-18, body grounding — the settled header under-specified this).** The two
+Stage-3 headers fixed the LOGICAL A/B contract but silently assumed the PHYSICAL linkage was free. It is NOT: the
+core is a SEPARATE TU compiled POSTGRES-independent into `libhomer_client.a`, and **nearly every helper it needs is
+file-`static` in `homer_client.c` and declared in no header** — `HomerClientSetError:231` (119 refs),
+`HomerClientCommandName:319` (8), `HomerClientCopyCommandCompletion:435` (4),
+`HomerClientMaterializeLegacyCompletionFromView:479` (3), `HomerClientBuildCompletionViewFromLegacy:545` (2), plus
+the DPU submit/export/atomic statics. A separate TU cannot call a file-static. **LINKAGE POLICY (decided, recorded):**
+- **Expose** `HomerClientBuildCompletionViewFromLegacy` (remove `static`, declare in `remote_execution_client.h`): the
+  core's `PeekCompletion` owns the completion-VIEW build (A, per the settled header, transport.h:256) and this is the
+  one A-helper it must reach that is NOT behind a transport op. Safe: it operates on frontend-safe types and lives in
+  `homer_client.o`, which is already in BOTH link contexts (external client lib AND the backend, via basebackup's
+  refs).
+- **Core-local `static` duplicate** for `HomerClientSetError` ONLY (a ~10-line vsnprintf wrapper): it is file-static
+  in homer_client.c, so the core carries its own `SessionSetError`; duplicating it avoids touching 119 call sites
+  and keeps the core TU self-contained (two same-named file-statics in different TUs do not collide). **CORRECTION
+  (2026-07-19): `HomerClientCommandName` is NOT static** — it is public (declared `remote_execution_client.h:289`),
+  so the core calls it DIRECTLY, no duplicate. (An earlier draft of this note wrongly listed it among the
+  duplicates; the code was always correct — core.c uses the public symbol.) The monotonic clock is likewise
+  duplicated (`SessionMonotonicMillis`, mirroring the static `HomerClientMonotonicMillis`).
+- **Everything else via the `HomerSqlTransport*` op surface.** The completion COPY/MATERIALIZE helpers stay `static`
+  in `homer_client.c` (used only by the B transport op `PollCompletion`@1661 which does the copy internally, and by
+  the old `Try` adapter); the DPU submit/export/atomic statics stay behind the transport op bodies. The core touches
+  NO carrier atomic directly — every frontier/credit/consumedHead atomic is inside a B pass-bracket op; the core only
+  decodes borrowed lease bytes (plain reads, ordered by the acquire in BeginPass).
+
+**`receiveExpectedCommandSequence` MOVE — CONFIRMED SAFE (grep-verified 2026-07-18).** Every reference is in the SQL
+path (`homer_client.c:3471/3488/3660/3675`, all inside the SQL identity/deliver helpers); basebackup's receive NEVER
+reads it. So the settled header's "core owns its OWN command-sequence" is a genuine ownership move with zero
+basebackup risk: it migrates into the private `HomerSession` core struct (removed from the carrier at
+`remote_execution_client.h:177`), while `receiveExpectedOrdinal:165` STAYS carrier-resident and B-owned (basebackup
+shares it for wrap-gap detection). This shrinks `sizeof(HomerClientBaseBackupStream)` by 8 bytes — a coordinated
+recompile of both trees, which Push 1 does anyway.
+
+**DEFERRED POST-VALIDATION CLEANUP (Push 1, 2026-07-19 — user decision: do these AFTER Push-1 validation passes; no hurry).** The citus-side surgery (worker + main-agent refutation) came back sound and BUILDS CLEAN (re-verified by the main agent: `HomerClientSession` the type removed, tree compiles as dbcomm with only pre-existing basebackup `-Wunused-but-set-variable` warnings). Two non-blocking hygiene items were consciously deferred so they do not perturb the validation candidate:
+1. **Remove the `#if 0` dead reference blocks** left in `homer_client.c` by the extraction (old close orchestration ~:2339, old SQL-result A-helpers `BeginCommandIdentity`/`AdvanceCommandIdentity`/`DeliverDecoded`/`HomerClientSqlResultDpuSinkCtx` ~:3648, old completion helpers ~:4973, the six removed public wrappers `StartCommandWithCompletion`/`StartCommand`/`StartAndWaitCommand`/`TryCommandCompletion`/`PollCommand`/`WaitCommandCompletion` ~:5163-5646). They are fenced out of the active object (verified: build succeeds with the carrier field + `HomerClientSession` type both removed, so every dangling `receiveExpectedCommandSequence`/`HomerClientSession` reference inside them is dead), but they now reference removed symbols and will not re-compile if re-enabled — pure reference cruft to delete once the extraction is validated.
+2. **Remove / debug-gate the worker-introduced libc `assert()`s** in `homer_client.c` (`#include <assert.h>` at :25; asserts at ReleaseStartSlot :1758, AcceptAndRelease :4248/:4249, FinishPass :4266). **CONFIRMED active in the perf build** (the real compile line is `-g -O2` with NO `-DNDEBUG`, so libc `assert()` is not compiled out). The load-bearing one is AcceptAndRelease:4249 — an atomic-load-per-result-record on the gate's hot path, which contaminates any MEASURED throughput number (harmless to functional correctness: the guard is always-true in the single-consumer pass discipline, so it never fires). Post-validation, replace the stale-release guard with a `HOMER_DPU_P2_DIAG`-gated check+trace (matching the header's "asserts (debug) / traces the guard" intent, homer_session_transport.h:306-312) and drop the per-pass/per-command asserts, restoring homer_client.c to assert-free. Until then, DO NOT quote performance numbers from a build carrying these asserts.
+
+**PUSH-1 VALIDATION ATTEMPT #1 (2026-07-19, run `candidate-20260719-004251`) — gate FAIL root-caused to an OPERATIONAL frontend-agent doorbell desync, NOT Push-1 code.** Full manual-runbook validation (build+install both trees, peer deploy, no DPU redeploy since host-only). Results:
+- **DPU TCP transport smoke — PASS** (host↔DPU DMA + byte-ring; exactly the path the one DPU-rebuilt Push-1 header `homer_byte_ring_sink.h` affects — so component A's Borrow/Release split is validated on the DMA path).
+- **Four-role selected-DPU basebackup — PASS** (23,259,288,507 bytes, 44,363 full laps of the 512 KiB ring → wrap proven; frontier balanced posted==retired+flushed). Exercises the shared carrier (post `receiveExpectedCommandSequence` removal), the refactored byte-ring consume core, and the peer OPEN/CLOSE transport — all green.
+- **Selected-DPU command GATE — FAIL**, reproduced identically on a clean Rule-12 retry. Client-0 fails at SQL session OPEN (`peer async op connection became inactive`). farnet1 DPU raised `HOMER_EVENT ... event=peer_host_spawn_retired ... op=5`, preceded by SIX `DPU doorbell ATTACH rejected: status=4` at service start (before any client).
+- **ROOT CAUSE (localized + verified, Push-1-INDEPENDENT):** `status=4 = HOMER_DPU_COMCH_SETUP_BAD_BRIDGE` (`homer_service_dpu_doorbell.c:688`). `HomerServiceDpuDoorbellValidateAttach` (`tuple_sink_service_process.c:46169`) accepts the frontend-agent doorbell ONLY if `HomerDpuDmaHasActiveHostMmapImport(engine, bridgeGeneration, clientInstanceId)` — so the farnet1 frontend agent (`citus.enable_homer_dpu_frontend_agent=on`, runbook §"PostgreSQL with frontend agent":329) must establish a host-mmap import with a MATCHING generation BEFORE its doorbell attaches (runbook :467: "doorbell attached before the first OPEN"). Six BAD_BRIDGE rejects ⇒ no matching import when the attach arrived ⇒ `TupleSinkServiceDpuBackendSpawnArmActive` (:21688, needs `doorbellFacts.attached`) stays false ⇒ gate `OPEN_COMMAND_SESSION` correctly rejected. This is a frontend-agent import/doorbell LIFECYCLE/ORDERING condition (consistent with the run's reported multi-restart supervisor churn), in the DPU-DMA-scheduler/doorbell/spawn-arm subsystem.
+- **Why NOT Push 1 (all VERIFIED):** `homer_frontend_agent.c` + `homer_frontend_dma_lifecycle.c` untouched by the Push-1 diff; the `HomerDpuFrontend*` export helpers in `homer_client.c` untouched (grep of the diff empty); doorbell/spawn code does not include `homer_byte_ring_sink.h`; the two Push-1-EXERCISED workloads (basebackup, smoke) PASS; the gate PASSED on the base SHA (`7210421e0d1` "S6 Track A … validate -c1"); and the host SQL client's A/B logic is never reached (peer rejects OPEN before any transaction). **Conclusion: the gate FAIL does not implicate the Push-1 host-side refactor; it is an operational frontend-agent doorbell-attach desync to be resolved rig-side (clean, correctly-ordered frontend-agent arming: DPU service up → farnet1 postgres with the frontend-agent GUC → verify doorbell ATTACHED → then gate), then re-run the gate.** Push 1 remains UNCOMMITTED pending a green gate. (Also noted, checker-raw, not diagnosed: `teardown_checks` stage2b `peak_shards=0` FAIL on the basebackup-only interval — the checker's `bad_ledger` predicate may not apply to a no-host-service-shard session; unrelated to Push 1.)
+
+**PUSH-1 GATE DESYNC — DEEP ROOT CAUSE (2026-07-19, user-directed investigation; VERIFIED in code + logs; Push-1-INDEPENDENT).** The gate BAD_BRIDGE is a frontend-agent doorbell/import GENERATION-STRANDING across a DPU-service restart:
+- The frontend agent (bgworker in farnet1 postgres, `citus.enable_homer_dpu_frontend_agent=on`) mints `bridgeGeneration = (MyProcPid<<32) ^ time(NULL) ^ arena_ptr` ONCE per instance (`homer_frontend_agent.c:1516`), and `clientInstanceId = bridgeGeneration ^ const` (:1521).
+- It exports the arena + spawn region and sends SETUP (the DPU DMA engine imports generation G) ONCE per instance (:1554-1579), THEN enters the doorbell steady state which, on a DPU restart, ONLY **reconnects the doorbell every second — it does NOT re-export** (:1622-1624). Re-export happens ONLY on the agent's OWN ERROR→proc_exit→bgworker-restart→fresh-generation path (:1526-1544); that path even notes the agent exits WITHOUT CLOSE, so "the DPU keeps a stale import" (:1537).
+- The DPU accepts a doorbell ATTACH only if `HomerDpuDmaHasActiveHostMmapImport(engine, bridgeGeneration, clientInstanceId)` is already true (`HomerServiceDpuDoorbellValidateAttach`, `tuple_sink_service_process.c:46169`; reject = `BAD_BRIDGE`, status=4).
+- **Therefore: restart the DPU service WITHOUT recycling the farnet1 frontend agent, and the agent's doorbell reconnects with its old generation G into a FRESH DPU that never imported G → BAD_BRIDGE forever → spawn arm never arms → gate OPEN_COMMAND_SESSION rejected.** Log proof (run `candidate-20260719-004251`, farnet1 DPU): the only IMPORTED generation is `17583322268413212` (5 arena exports accepted), but the doorbell ATTACH presents `4175513958737582` — two distinct bgworker lifetimes stranded across a DPU-service restart. The run's own Rule-12 DPU-service restarts (which do not cycle postgres) + the reported supervisor-state churn are exactly this trigger.
+- **OPERATIONAL FIX — now lives in the OPERATOR RUNBOOK + HAZARDS, not here** (it is a runner-facing procedure, not part of this design): operator runbook §"DPU services" (the frontend-agent ⇄ DPU-service co-arming invariant) + §"Selected-DPU command gate" (the gate-readiness precondition), with the incident rationale in `farnet_operational_hazards.md` §11. In one line: whenever a DPU service is (re)started, recycle the farnet1 frontend-agent PostgreSQL (5433 only) so it re-exports, and verify the doorbell is attached with a generation matching the DPU's accepted import before the gate.
+- **PUSH-1 VALIDATION COMPLETE — GREEN (2026-07-19, re-run under corrected co-arming).** Gate re-run `pgbench --homer --homer-dpu -c4 -j4 -t5` (20 tx) PASSED all four proofs: transport line present; 20/20 processed, 0 failed; 4 correlated `DPU backend spawn begin/COMPLETED` pairs (bridge_generation matching the agent's export `4157110881348830`); `peer_host_spawn_retired` ABSENT; 20 distinct decoded `abalance` values; `gate_check`→PASS `{transactions:20, spawn_pairs:4, decoded_values:20}`, `alarm_check`→PASS. The readiness precondition confirmed the frontend agent's export+doorbell both at gen `4157110881348830` matched the DPU's accepted import — proving the diagnosis + fix by construction (arming ORDER changed, zero code changed). Combined with attempt#1's smoke PASS + four-role basebackup PASS (same build/deploy, run `candidate-20260719-004251`), **all three required Push-1 workloads are green against the same artifacts.** Push 1 is CLEARED to commit (citus code + postgres pgbench + KB).
+
 ### 12.5b Stage 3.5 — migrate basebackup onto the unified session (the multi-consumer proof) (owner, 2026-07-18)
 Migrate `pg_basebackup` (RECEIVE client) + `basebackup_homer.c` (SEND backend) onto the unified core/interface
 (§13) as the SECOND, differently-shaped consumer — **before final retirement, while ① is still a live reference.**

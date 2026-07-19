@@ -508,3 +508,41 @@ chowned sources to the human user and broke `dbcomm` builds on exactly these; bo
 find /data/dbcomm/citus-dbcomm/src -type d \( -name .deps -o -name 'build-cdc-*' \) \
   -exec sudo -n chown -R dbcomm:dbcomm {} +
 ```
+
+---
+
+## §11 The DPU spawn arm depends on a frontend-agent doorbell a DPU restart SILENTLY STRANDS (2026-07-19, Stage-3 Push-1 gate)
+
+**Symptom:** the selected-DPU command gate fails at session OPEN with `pgbench: ... peer async op connection became
+inactive`, the farnet1 DPU log carries `tuple-sink service: DPU doorbell ATTACH rejected: status=4` (six times, at
+service start, before any client) followed by `HOMER_EVENT ... event=peer_host_spawn_retired ... op=5`, and the
+farnet0 DPU log shows `async local open failed phase=5 ... peer async op connection became inactive`. It reproduces
+on a plain Rule-12 retry and looks exactly like a broken command path — but the command path (and, in the Push-1
+case, the code under test) is never reached.
+
+**Mechanism (VERIFIED in code + logs):** the farnet1 frontend agent (bgworker in *our* 5433 postgres,
+`citus.enable_homer_dpu_frontend_agent=on`) mints `bridge_generation = (MyProcPid<<32) ^ time(NULL) ^ arena_ptr`
+**once per bgworker instance** (`homer_frontend_agent.c:1516`), exports its arena and sends SETUP so the DPU imports
+that generation **once** (:1554-1579), then enters a doorbell steady state that, on a DPU restart, only
+**reconnects the doorbell — it does NOT re-export** (:1622-1624). Re-export happens ONLY on the agent's own
+ERROR→proc_exit→bgworker-restart→fresh-generation path (:1526-1544). The DPU accepts a doorbell ATTACH only if it
+already holds a live host-mmap import with the *same* generation (`HomerServiceDpuDoorbellValidateAttach` →
+`HomerDpuDmaHasActiveHostMmapImport`, `tuple_sink_service_process.c:46169`; reject = `HOMER_DPU_COMCH_SETUP_BAD_BRIDGE`
+= status 4, `homer_service_dpu_doorbell.c:688`). So **restarting a DPU service while the frontend agent survives
+strands the doorbell**: the agent reconnects with its old generation into a fresh DPU that never imported it → BAD_BRIDGE
+forever → `TupleSinkServiceDpuBackendSpawnArmActive` (:21688, needs `doorbellFacts.attached`) stays false → OPEN
+rejected. Log proof: imported gen `17583322268413212` vs doorbell gen `4175513958737582` — two bgworker lifetimes
+stranded across a DPU restart.
+
+**Why it's invisible:** an un-armed spawn arm looks identical to a healthy idle service; nothing reports the stranding
+until the first OPEN. Same shape as §8.1 ("accepted is not still-works-afterwards") and §8.4 ("no error is not the
+intended path ran").
+
+**The rule (co-arming):** whenever a DPU service is (re)started — including the mandatory post-failed-gate Rule-12
+restart — **also recycle the farnet1 frontend agent** (restart our 5433 postgres; never touch the foreign 5432, §2)
+so a fresh bgworker re-exports into the new DPU instance; and **before the gate, verify the doorbell is attached with
+a generation matching the DPU's accepted import** (no `ATTACH rejected`). Operator procedure: operator runbook
+§"DPU services" (co-arming invariant) and §"Selected-DPU command gate" (gate-readiness precondition). This is an
+*operational* desync, not a code bug — the agent code and this restart property are long-standing and were confirmed
+untouched by the Stage-3 Push-1 refactor (which passed the DPU TCP smoke and four-role basebackup, and passed the
+gate itself once the agent was correctly co-armed).

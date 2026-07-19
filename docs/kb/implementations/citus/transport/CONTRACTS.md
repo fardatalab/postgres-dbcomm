@@ -959,6 +959,48 @@ the call site. If it is not on the list, **it has not been checked.**
 
 ---
 
+## HOST-CLIENT SQL session (Stage-3 Push-1). Paths below are `citus-dbcomm/src/bin/` (NOT the service dir above).
+
+## `HomerSqlSession` — OPAQUE, HEAP-OWNED SQL session handle (`homer_session_core.h`); the A-state core lives in `homer_session_core.c`
+
+- **MEANS:** an incomplete-typed handle to the private `struct HomerSession` (the SQL session state machine: command
+  sequence + one-outstanding-START, the completion peek/apply/ack lease + terminal latch, retained intent/sessionUID,
+  and the result payload decode). `HomerClientOpenSqlSessionSelectedDpu` **RETURNS** it (heap-allocated); Close **frees** it.
+- **DOES NOT MEAN** the old by-value `HomerClientSession` struct (RETIRED — removed from `remote_execution_client.h`).
+  Callers cannot size or stack-allocate it, and Open no longer fills a caller-provided struct. pgbench holds
+  `HomerSqlSession *` (`pgbench.c:712`), opens via the returned handle, and sets it NULL after Close.
+- **DOES NOT MEAN** POSTGRES/DOCA-dependent: `homer_session_core.c` compiles POSTGRES- and DOCA-independent (stdint/
+  stdbool + ABI headers only) and is a SECOND object in `libhomer_client.a` — it links into BOTH the client and the
+  backend (dead code until Stage 4). DOCA handles stay `void *` in the embedded carrier.
+- **ENFORCES:** the opaque type is declared once (guarded `HOMER_SQL_SESSION_HANDLE_DECLARED` in both
+  `homer_session_core.h` and `remote_execution_client.h`). Field partition: A-state → `struct HomerSession`;
+  transport carrier (`HomerClientBaseBackupStream`) is EMBEDDED as its substrate.
+
+## `HomerSqlTransport*` ops take an EXPLICIT `serviceSessionId` — **NEVER read `carrier->serviceSessionId` for a SQL session**
+
+- **MEANS:** the B-side transport ops the core calls (`HomerSqlTransportPublishStart` / `PollCompletion` /
+  `LifecycleClose`, `homer_client.c`) receive the session identity as an explicit scalar the core passes
+  (`core->serviceSessionId`).
+- **DOES NOT MEAN** the carrier holds the SQL identity: the SQL open path deliberately leaves
+  `carrier->serviceSessionId == 0` — the identity is adopted into the core, not the carrier. (basebackup, sharing the
+  same carrier struct, DOES set `carrier->serviceSessionId = dpuBridgeGeneration`.) A transport op that read the
+  carrier field would compare every SQL completion against 0 — a wrong-neighbor bug the explicit-arg contract prevents.
+- **ENFORCES:** every identity-needing `HomerSqlTransport*` body uses its `serviceSessionId` parameter; `PollCompletion`'s
+  role-6 identity check keys on it.
+
+## `struct HomerSession.receiveExpectedCommandSequence` (core, A) vs `carrier->receiveExpectedOrdinal` (carrier, B) — the result-decode A/B split
+
+- **MEANS:** the 1-based command-local sequence is owned by the CORE (reset to 1 at each in-band EOS by the core's
+  ConsumeResult); the 0-based transport recordOrdinal is owned by the CARRIER/transport (advanced/reset by the
+  `AcceptAndRelease` op). Accept order is A-command-seq FIRST, then B-ordinal, then credit release.
+- **DOES NOT MEAN** both live in the carrier: `receiveExpectedCommandSequence` was **MOVED OUT** of
+  `HomerClientBaseBackupStream` into the core (it was SQL-result-only; basebackup never read it). `receiveExpectedOrdinal`
+  STAYS in the carrier (basebackup shares it for wrap-gap detection).
+- **ENFORCES:** the core decode reads `core->receiveExpectedCommandSequence`; `HomerSqlTransportResultAcceptAndRelease`
+  is the only writer of `carrier->receiveExpectedOrdinal` on the SQL path.
+
+---
+
 ## Related
 
 - [`resource_retirement_contract_audit.md`](resource_retirement_contract_audit.md) — the narrative and evidence

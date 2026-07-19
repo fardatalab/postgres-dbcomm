@@ -353,6 +353,20 @@ ssh farnet0 "/tmp/farnet-validation-$RUN_ID/helpers/dpu_dispatch.sh" \
 Each child must own both 9727 and 9728. `HOMER_SERVICE_ENABLE_DPU_DMA=1` requires the machine-baseline progress
 policy. Do not start either host `citus_tuple_sink_service` for the selected-DPU gate.
 
+⚠ **Frontend-agent ⇄ DPU-service CO-ARMING (load-bearing; see hazards §11).** The farnet1 frontend agent exports
+its arena to the DPU and mints its `bridge_generation` **once per bgworker instance**, then only *reconnects* its
+doorbell on a DPU restart — it does **NOT** re-export. The DPU accepts a doorbell ATTACH only when it holds a live
+host-mmap import with the *same* generation. Therefore:
+- Prefer to bring **both DPU services up BEFORE** starting/recycling farnet1's frontend-agent PostgreSQL, so the
+  agent's first export targets a live DPU instance (a cold `postgres`-then-DPU order also eventually works via the
+  agent's own ERROR→bgworker-restart→fresh-generation retry, but wastes ~5 s cycles and is less deterministic).
+- **INVARIANT — whenever a DPU service is (re)started, RECYCLE the farnet1 frontend agent too:** restart farnet1's
+  own port-5433 PostgreSQL (never touch the foreign 5432) so a fresh bgworker re-exports its generation into the new
+  DPU instance. This binds the mandatory post-failed-gate Rule-12 DPU restart: **restart both DPU services AND
+  recycle the farnet1 frontend-agent PostgreSQL before any retry**, then re-verify the readiness precondition below.
+  Skipping the agent recycle strands its doorbell (`DPU doorbell ATTACH rejected: status=4` / BAD_BRIDGE), the spawn
+  arm never arms, and the gate fails at OPEN with `peer_host_spawn_retired` — an *operational* desync, not a code bug.
+
 ### Schema and identities
 
 ```sh
@@ -439,6 +453,18 @@ Roles:
 | farnet0 DPU | service bound `10.10.1.200:9717` |
 | farnet1 DPU | service bound `10.10.1.201:9717` |
 | farnet1 host | PostgreSQL with frontend agent; no host service |
+
+⚠ **GATE-READINESS PRECONDITION (verify BEFORE invoking `pgbench`).** Confirm the farnet1 frontend agent's spawn
+doorbell is ATTACHED to the *current* DPU service instance, or the gate fails at session OPEN. From the farnet1
+frontend-agent PostgreSQL log, find the agent's export + attach at the same generation, e.g.:
+```
+homer frontend agent: exported arena ... to DPU 10.10.1.201:9727, bridge_generation=<G> client_instance=<C> ...
+HOMER_EVENT ... component=frontend_agent event=dpu_doorbell_attached ... bridge_generation=<G> client_instance=<C>
+```
+and cross-check the farnet1 DPU log shows `DPU TCP setup mmap import accepted bridge_generation=<G> client_instance_id=<C>`
+for the **same** `<G>`/`<C>`, with **no** `DPU doorbell ATTACH rejected` since the last DPU-service start. If the
+generations differ or a reject appears, the agent is stranded (see the co-arming invariant above) — recycle the
+farnet1 frontend-agent PostgreSQL and re-verify; do NOT run the gate until this holds.
 
 Bracket both DPU logs before each candidate:
 
