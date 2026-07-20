@@ -23,6 +23,7 @@ remote execution session semantics.
 - [copy_path_revival_contract.md](copy_path_revival_contract.md) - Coverage, invariants, refuted suspects, and prerequisites for eventually reviving backend-to-backend COPY.
 - [cross_node_dpu_migration_checkpoint.md](cross_node_dpu_migration_checkpoint.md) - Implementation checkpoint for migrating Homer command, completion, and payload paths across the two-host DPU topology.
 - [dpu_byte_ring_pool_per_session_plan.md](dpu_byte_ring_pool_per_session_plan.md) - Design and staged plan for per-session DPU byte-ring resources and their lifetime protocol.
+- [dpu_collector_admission_starvation_mixed_workload.md](dpu_collector_admission_starvation_mixed_workload.md) - Why the MIXED pgbench+basebackup workload hangs: the 6-slot collector quota starves late collectors once two workload kinds coexist. The byte-ring pool is exonerated.
 - [dpu_collector_feedback_aliasing_defect_b.md](dpu_collector_feedback_aliasing_defect_b.md) - Active diagnosis and remediation plan for DPU collector feedback aliasing and starvation suppression.
 - [dpu_command_plane_migration_plan.md](dpu_command_plane_migration_plan.md) - Detailed staged plan and decisions for moving the Homer SQL command plane onto the DPUs.
 - [dpu_crossnode_command_completion_bridges_design.md](dpu_crossnode_command_completion_bridges_design.md) - Design and implementation steps for selected-DPU cross-node command and completion bridges.

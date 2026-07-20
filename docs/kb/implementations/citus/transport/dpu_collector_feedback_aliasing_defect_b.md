@@ -447,6 +447,15 @@ for it is LEGITIMATE. What is broken is the SIGNAL it backs off on. Fix the sign
    newly-admitted grouped grant consumes one of six collector slots, so FB-1 can **RELOCATE** the loss to later
    DPU collectors. The measured `DPU_PAYLOAD_PULL budget` is exactly compatible with that residual defect.
 
+   > ### ⚡ THIS PREDICTION CAME TRUE (2026-07-19). It is now a live, workload-breaking defect.
+   >
+   > The MIXED workload (gate pgbench CONCURRENT with four-role basebackup) **hangs**, at `-c4` and at `-c1`
+   > alike, with no alarm and no pool exhaustion. The trigger this item did not anticipate is that it takes a
+   > **second concurrent workload kind** to arm enough early collectors to push the late ones out of the
+   > six-slot quota — which is why every single-workload acceptance run has always passed.
+   > Full diagnosis, evidence, and the instrumented A/B design:
+   > [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md).
+
 ### Confirmed SAFE to split (VERIFIED)
 
 - Nothing reads `dpuDmaFeedback` as an engine-wide aggregate (its only such reader is behind the dead `goto`).
