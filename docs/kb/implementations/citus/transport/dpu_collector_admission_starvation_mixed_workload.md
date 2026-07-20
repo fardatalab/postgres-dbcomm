@@ -116,9 +116,13 @@ service-exit census (`HomerStarveDiagReportSummary`, `:12000`). The census print
 — the exact state under test. Four reasons are distinguished: `already-planned` (benign), `feedback-backoff`,
 `no-source` (stale scaffolding), **`budget`** (the quota).
 
-**Build:** both DPUs, `--cppflags='-D_GNU_SOURCE -DHOMER_COLLECTOR_STARVE_DIAG=1'` via
+**Build:** both DPUs, `--define=HOMER_COLLECTOR_STARVE_DIAG=1` via
 [`dpu_build.sh`](../../../../../tools/farnet_validation/remote/dpu_build.sh). Diagnostic-only; no performance
 number may be quoted from it.
+
+⚠ The flag is a repeatable, **whitespace-free** `--define=` argument on purpose. A single
+space-separated `--cppflags=` string does not survive the ssh hop (ssh forwards a command *string*, not an
+argument vector) and needs an extra quoting layer for farnet0's DPU than for farnet1's — hazards §6.3b.
 
 **Design — same binary, two arms, ONE variable (is a basebackup live?):**
 

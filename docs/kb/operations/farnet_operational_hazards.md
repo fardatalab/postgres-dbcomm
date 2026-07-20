@@ -228,6 +228,29 @@ It failed *safe* (a false negative, not a false pass), which is the only reason 
 the same disease this whole KB keeps cataloguing: **a diagnostic whose success is indistinguishable from its
 failure.** The same trap arms any `... | head -1`, `... | grep -m1`, or `... | read` under `pipefail`.
 
+> **⚠ IT RECURRED ON 2026-07-19, AND THAT TIME IT DID COST A RUN.** A newly added positive-instrumentation
+> assertion in `dpu_build.sh` was written as `strings "$binary" | grep -q 'starve-diag'` — this exact form — and
+> aborted the instrumented A/B collector-starvation run on **both** DPUs, on two correctly instrumented binaries.
+> The tell is in the raw evidence and is worth recognising on sight: **the identical command, run by hand against
+> the same inode, passes repeatably.** That discrepancy means the pipeline's *status*, not its *content*, is what
+> differs — i.e. this bug, every time.
+>
+> This entry existed and was accurate; it was not consulted before writing the check. **Read §3.3/§3.3b before
+> writing ANY build-proof grep.**
+
+**ENFORCES — every checked-in site that must obey this rule** (add new ones here in the same commit as the site):
+
+| site | form | status |
+|---|---|---|
+| `tools/farnet_validation/remote/dpu_build.sh` (instrumentation assertion) | `strings \| grep >/dev/null` | ✅ correct; carries a do-not-simplify warning |
+| `tools/farnet_validation/mixed_workload.sh:70` | `ssh … \| grep -qE '^[1-9]'` | ⚠ latent-safe ONLY because the producer emits one short line and finishes writing before `grep -q` exits |
+| `tools/farnet_validation/remote/dpu_process_cleanup.sh:74` | `ss \| tail \| grep -q .` | ⚠ latent-safe ONLY because `ss` listener output is small |
+| `tools/farnet_validation/remote/dpu_supervisor.sh:47` | `ss -H \| grep -q .` | ⚠ latent-safe ONLY because `ss` listener output is small |
+
+**The safety of the three `⚠` rows is an unstated invariant — bounded, small producer output — not a correct
+pattern.** They are the wrong shape and must not be copied. A producer that emits a large stream with an early
+match (`strings` on a binary is the canonical case) fails 100 % of the time.
+
 ### 3.3c A successful `tee` can mask a failed validation script
 
 Observed on 2026-07-17 during Stage-3 stripped acceptance. The inner script used `set -euo pipefail` and correctly
@@ -360,6 +383,32 @@ That is what made recovering those 30 edits a one-minute replay instead of an af
 
 `ssh farnet0 ssh dpu "cd ~/..."` — **farnet0's shell expands `~` to farnet0's home**, not the DPU's. Ship a
 script and invoke it by path.
+
+### 6.3b `ssh` does not forward an argument VECTOR — a value containing a space splits across the hop
+
+Hit on 2026-07-19 designing the diagnostic-build interface. `ssh host cmd a b c` does **not** deliver
+`("a" "b" "c")` to `cmd`: ssh **concatenates** its arguments into ONE command string and the remote login shell
+re-splits it on whitespace. So a single argument whose *value* contains a space arrives as **two** arguments:
+
+```sh
+# Caller believes it passes ONE argument. The DPU receives TWO.
+ssh dpu ./build.sh RID archive.tar --cppflags='-D_GNU_SOURCE -DFOO=1' service-bin
+#                                             ^ splits here, remotely
+```
+
+Local quoting protects only the LOCAL word split; it is consumed before ssh ever runs. And farnet0's DPU is
+reached through a **second** hop (`dpu_dispatch.sh` → `exec ssh dpu "$remote/$action" "$@"`), so it needs one
+more quoting layer than farnet1's DPU — the classic shape of a command that is right on one node and wrong on
+the other, producing **asymmetric evidence** rather than an honest error.
+
+**Do:** design remote interfaces so **no argument value ever contains whitespace** — take a repeatable
+single-valued flag (`--define=FOO=1 --define=BAR=2`) instead of one space-separated string, and *reject* a value
+containing whitespace, because such a value proves the quoting was already lost upstream. `printf '%q '` works
+but only if every caller remembers it at every hop, which is not a property you can rely on.
+
+⚠ Note this hazard is invisible to the environment as well: `dpu_dispatch.sh` forwards **arguments** but drops
+**exported variables**, so an env-var interface silently yields a NON-diagnostic build on farnet0 while working
+on farnet1. Positional, whitespace-free arguments are the only form that survives both hops.
 
 ### 6.4 Backticks inside `git commit -m "..."` trigger command substitution
 
