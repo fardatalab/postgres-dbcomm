@@ -257,7 +257,60 @@ send-open rides the same command plane and starves identically. One mechanism, b
 
 ---
 
-## ✅ THE FIX AS IMPLEMENTED (2026-07-20, citus tree; NOT yet validated on the rig)
+> ## ⚡ VALIDATED 2026-07-20 (`candidate-20260720-121352`, citus `f84e49bad`): THE FIX WORKS AND THE HANG REMAINS.
+>
+> **The starvation is gone.** All EIGHT reserved collectors record **ZERO** `budget` drops, on **both** DPUs,
+> in **every** stage — including the still-failing mixed run. Gate `-c1` 200/200, gate `-c4` 8000/8000,
+> four-role basebackup 23.26 GB: all **PASS**.
+>
+> **The mixed workload still FAILS**, with the identical `sql_execute kind=6 sequence=5` signature.
+>
+> ⇒ **Collector-admission starvation was REAL and is FIXED, but it was NOT the whole cause.** A second,
+> upstream defect is now the frontier. Do not read the earlier sections of this doc as a solved case.
+>
+> ### The new frontier: ring DISCOVERY collapses on the receiver DPU
+>
+> farnet0's DPU, gate-alone (PASSES) vs mixed (FAILS), same binary:
+>
+> | collector | gate alone | mixed |
+> |---|---|---|
+> | `DPU_COMMAND_PULL` | 115,085 | **17** |
+> | `DPU_PAYLOAD_PULL` | 115,085 | **17** |
+> | `DPU_BACKEND_COMMAND_STAGE` | 57,398 | **8** |
+> | `DPU_STAGED_COMMAND_DISPATCH` | 57,398 | **8** |
+>
+> `COMMAND_PULL` and `PAYLOAD_PULL` are appended under ONE shared predicate,
+> `facts.totalDiscoveredReadyRingCount > 0` (`tuple_sink_service_process.c:46718`-`:46726`), and both read
+> **17**. **With zero budget drops, this is an ARMING failure, not an admission failure** — the ready-ring
+> count is essentially always 0, so the client's command ring is never discovered. Everything downstream is
+> idle for want of input, which is why DISPATCH now shows grants≈drops≈0 instead of 3-against-1.5M.
+>
+> `DPU_GROUPED_CONTROL_READ` — the collector that discovers host commands — was granted **21,762,205** times
+> and discovered nothing.
+>
+> ### ⚠ UNRESOLVED, AND IT MAY INDICT THIS FIX
+>
+> The same counter in the PRE-fix mixed run was **3,084**; post-fix it is **17**. Normalizing for run length
+> (`GROUPED_CONTROL_READ` 53.2M pre vs 21.8M post) still leaves post-fix far lower. **Two live explanations:**
+> the fix made discovery collapse earlier, or the run simply wedged sooner. **This is NOT settled and the fix
+> must not be called clean until it is.**
+>
+> **The experiment that settles it:** re-run mixed with this change REVERTED on the same instrumented build
+> and compare `DPU_COMMAND_PULL` on equal footing. Do that BEFORE any further scheduler work.
+>
+> ### Behaviour that DID change for the better
+>
+> - The basebackup now moves **~1.4 GB** before wedging; pre-fix it never started (zero binds on the sender).
+> - The consumer now terminates itself with an explicit `stream terminated FAILED by sender abort …
+>   TRUNCATED` error instead of hanging past both DPU SIGTERMs and needing an identity-verified reap.
+>
+> ### Also observed
+>
+> - `DPU_SPAWN` recorded **163** `budget` drops on farnet1 — the unreserved collector already flagged below as
+>   meeting the silent-hang criterion. Watch it.
+> - The teardown `ALARM arena unbind found NO import … LEAKED` recurs, unchanged, on farnet1.
+
+## ✅ THE FIX AS IMPLEMENTED (2026-07-20, citus tree; validated as REMOVING THE STARVATION, but the mixed workload still fails)
 
 **Shape: reserve the whole command-plane pipeline, and stop double-charging reserved grants.**
 

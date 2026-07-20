@@ -606,8 +606,12 @@ the call site. If it is not on the list, **it has not been checked.**
   - the `PROGRESS POLICY-ADMISSION DROPS` line **must keep printing `lifecycle=`**, or it silently omits up to
     8 admissions per phase and `collectors=6` reads as the whole story
   - all caps are env-overridable, with **no coupling validation** — an override can re-break the equality rule
-- **STATUS:** implemented, compiles; **NOT yet validated on the rig.** Until the mixed workload passes, treat
-  the fix as unproven. Evidence and open risks:
+- **STATUS (2026-07-20):** implemented and **VALIDATED AS REMOVING THE STARVATION** — all 8 record ZERO
+  `budget` drops on both DPUs in every stage; gate `-c1`/`-c4` and four-role basebackup PASS. **But the MIXED
+  workload STILL HANGS**, so admission starvation was real and NOT the whole cause. The live frontier is now
+  ring DISCOVERY on the receiver DPU (`totalDiscoveredReadyRingCount` stays 0, so `DPU_COMMAND_PULL` and
+  `DPU_PAYLOAD_PULL` never arm). ⚠ Whether this change made discovery collapse EARLIER is **unsettled** —
+  that counter read 3,084 pre-fix and 17 post-fix. Evidence, the deciding experiment, and open risks:
   [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md).
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
