@@ -80,6 +80,15 @@ if [[ "$cppflags" == *HOMER_CONTROL_MAILBOX_STARVE_DIAG* ]]; then
         exit 1
     fi
 fi
+# Same assertion for the peer response-delivery 4-frontier probe. Marker 'resp-deliv',
+# distinct again from the other two prefixes. The three macro names are pairwise non-substring,
+# so the [[ == * ]] tests cannot alias.
+if [[ "$cppflags" == *HOMER_PEER_RESPONSE_DELIVERY_DIAG* ]]; then
+    if ! strings "$binary" | grep 'resp-deliv' > /dev/null; then
+        echo "HOMER_PEER_RESPONSE_DELIVERY_DIAG requested but no resp-deliv strings in the binary" >&2
+        exit 1
+    fi
+fi
 outputs=("$binary")
 if [[ " $* " == *" dpu-tcp-transport-smoke-bin "* ]]; then
     smoke=build/homer/homer_dpu_tcp_transport_smoke

@@ -181,6 +181,44 @@ Contract and rationale:
 [`../implementations/citus/transport/CONTRACTS.md`](../implementations/citus/transport/CONTRACTS.md)
 (`TupleSinkServiceAppendReadyControlMailboxActionsRdma()`).
 
+#### 1.2d `HOMER_PEER_RESPONSE_DELIVERY_DIAG` — WHICH of four frontiers a stuck peer-OPEN response died at
+
+**Symptom it serves:** the exact same one as §1.2c — a peer-OPEN async op parked in `STREAM_WAIT_PEER_OPEN`
+while the peer serviced the request — but AFTER §1.2c's class-starvation has been refuted. This probe does not
+ask *why* a stage was skipped; it asks *which stage* the response reached. The response crosses FOUR frontiers
+and this stamps each:
+
+```sh
+dpu_build.sh "$RUN_ID" "<citus.tar>" --define=HOMER_PEER_RESPONSE_DELIVERY_DIAG=1 \
+    service-bin dpu-tcp-transport-smoke-bin
+```
+
+Emits `[resp-deliv] F<n> ...` lines (marker `resp-deliv`; the helper asserts it landed):
+
+| frontier | node | line | identity |
+|---|---|---|---|
+| **F1** responder posts the OPEN response | the RESPONDER DPU | `F1 responder-posted` | conn_idx/gen + op_idx/gen/seq |
+| **F2** requester recv-CQ arms control-ready | the REQUESTER DPU | `F2 recv-arm` | conn_idx/gen + arrived_tail (bounded) |
+| **F3** requester mailbox match → op COMPLETED | the REQUESTER DPU | `F3 op-completed` | conn_idx/gen + op_idx/gen/seq |
+| **F4** requester owner consumes → ready | the REQUESTER DPU | `F4 owner-consumed` | session/sink + op_idx/gen/seq |
+
+**How to read it — the first frontier that does NOT report for the stuck op is the stall.** Correlate F1/F3/F4
+by `(op_idx, op_gen, seq)`; F2 is connection-level (correlate by `conn_idx/gen` + timing). Discrimination:
+
+- **no F2** on the requester ⇒ the response WIMM never reached its recv CQ (wire, or F1 never posted).
+- **F2 but no F3** ⇒ the mailbox DRAIN never ran/matched (drain scheduling — re-examine, but note §1.2c
+  class-starvation is already refuted).
+- **F3 but no F4** (until ~teardown) ⇒ the owner never CONSUMED it: the `LOCAL_IPC` machine that finalizes the
+  op was not granted. This is the leading remaining shape.
+
+F1/F3 are gated on `requestKind == OPEN`, so volume is one line per OPEN. SIGTERM the services as usual (the
+lines stream live, so a `kill -9` loses only the tail, but keep the discipline).
+
+⚠ **This probe is useless if the hang does not reproduce.** As of 2026-07-20 the hang has NOT reproduced on the
+last three runs (two pre-armed, one sequential-in-disguise); the six original hangs predate the pre-arming
+workaround. A reproduction run must use the ORIGINAL non-pre-armed order and may simply pass — which is itself a
+finding (the hang is not reliably reproducible ⇒ accept pre-arming as supported).
+
 ### 1.3 Reading a socketless backend's arena bind without the trace build
 
 The positive `remote exec backend: bound frontend arena slot=<N>` line is **compiled out** at the default

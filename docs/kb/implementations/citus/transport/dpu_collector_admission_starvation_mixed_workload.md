@@ -31,7 +31,13 @@ code-reachable hypothesis:
 NO existing log marker: (2) recv-CQ WIMM arrival arms the mailbox-ready bit (`:1742`), (3) mailbox matching moves
 the op to COMPLETED (`:10506`), (4) local owner polling consumes it and prints `ready` (`:41918`). **Only a
 reproduction that TIMESTAMPS all four frontiers with connection index/generation + op index/generation/sequence
-can localize it.** Three real defects were still found and fixed along the way (collector-admission starvation; a
+can localize it.** ⇒ **PROBE LANDED: `HOMER_PEER_RESPONSE_DELIVERY_DIAG` (citus `99aa04a42`)** stamps all four
+frontiers with `[resp-deliv] F<n>` lines; operator detail in
+[`farnet_diagnostics_and_baselines.md` §1.2d](../../../operations/farnet_diagnostics_and_baselines.md).
+⚠ **REPRODUCTION IS UNCERTAIN:** the hang has NOT reproduced on the last three runs (two pre-armed, one
+sequential-in-disguise); the six original hangs predate the pre-arming workaround. A reproduction run must use
+the ORIGINAL non-pre-armed order and MAY simply pass — which is itself a finding (⇒ accept pre-arming as
+supported). The probe is useless without a live hang to observe. Three real defects were still found and fixed along the way (collector-admission starvation; a
 watchdog blind to the state it existed to catch; control-mailbox class starvation), and **eleven** candidate
 causes/suspects were refuted.
 **Code baseline:** citus `8f4d20e60` (fix `6392a1853` + the revert scaffold).
