@@ -2,18 +2,26 @@
 
 <!-- kb-summary: The mixed pgbench+basebackup workload PASSES under the current (pre-armed) procedure, but the causation run REFUTED the control-mailbox fix as the cause: the reverted (pre-fix) build passes identically with zero starvation in the census. The pass is procedural (pre-arming avoids an open-during-close connection interaction), not the fix. The hang's real cause is OPEN. Records the mailbox fix as defensive hardening + seven refuted causes. -->
 
-**Status (2026-07-20): THE FIX IS REFUTED AS THE CAUSE; THE HANG'S REAL MECHANISM IS OPEN AGAIN.** The mixed
-workload passes under the current PRE-ARMED procedure — but so does the build with the control-mailbox fix
-REVERTED (see the causation-run section below). A controlled fixed-vs-reverted comparison shows identical
-outcomes and **zero starvation in either census** (`ready_passes` single digits, the path was never contended).
-⇒ **Class-admission starvation was NOT the mechanism of the hang, and the earlier "the fix made it pass" claim
-does not hold.** The passes are almost certainly procedural: both used pre-arming, which avoids the
-open-during-close connection interaction that run 6 hit (result peer-open blocked until the OTHER session's
-connection was `freed ... for reuse`, generation 2→3). The mailbox fix STAYS as legitimate defensive hardening
-(cross-class starvation is possible by construction), but the hang's real cause — a connection-lifecycle/reuse
-interaction, matching the original localization — is **once again the open frontier.** Three real defects were
-still found and fixed along the way (collector-admission starvation; a watchdog blind to the state it existed to
-catch; control-mailbox class starvation), and **seven** candidate causes were refuted.
+**Status (2026-07-20): FRONTIER = THE P3 OPEN RESPONSE ROUND-TRIP. The connection-reuse hypothesis is REFUTED.**
+The mixed workload passes under the current PRE-ARMED procedure — and so does the control-mailbox fix REVERTED
+(causation-run section below), so **class-admission starvation was NOT the mechanism** and "the fix made it pass"
+does not hold (it stays as defensive hardening only). A static trace then **refuted the connection-reuse
+hypothesis too** (ninth refuted cause): the `generation 2→3` was TWO DIFFERENT connections
+(`connection_generation=2` = the incoming COMMAND connection `dpuResultOriginConnectionGeneration`,
+`tuple_sink_service_process.c:43142`; `peer_generation=3` = the outgoing PAYLOAD connection,
+`:27959`) — consecutive only because the global counter handed them out back-to-back, NOT a reset/reuse. B's
+`STREAM_WAIT_PEER_OPEN` completion reads only B's own op state and does NOT depend on A's session/close/connection;
+the "open completes when A's connection is freed" correlation is a **teardown artifact**, not a causal edge. But
+the op DID complete (`ready, bound`) at teardown, so the response was eventually processed — just not until then.
+⇒ **The frontier is the RESPONSE ROUND-TRIP:** did farnet0 POST the OPEN response, and did farnet1 PROCESS it,
+before teardown? (`peer-provisioned receive sink` on farnet0 is printed BEFORE response publication,
+`:30224` vs `remote_execution_peer_transport_rdma.c:10982`, so it proves only that the sink was bound — NOT that
+the response was posted or arrived.) Named suspect from the first trace: the per-connection `pendingSyncResponse`
+single-slot head-of-line block. Latent (INFERRED, unproven here): the `exactConnectionGeneration` ABA gap
+(captured at publish, never compared at poll). **Not resolvable from retained logs or static analysis — needs a
+reproduction with targeted probes on the response post + that slot.** Three real defects were still found and
+fixed along the way (collector-admission starvation; a watchdog blind to the state it existed to catch;
+control-mailbox class starvation), and **nine** candidate causes were refuted.
 **Code baseline:** citus `8f4d20e60` (fix `6392a1853` + the revert scaffold).
 **Line numbers are `src/backend/distributed/utils/homer/tuple_sink_service_process.c` unless stated.**
 
@@ -589,10 +597,12 @@ same state a real failure produces) so `SelectedSessionCloseWorkDrained` returns
 well-tested finalize path runs UNCHANGED. Only new code is the surgical command-state flip; no new teardown, no
 leak.
 
-**STATUS: HELD until the hang trace lands.** Variant (c) touches the session/command-lifecycle that the
-open connection-reuse hang investigation is examining, so the exact command-state to flip must be chosen with
-that context. The safe half (a wall-clock deadline + a terminal ALARM naming the wedged gate-2 close) is
-designed and ready but not yet written, pending that decision.
+**STATUS: DE-ENTANGLED and ready to implement (2026-07-20, after the hang trace).** The trace REFUTED the
+connection-reuse hypothesis and confirmed A's close does NOT gate B's open — so variant (c) is now
+well-specified and independent of the open hang: force **A's own** stuck outstanding command to terminal-failed
+(the command that defers A's `TupleSinkServiceResetSession` at `tuple_sink_service_process.c:25365`,25454) so
+`SelectedSessionCloseWorkDrained` returns true and the existing finalize path runs unchanged. No longer blocked
+on the hang; awaiting go-ahead to implement.
 
 ## Consequences beyond this workload
 

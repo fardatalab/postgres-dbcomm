@@ -679,12 +679,17 @@ in `remote_execution_peer_transport_rdma.h` is the consumer's cap. The two are O
   was closing, released only at teardown (`freed 1 outgoing connection(s) for reuse`, generation 2→3) — an
   **open-during-close connection interaction** that pre-arming avoids. Leading hypothesis, not yet established.
 - **THE FIX STAYS ANYWAY:** cross-class / two-direction starvation IS possible by construction (verified in
-  code), so this is legitimate hardening. It is just not the hang fix, and the hang's real cause — a
-  connection-lifecycle/reuse interaction, matching the original localization — is once again OPEN.
-- **NEXT:** reproduce the original hang by running mixed with the NON-pre-armed launch order on the current
-  build. Hang ⇒ pre-arming was masking it (chase the open-during-close connection path). Pass ⇒ something
-  environmental changed; find what. The `HOMER_CONTROL_MAILBOX_REVERT_STRICT_PRIORITY` scaffold remains as the
-  on-demand reproduction lever for the starvation path specifically.
+  code), so this is legitimate hardening. It is just not the hang fix.
+- **FRONTIER (after a static trace refuted the connection-reuse hypothesis too — the `2→3` was two DIFFERENT
+  connections, not a reset):** the P3 OPEN **response round-trip**. The op completed (`ready, bound`) only at
+  teardown, so the response was processed — just not until then. Suspect: the per-connection
+  `pendingSyncResponse` single-slot head-of-line block (see that entry below); latent: the
+  `exactConnectionGeneration` ABA gap. Full detail:
+  [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md).
+- **NEXT:** reproduce the hang (NON-pre-armed launch order) with targeted probes on the response post
+  (`remote_execution_peer_transport_rdma.c:10982`) and the `pendingSyncResponse` slot state. The
+  `HOMER_CONTROL_MAILBOX_REVERT_STRICT_PRIORITY` scaffold remains the on-demand lever for the starvation path
+  specifically (unrelated to this frontier).
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
 
