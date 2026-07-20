@@ -660,11 +660,25 @@ in `remote_execution_peer_transport_rdma.h` is the consumer's cap. The two are O
     not move it back into `tuple_sink_service_process.c`
   - a new traffic class must be added to `HomerTransportServiceLoopPriority[]` **and** counted in
     `HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT`, or it is enumerated by nobody
-- **STATUS (2026-07-20):** three-pass admission + probe **LANDED, NOT YET VALIDATED ON THE RIG.** ⚠ The
-  starvation *shape* is verified in code; that it is the cause of the mixed-workload hang is **NOT yet proven** —
-  the naive "bulk starves the gate" story does **not** work, since `BULK_PAYLOAD` ranks BELOW
-  `FOREGROUND_PAYLOAD`. It requires `CRITICAL_CONTROL` to hold ≥2 ready actions nearly every pass. The next run
-  must carry `HOMER_CONTROL_MAILBOX_STARVE_DIAG=1` and settle that.
+- **STATUS (2026-07-20):** three-pass admission + probe **LANDED and the MIXED WORKLOAD PASSES** (citus
+  `6392a1853`, candidate `candidate-20260720-165458-r2`, `-c4 -t6000`, **329 s of proven concurrent overlap**):
+  gate 24000/24000, basebackup 23.26 GB / 44,372 ring laps, every checker green. **The 6/6 deterministic hang did
+  NOT reproduce** — including that it previously hung at `-c1`, which is not a race, so a structural wedge was
+  removed by a structural change to this exact subsystem (the P3 OPEN *response* is a peer control-mailbox
+  message).
+- **⚠ CAUSATION IS STRONG-CIRCUMSTANTIAL, NOT ABSOLUTE — and the census REFUTED the specific hypothesis.** The
+  `[mailbox-diag]` census on both DPUs shows `starved% = 0.00%` for FOREGROUND/BULK/MAINTENANCE and **no
+  `CRITICAL_CONTROL` row at all** (it was never ready → skipped). So the earlier "CRITICAL holds both slots"
+  theory is **wrong**; if this fix is what unblocked the hang, the trigger was a DIFFERENT class monopolizing
+  both slots — most plausibly ONE class taking both its directions, which is exactly what the "at most one action
+  per class in passes A/B" bound now prevents. Two facts keep this from being pure timing luck: (1) FOREGROUND
+  `ready_passes = 8`, not the ~1,000,000 a stuck-ready response would inflate it to under the hang — evidence the
+  mailbox now drains promptly; (2) the fix sits in the exact path the failure was localized to (response
+  published by the peer, not consumed on farnet1). **The census cannot show the original defect because the fix
+  is in the build that produced it** — `starved%=0` is what a working fix AND "never the cause" both look like.
+- **TO PROVE CAUSATION EXACTLY (one run, optional):** revert ONLY
+  `TupleSinkServiceAppendReadyControlMailboxActionsRdma()` to the single strict-priority loop, keep the probe,
+  run mixed. A class at `starved% ≈ 100%` with `ready_passes` in the hundreds of thousands nails it.
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
 

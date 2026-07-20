@@ -1,14 +1,16 @@
 # The mixed-workload hang — investigation record and current frontier
 
-<!-- kb-summary: Why the mixed pgbench+basebackup workload hangs. The P3 result peer-open is BLOCKED, not failed — it completes at teardown. Prime suspect: control-mailbox class admission (8 enumerated, 2 planned, no cross-class rotation). Includes SEVEN refuted causes and three defects fixed along the way. -->
+<!-- kb-summary: The mixed pgbench+basebackup workload now PASSES (citus 6392a1853) after a control-mailbox class-admission fix (8 enumerated, 2 planned, rotate across classes). Causation is strong-circumstantial not absolute: the census refuted the CRITICAL_CONTROL hypothesis. Records SEVEN refuted causes and three defects fixed along the way. -->
 
-**Status (2026-07-20): STILL BROKEN.** The gate's P3 result peer-open is **BLOCKED, NOT FAILED** — it does
-complete, at TEARDOWN, ~1,000,000 service passes late, the instant the *other* session's payload connection is
-released. Three real defects were found and fixed on the way (collector-admission starvation; a watchdog blind
-to the very state it existed to catch; control-mailbox class starvation), and **seven** candidate causes were
-refuted. Read the banner below before anything else in this file — later sections are the historical trail and
-several of their headline conclusions were superseded.
-**Code baseline:** citus `434c7e9e7` + the control-mailbox admission change (unvalidated on the rig).
+**Status (2026-07-20): THE MIXED WORKLOAD PASSES.** After landing the control-mailbox class-admission fix
+(citus `6392a1853`), candidate `candidate-20260720-165458-r2` ran the gate `-c4 -t6000` CONCURRENTLY with the
+four-role basebackup for **329 s of proven overlap**: gate 24000/24000, basebackup 23.26 GB / 44,372 ring laps,
+all checkers green, and **the six-run deterministic hang did NOT reproduce**. Three real defects were found and
+fixed getting here (collector-admission starvation; a watchdog blind to the very state it existed to catch;
+control-mailbox class starvation), and **seven** candidate causes were refuted. ⚠ **CAUSATION IS
+STRONG-CIRCUMSTANTIAL, NOT ABSOLUTE** — see the "did the fix work for the right reason?" section below; the
+`[mailbox-diag]` census refuted the specific `CRITICAL_CONTROL` hypothesis even as the workload passed.
+**Code baseline:** citus `6392a1853`.
 **Line numbers are `src/backend/distributed/utils/homer/tuple_sink_service_process.c` unless stated.**
 
 > ## ⛔ THE MIXED WORKLOAD HAS NEVER PASSED. Six runs. The byte-ring pool it was written to stress is EXONERATED.
@@ -361,10 +363,52 @@ send-open rides the same command plane and starves identically. One mechanism, b
 > mailbox (which is what carries the P3 OPEN response) could be discarded indefinitely, **without
 > incrementing any drop counter**. That silence is why six runs of admission reports showed nothing.
 >
-> ⚠ **THIS IS NOT YET PROVEN, AND THE OBVIOUS VERSION OF THE STORY IS WRONG.** "The basebackup crowds
-> out the gate" **cannot** be the mechanism: `BULK_PAYLOAD` ranks BELOW `FOREGROUND_PAYLOAD`. The
-> starvation requires `CRITICAL_CONTROL` to hold ≥2 ready actions nearly every pass. The next run must
-> carry `HOMER_CONTROL_MAILBOX_STARVE_DIAG=1` and read `starved/ready` per class to settle it.
+> ⚠ **THE OBVIOUS VERSION OF THE STORY IS WRONG.** "The basebackup crowds out the gate" **cannot** be
+> the mechanism: `BULK_PAYLOAD` ranks BELOW `FOREGROUND_PAYLOAD`. The prime-suspect writeup above
+> guessed `CRITICAL_CONTROL` holds ≥2 ready actions every pass — **the validation census refuted that**
+> (next section).
+
+> ## ✅ VALIDATED 2026-07-20 (`candidate-20260720-165458-r2`, citus `6392a1853`): THE MIXED WORKLOAD PASSES — but did the fix work for the RIGHT REASON?
+>
+> **The workload passes.** Gate `-c4 -t6000` = 24000/24000, basebackup 23.26 GB / 44,372 ring laps, **329 s of
+> proven concurrent overlap** (not sequential-in-disguise — the validator caught attempt 1 being exactly that,
+> `sender_end` 5 s BEFORE `gate_start`, and re-ran with the gate pre-armed). All checkers green. **The six-run
+> deterministic hang did not reproduce.**
+>
+> ### ⚠ Causation is strong-circumstantial, NOT absolute — and the census refuted the specific hypothesis
+>
+> The `[mailbox-diag]` census, IDENTICAL on both DPUs:
+> ```
+> traffic_class        ready_passes   starved_passes   starved%
+> FOREGROUND_PAYLOAD             8              0        0.00%
+> BULK_PAYLOAD                   8              0        0.00%
+> MAINTENANCE                    6              0        0.00%
+> ```
+> **No `CRITICAL_CONTROL` row** — the printer skips classes that were never ready, so CRITICAL was ready on ZERO
+> passes. ⇒ **The "CRITICAL holds both slots" theory is dead.** If this fix is what unblocked the hang, the
+> trigger was a DIFFERENT class taking both slots — most plausibly ONE class taking both its DIRECTIONS, which is
+> exactly what the new "at most one action per class in passes A/B" bound prevents.
+>
+> **Why this is not merely `starved%=0` because the fix is in** (that alone would be tautological — a working
+> fix and "never the cause" look identical):
+> 1. **`FOREGROUND_PAYLOAD ready_passes = 8`, not ~1,000,000.** Under the original hang the P3 response sat
+>    ready-but-unconsumed for ~1M passes; this probe would have counted every one. Eight means the mailbox now
+>    drains within a pass or two of becoming ready. That is a genuine negative for "still stuck."
+> 2. **The fix is in the exact localized path** — the response is published by the peer and not consumed on
+>    farnet1, and control-mailbox admission is what decides whether that response is consumed.
+> 3. **The hang was 6/6 deterministic, including at `-c1`** (not a race). A deterministic structural wedge,
+>    removed by a structural change to this subsystem — not a timing perturbation.
+>
+> **What is still NOT proven:** the census cannot show the ORIGINAL defect, because the fix is in the build that
+> produced it. The exact starvation trigger (which class monopolized both slots) is inferred, not observed.
+>
+> ### To prove causation EXACTLY (one run, optional)
+>
+> Revert ONLY `TupleSinkServiceAppendReadyControlMailboxActionsRdma()` to the single strict-priority loop, keep
+> `HOMER_CONTROL_MAILBOX_STARVE_DIAG=1`, run mixed. A class at `starved% ≈ 100%` with `ready_passes` in the
+> hundreds of thousands nails it; anything else means the fix helped by a mechanism other than the one designed,
+> and the frontier returns to the blocked-resource question (the open completes on `freed 1 outgoing
+> connection(s) for reuse`, generation 2 → 3).
 
 > ## ⚡ VALIDATED 2026-07-20 (`candidate-20260720-121352`, citus `f84e49bad`): THE FIX WORKS AND THE HANG REMAINS.
 >
