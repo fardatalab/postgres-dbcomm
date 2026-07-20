@@ -602,7 +602,9 @@ connection-reuse hypothesis and confirmed A's close does NOT gate B's open — s
 well-specified and independent of the open hang: force **A's own** stuck outstanding command to terminal-failed
 (the command that defers A's `TupleSinkServiceResetSession` at `tuple_sink_service_process.c:25365`,25454) so
 `SelectedSessionCloseWorkDrained` returns true and the existing finalize path runs unchanged. No longer blocked
-on the hang; awaiting go-ahead to implement.
+on the hang. **DEFERRED to a future session (user decision 2026-07-20)** — fully specified here; only fires when
+a command is genuinely stuck, so the latent risk is bounded. Pick up by implementing the wall-clock deadline +
+the command-terminalization flip, then the existing finalize path.
 
 ## Consequences beyond this workload
 
