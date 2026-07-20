@@ -557,6 +557,43 @@ the call site. If it is not on the list, **it has not been checked.**
 - **NOT 64:** DPU byte-ring pool = **16 per DPU** (see the derivation entry below); frontend arena = **16** slots;
   import table = **1024**.
 
+## `HOMER_SERVICE_MACHINE_BASELINE_MAX_COLLECTOR_GRANTS` = 6 — **DOES NOT MEAN six collectors run. It means FOUR.**
+
+*(`tuple_sink_service_process.c:188`. All line numbers in this entry are that file.)*
+
+- **MEANS:** the per-phase cap on collector grants in the machine-baseline progress plan. Enforced at `:11560`,
+  which is the branch that rejects a collector with diagnostic reason `budget`.
+- **⛔ DOES NOT MEAN "six slots are available to the collector list."** A **reserved lifecycle grant** is admitted
+  by the bypass at `:11544` **and still increments `collectorGrants`** (`:11547`, `:11551`). `DPU_SETUP_LISTENER`
+  and `DPU_DOORBELL` are permanently reserved (`:11462`), so they consume 2 of the 6 on every phase where they
+  are candidates. **The effective quota for the other seventeen collectors is FOUR.**
+- **⛔ DOES NOT MEAN a starved collector is retried fairly later.** Admission is a **fixed-order** list
+  (`:13060`–`:13239`) with **no rotation**. A collector past the quota is not delayed, it is **shed on every
+  pass, silently, for as long as the earlier ones stay armed** — no alarm, no timeout, no error.
+- **THE RULE:** any workload combination that keeps more than four non-reserved collectors armed starves
+  everything after them. **MEASURED:** a bulk basebackup concurrent with SQL arms ordinals 3, 4, 5, 6, 9 and 10,
+  so `DPU_STAGED_COMMAND_DISPATCH` (ordinal 11) was granted **3** times against **1,514,591** budget drops, and
+  the mixed workload hangs. Gate-alone on the same binary: ~870 total drops.
+- **NEAR-NEIGHBOUR TRAP:** `MAX_BLIND_COLLECTOR_GRANTS` = 2 (`:197`) is a *different, tighter* line at `:11576`
+  — but **both rejections increment the same `collectorBudgetDrops` counter**, so the `starve-diag` census
+  reports both as reason `budget` and **cannot distinguish them.** Resolve it from the append site, not the
+  census: a collector is blind only when `!dependencyDemand && !knownExpectedWork`. The DPU command-plane
+  collectors all pass `knownExpectedWork = true` (`:46826`, `:46726`, `:46838`) and so are **never** blind;
+  `DPU_GROUPED_CONTROL_READ` is blind exactly when `groupedControlRingCount == 0` (`:46676`).
+- **⛔ ZERO DROPS IS NOT HEALTH.** A collector armed only by an upstream collector's output reports a clean
+  scorecard while doing nothing. `DPU_STAGED_COMMAND_EXECUTE` (`:46829`, armed only when
+  `stagedCommandDispatchCount > 0`) showed **grants=3, drops=0** purely because DISPATCH ran 3 times. **Read a
+  grant count against its upstream's, not on its own.**
+- **ENFORCES** — sites that must obey or account for the effective-4 rule:
+  - `:11560` the rejection; `:11544`-`:11551` the reserved bypass that consumes shared quota
+  - `:11462` the reserved set (adding a member costs one of the shared slots)
+  - `:13060`-`:13239` the fixed append order — **a new collector's ORDINAL decides whether it can ever run**
+  - `:13858`-`:13877` every cap is env-overridable, so a deployment can make this worse (or test a fix with no
+    code change)
+- **TEMPTING WRONG MOVE:** raising the cap alone. It moves the cliff; the fixed order still starves whatever
+  does not fit, permanently. Full evidence and fix space:
+  [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md).
+
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
 
 - **MEANS:** the DPU byte-ring pool is a **fixed, per-DPU** set of slots:

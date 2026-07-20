@@ -2,8 +2,9 @@
 
 <!-- kb-summary: Diagnosis of the mixed pgbench+basebackup hang: fixed-order collector admission starves late DPU collectors when two workload kinds coexist. -->
 
-**Status: DIAGNOSED, NOT YET WITNESSED BY NAME. Instrumented A/B run designed and pre-registered below; no fix
-proposed until the identity of the starved collectors is read from a log line.**
+**Status: ROOT-CAUSED AND MEASURED (2026-07-19). The mechanism is confirmed; the starved collector is
+`DPU_STAGED_COMMAND_DISPATCH`, NOT `DPU_STAGED_COMMAND_EXECUTE` as first predicted. Fix shape is a live design
+decision — see "The fix space" at the end. No scheduler change has been made.**
 **Code baseline:** citus `31f0e958f` (post-S6, post-S7 Stage 4).
 **Line numbers are `src/backend/distributed/utils/homer/tuple_sink_service_process.c` unless stated.**
 
@@ -161,6 +162,106 @@ using it as the control would confound the result with SHA drift. It is corrobor
 as evidence against the hypothesis when it is really a missing probe.
 
 ---
+
+---
+
+## ⚡ MEASURED RESULT (2026-07-19, `candidate-20260719-203050`, citus `31f0e958f`)
+
+Instrumented A/B, same binary, one variable. **Arm A (gate alone) PASSED 200/200. Arm B (mixed) FAILED 0/200**
+with the `sql_execute kind=6 sequence=5` signature. A third control appeared by accident: Arm B's first attempt
+ran **non-overlapping** and **passed both halves** (200/200 + 23.26 GB) in the same session on the same
+binaries. Overlap alone flips the outcome.
+
+### Total collector `budget` drops, farnet1 DPU
+
+| | Arm A (gate alone) | Arm B (mixed) |
+|---|---|---|
+| total | **~870** | **~8,600,000** |
+
+### The starved collectors (farnet1, Arm B)
+
+| collector | ordinal | grants | `budget` drops | Arm A drops |
+|---|---|---|---|---|
+| **`DPU_STAGED_COMMAND_DISPATCH`** | **11** | **3** | **1,514,591** | absent |
+| `DPU_BACKEND_COMPLETION_PULL` | 14 | 7,874 | 1,514,596 | 0 |
+| `DPU_PAYLOAD_PULL` | 15 | 24,247,736 | 2,015,105 | 141 |
+| `DPU_BACKEND_COMMAND_STAGE` | 10 | 660,180 | 854,414 | absent |
+| `PEER_CM_SETUP` | 19 | 18,529,006 | 2,740,606 | 729 |
+
+### ❌ REFUTED — prediction 1: `DPU_STAGED_COMMAND_EXECUTE` is starved
+
+It is not. Arm B: **grants=3, ZERO drops.** The prediction named the wrong link in the chain.
+
+> ### ⚠⚠ WHY IT LOOKED INNOCENT — GENERALIZE THIS, IT WILL RECUR
+>
+> `STAGED_COMMAND_EXECUTE` (13) is armed **only when `stagedCommandDispatchCount > 0`** (`:46829`) — i.e. only
+> when DISPATCH (11) produced something. Dispatch ran 3 times, so execute was armed 3 times, granted 3 times,
+> and dropped never. **A perfect scorecard produced entirely by upstream starvation.**
+>
+> The census doc's rule is "`max=0 grants=0` means the collector NEVER RAN". The subtler form, and the one that
+> cost this investigation a wrong prediction, is: **LOW GRANTS + ZERO DROPS = STARVED UPSTREAM. Zero drops is
+> not evidence of health.** Always read a collector's grant count against its upstream's.
+
+### ✅ CONFIRMED — the mechanism, localized to `:11560`
+
+**The rejecting line is `maxCollectorGrants` (6) at `:11560`** — VERIFIED, not inferred:
+
+- All four collectors pass `knownExpectedWork = true` at their append sites (`:46826` dispatch, `:46726`
+  payload-pull, `:46838` execute), so `blindCollectorGrant` is **false** and the 2-slot blind line at `:11576`
+  is **unreachable** for them. (`DPU_GROUPED_CONTROL_READ` *can* be blind — its flag is
+  `facts.groupedControlRingCount > 0`, `:46676` — but that is a different collector.)
+- `maxPlanGrants` (16) is **not** binding: every `PROGRESS POLICY-ADMISSION DROPS` line in both arms reports
+  `DROPPED total=0`.
+
+> ### 🔑 THE AMPLIFIER — THE EFFECTIVE QUOTA IS **4**, NOT 6
+>
+> A reserved lifecycle grant is admitted by the bypass at `:11544` **and still increments `collectorGrants`**
+> (`:11547`, `:11551`). So `DPU_SETUP_LISTENER` and `DPU_DOORBELL` are guaranteed admission *and* permanently
+> consume 2 of the 6 collector slots. **Seventeen collectors compete for FOUR.**
+>
+> This is why a bulk workload is enough to break it: a live basebackup arms ordinals 3, 4, 5, 6, 9 and 10
+> (`COMMAND_SEND_CQ`, `GROUPED_CONTROL_READ`, `PE_DRAIN`, `COMMAND_PULL`, `PEER_COMMAND_LANDING`,
+> `BACKEND_COMMAND_STAGE`) — **six candidates for four slots.** Ordinal 11 is never reached.
+
+### The apparent ordinal inversion, resolved
+
+`DPU_PAYLOAD_PULL` (15) took 24M grants while `DISPATCH` (11) took 3 — impossible under a naive
+"earlier ordinal always wins" model, and it is what forced the model to be corrected. The resolution is that
+the two are armed in largely **disjoint sets of passes**, and the drop counts prove it: payload-pull's
+**2,015,105** drops are the same order as dispatch's **1,514,591** — those are the *busy* passes, where
+everything from ordinal 11 on is shed. In the other ~24M passes fewer early collectors are armed and
+payload-pull is admitted. Dispatch is armed only when a staged SQL request coexists with free dispatch and
+publish slots (`:46816`) — which, during a mixed run, is exactly when the pass is busy.
+
+**⇒ Dispatch starved ⇒ the SQL command is never dispatched ⇒ `kind=6 sequence=5` timeout. The basebackup's own
+send-open rides the same command plane and starves identically. One mechanism, both symptoms.**
+
+### Still NOT established
+
+- **That relieving the quota fixes it.** The causal chain is verified by construction and by the A/B, but the
+  decisive test is cheap and has not been run: every cap is env-tunable (`:13858`-`:13877`), so raising
+  `HOMER_MACHINE_BASELINE_MAX_COLLECTOR_GRANTS` and re-running the mixed workload tests the whole chain with
+  **zero code change**. Do this before implementing anything.
+- **Why the basebackup byte-ring binds appeared on farnet1 this run and farnet0 in the previous one.** The
+  earlier receiver/sender topology argument in this doc is therefore SUSPECT and must not be relied on.
+- **A teardown defect, separate from this one:** the Arm B consumer survived sender exit *and* both DPU
+  SIGTERMs, requiring an identity-verified reap.
+
+---
+
+## The fix space (nothing implemented; the numbers now constrain it)
+
+| option | effect | problem |
+|---|---|---|
+| **Raise `maxCollectorGrants` only** | more slots | moves the cliff; fixed order still means whatever does not fit starves **permanently**. A third workload re-breaks it. |
+| **Extend reserved lifecycle admission** to the command-plane collectors | guarantees them *by construction* | reserved grants **consume the shared quota** (`:11547`), so adding members without resizing takes the effective quota 4 → 2 and starves the throughput collectors instead |
+| **Stop counting reserved grants against `collectorGrants`** | decouples the two lines | contradicts the deliberate "it really did spend a grant" comment at `:11528`; needs its own justification |
+| **Rotation / round-robin** | bounded delay instead of permanent starvation | would demote `DPU_GROUPED_CONTROL_READ`, which is granted ~46M times and needs to run nearly every pass |
+| **Unified grant scheduler** | real admission with priorities | large redesign — the long-term answer, not this fix |
+
+The reserved-set docstring's own criterion (`:11457`) — *"Only listeners whose starvation is a SILENT hang
+qualify"* — is satisfied by `DPU_STAGED_COMMAND_DISPATCH` on this evidence. But the sizing is a genuine design
+decision with hot-path cost, and S6's latency number is still outstanding and would be perturbed by it.
 
 ## Consequences beyond this workload
 
