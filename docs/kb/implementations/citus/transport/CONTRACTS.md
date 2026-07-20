@@ -607,12 +607,64 @@ the call site. If it is not on the list, **it has not been checked.**
     8 admissions per phase and `collectors=6` reads as the whole story
   - all caps are env-overridable, with **no coupling validation** — an override can re-break the equality rule
 - **STATUS (2026-07-20):** implemented and **VALIDATED AS REMOVING THE STARVATION** — all 8 record ZERO
-  `budget` drops on both DPUs in every stage; gate `-c1`/`-c4` and four-role basebackup PASS. **But the MIXED
-  workload STILL HANGS**, so admission starvation was real and NOT the whole cause. The live frontier is now
-  ring DISCOVERY on the receiver DPU (`totalDiscoveredReadyRingCount` stays 0, so `DPU_COMMAND_PULL` and
-  `DPU_PAYLOAD_PULL` never arm). ⚠ Whether this change made discovery collapse EARLIER is **unsettled** —
-  that counter read 3,084 pre-fix and 17 post-fix. Evidence, the deciding experiment, and open risks:
+  `budget` drops on both DPUs in every stage; gate `-c1`/`-c4` and four-role basebackup PASS. **The MIXED
+  workload STILL HANGS**, so *this* admission starvation was real and NOT the whole cause. The hang is now
+  localized to a DIFFERENT admission point one layer down — control-mailbox class admission, see the next
+  entry. **`PEER_CM_SETUP` is NOT the culprit and must not be re-chased: measured 271,707 `budget` drops
+  against 12,409,722 grants (2%).** Ring DISCOVERY is likewise refuted — a collapsed
+  `DPU_COMMAND_PULL`/`DPU_PAYLOAD_PULL` count is a CONSEQUENCE of no result returning, not a cause. Full
+  evidence and the four refuted causes:
   [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md).
+
+## `TupleSinkServiceAppendReadyControlMailboxActionsRdma()` — **control-mailbox class admission: 8 enumerated, 2 planned, and the 6 discarded ones raise NO counter**
+
+*(`remote_execution_peer_transport_rdma.c`; producer of the array, and `HOMER_CONTROL_MAILBOX_ACTIONS_PER_PASS`
+in `remote_execution_peer_transport_rdma.h` is the consumer's cap. The two are ONE coupled unit across two files.)*
+
+- **MEANS:** it enumerates ready peer-control mailboxes into an array the scheduler then plans from. It decides
+  **ORDER**, and order is what decides who runs — because the consumer keeps only the first two entries.
+- **🔑 THE 8-vs-2 GAP IS THE WHOLE CONTRACT.** The caller passes capacity
+  `HOMER_CONTROL_READY_CANDIDATE_BUDGET` = **8** (`tuple_sink_service_process.c:48062`); the planner's
+  `controlMailboxActions` loop consumes `HOMER_CONTROL_MAILBOX_ACTIONS_PER_PASS` = **2**
+  (`tuple_sink_service_process.c`, in `HomerServiceBuildMachineBaselineProgressActionPlanPhase`). **Six actions
+  are discarded on every busy pass, and the truncation happens BEFORE budget accounting — so it increments no
+  admission-drop counter anywhere.**
+- **⛔ SILENCE IS A VALID STATE HERE, AND THAT IS THE BUG'S CAMOUFLAGE.** A starved class appears in the
+  `PROGRESS POLICY-ADMISSION DROPS` line as neither granted nor dropped, which is indistinguishable from
+  healthy idle. The only instrument that can see it is the `[mailbox-diag]` census (below).
+- **DOES NOT MEAN "priority order is the admission order".** Since 2026-07-20 admission is **three passes**:
+  **A** — slot 0 by STRICT priority, so `CRITICAL_CONTROL` keeps absolute precedence (session lifecycle, close,
+  reset); **B** — remaining slots rotate over the OTHER classes from the persistent `classCursor`; **C** —
+  capacity backfill by strict priority, **no cursor update**, so a lone busy class cannot drag the rotation.
+- **⛔ ONE CLASS MAY TAKE AT MOST ONE SLOT PER PASS IN A/B.** `TupleSinkServiceAppendOneControlMailboxClass()`
+  returns after its FIRST successful append. That is load-bearing, not factoring: the pre-fix inline loop let a
+  single class take both slots (one per direction), which is exactly how one busy class consumed a whole pass.
+- **⛔ RAISING `HOMER_CONTROL_MAILBOX_ACTIONS_PER_PASS` IS NOT A FIX.** Up to
+  `HOMER_TRANSPORT_SERVICE_LOOP_PRIORITY_COUNT` (4) × 2 directions = **8** (class, direction) pairs can be ready
+  at once, so any cap below 8 still starves someone — and a larger cap only makes the hang rarer, i.e. converts
+  a reproducible failure into a flaky one. **Fairness is the enumeration's job, never the cap's.**
+- **THE FOURTH CURSOR:** `HomerControlReadyIndex` rotates at three levels — `incomingCursor`/`outgoingCursor`
+  within a (class, direction) pair, `nextDirectionIncoming` between directions — and **had no cursor across
+  classes** until `classCursor` was added. Three cursors and a strictly ordered fourth dimension is the shape to
+  look for when a capped band starves.
+- **THE PROBE:** `HOMER_CONTROL_MAILBOX_STARVE_DIAG=1` arms a per-class `[mailbox-diag]` census printed from
+  `TupleSinkServiceReportPeerControlRetirementAccountingRdma()`. **Read `starved/ready`, NEVER `starved` alone**
+  — a six-figure raw count means nothing (see the `PEER_CM_SETUP` 2% trap above). A ratio near 1.0 on a
+  non-`CRITICAL` class means this fix regressed.
+- **⛔ THE PROBE DEPENDS ON:** `TupleSinkServiceTryBuildControlMailboxAction()` NOT clearing the ready bit on its
+  success path (it clears only when rejecting a stale connection or disarming a drained mailbox). If that
+  changes, every admitted class reads as "not ready" and the census reports ~100% starvation for everyone.
+- **ENFORCES:**
+  - the enumeration's three passes and the consumer's cap — change one, check both files
+  - `HOMER_CONTROL_MAILBOX_ACTIONS_PER_PASS` lives in the **header** precisely so the producer can see it; do
+    not move it back into `tuple_sink_service_process.c`
+  - a new traffic class must be added to `HomerTransportServiceLoopPriority[]` **and** counted in
+    `HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT`, or it is enumerated by nobody
+- **STATUS (2026-07-20):** three-pass admission + probe **LANDED, NOT YET VALIDATED ON THE RIG.** ⚠ The
+  starvation *shape* is verified in code; that it is the cause of the mixed-workload hang is **NOT yet proven** —
+  the naive "bulk starves the gate" story does **not** work, since `BULK_PAYLOAD` ranks BELOW
+  `FOREGROUND_PAYLOAD`. It requires `CRITICAL_CONTROL` to hold ≥2 ready actions nearly every pass. The next run
+  must carry `HOMER_CONTROL_MAILBOX_STARVE_DIAG=1` and settle that.
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
 

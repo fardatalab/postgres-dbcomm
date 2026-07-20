@@ -41,19 +41,25 @@ CPPFLAGS='-D_GNU_SOURCE -DHOMER_REMOTE_EXEC_TRACE=1'
 instrumentation is gone. See `farnet_operational_hazards.md` §3.1 — a plain `make` will happily relink the
 instrumented objects.
 
-### 1.2 The TWO starvation diagnostics — pick the right one
+### 1.2 The THREE starvation diagnostics — pick the right one
 
-⚠ **There are two similarly-named macros and they answer DIFFERENT questions. Both print lines prefixed
+⚠ **Three similarly-named macros answer DIFFERENT questions. The first two both print lines prefixed
 `[starve-diag]`, so the log prefix does not tell you which build you are reading.**
 
-| macro | answers | emits |
-|---|---|---|
-| `HOMER_DPU_SETUP_STARVE_DIAG` | "is the service wedged / is the listener frozen?" | a per-pass counter line for **four** actions: PE_DRAIN, SETUP_LISTENER, DOORBELL, SPAWN |
-| `HOMER_COLLECTOR_STARVE_DIAG` | "**WHICH** collector is being dropped, and by **which gate**?" | a `(kind, reason)` line per drop for **every** collector, plus a service-exit census |
+| macro | answers | emits | prefix |
+|---|---|---|---|
+| `HOMER_DPU_SETUP_STARVE_DIAG` | "is the service wedged / is the listener frozen?" | a per-pass counter line for **four** actions: PE_DRAIN, SETUP_LISTENER, DOORBELL, SPAWN | `[starve-diag]` |
+| `HOMER_COLLECTOR_STARVE_DIAG` | "**WHICH** collector is being dropped, and by **which gate**?" | a `(kind, reason)` line per drop for **every** collector, plus a service-exit census | `[starve-diag]` |
+| `HOMER_CONTROL_MAILBOX_STARVE_DIAG` | "is a peer-control TRAFFIC CLASS being enumerated but never planned?" | a per-traffic-class service-exit census of ready vs starved passes | `[mailbox-diag]` |
 
 **If you are asking which collector is starved, you want `HOMER_COLLECTOR_STARVE_DIAG` (§1.2b).** The
 setup diagnostic is structurally blind to every collector outside its four, which is the exact defect that
 made it useless during the FB-0 hunt.
+
+**⛔ THE COLLECTOR CENSUS CANNOT SEE CONTROL-MAILBOX STARVATION, AND WILL LOOK CLEAN WHILE IT HAPPENS.**
+Control-mailbox actions are truncated to `HOMER_CONTROL_MAILBOX_ACTIONS_PER_PASS` (2 of 8 enumerated)
+**before** budget accounting, so a starved traffic class raises **no** drop in `[starve-diag]` and appears in
+the admission report as neither granted nor dropped — identical to healthy idle. Use §1.2c for that question.
 
 #### 1.2a `HOMER_DPU_SETUP_STARVE_DIAG` — when the DPU service "does nothing"
 
@@ -135,6 +141,45 @@ destroys the entire deliverable and the run must be repeated.**
 
 Current investigation using this instrument:
 [`../implementations/citus/transport/dpu_collector_admission_starvation_mixed_workload.md`](../implementations/citus/transport/dpu_collector_admission_starvation_mixed_workload.md).
+
+#### 1.2c `HOMER_CONTROL_MAILBOX_STARVE_DIAG` — is a peer-control TRAFFIC CLASS never planned?
+
+**Symptom it serves:** a peer-control request is published and its response never observed — the owning async
+op sits in `STREAM_WAIT_PEER_OPEN` forever — while **both** DPUs look healthy, the peer serviced the request
+normally, and `[starve-diag]` shows nothing wrong. **This is the one starvation the collector census cannot
+see:** control-mailbox actions are enumerated up to 8 and truncated to
+`HOMER_CONTROL_MAILBOX_ACTIONS_PER_PASS` (**2**) *before* budget accounting, so the 6 discarded actions raise
+no drop anywhere.
+
+```sh
+dpu_build.sh "$RUN_ID" "<citus.tar>" --define=HOMER_CONTROL_MAILBOX_STARVE_DIAG=1 \
+    service-bin dpu-tcp-transport-smoke-bin
+```
+
+Emits one `[mailbox-diag]` census at service exit:
+
+```
+[mailbox-diag] ===== control-mailbox class admission (cap=2/pass over 4 classes) =====
+[mailbox-diag]   traffic_class              ready_passes   starved_passes   starved%
+[mailbox-diag]   CRITICAL_CONTROL              12409722                0       0.00%
+[mailbox-diag]   FOREGROUND_PAYLOAD             8123441          8123441     100.00%   <-- STARVED: ...
+```
+
+⚠⚠ **READ `starved%`, NEVER `starved_passes` ALONE.** A six-figure raw count is meaningless without its
+denominator — this project lost an afternoon to a 271,707-drop counter that sat beside 12,409,722 grants (2%,
+i.e. healthy). **A ratio near 1.0 on a non-`CRITICAL` class is the defect; a small ratio is ordinary
+contention.**
+
+⛔ Same exit requirement as §1.2b: **`SIGTERM` and let it exit.** `kill -9` destroys the census.
+
+⚠ **A clean census does not exonerate the fix.** The three-pass admission in
+`TupleSinkServiceAppendReadyControlMailboxActionsRdma()` is *supposed* to keep `starved%` low; on a build that
+already carries it, low numbers mean the fix is working, **not** that starvation was never possible. To
+observe the original defect you would have to revert that function.
+
+Contract and rationale:
+[`../implementations/citus/transport/CONTRACTS.md`](../implementations/citus/transport/CONTRACTS.md)
+(`TupleSinkServiceAppendReadyControlMailboxActionsRdma()`).
 
 ### 1.3 Reading a socketless backend's arena bind without the trace build
 

@@ -70,6 +70,16 @@ if [[ "$cppflags" == *HOMER_COLLECTOR_STARVE_DIAG* ]]; then
         exit 1
     fi
 fi
+# Same assertion for the control-mailbox class census. Its marker is 'mailbox-diag', NOT
+# 'starve-diag' -- deliberately a different prefix, because it answers a different question and
+# reusing the prefix would make the two indistinguishable in a log. The two macro names are not
+# substrings of one another, so the tests above and here cannot alias.
+if [[ "$cppflags" == *HOMER_CONTROL_MAILBOX_STARVE_DIAG* ]]; then
+    if ! strings "$binary" | grep 'mailbox-diag' > /dev/null; then
+        echo "HOMER_CONTROL_MAILBOX_STARVE_DIAG requested but no mailbox-diag strings in the binary" >&2
+        exit 1
+    fi
+fi
 outputs=("$binary")
 if [[ " $* " == *" dpu-tcp-transport-smoke-bin "* ]]; then
     smoke=build/homer/homer_dpu_tcp_transport_smoke

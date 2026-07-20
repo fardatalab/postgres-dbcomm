@@ -1,17 +1,23 @@
 # The mixed-workload hang — investigation record and current frontier
 
-<!-- kb-summary: Why the mixed pgbench+basebackup workload hangs. Current frontier: a P3 result stream's peer binding never activates, so the result egress is never armed. Includes four refuted causes and the collector-starvation defect fixed along the way. -->
+<!-- kb-summary: Why the mixed pgbench+basebackup workload hangs. The P3 result peer-open is BLOCKED, not failed — it completes at teardown. Prime suspect: control-mailbox class admission (8 enumerated, 2 planned, no cross-class rotation). Includes SEVEN refuted causes and three defects fixed along the way. -->
 
-**Status (2026-07-20): STILL BROKEN. Frontier localized and WITNESSED — the gate's result stream binds its
-mirror but its PEER BINDING NEVER ACTIVATES, so the result egress is never armed and the result never
-returns.** Two real defects were found and fixed on the way (collector-admission starvation; a watchdog blind
-to the very state it existed to catch), and **four** candidate causes were refuted. Read the banner below
-before anything else in this file — later sections are the historical trail and their headline conclusions
-were superseded.
-**Code baseline:** citus `434c7e9e7`.
+**Status (2026-07-20): STILL BROKEN.** The gate's P3 result peer-open is **BLOCKED, NOT FAILED** — it does
+complete, at TEARDOWN, ~1,000,000 service passes late, the instant the *other* session's payload connection is
+released. Three real defects were found and fixed on the way (collector-admission starvation; a watchdog blind
+to the very state it existed to catch; control-mailbox class starvation), and **seven** candidate causes were
+refuted. Read the banner below before anything else in this file — later sections are the historical trail and
+several of their headline conclusions were superseded.
+**Code baseline:** citus `434c7e9e7` + the control-mailbox admission change (unvalidated on the rig).
 **Line numbers are `src/backend/distributed/utils/homer/tuple_sink_service_process.c` unless stated.**
 
 > ## ⛔ THE MIXED WORKLOAD HAS NEVER PASSED. Six runs. The byte-ring pool it was written to stress is EXONERATED.
+
+> ## ⛔ "NEVER ESTABLISHES" WAS WRONG — IT IS A DELAY, NOT A FAILURE.
+> An earlier version of this file said the peer binding *never activates*. Run 6 line 214 disproves that:
+> `service-owned P3 result peer-open ready ... detail=peer stream bound`. It arrives at teardown. **A blocked
+> resource and a failed one demand completely different fixes, and this file sent the investigation at the
+> wrong one for a full run.**
 
 ---
 
@@ -311,11 +317,54 @@ send-open rides the same command plane and starves identically. One mechanism, b
 > not because they were broken. **Before believing a collapsed counter is a cause, ask what it counts
 > when the system is merely idle.**
 >
-> ### The frontier now
+> ### ⛔ FOUR MORE THINGS THAT ARE **NOT** THE CAUSE (2026-07-20, from retained run-6 logs, no new run)
 >
-> Why does the service-owned P3 result OPEN not complete — i.e. never set `peerBindingActive` on the
-> stream — when the result stream is not the first on its connection? The arm is the documented
-> post-OPEN handoff, so the async OPEN op is where to look next.
+> 4. **`PEER_CM_SETUP` starvation.** REFUTED by its own denominator: **271,707 `budget` drops against
+>    12,409,722 grants** — a 2% rate. The `grants` column added to the exit census two commits earlier
+>    is what caught this; the raw drop count alone looked damning.
+> 5. **`PEER_RECV_CQ` never granted.** It has **zero** grants — in *every* run, **including the passing
+>    ones** (`stage1`, `stage2`, `control_*`, `arm_a`, `arm_b`). Normal, not a discriminator.
+> 6. **Malformed OPEN geometry.** farnet0 provisioned the receive sink with
+>    `payload_ring_slot_count=0 payload_ring_slot_bytes=0` — identical in every passing run.
+> 7. **The farnet0 (receiver) side generally.** It received and serviced the OPEN normally: run 6 farnet0
+>    line 60, `peer-provisioned receive sink ... peer_session=5927597253484435
+>    peer_sink=6507436609316216724`. **The request crossed. The RESPONSE was not consumed on farnet1.**
+>
+> ### ⚠⚠ THE METHODOLOGICAL LESSON, PAID FOR THREE TIMES — AND ITS COROLLARY, PAID FOR TWICE MORE
+>
+> **Three of the seven dead ends were CONSEQUENCES mistaken for causes**, and each time the tell was
+> identical: *a counter that measures work performed collapses when no work happens.* Discovery
+> counts, dispatch grants, and close-drain state all collapsed because the result never came back —
+> not because they were broken. **Before believing a collapsed counter is a cause, ask what it counts
+> when the system is merely idle.**
+>
+> **COROLLARY (causes 5 and 6): an anomaly is only evidence if it DISTINGUISHES the failing run from a
+> passing one.** Both died to a control comparison, not to argument. Diff the census against a green
+> run *before* building a theory on any number. **And never read a drop count without its denominator**
+> (cause 4).
+>
+> ### The frontier now — a BLOCKED open, and the prime suspect
+>
+> The op is parked in `STREAM_WAIT_PEER_OPEN`, and both neighbours are excluded by evidence:
+> `mirror_mr` non-null proves `STREAM_REGISTER_MIRROR` completed, and a publish failure in
+> `STREAM_START_PEER_OPEN` would have printed a `failed` completion line. **So the request was
+> published and the response was never delivered to the op.**
+>
+> The release is exact: the open completes the instant
+> `payload connection release: session=...434 freed 1 outgoing connection(s) for reuse` appears, with
+> the connection generation moving 2 → 3.
+>
+> **PRIME SUSPECT — control-mailbox class admission** (see the
+> `TupleSinkServiceAppendReadyControlMailboxActionsRdma()` entry in [`CONTRACTS.md`](./CONTRACTS.md)):
+> 8 actions are enumerated, **2** are planned, and until 2026-07-20 the enumeration walked traffic
+> classes in strict priority with **no rotation across classes** — so a ready `FOREGROUND_PAYLOAD`
+> mailbox (which is what carries the P3 OPEN response) could be discarded indefinitely, **without
+> incrementing any drop counter**. That silence is why six runs of admission reports showed nothing.
+>
+> ⚠ **THIS IS NOT YET PROVEN, AND THE OBVIOUS VERSION OF THE STORY IS WRONG.** "The basebackup crowds
+> out the gate" **cannot** be the mechanism: `BULK_PAYLOAD` ranks BELOW `FOREGROUND_PAYLOAD`. The
+> starvation requires `CRITICAL_CONTROL` to hold ≥2 ready actions nearly every pass. The next run must
+> carry `HOMER_CONTROL_MAILBOX_STARVE_DIAG=1` and read `starved/ready` per class to settle it.
 
 > ## ⚡ VALIDATED 2026-07-20 (`candidate-20260720-121352`, citus `f84e49bad`): THE FIX WORKS AND THE HANG REMAINS.
 >
