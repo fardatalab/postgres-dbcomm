@@ -257,7 +257,63 @@ send-open rides the same command plane and starves identically. One mechanism, b
 
 ---
 
-## The fix space (nothing implemented; the numbers now constrain it)
+## ✅ THE FIX AS IMPLEMENTED (2026-07-20, citus tree; NOT yet validated on the rig)
+
+**Shape: reserve the whole command-plane pipeline, and stop double-charging reserved grants.**
+
+1. `HomerServiceProgressCollectorReservedLifecycleAdmission()` grows from 2 members to **8**: the two
+   listeners plus all six selected-DPU command-plane stages (`STAGE`, `DISPATCH`, `PUBLISH`, `EXECUTE`,
+   `COMPLETION_PULL`, `COMPLETION_PUSH`).
+2. `MAX_LIFECYCLE_COLLECTOR_GRANTS` 2 → **8**, preserving **cap == membership** (the order-independence rule).
+3. A reserved grant is billed to the reserved line **only** — it no longer increments
+   `planGrants`/`collectorGrants`.
+4. `MAX_GRANTS` (16) and `MAX_COLLECTOR_GRANTS` (6) are **UNCHANGED**.
+5. The `PROGRESS POLICY-ADMISSION DROPS` line now prints `lifecycle=` grants and cap.
+
+**Why the whole pipeline and not just the measured stages.** The six are joined by BOUNDED queues, so
+guaranteeing a subset relocates the wedge to whichever stage is left out. That was not hypothetical: the first
+version of this fix reserved only `DISPATCH` and `COMPLETION_PULL`, and refutation showed the wedge would move
+to `PUBLISH`, whose `backendCommandPublishSlots[]` is 16 deep and whose overflow path reports an internal
+`blocked` and silently retains the command. **Reserve the pipeline, or none of it.**
+
+### ❌ REJECTED, AFTER BEING APPROVED — "compensating cap resize" (raise the caps by the size of the reserved set)
+
+This was the agreed plan and it does not survive its own arithmetic once the reserved set is the full pipeline.
+Reserved members are **interleaved** through the fixed order (ordinals 1, 2, 10–14, 16), so if reserved grants
+are billed to the shared cap `C`, the count at `DPU_PAYLOAD_PULL` (ordinal 15) is already
+`7 + min(7, C-2)` — which is `>= C` for **every `C < 15`**. That rejects the 24-million-grant **bulk data
+path** in every busy pass. Raising `C` to 15 to rescue it then starves `DPU_SPAWN` (18), whose starvation is a
+peer hung in `WAIT_PEER_OPEN` with no error on either side.
+
+**⇒ A cap cannot be sized to spare everyone; it can only choose a different victim.** The double-charging, not
+the cap size, was the amplifier — so the fix removes the double-charge and leaves the caps alone.
+
+### What the refutation got right, and what it got wrong
+
+- ✅ **RIGHT, and it changed the design:** guaranteeing a subset of a bounded-queue pipeline relocates the hang
+  to `PUBLISH`; the "shared budget unchanged" invariant as originally written was inaccurate; the pgbench
+  client does NOT "wait forever" (it has a 30 s deadline and prints the `kind/sequence` line); the admission
+  diagnostic did not expose the lifecycle line; the `CONTRACTS.md` entry was stale against the staged source.
+  All corrected.
+- ❌ **WRONG:** *"`DISPATCH` is the wrong collector — `SQL_EXECUTE` is owned by `STAGE`."* The ownership claim
+  is right but the conclusion is not. The staged-command queue is **HEAD-BLOCKING**, and ownership is
+  partitioned: `START_COMMAND` → `STAGE`, **everything else → `DISPATCH` (the catch-all)**. Starving `DISPATCH`
+  leaves a non-START command immortal at the head, making every START behind it unreachable. The tree documents
+  this exact wedge as having already happened once with `POLL_COMMAND_COMPLETION`. The measurement confirms it:
+  `STAGE` was granted **660,180** times and achieved nothing, because it kept peeking a head it does not own.
+
+### Residual risks to watch on the validation run
+
+- **Per-phase work rises**: worst case `MAX_GRANTS + MAX_LIFECYCLE_COLLECTOR_GRANTS` = **24** actions, up from
+  16 — but only when all eight stages simultaneously have real work.
+- **`COMPLETION_PULL` is not a cheap grant**: it scans all imports/rings. Guaranteeing it makes that scan
+  every-pass while any command is outstanding. Watch its cost.
+- **`DPU_SPAWN` (18) remains unreserved** while meeting the silent-hang criterion. First suspect if a *session
+  bring-up* (rather than a command) hangs.
+- **No coupling validation exists** — the caps are independently env-overridable, so an override can silently
+  break the `cap == membership` rule.
+
+## The fix space that was considered (kept for the reasoning, not as a menu)
 
 | option | effect | problem |
 |---|---|---|

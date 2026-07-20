@@ -557,41 +557,57 @@ the call site. If it is not on the list, **it has not been checked.**
 - **NOT 64:** DPU byte-ring pool = **16 per DPU** (see the derivation entry below); frontend arena = **16** slots;
   import table = **1024**.
 
-## `HOMER_SERVICE_MACHINE_BASELINE_MAX_COLLECTOR_GRANTS` = 6 — **DOES NOT MEAN six collectors run. It means FOUR.**
+## `HomerServiceProgressCollectorReservedLifecycleAdmission()` — **the 8 collectors that CANNOT be delayed; cap MUST equal membership**
 
-*(`tuple_sink_service_process.c:188`. All line numbers in this entry are that file.)*
+*(`tuple_sink_service_process.c`; the predicate, the three caps, and the reserve function are one coupled unit.)*
 
-- **MEANS:** the per-phase cap on collector grants in the machine-baseline progress plan. Enforced at `:11560`,
-  which is the branch that rejects a collector with diagnostic reason `budget`.
-- **⛔ DOES NOT MEAN "six slots are available to the collector list."** A **reserved lifecycle grant** is admitted
-  by the bypass at `:11544` **and still increments `collectorGrants`** (`:11547`, `:11551`). `DPU_SETUP_LISTENER`
-  and `DPU_DOORBELL` are permanently reserved (`:11462`), so they consume 2 of the 6 on every phase where they
-  are candidates. **The effective quota for the other seventeen collectors is FOUR.**
-- **⛔ DOES NOT MEAN a starved collector is retried fairly later.** Admission is a **fixed-order** list
-  (`:13060`–`:13239`) with **no rotation**. A collector past the quota is not delayed, it is **shed on every
-  pass, silently, for as long as the earlier ones stay armed** — no alarm, no timeout, no error.
-- **THE RULE:** any workload combination that keeps more than four non-reserved collectors armed starves
-  everything after them. **MEASURED:** a bulk basebackup concurrent with SQL arms ordinals 3, 4, 5, 6, 9 and 10,
-  so `DPU_STAGED_COMMAND_DISPATCH` (ordinal 11) was granted **3** times against **1,514,591** budget drops, and
-  the mixed workload hangs. Gate-alone on the same binary: ~870 total drops.
-- **NEAR-NEIGHBOUR TRAP:** `MAX_BLIND_COLLECTOR_GRANTS` = 2 (`:197`) is a *different, tighter* line at `:11576`
-  — but **both rejections increment the same `collectorBudgetDrops` counter**, so the `starve-diag` census
-  reports both as reason `budget` and **cannot distinguish them.** Resolve it from the append site, not the
-  census: a collector is blind only when `!dependencyDemand && !knownExpectedWork`. The DPU command-plane
-  collectors all pass `knownExpectedWork = true` (`:46826`, `:46726`, `:46838`) and so are **never** blind;
-  `DPU_GROUPED_CONTROL_READ` is blind exactly when `groupedControlRingCount == 0` (`:46676`).
-- **⛔ ZERO DROPS IS NOT HEALTH.** A collector armed only by an upstream collector's output reports a clean
-  scorecard while doing nothing. `DPU_STAGED_COMMAND_EXECUTE` (`:46829`, armed only when
-  `stagedCommandDispatchCount > 0`) showed **grants=3, drops=0** purely because DISPATCH ran 3 times. **Read a
-  grant count against its upstream's, not on its own.**
-- **ENFORCES** — sites that must obey or account for the effective-4 rule:
-  - `:11560` the rejection; `:11544`-`:11551` the reserved bypass that consumes shared quota
-  - `:11462` the reserved set (adding a member costs one of the shared slots)
-  - `:13060`-`:13239` the fixed append order — **a new collector's ORDINAL decides whether it can ever run**
-  - `:13858`-`:13877` every cap is env-overridable, so a deployment can make this worse (or test a fix with no
-    code change)
-- **TEMPTING WRONG MOVE:** raising the cap alone. It moves the cliff; the fixed order still starves whatever
-  does not fit, permanently. Full evidence and fix space:
+- **MEANS:** the collectors whose starvation is a **SILENT HANG** — no alarm, no error, no log line on either
+  side. They draw from a reserved line that BYPASSES the ordinary caps, so they are **admitted, not merely
+  preferred**. Eight members: `DPU_SETUP_LISTENER`, `DPU_DOORBELL`, and the six selected-DPU command-plane
+  stages `DPU_BACKEND_COMMAND_STAGE`, `DPU_STAGED_COMMAND_DISPATCH`, `DPU_BACKEND_COMMAND_PUBLISH`,
+  `DPU_STAGED_COMMAND_EXECUTE`, `DPU_BACKEND_COMPLETION_PULL`, `DPU_COMPLETION_PUSH`.
+- **⛔ THE CRITERION IS "SILENT", NOT "LISTENER".** `PEER_CM_SETUP` is excluded because its starvation surfaces
+  as a peer-open timeout — loud. `DPU_SPAWN` is a known OPEN QUESTION: its own comment says a suppressed spawn
+  is a peer hung in `WAIT_PEER_OPEN` with no error either side (which meets the criterion), but it measured
+  running, not starved, so it is out until evidence names it.
+- **🔑 THE RULE: `MAX_LIFECYCLE_COLLECTOR_GRANTS` MUST EQUAL THE MEMBER COUNT (both 8).** That equality is the
+  ONLY thing making the guarantee independent of append order — the members are scattered across ordinals
+  1, 2, 10, 11, 12, 13, 14, 16 of a 19-entry fixed list with no rotation. **Add a ninth member without raising
+  the cap and you re-create the exact positional starvation this exists to remove, one layer in.**
+- **⛔ A RESERVED GRANT IS BILLED TO THE RESERVED LINE ONLY.** It does **not** increment
+  `planGrants`/`collectorGrants`. It used to do both, on the reasoning that "the plan really did spend a grant"
+  — correct as accounting and the direct cause of a whole-service wedge, because every reserved member then
+  permanently shrank the shared quota (a cap of 6 was an effective **4**).
+- **⛔ THE CAPS ARE NOT THE STARVATION FIX. RAISING THEM CANNOT WORK — HERE IS THE ARITHMETIC.** Because
+  reserved members are INTERLEAVED in the fixed order, if reserved grants were billed to the shared cap `C`,
+  then at `DPU_PAYLOAD_PULL` (ordinal 15) the count would already be `7 + min(7, C-2)`, which is `>= C` for
+  every `C < 15` ⇒ **the bulk data path is rejected in every busy pass.** Raising `C` to 15 to rescue it then
+  starves `DPU_SPAWN` (18). A cap cannot spare everyone; it only picks a different victim.
+- **CAPACITY (unchanged by the fix, on purpose):** `MAX_GRANTS` = 16, `MAX_COLLECTOR_GRANTS` = 6,
+  `MAX_BLIND_COLLECTOR_GRANTS` = 2, `MAX_LIFECYCLE_COLLECTOR_GRANTS` = 8. Worst case actions per phase is
+  `MAX_GRANTS + MAX_LIFECYCLE_COLLECTOR_GRANTS` = **24**, not 16 — and only when all eight stages have real
+  work, since each is armed by an exact work predicate.
+- **⛔ ZERO DROPS IS NOT HEALTH.** A stage armed only by its upstream's output reports a clean scorecard while
+  doing nothing. In the measured wedge, four of the six pipeline stages showed **zero** drops; `STAGE` burned
+  **660,180** grants achieving nothing (it peeks a shared head it does not own); `DISPATCH`, `EXECUTE` and
+  `COMPLETION_PUSH` each moved exactly **3**. **Read a collector's grants against its upstream's, never alone.**
+- **WHY THE SET, NOT THE INDIVIDUAL:** the six are a pipeline joined by BOUNDED queues, so guaranteeing a
+  subset only relocates the wedge to the unguaranteed stage (`PUBLISH`'s queue is 16 deep and its overflow path
+  reports an internal `blocked` and silently RETAINS the command). **Reserve the pipeline, or none of it.**
+- **NEAR-NEIGHBOUR TRAP:** `MAX_BLIND_COLLECTOR_GRANTS` (2) is a *different, tighter* line, but **both** it and
+  `MAX_COLLECTOR_GRANTS` increment the same `collectorBudgetDrops`, so the `starve-diag` census reports both as
+  reason `budget` and **cannot distinguish them**. Resolve from the append site: blind ⟺
+  `!dependencyDemand && !knownExpectedWork`. The DPU command-plane collectors all pass `knownExpectedWork=true`
+  and are therefore **never** blind; `DPU_GROUPED_CONTROL_READ` is blind exactly when
+  `groupedControlRingCount == 0`.
+- **ENFORCES:**
+  - the reserved predicate, the three caps, and the reserve function — change one, check all four
+  - the fixed append order — **a new collector's ORDINAL decides whether it can ever run**
+  - the `PROGRESS POLICY-ADMISSION DROPS` line **must keep printing `lifecycle=`**, or it silently omits up to
+    8 admissions per phase and `collectors=6` reads as the whole story
+  - all caps are env-overridable, with **no coupling validation** — an override can re-break the equality rule
+- **STATUS:** implemented, compiles; **NOT yet validated on the rig.** Until the mixed workload passes, treat
+  the fix as unproven. Evidence and open risks:
   [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md).
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
