@@ -660,25 +660,31 @@ in `remote_execution_peer_transport_rdma.h` is the consumer's cap. The two are O
     not move it back into `tuple_sink_service_process.c`
   - a new traffic class must be added to `HomerTransportServiceLoopPriority[]` **and** counted in
     `HOMER_TRANSPORT_TRAFFIC_CLASS_COUNT`, or it is enumerated by nobody
-- **STATUS (2026-07-20):** three-pass admission + probe **LANDED and the MIXED WORKLOAD PASSES** (citus
-  `6392a1853`, candidate `candidate-20260720-165458-r2`, `-c4 -t6000`, **329 s of proven concurrent overlap**):
-  gate 24000/24000, basebackup 23.26 GB / 44,372 ring laps, every checker green. **The 6/6 deterministic hang did
-  NOT reproduce** — including that it previously hung at `-c1`, which is not a race, so a structural wedge was
-  removed by a structural change to this exact subsystem (the P3 OPEN *response* is a peer control-mailbox
-  message).
-- **⚠ CAUSATION IS STRONG-CIRCUMSTANTIAL, NOT ABSOLUTE — and the census REFUTED the specific hypothesis.** The
-  `[mailbox-diag]` census on both DPUs shows `starved% = 0.00%` for FOREGROUND/BULK/MAINTENANCE and **no
-  `CRITICAL_CONTROL` row at all** (it was never ready → skipped). So the earlier "CRITICAL holds both slots"
-  theory is **wrong**; if this fix is what unblocked the hang, the trigger was a DIFFERENT class monopolizing
-  both slots — most plausibly ONE class taking both its directions, which is exactly what the "at most one action
-  per class in passes A/B" bound now prevents. Two facts keep this from being pure timing luck: (1) FOREGROUND
-  `ready_passes = 8`, not the ~1,000,000 a stuck-ready response would inflate it to under the hang — evidence the
-  mailbox now drains promptly; (2) the fix sits in the exact path the failure was localized to (response
-  published by the peer, not consumed on farnet1). **The census cannot show the original defect because the fix
-  is in the build that produced it** — `starved%=0` is what a working fix AND "never the cause" both look like.
-- **TO PROVE CAUSATION EXACTLY (one run, optional):** revert ONLY
-  `TupleSinkServiceAppendReadyControlMailboxActionsRdma()` to the single strict-priority loop, keep the probe,
-  run mixed. A class at `starved% ≈ 100%` with `ready_passes` in the hundreds of thousands nails it.
+- **STATUS (2026-07-20) — THE FIX IS DEFENSIVE HARDENING, NOT THE PROVEN HANG FIX. The causation run REFUTED
+  it.** ⛔ Do not read this entry as "the fix resolved the mixed-workload hang." A controlled experiment says
+  otherwise:
+  - **Fixed build** (`6392a1853`, pre-armed `-c4 -t6000`): mixed workload PASSES; census FG/BULK/MAINT
+    `ready_passes = 8/8/6`, `starved% = 0`.
+  - **Reverted build** (`8f4d20e60` with `HOMER_CONTROL_MAILBOX_REVERT_STRICT_PRIORITY=1` — the EXACT pre-fix
+    strict-priority walk, `causation-20260720-173641`): mixed workload **ALSO PASSES**; census `ready_passes =
+    4/4/3`, `starved% = 0`. **No hang.**
+  - ⇒ Same workload, fix vs its own revert, **identical outcome and no starvation in EITHER**. `ready_passes` is
+    single digits in both — the control-mailbox path was barely exercised and NEVER contended, so class-admission
+    starvation did not occur even with the old code. **This workload cannot distinguish the fix from its revert,
+    and did not.** The earlier "the fix made it pass" claim does not hold.
+- **WHY THE PASSES ARE NOT THE FIX:** between the last hanging run (`434c7e9e7`) and the first pass the only code
+  deltas were this mailbox change (now shown irrelevant to the outcome) and a cosmetic alarm-label fix. Neither
+  explains a pass. The variable that flipped hang→pass is **procedural**: both passing runs PRE-ARMED the gate
+  (all 4 sessions open before the basebackup). Run 6's hang was a result peer-open blocked while ANOTHER session
+  was closing, released only at teardown (`freed 1 outgoing connection(s) for reuse`, generation 2→3) — an
+  **open-during-close connection interaction** that pre-arming avoids. Leading hypothesis, not yet established.
+- **THE FIX STAYS ANYWAY:** cross-class / two-direction starvation IS possible by construction (verified in
+  code), so this is legitimate hardening. It is just not the hang fix, and the hang's real cause — a
+  connection-lifecycle/reuse interaction, matching the original localization — is once again OPEN.
+- **NEXT:** reproduce the original hang by running mixed with the NON-pre-armed launch order on the current
+  build. Hang ⇒ pre-arming was masking it (chase the open-during-close connection path). Pass ⇒ something
+  environmental changed; find what. The `HOMER_CONTROL_MAILBOX_REVERT_STRICT_PRIORITY` scaffold remains as the
+  on-demand reproduction lever for the starvation path specifically.
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
 

@@ -1,16 +1,20 @@
 # The mixed-workload hang — investigation record and current frontier
 
-<!-- kb-summary: The mixed pgbench+basebackup workload now PASSES (citus 6392a1853) after a control-mailbox class-admission fix (8 enumerated, 2 planned, rotate across classes). Causation is strong-circumstantial not absolute: the census refuted the CRITICAL_CONTROL hypothesis. Records SEVEN refuted causes and three defects fixed along the way. -->
+<!-- kb-summary: The mixed pgbench+basebackup workload PASSES under the current (pre-armed) procedure, but the causation run REFUTED the control-mailbox fix as the cause: the reverted (pre-fix) build passes identically with zero starvation in the census. The pass is procedural (pre-arming avoids an open-during-close connection interaction), not the fix. The hang's real cause is OPEN. Records the mailbox fix as defensive hardening + seven refuted causes. -->
 
-**Status (2026-07-20): THE MIXED WORKLOAD PASSES.** After landing the control-mailbox class-admission fix
-(citus `6392a1853`), candidate `candidate-20260720-165458-r2` ran the gate `-c4 -t6000` CONCURRENTLY with the
-four-role basebackup for **329 s of proven overlap**: gate 24000/24000, basebackup 23.26 GB / 44,372 ring laps,
-all checkers green, and **the six-run deterministic hang did NOT reproduce**. Three real defects were found and
-fixed getting here (collector-admission starvation; a watchdog blind to the very state it existed to catch;
-control-mailbox class starvation), and **seven** candidate causes were refuted. ⚠ **CAUSATION IS
-STRONG-CIRCUMSTANTIAL, NOT ABSOLUTE** — see the "did the fix work for the right reason?" section below; the
-`[mailbox-diag]` census refuted the specific `CRITICAL_CONTROL` hypothesis even as the workload passed.
-**Code baseline:** citus `6392a1853`.
+**Status (2026-07-20): THE FIX IS REFUTED AS THE CAUSE; THE HANG'S REAL MECHANISM IS OPEN AGAIN.** The mixed
+workload passes under the current PRE-ARMED procedure — but so does the build with the control-mailbox fix
+REVERTED (see the causation-run section below). A controlled fixed-vs-reverted comparison shows identical
+outcomes and **zero starvation in either census** (`ready_passes` single digits, the path was never contended).
+⇒ **Class-admission starvation was NOT the mechanism of the hang, and the earlier "the fix made it pass" claim
+does not hold.** The passes are almost certainly procedural: both used pre-arming, which avoids the
+open-during-close connection interaction that run 6 hit (result peer-open blocked until the OTHER session's
+connection was `freed ... for reuse`, generation 2→3). The mailbox fix STAYS as legitimate defensive hardening
+(cross-class starvation is possible by construction), but the hang's real cause — a connection-lifecycle/reuse
+interaction, matching the original localization — is **once again the open frontier.** Three real defects were
+still found and fixed along the way (collector-admission starvation; a watchdog blind to the state it existed to
+catch; control-mailbox class starvation), and **seven** candidate causes were refuted.
+**Code baseline:** citus `8f4d20e60` (fix `6392a1853` + the revert scaffold).
 **Line numbers are `src/backend/distributed/utils/homer/tuple_sink_service_process.c` unless stated.**
 
 > ## ⛔ THE MIXED WORKLOAD HAS NEVER PASSED. Six runs. The byte-ring pool it was written to stress is EXONERATED.
@@ -409,6 +413,32 @@ send-open rides the same command plane and starves identically. One mechanism, b
 > hundreds of thousands nails it; anything else means the fix helped by a mechanism other than the one designed,
 > and the frontier returns to the blocked-resource question (the open completes on `freed 1 outgoing
 > connection(s) for reuse`, generation 2 → 3).
+>
+> ### ⛔ RESULT OF THAT RUN (`causation-20260720-173641`, citus `8f4d20e60` + `REVERT_STRICT_PRIORITY=1`): THE REVERT PASSED. THE FIX IS REFUTED AS THE CAUSE.
+>
+> The reverted (pre-fix strict-priority) build ran the SAME pre-armed mixed workload and **PASSED — no hang**,
+> gate 24000/24000, basebackup 23.26 GB. Census, identical both DPUs:
+> ```
+> traffic_class        ready_passes   starved_passes   starved%
+> FOREGROUND_PAYLOAD             4              0        0.00%
+> BULK_PAYLOAD                   4              0        0.00%
+> MAINTENANCE                    3              0        0.00%
+> ```
+> **`starved% = 0` even with the OLD code, `ready_passes` single digits.** Per the prediction directly above,
+> "anything else means the fix helped by a mechanism other than the one designed" — so:
+> - **Class-admission starvation was NOT the mechanism.** It did not occur even reverted; the path was never
+>   contended (single-digit `ready_passes` in both builds). The workload as run does not exercise it at all.
+> - **The two passes (fixed and reverted) are procedural, not the fix.** Both pre-armed the gate. Between the
+>   last hanging run and the first pass, no code change explains the flip except this fix — which the revert now
+>   shows is irrelevant to the outcome. Pre-arming avoids the run-6 open-during-close contention.
+> - **The frontier returns to exactly the blocked-resource question** named above: the open completes on
+>   `freed 1 outgoing connection(s) for reuse`, generation 2 → 3 — a connection-lifecycle/reuse interaction, not
+>   mailbox scheduling. **This is where the investigation resumes.**
+>
+> **Methodological win, not a loss:** the causation run did its job — it FALSIFIED a plausible, already-committed
+> story before it hardened into accepted fact. This is the eighth refuted cause, and the first one refuted by a
+> deliberately-constructed experiment rather than by re-reading logs. The mailbox fix stays as hardening; the
+> claim that it fixed the hang does not.
 
 > ## ⚡ VALIDATED 2026-07-20 (`candidate-20260720-121352`, citus `f84e49bad`): THE FIX WORKS AND THE HANG REMAINS.
 >
