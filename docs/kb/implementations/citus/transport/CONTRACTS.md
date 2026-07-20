@@ -680,16 +680,18 @@ in `remote_execution_peer_transport_rdma.h` is the consumer's cap. The two are O
   **open-during-close connection interaction** that pre-arming avoids. Leading hypothesis, not yet established.
 - **THE FIX STAYS ANYWAY:** cross-class / two-direction starvation IS possible by construction (verified in
   code), so this is legitimate hardening. It is just not the hang fix.
-- **FRONTIER (after a static trace refuted the connection-reuse hypothesis too — the `2→3` was two DIFFERENT
-  connections, not a reset):** the P3 OPEN **response round-trip**. The op completed (`ready, bound`) only at
-  teardown, so the response was processed — just not until then. Suspect: the per-connection
-  `pendingSyncResponse` single-slot head-of-line block (see that entry below); latent: the
-  `exactConnectionGeneration` ABA gap. Full detail:
+- **FRONTIER (two static traces later — STATIC ANALYSIS EXHAUSTED):** the delay is on **farnet1's
+  response-DELIVERY chain**, not the round-trip send side. Refuted, each from code or retained logs:
+  connection-reuse (`2→3` = two different connections); "completes at teardown" (the `ready` line is
+  live-pump-only, so the op finished while LIVE ~1M passes late); suspect A `pendingSyncResponse` latch (its
+  unconditional probe fired ZERO times on both DPUs); suspect B `exactConnectionGeneration` ABA (op-tuple +
+  scheduler re-eval prevent a 1M-pass wait — a latent defensive-check gap, not this bug). The response WAS
+  posted; the stall is in recv-CQ arm → mailbox drain → op COMPLETED → owner consume, none of which has a log
+  marker. Full detail:
   [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md).
-- **NEXT:** reproduce the hang (NON-pre-armed launch order) with targeted probes on the response post
-  (`remote_execution_peer_transport_rdma.c:10982`) and the `pendingSyncResponse` slot state. The
-  `HOMER_CONTROL_MAILBOX_REVERT_STRICT_PRIORITY` scaffold remains the on-demand lever for the starvation path
-  specifically (unrelated to this frontier).
+- **NEXT (needs a live run):** reproduce the hang (NON-pre-armed launch order) with a probe that TIMESTAMPS all
+  four delivery frontiers with connection index/generation + op index/generation/sequence. The
+  `HOMER_CONTROL_MAILBOX_REVERT_STRICT_PRIORITY` scaffold is unrelated to this frontier.
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
 

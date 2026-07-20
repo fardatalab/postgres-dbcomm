@@ -2,26 +2,38 @@
 
 <!-- kb-summary: The mixed pgbench+basebackup workload PASSES under the current (pre-armed) procedure, but the causation run REFUTED the control-mailbox fix as the cause: the reverted (pre-fix) build passes identically with zero starvation in the census. The pass is procedural (pre-arming avoids an open-during-close connection interaction), not the fix. The hang's real cause is OPEN. Records the mailbox fix as defensive hardening + seven refuted causes. -->
 
-**Status (2026-07-20): FRONTIER = THE P3 OPEN RESPONSE ROUND-TRIP. The connection-reuse hypothesis is REFUTED.**
-The mixed workload passes under the current PRE-ARMED procedure — and so does the control-mailbox fix REVERTED
-(causation-run section below), so **class-admission starvation was NOT the mechanism** and "the fix made it pass"
-does not hold (it stays as defensive hardening only). A static trace then **refuted the connection-reuse
-hypothesis too** (ninth refuted cause): the `generation 2→3` was TWO DIFFERENT connections
-(`connection_generation=2` = the incoming COMMAND connection `dpuResultOriginConnectionGeneration`,
-`tuple_sink_service_process.c:43142`; `peer_generation=3` = the outgoing PAYLOAD connection,
-`:27959`) — consecutive only because the global counter handed them out back-to-back, NOT a reset/reuse. B's
-`STREAM_WAIT_PEER_OPEN` completion reads only B's own op state and does NOT depend on A's session/close/connection;
-the "open completes when A's connection is freed" correlation is a **teardown artifact**, not a causal edge. But
-the op DID complete (`ready, bound`) at teardown, so the response was eventually processed — just not until then.
-⇒ **The frontier is the RESPONSE ROUND-TRIP:** did farnet0 POST the OPEN response, and did farnet1 PROCESS it,
-before teardown? (`peer-provisioned receive sink` on farnet0 is printed BEFORE response publication,
-`:30224` vs `remote_execution_peer_transport_rdma.c:10982`, so it proves only that the sink was bound — NOT that
-the response was posted or arrived.) Named suspect from the first trace: the per-connection `pendingSyncResponse`
-single-slot head-of-line block. Latent (INFERRED, unproven here): the `exactConnectionGeneration` ABA gap
-(captured at publish, never compared at poll). **Not resolvable from retained logs or static analysis — needs a
-reproduction with targeted probes on the response post + that slot.** Three real defects were still found and
-fixed along the way (collector-admission starvation; a watchdog blind to the state it existed to catch;
-control-mailbox class starvation), and **nine** candidate causes were refuted.
+**Status (2026-07-20): FRONTIER = FARNET1's RESPONSE-DELIVERY CHAIN. STATIC ANALYSIS EXHAUSTED — needs a live
+4-frontier probe.** The mixed workload passes under the current PRE-ARMED procedure — and so does the
+control-mailbox fix REVERTED (causation-run section), so **class-admission starvation was NOT the mechanism** and
+"the fix made it pass" does not hold (hardening only). Two static traces then refuted every remaining
+code-reachable hypothesis:
+- **Connection-reuse REFUTED:** the `generation 2→3` was TWO DIFFERENT connections (`connection_generation=2` =
+  incoming COMMAND connection `dpuResultOriginConnectionGeneration` `:43142`; `peer_generation=3` = outgoing
+  PAYLOAD connection `:27959`), consecutive only by the global counter. B's `STREAM_WAIT_PEER_OPEN` completion
+  reads only B's own op state; it does NOT depend on A's session/close/connection.
+- **"Completes at teardown" was IMPRECISE — the correction matters:** the `ready` line is emitted ONLY by the
+  LIVE progress pump (`:41918`, `:49875`); shutdown has no pump and reports waiting ops as LOST, not completed
+  (`remote_execution_peer_transport_rdma.c:7773`, `:6388`). So the op completed while the service was **still
+  live**, ~1M passes late — NOT during teardown. The "open completes when A's connection is freed" correlation
+  is a **coincidence of timing**, on DIFFERENT nodes (A's release is on farnet1; if the delay were a
+  responder-side latch it would be on farnet0). Not a causal edge.
+- **Suspect A (`pendingSyncResponse` head-of-line latch) REFUTED from retained logs:** its unconditional probe
+  `latched pending synchronous control response` (`remote_execution_peer_transport_rdma.c:10793`) fired **ZERO**
+  times on BOTH DPUs; `exact control mailbox drain failed` also zero. farnet0's response for B never latched — it
+  was posted normally.
+- **Suspect B (`exactConnectionGeneration` ABA) REFUTED as the cause:** the op tuple
+  (opIndex/opGeneration/messageSequence/requestKind, `:10490`,`:14714`) prevents aliasing, and after a reset the
+  machine-baseline re-evaluates the op and FAILS it promptly (`:50498`,`:47242`) — it cannot produce a 1M-pass
+  wait. It IS a real latent defensive-check omission (capture-but-never-compare) worth closing, but not this
+  bug.
+
+⇒ **The response was POSTED by farnet0. The delay is on FARNET1's DELIVERY CHAIN** — one of four frontiers with
+NO existing log marker: (2) recv-CQ WIMM arrival arms the mailbox-ready bit (`:1742`), (3) mailbox matching moves
+the op to COMPLETED (`:10506`), (4) local owner polling consumes it and prints `ready` (`:41918`). **Only a
+reproduction that TIMESTAMPS all four frontiers with connection index/generation + op index/generation/sequence
+can localize it.** Three real defects were still found and fixed along the way (collector-admission starvation; a
+watchdog blind to the state it existed to catch; control-mailbox class starvation), and **eleven** candidate
+causes/suspects were refuted.
 **Code baseline:** citus `8f4d20e60` (fix `6392a1853` + the revert scaffold).
 **Line numbers are `src/backend/distributed/utils/homer/tuple_sink_service_process.c` unless stated.**
 
