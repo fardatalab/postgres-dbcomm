@@ -1152,6 +1152,30 @@ in `remote_execution_peer_transport_rdma.h` is the consumer's cap. The two are O
 - **ENFORCES:** the FAILED arm in `HomerClientPollBaseBackupReceive`;
   `HomerDpuDmaSubmitByteRingWriteTerminal` accepts ONLY CLOSED/FAILED (in-function guard).
 
+## `HomerServiceDpuResetSelectedSessionForClose()` — **DRAIN-ASSUMING, not forcible. It REFUSES an undrained session.**
+
+*(`tuple_sink_service_process.c`; the per-session half of the selected-DPU close reset, wrapped by the setup
+server's `closeFinalizeCallback` = `HomerServiceDpuResetSelectedSessionForClose`... `...ForClosingSetup`.)*
+
+- **MEANS:** clears a selected session's sequence/frontier state at close. It runs `SelectedSessionCloseWorkDrained`
+  FIRST and, if the session is **not** drained, RETURNS AN ERROR (`:43807-43814`, "close reached scheduler with
+  unfinished command state") — it does **not** tear the session down.
+- **⛔ DOES NOT MEAN "force-reset the session."** This is the money line. It is a *finalizer that assumes the drain
+  already succeeded*, called only AFTER gate 2 passes in the normal close. **Triggering it on a still-wedged
+  (undrained) session does not terminate the session — it errors mid-loop**, and in the setup-server path that
+  leaves sessions occupied and the host mmap mapped (`HomerDpuDmaDetachHostMmapForClose`,
+  `homer_service_dpu_setup_tcp.c:805`, never runs) → a leak.
+- **⇒ RULE FOR ANY BOUNDED/TERMINAL CLOSE FIX:** you cannot bound the close by *bypassing* the drain to this
+  finalizer. You must make the drain **converge** — force the stuck command to terminal-failed so
+  `SelectedSessionCloseWorkDrained` returns true — and then let this finalizer run on a genuinely-drained session.
+- **ENFORCES:** the `!sessionDrained` error arm at `:43807`; its two callers
+  (`...ForClosingSetup` finalize `:44018`, and `:46668`). Any future "force close after deadline" MUST route
+  through a command-terminalization step, not around it.
+- **STATUS (2026-07-20):** discovered while designing the close-drain blast-radius fix (Option A). The fix is
+  HELD pending the connection-reuse hang trace; design + rationale in
+  [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md)
+  ("Deferred fix: close-drain blast radius").
+
 ---
 
 ## HOST-CLIENT SQL session (Stage-3 Push-1). Paths below are `citus-dbcomm/src/bin/` (NOT the service dir above).

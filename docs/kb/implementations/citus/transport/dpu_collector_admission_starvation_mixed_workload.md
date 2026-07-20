@@ -563,6 +563,37 @@ The reserved-set docstring's own criterion (`:11457`) — *"Only listeners whose
 qualify"* — is satisfied by `DPU_STAGED_COMMAND_DISPATCH` on this evidence. But the sizing is a genuine design
 decision with hot-path cost, and S6's latency number is still outstanding and would be perturbed by it.
 
+## Deferred fix: close-drain blast radius (design blocked on the hang trace)
+
+**The defect (latent, only fires when a command is genuinely stuck — i.e. the hang):** the DPU setup-TCP
+server is single-client ([`homer_service_dpu_setup_tcp.c:445`](../../../../../citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c)),
+and its close-drain has two unbounded gates that `return true` forever — gate 1 = DOCA tasks in-flight (`:759`),
+gate 2 = the semantic callback `HomerServiceDpuClosingSetupSemanticDrained` (`:783`). A session whose command
+never completes wedges gate 2, and *"the server accepts ONE client at a time, so every later setup is blocked"*
+(`:379`). One stuck session → total setup outage.
+
+**Chosen repair (2026-07-20): Option A — bounded wait → terminal, gate-2-scoped.** Gate 2 is the safe case
+(DOCA already at 0, so detaching host mmap is safe); gate 1 stays unbounded for now (force-finalizing with DOCA
+in-flight would free host memory a task still reads).
+
+**⛔ THE TRAP that reshaped the fix:** the plan assumed the terminal action could just TRIGGER the existing
+finalize path on a deadline. It cannot. `HomerServiceDpuResetSelectedSessionForClose`
+([`tuple_sink_service_process.c:43807-43814`](../../../../../citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c))
+is **drain-ASSUMING**: it re-checks `SelectedSessionCloseWorkDrained` and RETURNS AN ERROR on an undrained
+session — it does not forcibly reset. Force-calling it on the wedged (undrained) session errors mid-loop,
+releasing the accept slot but leaving sessions occupied and the host mmap mapped (the detach at `:805` never
+runs) → a leak.
+
+**⇒ Preferred design is variant (c):** after the deadline, force the stuck command to **terminal-failed** (the
+same state a real failure produces) so `SelectedSessionCloseWorkDrained` returns true and the existing,
+well-tested finalize path runs UNCHANGED. Only new code is the surgical command-state flip; no new teardown, no
+leak.
+
+**STATUS: HELD until the hang trace lands.** Variant (c) touches the session/command-lifecycle that the
+open connection-reuse hang investigation is examining, so the exact command-state to flip must be chosen with
+that context. The safe half (a wall-clock deadline + a terminal ALARM naming the wedged gate-2 close) is
+designed and ready but not yet written, pending that decision.
+
 ## Consequences beyond this workload
 
 This is **not** a mixed-workload quirk. Any two concurrent workload kinds that together arm more than six
