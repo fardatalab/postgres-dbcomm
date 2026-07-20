@@ -41,7 +41,21 @@ CPPFLAGS='-D_GNU_SOURCE -DHOMER_REMOTE_EXEC_TRACE=1'
 instrumentation is gone. See `farnet_operational_hazards.md` §3.1 — a plain `make` will happily relink the
 instrumented objects.
 
-### 1.2 `HOMER_DPU_SETUP_STARVE_DIAG` — when the DPU service "does nothing"
+### 1.2 The TWO starvation diagnostics — pick the right one
+
+⚠ **There are two similarly-named macros and they answer DIFFERENT questions. Both print lines prefixed
+`[starve-diag]`, so the log prefix does not tell you which build you are reading.**
+
+| macro | answers | emits |
+|---|---|---|
+| `HOMER_DPU_SETUP_STARVE_DIAG` | "is the service wedged / is the listener frozen?" | a per-pass counter line for **four** actions: PE_DRAIN, SETUP_LISTENER, DOORBELL, SPAWN |
+| `HOMER_COLLECTOR_STARVE_DIAG` | "**WHICH** collector is being dropped, and by **which gate**?" | a `(kind, reason)` line per drop for **every** collector, plus a service-exit census |
+
+**If you are asking which collector is starved, you want `HOMER_COLLECTOR_STARVE_DIAG` (§1.2b).** The
+setup diagnostic is structurally blind to every collector outside its four, which is the exact defect that
+made it useless during the FB-0 hunt.
+
+#### 1.2a `HOMER_DPU_SETUP_STARVE_DIAG` — when the DPU service "does nothing"
 
 **Symptom:** the DPU service spins at 100% CPU, logs nothing, and stops accepting setup connections
 (`ss -ltn` on the DPU shows a **nonzero `Recv-Q`** on the `9727` LISTEN socket).
@@ -53,9 +67,10 @@ CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_SETUP_STARVE_DIAG=1'
 ```
 [starve-diag] pass=46500001 pedrain_grants=428773 listener_grants=90831 imported=1 rings=49 inflight=0 \
               tcp{due=0 active=0 polls=90831 accepted=4 acks=3 errs=1}
-[starve-diag] SETUP_LISTENER dropped: budget (count=...)      <-- must NEVER print
-[starve-diag] PE_DRAIN dropped: feedback-backoff (count=...)
 ```
+
+⚠ This macro emits **grant counters only**. The `… dropped: <reason>` lines belong to
+`HOMER_COLLECTOR_STARVE_DIAG` (§1.2b) — do not expect them from this build.
 
 **How to read it (post-S3.2, citus `52fd1ab3d`):**
 
@@ -68,7 +83,8 @@ CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_SETUP_STARVE_DIAG=1'
 - **`polls == grants` exactly, for BOTH listeners** (`tcp{polls=…}` and `bell{polls=…}`). Any drift means a
   grant retired a poll obligation **without polling**.
 - **`SETUP_LISTENER dropped` and `DOORBELL dropped` must never print** — both draw from the reserved lifecycle
-  grant line.
+  grant line. ⚠ Those lines come from the **collector** diagnostic (§1.2b), not from this build; to check the
+  rule you must build with `HOMER_COLLECTOR_STARVE_DIAG`.
 - **`bell{rej=N>0}`** means an ATTACH named a bridge generation with no live ACTIVE import — normally a
   restarted agent racing a stale import; resolves on retry.
 - **`pedrain_grants` frozen while idle is now CORRECT.** PE_DRAIN is armed only by in-flight DOCA tasks or a
@@ -80,6 +96,45 @@ CPPFLAGS='-D_GNU_SOURCE -DHOMER_DPU_SETUP_STARVE_DIAG=1'
   that will hang in `WAIT_PEER_OPEN` forever.
 
 See `../future-directions/citus/transport/dpu_scheduler_arm_execute_mismatch.md` §0/§0b/§0c.
+
+#### 1.2b `HOMER_COLLECTOR_STARVE_DIAG` — WHICH collector was dropped, and by which gate
+
+**Symptom it serves:** progress stops for one workload or one session while the service looks healthy and
+idle — no `ALARM`, no `pool exhausted`, no `fatal error state`, no error on either side. Also the correct
+tool whenever `PROGRESS POLICY-ADMISSION DROPS` shows `granted collectors=6 | DROPPED collectors=N`: that
+line reports a **count, not an identity**, and this diagnostic supplies the identity.
+
+Build it through the validation helper, which asserts the instrumentation actually landed:
+
+```sh
+dpu_build.sh "$RUN_ID" "<citus.tar>" --define=HOMER_COLLECTOR_STARVE_DIAG=1 \
+    service-bin dpu-tcp-transport-smoke-bin
+```
+
+**Four drop reasons are distinguished, and the distinction is the whole point:**
+
+| reason | meaning |
+|---|---|
+| `budget` | lost to a grant quota (`maxPlanGrants` / `maxCollectorGrants` / payload / blind) |
+| `feedback-backoff` | suppressed after an empty streak |
+| `no-source` | no entry in the collector→source map — stale scaffolding; consumes **no** budget |
+| `already-planned` | benign double-consideration in one pass |
+
+**The deliverable is the SERVICE-EXIT CENSUS, not the streamed lines.** The stream is rate-limited (first 8,
+then powers of two) per `(kind, reason)`; the census is the complete total. Two tables print:
+
+1. **collector drop totals** — `collector | reason | count`.
+2. **backoff boundedness** — `collector | max_backoff_since_grant | grants`.
+
+⚠⚠ **In table 2, read the `grants` column FIRST, and read `max=0 grants=0` as "THIS COLLECTOR NEVER RAN".**
+That is a far worse state than a large `max`, and the two are indistinguishable without the `grants` column —
+which is precisely why it is printed beside it.
+
+⛔ **The census prints AS THE SERVICE EXITS. Stop the DPU service with `SIGTERM` and let it exit. A `kill -9`
+destroys the entire deliverable and the run must be repeated.**
+
+Current investigation using this instrument:
+[`../implementations/citus/transport/dpu_collector_admission_starvation_mixed_workload.md`](../implementations/citus/transport/dpu_collector_admission_starvation_mixed_workload.md).
 
 ### 1.3 Reading a socketless backend's arena bind without the trace build
 
