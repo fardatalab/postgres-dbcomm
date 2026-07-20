@@ -1,18 +1,17 @@
-# Mixed-workload liveness failure — the 6-slot collector quota starves late collectors
+# The mixed-workload hang — investigation record and current frontier
 
-<!-- kb-summary: Diagnosis of the mixed pgbench+basebackup hang: fixed-order collector admission starves late DPU collectors when two workload kinds coexist. -->
+<!-- kb-summary: Why the mixed pgbench+basebackup workload hangs. Current frontier: a P3 result stream's peer binding never activates, so the result egress is never armed. Includes four refuted causes and the collector-starvation defect fixed along the way. -->
 
-**Status: ROOT-CAUSED AND MEASURED (2026-07-19). The mechanism is confirmed; the starved collector is
-`DPU_STAGED_COMMAND_DISPATCH`, NOT `DPU_STAGED_COMMAND_EXECUTE` as first predicted. Fix shape is a live design
-decision — see "The fix space" at the end. No scheduler change has been made.**
-**Code baseline:** citus `31f0e958f` (post-S6, post-S7 Stage 4).
+**Status (2026-07-20): STILL BROKEN. Frontier localized and WITNESSED — the gate's result stream binds its
+mirror but its PEER BINDING NEVER ACTIVATES, so the result egress is never armed and the result never
+returns.** Two real defects were found and fixed on the way (collector-admission starvation; a watchdog blind
+to the very state it existed to catch), and **four** candidate causes were refuted. Read the banner below
+before anything else in this file — later sections are the historical trail and their headline conclusions
+were superseded.
+**Code baseline:** citus `434c7e9e7`.
 **Line numbers are `src/backend/distributed/utils/homer/tuple_sink_service_process.c` unless stated.**
 
-> ## ⛔ THE MIXED WORKLOAD DOES NOT WORK. Two runs, both FAIL, and the pool is EXONERATED.
->
-> The [MIXED workload](../../../../../AGENTS.md) (gate pgbench CONCURRENT with four-role basebackup) has
-> **never passed**. It was made policy on 2026-07-19 and failed on its first two attempts. **The byte-ring pool
-> — the resource this workload was introduced to stress — is not the cause.**
+> ## ⛔ THE MIXED WORKLOAD HAS NEVER PASSED. Six runs. The byte-ring pool it was written to stress is EXONERATED.
 
 ---
 
@@ -256,6 +255,67 @@ send-open rides the same command plane and starves identically. One mechanism, b
   SIGTERMs, requiring an identity-verified reap.
 
 ---
+
+> ## 🎯 ROOT CAUSE LOCALIZED 2026-07-20 (run 6, citus `434c7e9e7`). READ THIS FIRST — THIS DOC'S TITLE IS NOW TOO NARROW.
+>
+> **The mixed-workload hang is NOT collector starvation.** That was one real defect on the way (fixed,
+> below), but the hang survives it. The chain, established over six runs:
+>
+> ```
+> mixed workload -> the gate's result stream is the SECOND payload stream on farnet1
+>   -> its peer binding NEVER ACTIVATES  (peer_binding_active=0, locally_initiated=0, generation=0)
+>   -> TupleSinkServiceArmServiceResultPayloadEgress never arms the mirror egress
+>   -> no result bytes egress; the EOS gate (completedHead >= eosPostedSourceTail) never releases
+>   -> DPU_PEER_COMPLETION_EGRESS collapses 55,755 grants -> 5   (ZERO admission drops: ARMING, not admission)
+>   -> the result never returns; pgbench times out on `sql_execute kind=6 sequence=5`
+>   -> the session cannot close (outstanding_sequence=5) -> close-drain wedges
+>   -> the SINGLE-CLIENT setup server blocks ALL later DPU setup
+> ```
+>
+> **WITNESSED**, farnet1, run 6:
+> ```
+> ALARM service-owned P3 result stream BOUND BUT NEVER ARMED for 1000000 service passes
+>   blocked_by=peer_binding_not_active peer_binding_active=0 peer_binding_locally_initiated=0
+>   uses_dpu_mirror_source=1 mirror_mr=0xc7168397fae0 peer_generation=0
+> ```
+> The mirror source and MR are FINE. All three peer-binding fields are zero — the binding was never
+> established at all, not "failed". The result peer-open **starts** (`started service-owned P3 result
+> peer-open ... connection_generation=2`) and never completes back onto the stream.
+>
+> ### The A/B that proves it is the arming, not anything downstream
+>
+> | | peer-open | mirror bind | egress armed |
+> |---|---|---|---|
+> | gate alone (**passes**) | line 32 | line 61 | **line 63** — two lines later |
+> | mixed (**hangs**) | line 110 | line 118 | **line 200** — only at teardown |
+>
+> ### ⛔ THREE THINGS THAT ARE **NOT** THE CAUSE — each cost a cycle; do not re-chase
+>
+> 1. **Collector admission starvation.** Real, measured, FIXED (below). Hang survives it.
+> 2. **A torn 64-byte grouped-control snapshot.** REFUTED: the probe built to catch it fired on a
+>    PASSING run (benign first-publication, `prev_epoch=0 tail=0`). The DOCA ascending-fetch-order
+>    platform assumption survived.
+> 3. **Peer-transport connection resets / "churn".** REFUTED: all generations are destroyed
+>    TOGETHER at teardown with `reason=7`. `generation=2 posted=8 retired=1 flushed=7` is a
+>    teardown artifact of an INCOMING connection, not a mid-run reset. There is no churn.
+>
+> Also eliminated: byte-ring pool capacity (3 of 16 slots used), machine admission (zero machine
+> drops, no candidate overflow), and ring DISCOVERY (`DPU_COMMAND_PULL` 115,085 -> 17 is a
+> CONSEQUENCE — the counter measures work that happened, and no transactions completed).
+>
+> ### ⚠⚠ THE METHODOLOGICAL LESSON, PAID FOR THREE TIMES
+>
+> **Three of the four dead ends were CONSEQUENCES mistaken for causes**, and each time the tell was
+> identical: *a counter that measures work performed collapses when no work happens.* Discovery
+> counts, dispatch grants, and close-drain state all collapsed because the result never came back —
+> not because they were broken. **Before believing a collapsed counter is a cause, ask what it counts
+> when the system is merely idle.**
+>
+> ### The frontier now
+>
+> Why does the service-owned P3 result OPEN not complete — i.e. never set `peerBindingActive` on the
+> stream — when the result stream is not the first on its connection? The arm is the documented
+> post-OPEN handoff, so the async OPEN op is where to look next.
 
 > ## ⚡ VALIDATED 2026-07-20 (`candidate-20260720-121352`, citus `f84e49bad`): THE FIX WORKS AND THE HANG REMAINS.
 >
