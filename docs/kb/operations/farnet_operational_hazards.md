@@ -421,6 +421,28 @@ read-only, so Codex will confidently report permission bugs and stale artifacts 
 host**. Confirm from the main agent (`stat`, `findmnt`, a real write probe) before acting. Claims about file
 *contents* and code *structure* are unaffected.
 
+### 6.6 A validator's FACTUAL SUMMARY is a claim to verify — not just its theories
+
+The "do not inherit conclusions" rule is usually applied to a subagent's *reasoning*. It applies just as much to
+its **plain statements of where evidence came from**, and that failure is harder to spot because it arrives with
+no argument attached.
+
+Observed 2026-07-19: a validation report stated that `basebackup receive-open` appeared on **farnet1's** DPU log.
+The raw logs put both lines in **farnet0's** — where the topology requires them, since `basebackup_consumer.sh`
+hardcodes `HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.200` (farnet0's own DPU) and the line is emitted receiver-side
+(`tuple_sink_service_process.c:39255`). The report was otherwise accurate; this one attribution sent the
+investigation hunting a run-shape violation and a runbook ambiguity that **did not exist**.
+
+**Rules that follow:**
+
+1. **Re-derive any attribution a conclusion rests on, from the retained raw logs, with `grep -a -H` over both
+   files at once** so the filename comes from the tool rather than from anyone's recall.
+2. **Retaining raw logs is load-bearing, not housekeeping.** It is the only reason this was recoverable.
+3. **Beware the node-identity trap when checking:** an address in a service log is usually the **peer's**, not
+   the writer's. `peer=`, `peer transport host=`, `peer_host=` all identify *the other end*. A log whose peer is
+   `10.10.1.200` is farnet1's DPU, not farnet0's. Reading it the other way inverts every conclusion — name the
+   field, not just the value.
+
 ---
 
 ## 7. Smoke-test hazards (`homer_dpu_tcp_transport_smoke`)

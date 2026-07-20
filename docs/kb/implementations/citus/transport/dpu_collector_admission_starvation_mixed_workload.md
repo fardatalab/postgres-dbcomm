@@ -242,8 +242,16 @@ send-open rides the same command plane and starves identically. One mechanism, b
   decisive test is cheap and has not been run: every cap is env-tunable (`:13858`-`:13877`), so raising
   `HOMER_MACHINE_BASELINE_MAX_COLLECTOR_GRANTS` and re-running the mixed workload tests the whole chain with
   **zero code change**. Do this before implementing anything.
-- **Why the basebackup byte-ring binds appeared on farnet1 this run and farnet0 in the previous one.** The
-  earlier receiver/sender topology argument in this doc is therefore SUSPECT and must not be relied on.
+- ~~Why the basebackup byte-ring binds appeared on farnet1 this run and farnet0 in the previous one.~~
+  **RESOLVED — there was no inversion.** The validator's summary mis-attributed the lines; the raw logs put both
+  `basebackup receive-open` lines in **farnet0's** DPU log, which is where the runbook topology requires them
+  (`basebackup_consumer.sh` hardcodes `HOMER_FRONTEND_DPU_SETUP_HOST=10.10.1.200`, farnet0's own DPU, and the
+  line is emitted receiver-side — `tuple_sink_service_process.c:39255`, whose own comment says "confirm the
+  pairing tag reached farnet0"). **No run-shape violation and no runbook ambiguity.** The two runs agree, and
+  the receiver/sender topology argument in this doc STANDS.
+  ⚠ The census attribution was re-verified independently against the raw logs and IS correct: farnet1 carries
+  the 1,514,591 dispatch drops. **A validator's factual summary is a claim to verify, not a fact to inherit —
+  the retained raw logs are what made that checkable.**
 - **A teardown defect, separate from this one:** the Arm B consumer survived sender exit *and* both DPU
   SIGTERMs, requiring an identity-verified reap.
 
