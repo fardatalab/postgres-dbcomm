@@ -680,18 +680,18 @@ in `remote_execution_peer_transport_rdma.h` is the consumer's cap. The two are O
   **open-during-close connection interaction** that pre-arming avoids. Leading hypothesis, not yet established.
 - **THE FIX STAYS ANYWAY:** cross-class / two-direction starvation IS possible by construction (verified in
   code), so this is legitimate hardening. It is just not the hang fix.
-- **FRONTIER (two static traces later — STATIC ANALYSIS EXHAUSTED):** the delay is on **farnet1's
-  response-DELIVERY chain**, not the round-trip send side. Refuted, each from code or retained logs:
-  connection-reuse (`2→3` = two different connections); "completes at teardown" (the `ready` line is
-  live-pump-only, so the op finished while LIVE ~1M passes late); suspect A `pendingSyncResponse` latch (its
-  unconditional probe fired ZERO times on both DPUs); suspect B `exactConnectionGeneration` ABA (op-tuple +
-  scheduler re-eval prevent a 1M-pass wait — a latent defensive-check gap, not this bug). The response WAS
-  posted; the stall is in recv-CQ arm → mailbox drain → op COMPLETED → owner consume, none of which has a log
-  marker. Full detail:
+- **FRONTIER (REPRODUCED + LOCALIZED, 2026-07-20 late):** the hang is at **F1→F2 — farnet0 POSTS the OPEN
+  response but farnet1 never RECV-PROCESSES it on the outgoing FOREGROUND result connection.** Reproduction
+  recipe: **non-pre-armed + `SCALE=150`** (a DB big enough for a sustained basebackup window; `SCALE=1` masks it).
+  Verified from the `HOMER_PEER_RESPONSE_DELIVERY_DIAG` probe: farnet0 F1-posts all 4 result responses; farnet1
+  F2 recv-arms ONLY the CRITICAL command connection, NEVER the 4 FOREGROUND result connections. No mismatch, no
+  latch, no drain-fail. Leading mechanism (INFERRED): farnet1's recv-CQ poll/dispatch does not cover / starves
+  the OUTGOING foreground payload connections' recv side under load — DISTINCT from the control-mailbox action
+  (the `6392a1853` class-admission path). ⚠ The earlier "causation run refuted the fix" was on a PRE-ARMED run
+  that never reproduced the hang, so it tested nothing. Full detail:
   [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md).
-- **NEXT (needs a live run):** reproduce the hang (NON-pre-armed launch order) with a probe that TIMESTAMPS all
-  four delivery frontiers with connection index/generation + op index/generation/sequence. The
-  `HOMER_CONTROL_MAILBOX_REVERT_STRICT_PRIORITY` scaffold is unrelated to this frontier.
+- **NEXT:** examine farnet1's recv-CQ dispatch for outgoing foreground payload connections (why polled for
+  CRITICAL command connections but not these); targeted probe on the recv-CQ poll schedule, or fix if plain.
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
 

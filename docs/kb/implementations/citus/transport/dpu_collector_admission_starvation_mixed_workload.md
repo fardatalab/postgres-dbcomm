@@ -2,8 +2,33 @@
 
 <!-- kb-summary: The mixed pgbench+basebackup workload PASSES under the current (pre-armed) procedure, but the causation run REFUTED the control-mailbox fix as the cause: the reverted (pre-fix) build passes identically with zero starvation in the census. The pass is procedural (pre-arming avoids an open-during-close connection interaction), not the fix. The hang's real cause is OPEN. Records the mailbox fix as defensive hardening + seven refuted causes. -->
 
-**Status (2026-07-20): FRONTIER = FARNET1's RESPONSE-DELIVERY CHAIN. STATIC ANALYSIS EXHAUSTED — needs a live
-4-frontier probe.** The mixed workload passes under the current PRE-ARMED procedure — and so does the
+**Status (2026-07-20, LATE): REPRODUCED + LOCALIZED to F1→F2. The response is POSTED but farnet1 NEVER
+RECV-PROCESSES it on the outgoing FOREGROUND result connections.**
+- **REPRODUCTION RECIPE FOUND:** non-pre-armed launch order **+ `SCALE=150`** (a DB big enough that the basebackup
+  sustains a real transfer window). `SCALE=1` is why the prior three runs passed — the basebackup finished before
+  any overlap. Candidate `candidate-20260720-190749`, citus `99aa04a42`, gate `-c4`: all 4 clients time out on
+  `sql_execute kind=6 seq=5`, `0/8000`, basebackup also stalls. The historical hang, reproduced on demand.
+- **LOCALIZED (VERIFIED from the `[resp-deliv]` probe + the raw candidate interval):** each of the 4 gate result
+  streams starts its peer-open, allocates a NEW outgoing FOREGROUND (`class=2`) payload connection, establishes
+  the RDMA transport, binds its byte-ring — then `BOUND BUT NEVER ARMED`. farnet0 (responder) **F1-posted all 4
+  responses** (its conn_gen=3–6). farnet1 (requester) **F2 recv-arms ONLY on conn_gen=1 and conn_gen=2** (the
+  latter is the CRITICAL command connection — its F2 lines interleave with `landed peer command sequence=1..5`).
+  farnet1 **NEVER F2 recv-arms on the 4 FOREGROUND result connections.** No `did not match an outstanding op`,
+  no `latched pending synchronous`, no `drain failed`. ⇒ **The stall is F1→F2: the OPEN responses are posted by
+  farnet0 but never enter farnet1's recv path on the outgoing foreground result connections**, while the CRITICAL
+  command connection is recv-polled fine.
+- **LEADING MECHANISM (INFERRED, not yet proven):** farnet1's recv-CQ poll/dispatch does not cover the OUTGOING
+  foreground payload connections' recv side (or starves them) under concurrent load — so peer-open RESPONSES that
+  arrive on an outgoing connection are never received. The first codex trace noted foreground recv-CQ polling is
+  timing-wheel driven and "may skip … or is not canonical." This is the recv-CQ **poll/dispatch**, DISTINCT from
+  the control-mailbox **action** (the class-admission path the `6392a1853` fix touched).
+- **⚠ CORRECTION to the causation-run conclusion:** that run "refuted" the class-admission fix, but it was
+  PRE-ARMED and **never reproduced the hang**, so it tested nothing about the fix under the failure. The fix's
+  relevance to the hang was UNDETERMINED, not refuted. (It is still very likely not the hang fix — but because
+  this frontier is the recv-CQ poll, not the mailbox action — not because a pre-armed pass showed anything.)
+- **NEXT:** examine farnet1's recv-CQ dispatch for OUTGOING foreground payload connections — how their recv side
+  is polled, and why it is skipped while CRITICAL command connections are polled. Confirm with a targeted probe on
+  the recv-CQ poll scheduling (which connections it visits per pass), or fix if the dispatch omission is plain. The mixed workload passes under the current PRE-ARMED procedure — and so does the
 control-mailbox fix REVERTED (causation-run section), so **class-admission starvation was NOT the mechanism** and
 "the fix made it pass" does not hold (hardening only). Two static traces then refuted every remaining
 code-reachable hypothesis:
