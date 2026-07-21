@@ -17,18 +17,37 @@ RECV-PROCESSES it on the outgoing FOREGROUND result connections.**
   no `latched pending synchronous`, no `drain failed`. ⇒ **The stall is F1→F2: the OPEN responses are posted by
   farnet0 but never enter farnet1's recv path on the outgoing foreground result connections**, while the CRITICAL
   command connection is recv-polled fine.
-- **LEADING MECHANISM (INFERRED, not yet proven):** farnet1's recv-CQ poll/dispatch does not cover the OUTGOING
-  foreground payload connections' recv side (or starves them) under concurrent load — so peer-open RESPONSES that
-  arrive on an outgoing connection are never received. The first codex trace noted foreground recv-CQ polling is
-  timing-wheel driven and "may skip … or is not canonical." This is the recv-CQ **poll/dispatch**, DISTINCT from
-  the control-mailbox **action** (the class-admission path the `6392a1853` fix touched).
+- **ROOT CAUSE — FOUND AND VERIFIED IN CODE (2026-07-20):** the FOREGROUND recv-CQ **liveness action** is the
+  ONLY path that discovers foreground payload WIMMs (`HomerServiceMachineBaselineAppendRecvCqLivenessAction`
+  comment, `tuple_sink_service_process.c:13043-13047`). It competes for the shared **6-collector budget**, and
+  when that budget is full it is **silently dropped** — `HomerMachineBaselineBudgetTryReserve(...)` fails →
+  `return true` with **no action appended and NO diagnostic** (`:13049-13052`). A pending `STREAM_WAIT_PEER_OPEN`
+  op does NOT create a demand-driven recv poll: the machine-baseline peer collector bundle is only
+  `PEER_CM_SETUP` + `PEER_CLOSE_LIFETIME`, NOT `PEER_RECV_CQ` (`:12454-12457`). By contrast CRITICAL command
+  traffic HAS a separate **exact-demand** recv path (`remote_execution_peer_transport_rdma.c:2097,:2419,:2981`),
+  so it is immune. ⇒ Under MIXED load the 6-collector budget saturates (the reproduced run's admission line
+  confirms: `granted collectors=6 | DROPPED collectors=1-2`), the foreground liveness action is dropped every
+  pass, the OPEN-response CQE is never polled, and the result stream is BOUND BUT NEVER ARMED. Teardown drops the
+  load → budget frees → the poll runs (in run 6, the open completed exactly then).
+- **This single mechanism explains everything:** the `6392a1853` class-admission fix didn't help (WRONG action —
+  control-mailbox, not recv-CQ liveness); the `[starve-diag]` census read 0 (this drop emits NO diagnostic);
+  pre-arming masks it (budget not saturated during the open window); `SCALE=150` is required (sustained load
+  keeps the budget saturated); "completes at teardown" (load drops).
+- **Residual (small):** F2 fires only on a successful CQ poll, so it cannot formally separate "never polled" from
+  "polled-but-empty." But the mechanism is fully verified in code, the admission line confirms saturation, and RC
+  delivery is reliable — "never polled" is overwhelmingly supported. The fix + a recipe reproduction confirm it.
 - **⚠ CORRECTION to the causation-run conclusion:** that run "refuted" the class-admission fix, but it was
   PRE-ARMED and **never reproduced the hang**, so it tested nothing about the fix under the failure. The fix's
   relevance to the hang was UNDETERMINED, not refuted. (It is still very likely not the hang fix — but because
   this frontier is the recv-CQ poll, not the mailbox action — not because a pre-armed pass showed anything.)
-- **NEXT:** examine farnet1's recv-CQ dispatch for OUTGOING foreground payload connections — how their recv side
-  is polled, and why it is skipped while CRITICAL command connections are polled. Confirm with a targeted probe on
-  the recv-CQ poll scheduling (which connections it visits per pass), or fix if the dispatch omission is plain. The mixed workload passes under the current PRE-ARMED procedure — and so does the
+- **NEXT — THE FIX (design choice, pending user):** give the foreground recv-CQ discovery a path that is NOT
+  silently droppable by the 6-collector budget when a peer-open is pending on that connection. Options:
+  **(A) reserved admission** for the liveness action (mirror `HomerServiceProgressCollectorReservedLifecycleAdmission`
+  — bypass the ordinary cap) when a pending open waits on it; **(B) exact recv demand** for a foreground
+  connection with an outstanding peer-open (extend CRITICAL's exact-demand path to foreground). BOTH should also
+  add the **missing diagnostic** on the silent drop (`:13051`) so this can never again be invisible. Validate by
+  reproduction (non-pre-armed + `SCALE=150`) — a pass under that recipe is a genuine confirmation (unlike the
+  pre-armed causation run). The mixed workload passes under the current PRE-ARMED procedure — and so does the
 control-mailbox fix REVERTED (causation-run section), so **class-admission starvation was NOT the mechanism** and
 "the fix made it pass" does not hold (hardening only). Two static traces then refuted every remaining
 code-reachable hypothesis:
