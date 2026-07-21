@@ -41,13 +41,45 @@ RECV-PROCESSES it on the outgoing FOREGROUND result connections.**
   relevance to the hang was UNDETERMINED, not refuted. (It is still very likely not the hang fix — but because
   this frontier is the recv-CQ poll, not the mailbox action — not because a pre-armed pass showed anything.)
 - **NEXT — THE FIX (design choice, pending user):** give the foreground recv-CQ discovery a path that is NOT
-  silently droppable by the 6-collector budget when a peer-open is pending on that connection. Options:
-  **(A) reserved admission** for the liveness action (mirror `HomerServiceProgressCollectorReservedLifecycleAdmission`
-  — bypass the ordinary cap) when a pending open waits on it; **(B) exact recv demand** for a foreground
-  connection with an outstanding peer-open (extend CRITICAL's exact-demand path to foreground). BOTH should also
-  add the **missing diagnostic** on the silent drop (`:13051`) so this can never again be invisible. Validate by
-  reproduction (non-pre-armed + `SCALE=150`) — a pass under that recipe is a genuine confirmation (unlike the
-  pre-armed causation run). The mixed workload passes under the current PRE-ARMED procedure — and so does the
+  silently droppable by the 6-collector budget when a peer-open is pending on that connection.
+  **CHOSEN: Option B — exact recv demand for foreground (user decision 2026-07-20).** Keep the earlier
+  reserved-lifecycle fix as-is (right tool for a FIXED collector set); use exact-demand here (right tool for a
+  DYNAMIC per-connection set); both converge long-term on the unified scheduler
+  ([`homer_unified_aggregate_action_scheduler_plan.md`](../../../future-directions/citus/transport/homer_unified_aggregate_action_scheduler_plan.md)).
+
+  **IMPLEMENTATION PLAN (Option B), all `remote_execution_peer_transport_rdma.{c,h}` unless noted:**
+  The exact-demand bitmap `HomerCriticalRecvDemandSet` (`:851`) is structurally general, but BOTH the arm
+  (`SetCriticalRecvDemand` `:2419`, gated CRITICAL) and the consume-revalidation
+  (`HasCriticalClientCompletionDemand` `:2097` = `CRITICAL && clientCommandsAwaitingTerminal>0`) are
+  command-specific, and the append path (`AppendCriticalRecvDemandAction`, `tuple_sink:13022`) is already
+  budget-free. So add a PARALLEL foreground demand signal OR'd into the shared machinery:
+  1. **New field** `uint32_t payloadOpensAwaitingResponse` on the connection (beside `clientCommandsAwaitingTerminal`
+     `:1254`).
+  2. **New checks:** `HasPayloadOpenRecvDemand(c)` = `FOREGROUND_PAYLOAD && payloadOpensAwaitingResponse>0`;
+     `HasExactRecvDemand(c)` = critical OR payload. Replace `HasCriticalClientCompletionDemand` at the CONSUME
+     sites (`:2569`, `:9660`) with `HasExactRecvDemand`. (Leave the arm-site gate as-is; add a parallel arm.)
+  3. **New Set/Clear** `Set/ClearPayloadOpenRecvDemand` mirroring the critical pair but gated FOREGROUND, touching
+     the SAME bitmap + `demandedConnectionCount` (NOT the critical-specific
+     `criticalClientCompletionDemandConnectionCount`).
+  4. **New public arm/clear** `Set/ClearPeerConnectionPayloadOpenAwaitingResponseRdma(handle, generation, …)`
+     mirroring the `ClientCommandAwaitingTerminal` pair (`:2995`/`:3026`): on 0→1 set demand, on 1→0 clear;
+     revalidate generation.
+  5. **Arm/clear lifecycle** (the risk — must be leak-free):
+     - ARM in the async op just after it publishes and enters `STREAM_WAIT_PEER_OPEN`
+       (`tuple_sink_service_process.c:41443-41444`), on `asyncOp->peerConnectionHandle`, ONLY for the service-
+       result foreground open (`asyncOp->clientSqlResultOpen`). Stamp `asyncOp->payloadRecvDemandArmed=true` +
+       the armed connection handle+generation so clear targets the exact incarnation.
+     - CLEAR whenever the op leaves WAIT: on COMPLETED, on every FAILED path, and in
+       `TupleSinkServiceResetLocalControlAsyncOp` — guarded by `payloadRecvDemandArmed` so it fires exactly once.
+     - RESET: extend the connection-reset clear (`:2967`) to clear payload demand too (today it only clears when
+       `clientCommandsAwaitingTerminal>0`), so a reset under an armed foreground open cannot leak a bit.
+  6. **The diagnostic** (independent, do regardless): at the silent drop (`tuple_sink:13051`) emit a bounded
+     `[recv-liveness-drop]` line (conn idx/gen/class) so a budget refusal on the sole foreground-WIMM discovery
+     path is never again invisible. Cross-cutting rule recorded: no budget-refusal `return true` without a drop
+     signal.
+  Validate by reproduction (non-pre-armed + `SCALE=150`) — a pass under that recipe is a genuine confirmation
+  (unlike the pre-armed causation run). Implementation delegated to a Codex worker against this plan; diff
+  reviewed adversarially before validation. The mixed workload passes under the current PRE-ARMED procedure — and so does the
 control-mailbox fix REVERTED (causation-run section), so **class-admission starvation was NOT the mechanism** and
 "the fix made it pass" does not hold (hardening only). Two static traces then refuted every remaining
 code-reachable hypothesis:
