@@ -685,13 +685,46 @@ in `remote_execution_peer_transport_rdma.h` is the consumer's cap. The two are O
   recipe: **non-pre-armed + `SCALE=150`** (a DB big enough for a sustained basebackup window; `SCALE=1` masks it).
   Verified from the `HOMER_PEER_RESPONSE_DELIVERY_DIAG` probe: farnet0 F1-posts all 4 result responses; farnet1
   F2 recv-arms ONLY the CRITICAL command connection, NEVER the 4 FOREGROUND result connections. No mismatch, no
-  latch, no drain-fail. Leading mechanism (INFERRED): farnet1's recv-CQ poll/dispatch does not cover / starves
-  the OUTGOING foreground payload connections' recv side under load — DISTINCT from the control-mailbox action
+  latch, no drain-fail. Verified mechanism: farnet1's budgeted recv-CQ liveness action starves for the OUTGOING
+  foreground payload connections under load — DISTINCT from the control-mailbox action
   (the `6392a1853` class-admission path). ⚠ The earlier "causation run refuted the fix" was on a PRE-ARMED run
   that never reproduced the hang, so it tested nothing. Full detail:
   [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md).
-- **NEXT:** examine farnet1's recv-CQ dispatch for outgoing foreground payload connections (why polled for
-  CRITICAL command connections but not these); targeted probe on the recv-CQ poll schedule, or fix if plain.
+- **NEXT:** Option B exact foreground recv demand is implemented and syntax-verified; run the non-pre-armed
+  `SCALE=150` mixed workload and require the gate, basebackup, candidate-bracketed DPU logs, and alarm checks to
+  pass before calling the root-cause fix validated.
+
+## `payloadOpensAwaitingResponse` / shared exact recv demand — **foreground OPEN responses bypass collector admission**
+
+- **MEANS:** a published service-result OPEN on a `FOREGROUND_PAYLOAD` connection has an outstanding response
+  that must be discovered by polling that exact connection incarnation's recv CQ. The per-connection
+  `payloadOpensAwaitingResponse` counter owns one direction/index bit in the shared `HomerCriticalRecvDemandSet`
+  on its 0→1 transition (`remote_execution_peer_transport_rdma.c:1259`, `:2109`, `:2531`, `:3200`).
+- **DOES NOT MEAN:** all foreground payload connections are permanently hot, or the critical-client completion
+  summary includes payload opens. Foreground demand increments the shared `demandedConnectionCount` but never
+  `criticalClientCompletionDemandConnectionCount`; candidate construction therefore gates on
+  `TupleSinkServicePeerSchedulerFacts.exactRecvDemandConnectionCount`
+  (`remote_execution_peer_transport_rdma.h:983`; `tuple_sink_service_process.c:48130`).
+- **CONTRACT / INVARIANT:** the exact-demand action is budget-free because it exists precisely when the only blind
+  recv-WIMM discovery action can be refused by the six-collector cap. `HomerServiceMachineBaselineAppendCriticalRecvDemandAction()`
+  must not call `HomerMachineBaselineBudgetTryReserve()` (`tuple_sink_service_process.c:13005`). The historical
+  action/type names remain, but the action carries `trafficClass` and both build-time and execution-time
+  revalidation use `TupleSinkServicePeerConnectionHasExactRecvDemand()`
+  (`remote_execution_peer_transport_rdma.c:2686`, `:9883`). The two broad-pump arm-site predicates remain
+  critical-only; foreground coverage is added only through exact demand.
+- **ENFORCES / EVERY SITE THAT MUST OBEY IT:** ARM happens only after a service-result request publishes and the
+  async op enters `STREAM_WAIT_PEER_OPEN` (`tuple_sink_service_process.c:41546-41563`). The async op records the
+  exact handle+generation and `TupleSinkServiceClearAsyncOpPayloadRecvDemand()` clears it on successful response,
+  every stream-open failure, and `TupleSinkServiceResetLocalControlAsyncOp()` (`:40309`, `:40345`,
+  `:41578-41603`). Connection reset independently clears the bitmap and zeroes the counter before slot teardown
+  (`remote_execution_peer_transport_rdma.c:3082`, `:8000`). A stale-generation async clear is a benign no-op;
+  it must never clear a reused connection incarnation.
+- **DIAGNOSTIC:** `HOMER_RECV_LIVENESS_DROP_DIAG=1` emits bounded first-8-then-every-1024th
+  `[recv-liveness-drop] conn_idx=... conn_gen=... class=... n=...` records at the liveness budget refusal
+  (`tuple_sink_service_process.c:92`, `:13063`). It is default-off and does not alter refusal behavior.
+- **STATUS (2026-07-20):** implemented; both DPU-service translation units pass compile-database
+  `gcc -fsyntax-only` with the diagnostic OFF and ON. The non-pre-armed `SCALE=150` mixed acceptance workload has
+  not yet run, so runtime correctness remains unproven.
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
 

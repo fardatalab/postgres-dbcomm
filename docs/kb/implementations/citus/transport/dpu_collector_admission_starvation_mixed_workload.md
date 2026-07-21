@@ -1,9 +1,16 @@
 # The mixed-workload hang — investigation record and current frontier
 
-<!-- kb-summary: The mixed pgbench+basebackup workload PASSES under the current (pre-armed) procedure, but the causation run REFUTED the control-mailbox fix as the cause: the reverted (pre-fix) build passes identically with zero starvation in the census. The pass is procedural (pre-arming avoids an open-during-close connection interaction), not the fix. The hang's real cause is OPEN. Records the mailbox fix as defensive hardening + seven refuted causes. -->
+<!-- kb-summary: The mixed pgbench+basebackup hang is localized to a budget-starved foreground recv-CQ OPEN response; Option B exact recv demand is implemented and syntax-verified, with non-pre-armed SCALE=150 hardware validation still pending. -->
 
 **Status (2026-07-20, LATE): REPRODUCED + LOCALIZED to F1→F2. The response is POSTED but farnet1 NEVER
 RECV-PROCESSES it on the outgoing FOREGROUND result connections.**
+- **IMPLEMENTATION STATUS (2026-07-20): Option B is implemented and statically verified; hardware validation is
+  NOT YET RUN.** `payloadOpensAwaitingResponse` now arms the shared generation-bearing exact-demand bitmap from
+  service-result OPEN publish through every WAIT exit/reset (`remote_execution_peer_transport_rdma.c:1259`,
+  `:3200`, `:3252`; `tuple_sink_service_process.c:40309`, `:41546-41594`). The exact action is enumerated from
+  the shared aggregate count and now actually bypasses the six-collector budget
+  (`tuple_sink_service_process.c:13005`, `:48130`). Both service translation units pass the compile-database
+  `gcc -fsyntax-only` flags with the diagnostic OFF and with `HOMER_RECV_LIVENESS_DROP_DIAG=1`.
 - **REPRODUCTION RECIPE FOUND:** non-pre-armed launch order **+ `SCALE=150`** (a DB big enough that the basebackup
   sustains a real transfer window). `SCALE=1` is why the prior three runs passed — the basebackup finished before
   any overlap. Candidate `candidate-20260720-190749`, citus `99aa04a42`, gate `-c4`: all 4 clients time out on
@@ -24,8 +31,14 @@ RECV-PROCESSES it on the outgoing FOREGROUND result connections.**
   `return true` with **no action appended and NO diagnostic** (`:13049-13052`). A pending `STREAM_WAIT_PEER_OPEN`
   op does NOT create a demand-driven recv poll: the machine-baseline peer collector bundle is only
   `PEER_CM_SETUP` + `PEER_CLOSE_LIFETIME`, NOT `PEER_RECV_CQ` (`:12454-12457`). By contrast CRITICAL command
-  traffic HAS a separate **exact-demand** recv path (`remote_execution_peer_transport_rdma.c:2097,:2419,:2981`),
-  so it is immune. ⇒ Under MIXED load the 6-collector budget saturates (the reproduced run's admission line
+  traffic HAS a separate **exact-demand** recv path (`remote_execution_peer_transport_rdma.c:2097,:2419,:2981`)
+  that FOREGROUND lacked entirely — **that missing path is the real asymmetry.** ⚠ CORRECTION (found during the
+  fix): the exact-demand *append* was NOT budget-free as an earlier draft claimed — it too called
+  `BudgetTryReserve` and could be dropped. Critical simply didn't hang in the run (its demand armed early /
+  enumerated before the burst of foreground opens saturated the budget), so its non-hang was timing/order, not
+  structural immunity. The fix therefore makes the exact-demand append truly budget-free for BOTH classes AND
+  adds the foreground exact demand foreground never had. ⇒ Under MIXED load the 6-collector budget saturates (the
+  reproduced run's admission line
   confirms: `granted collectors=6 | DROPPED collectors=1-2`), the foreground liveness action is dropped every
   pass, the OPEN-response CQE is never polled, and the result stream is BOUND BUT NEVER ARMED. Teardown drops the
   load → budget frees → the poll runs (in run 6, the open completed exactly then).
@@ -35,12 +48,13 @@ RECV-PROCESSES it on the outgoing FOREGROUND result connections.**
   keeps the budget saturated); "completes at teardown" (load drops).
 - **Residual (small):** F2 fires only on a successful CQ poll, so it cannot formally separate "never polled" from
   "polled-but-empty." But the mechanism is fully verified in code, the admission line confirms saturation, and RC
-  delivery is reliable — "never polled" is overwhelmingly supported. The fix + a recipe reproduction confirm it.
+  delivery is reliable — "never polled" is overwhelmingly supported. The implemented fix plus a fresh recipe
+  reproduction must still confirm it.
 - **⚠ CORRECTION to the causation-run conclusion:** that run "refuted" the class-admission fix, but it was
   PRE-ARMED and **never reproduced the hang**, so it tested nothing about the fix under the failure. The fix's
   relevance to the hang was UNDETERMINED, not refuted. (It is still very likely not the hang fix — but because
   this frontier is the recv-CQ poll, not the mailbox action — not because a pre-armed pass showed anything.)
-- **NEXT — THE FIX (design choice, pending user):** give the foreground recv-CQ discovery a path that is NOT
+- **NEXT — HARDWARE CONFIRMATION:** give the foreground recv-CQ discovery a path that is NOT
   silently droppable by the 6-collector budget when a peer-open is pending on that connection.
   **CHOSEN: Option B — exact recv demand for foreground (user decision 2026-07-20).** Keep the earlier
   reserved-lifecycle fix as-is (right tool for a FIXED collector set); use exact-demand here (right tool for a
@@ -51,8 +65,11 @@ RECV-PROCESSES it on the outgoing FOREGROUND result connections.**
   The exact-demand bitmap `HomerCriticalRecvDemandSet` (`:851`) is structurally general, but BOTH the arm
   (`SetCriticalRecvDemand` `:2419`, gated CRITICAL) and the consume-revalidation
   (`HasCriticalClientCompletionDemand` `:2097` = `CRITICAL && clientCommandsAwaitingTerminal>0`) are
-  command-specific, and the append path (`AppendCriticalRecvDemandAction`, `tuple_sink:13022`) is already
-  budget-free. So add a PARALLEL foreground demand signal OR'd into the shared machinery:
+  command-specific. **Implementation correction:** the plan assumed the append path was already budget-free,
+  but current code still called `HomerMachineBaselineBudgetTryReserve(... collectorGrant=true ...)`; leaving it
+  unchanged would silently drop the new exact action under the same saturated six-collector budget. The landed
+  implementation removes that gate and also enumerates from the shared `demandedConnectionCount` rather than the
+  critical-only summary. Then add a PARALLEL foreground demand signal OR'd into the shared machinery:
   1. **New field** `uint32_t payloadOpensAwaitingResponse` on the connection (beside `clientCommandsAwaitingTerminal`
      `:1254`).
   2. **New checks:** `HasPayloadOpenRecvDemand(c)` = `FOREGROUND_PAYLOAD && payloadOpensAwaitingResponse>0`;
@@ -78,8 +95,8 @@ RECV-PROCESSES it on the outgoing FOREGROUND result connections.**
      path is never again invisible. Cross-cutting rule recorded: no budget-refusal `return true` without a drop
      signal.
   Validate by reproduction (non-pre-armed + `SCALE=150`) — a pass under that recipe is a genuine confirmation
-  (unlike the pre-armed causation run). Implementation delegated to a Codex worker against this plan; diff
-  reviewed adversarially before validation. The mixed workload passes under the current PRE-ARMED procedure — and so does the
+  (unlike the pre-armed causation run). Implementation is complete and awaits adversarial diff review before
+  hardware validation. The mixed workload passes under the current PRE-ARMED procedure — and so does the
 control-mailbox fix REVERTED (causation-run section), so **class-admission starvation was NOT the mechanism** and
 "the fix made it pass" does not hold (hardening only). Two static traces then refuted every remaining
 code-reachable hypothesis:
