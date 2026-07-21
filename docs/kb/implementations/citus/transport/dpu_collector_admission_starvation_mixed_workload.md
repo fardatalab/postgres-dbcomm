@@ -845,7 +845,41 @@ functional logic (normal-path same-pass finalize, guard split, `*drained` semant
 remaining findings were *overstated claims in my comments* (not logic bugs) and were corrected to match what the
 review established — the accurately-scoped residuals (abnormal-path finalize skip, error-path deadline reuse under
 a same-client retry, lingering RDMA recv-demand bounded by teardown) are documented at their sites and above.
-**Owed: a build + the clean acceptance run** to certify it in a performance build.
+
+### ✅ ACCEPTANCE VALIDATED (2026-07-21, citus `1bde1a3b2`)
+
+Full transport acceptance run **PASS** on the candidate. Stamped: citus `1bde1a3b2`, branch `homer-dpu-migration`,
+performance build (stripped/non-debug), RUN_ID `candidate-20260720-235949-r2`.
+
+- **THE MIXED WORKLOAD PASSES** (the whole investigation's target): SCALE=150, non-pre-armed launch order, `-c4`,
+  genuine concurrency (`overlap_seconds=119`). Gate **8000/8000** 0-failed; basebackup **25,600,400,049 bytes /
+  48,828 ring laps** — matching the prior `947b7692a` baseline exactly. 4 DPU backend-spawn `begin`+`COMPLETED`
+  pairs on farnet1; `gate_check`/`basebackup_check`/`alarm_check`/`frontier_checks`/`teardown_checks` all PASS on
+  BOTH DPU logs; every frontier generation (1–11) balanced; `fatal=false` on both DPUs.
+- **Supporting tiers:** gate warmup + 3 warmed `-c1 -t2000` repeats (2000/2000 each; ~306/304/304 tps — warmup
+  excluded); four-role basebackup 23.26 GB / 44,371 laps; frontend-agent-attached workload with the DPU setup
+  listener proven LIVE afterwards.
+- **Regression tripwires ABSENT** (independently re-verified over the r2 DPU logs): `close_drain_force_terminal`,
+  `close-drain ABANDONED`, `abandon cleared NOTHING`, the old `ALARM arena unbind found NO import … LEAKED`, and
+  the historical `BOUND BUT NEVER ARMED` hang signature — none present. (Per this design, the ABSENCE of
+  `close_drain_force_terminal` IS the per-run proof no command wedged.)
+- **Rule 6:** `starve-diag` / `progress_machine_baseline_stats` proven ABSENT on the host binary AND both
+  independently-built DPU binaries. Bridge protocol `5U` unchanged (command-plane-only change).
+
+**Honest provenance / limits (disclosed by the validator):**
+- **Re-preflighted provenance, not clean-on-first-preflight-through-teardown.** Attempt 1 (`candidate-20260720-234840`)
+  was discarded diagnostic-only: a `-c4` gate *warmup* with all 4 pgbench threads pinned to one CPU (`gate.sh`'s
+  fixed `--client-cpu=3`) ran slower than the operator's 2-min `ssh` timeout; the local `ssh` was killed while the
+  remote `pgbench` completed headless. Confirmed **NOT a hang** (thread states + DPU sequence deltas + clean
+  teardown captured), discarded per hazard §8.3, both DPU services restarted (Rule 12), moved to RUN_ID2. This is
+  a *tooling* limit (CPU-shared `-c4` gate + short timeout), not a defect in this change.
+- **The POSITIVE abandon path was NOT exercised** — a healthy close never hits the 10 s deadline, and a genuine
+  wedge cannot be manufactured without re-introducing a bug. This run proves the change is **inert/silent on a
+  healthy run** (no spurious abandon, no regression); the abandon path's correctness rests on the 3-round code
+  review, not the rig. The downgraded arena `NOTE` also did not fire this run (only its `ALARM`-form absence was
+  proven); its cosmetic correctness rests on the code+log verdict above.
+
+⇒ **Candidate ACCEPTED.** No further work owed on the close-drain / arena / ABA items.
 
 ## Arena-unbind `LEAKED` alarm — VERDICT: COSMETIC (2026-07-20), alarm downgraded
 
