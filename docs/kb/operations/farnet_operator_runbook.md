@@ -482,6 +482,19 @@ ssh farnet0 "/tmp/farnet-validation-$RUN_ID/helpers/gate.sh" \
   /data/dbcomm/pg-citus "$DBOID" "$USEROID" 5 1
 ```
 
+`gate.sh` args are `<prefix> <dboid> <useroid> <transactions> <debug> [clients] [jobs]` (clients/jobs default
+`1 1`). A multi-client run appends them, e.g. `... "$USEROID" 2000 0 4 4` for `-c4`.
+
+⚠ **`-c4` (multi-client) CORRECTNESS gates are CPU-CONTENDED and SLOW — give them a LONG timeout, or background
+them.** `gate.sh` pins pgbench to a fixed `--client-cpu=3` ([`remote/gate.sh:16`](../../../tools/farnet_validation/remote/gate.sh)),
+so every client thread of a `-cN` run contends on ONE CPU. This is intentional — it is a *correctness* shape, not
+a perf gate (the script's own header comment says so; a perf run must spread client CPUs per the workload policy)
+— but a `-c4 -t2000` run can take many minutes. **Do NOT wrap it in a short (~2 min) `ssh`/`timeout` window:** the
+remote `pgbench` keeps running headless to completion even after the local `ssh` is killed, which LOOKS like a
+hang but is not, and forces a diagnostic-only discard plus a full Rule-12 DPU-service restart. Use a generous
+timeout (≥10 min for `-c4 -t2000`) or run the gate backgrounded and poll for its completion/result before
+bracketing. `-c1` gates finish in well under a minute and need no special handling.
+
 A debug gate requires four independent proofs:
 
 1. client transport line is `homer-dpu (implies dpu result relay)` (native flag after the S6 Track A fold; the
