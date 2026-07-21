@@ -127,8 +127,13 @@ code-reachable hypothesis:
 - **Suspect B (`exactConnectionGeneration` ABA) REFUTED as the cause:** the op tuple
   (opIndex/opGeneration/messageSequence/requestKind, `:10490`,`:14714`) prevents aliasing, and after a reset the
   machine-baseline re-evaluates the op and FAILS it promptly (`:50498`,`:47242`) — it cannot produce a 1M-pass
-  wait. It IS a real latent defensive-check omission (capture-but-never-compare) worth closing, but not this
-  bug.
+  wait. It IS a real latent defensive-check omission (capture-but-never-compare), but **CONSCIOUSLY DEFERRED
+  (2026-07-20), not a fix to make.** It is a *missing* check, not a *wrong* one: no site reads the captured
+  `exactConnectionGeneration` and acts on it, so there is no miscompare waiting to fire — the op tuple above is
+  the real aliasing guard and it holds. Closing it (threading the generation into the readiness/poll compare)
+  would change zero observable behavior. Revisit ONLY if the op-tuple guard is ever weakened; the cheap
+  belt-and-suspenders would then be a debug-gated assert at the consume site (`:2686`,`:9883`) comparing the
+  captured generation to the live one, tripping loudly if the op tuple ever fails to cover a case.
 
 ⇒ **The response was POSTED by farnet0. The delay is on FARNET1's DELIVERY CHAIN** — one of four frontiers with
 NO existing log marker: (2) recv-CQ WIMM arrival arms the mailbox-ready bit (`:1742`), (3) mailbox matching moves
@@ -692,7 +697,7 @@ The reserved-set docstring's own criterion (`:11457`) — *"Only listeners whose
 qualify"* — is satisfied by `DPU_STAGED_COMMAND_DISPATCH` on this evidence. But the sizing is a genuine design
 decision with hot-path cost, and S6's latency number is still outstanding and would be perturbed by it.
 
-## Deferred fix: close-drain blast radius (design blocked on the hang trace)
+## Close-drain blast radius fix (IMPLEMENTED 2026-07-20 — variant (c), service-side)
 
 **The defect (latent, only fires when a command is genuinely stuck — i.e. the hang):** the DPU setup-TCP
 server is single-client ([`homer_service_dpu_setup_tcp.c:445`](../../../../../citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_setup_tcp.c)),
@@ -718,14 +723,160 @@ same state a real failure produces) so `SelectedSessionCloseWorkDrained` returns
 well-tested finalize path runs UNCHANGED. Only new code is the surgical command-state flip; no new teardown, no
 leak.
 
-**STATUS: DE-ENTANGLED and ready to implement (2026-07-20, after the hang trace).** The trace REFUTED the
-connection-reuse hypothesis and confirmed A's close does NOT gate B's open — so variant (c) is now
-well-specified and independent of the open hang: force **A's own** stuck outstanding command to terminal-failed
-(the command that defers A's `TupleSinkServiceResetSession` at `tuple_sink_service_process.c:25365`,25454) so
-`SelectedSessionCloseWorkDrained` returns true and the existing finalize path runs unchanged. No longer blocked
-on the hang. **DEFERRED to a future session (user decision 2026-07-20)** — fully specified here; only fires when
-a command is genuinely stuck, so the latent risk is bounded. Pick up by implementing the wall-clock deadline +
-the command-terminalization flip, then the existing finalize path.
+**STATUS: IMPLEMENTED (2026-07-20, session picking up the deferred item).** The trace REFUTED the
+connection-reuse hypothesis and confirmed A's close does NOT gate B's open, so variant (c) is independent of the
+(now-fixed) open hang. Implemented entirely service-side inside the gate-2 callback with **zero setup-TCP
+changes** — see the verified design below.
+
+### Verified design (three imprecisions in the earlier spec corrected)
+
+Re-reading the code before implementing corrected three things the earlier one-line spec got wrong or left
+open — recording both the wrong framing and the verified one, per the debugging doctrine:
+
+1. **WRONG LAYER in the earlier pointer.** The spec said "the command that defers A's
+   `TupleSinkServiceResetSession` at `:25365,25454`." That is the **RDMA peer-session** layer (the
+   command-mailbox-writers-quiesce DEFER guard, `TupleSinkServiceClientSqlPeerCommandMailboxMayDeregister`).
+   Gate 2 does **not** check that. Gate 2 = `HomerServiceDpuClosingSetupSemanticDrained`
+   ([`:44040`](../../../../../citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c)) →
+   `HomerServiceDpuSelectedSessionCloseWorkDrained`
+   ([`:44507`](../../../../../citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c)),
+   which wedges on the **DPU-scheduler** `HomerServiceDpuSelectedSessionState` fields: `commandInFlight`,
+   `completionEventCount>0`, or any of the three slot arrays (`backendCommandPublishSlots`,
+   `pendingResponseSlots`, `stagedCommandDispatchSlots`) still matching the session (`:44526-44562`). The flip
+   targets **those**, not the RDMA-session mailbox state.
+
+2. **GATE 2 HAS A SECOND SUB-CONDITION the spec ignored** — `HomerServiceDpuPayloadStreamsDrainedForClosingSetup`
+   ([`:43944`](../../../../../citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c)),
+   which waits until every byte-ring the setup owns has been pulled into the DPU-local mirror
+   (`hostPublishAccepted && acceptedPublishedTail == completedByteTail`). This is **deliberately NOT forced**:
+   it is the host-export-still-referenced-by-a-DMA-read dependency, the same class of hazard as gate 1's
+   unbounded DOCA wait — forcing it would free host memory a mirror pull still reads. It also converges on its
+   own (background reclaim pump), so it never hangs like a stuck *command* can. **⚠ CORRECTED by the adversarial
+   review (2026-07-20):** an earlier draft here claimed "the wedged session owns no payload stream." That is
+   FALSE — a tuple-sink-ready completion DOES initialize a byte-ring result stream
+   (`HomerServiceDpuFinalizePendingResultStream`), and peer completion readiness is gated on result payload EOS
+   (`HomerServicePayloadStreamResultEosPosted`). The correct reason command-only abandon suffices: the payload
+   **drain** gate waits only on **local-handle count == 0** and the **host-pull frontier**
+   (`hostPublishAccepted && acceptedPublishedTail == completedByteTail`) — it deliberately does NOT wait on peer
+   binding / EOS / RDMA semantic closure. So even when the result stream's peer binding never armed (the hang),
+   the payload-drain gate converges on its own once those two local frontiers are met. The residual uncertainty
+   the review flagged (we did not capture those two frontier values at the observed wedge) is why the fix is
+   scoped as a **best-effort abandon** of command state, leaving the payload path to converge naturally rather
+   than forcing it.
+
+3. **COMPLETION DELIVERY IS LOCAL-ONLY / MOOT — decided, not asked.** "Terminal-failed (the same state a real
+   failure produces)" could mean "synthesize a FAILED completion and deliver it to node A." It does **not** here:
+   at close-drain the whole setup (bridge generation) is being destroyed — `HomerServiceDpuResetSelectedSessionForClose`
+   memsets the selected session right after (`:43929`), and node A's client already sent
+   `CLIENT_SQL_SESSION_CLOSE`. There is no live consumer to deliver to. So the force is a **local** state clear
+   (converge the DPU's own teardown), NOT a cross-node completion synthesis. Recorded as a judgment call:
+   options were (local clear) vs (cross-node FAILED publish); chose local because the session is being torn down
+   and the plan's direction is "existing finalize path runs unchanged."
+
+### As implemented (best-effort ABANDON, after the adversarial review hardened it)
+
+The user's chosen shape (2026-07-20) after the review broke several first-cut claims: a **best-effort abandon**,
+explicitly NOT a synthesized real terminal. It clears exactly the DPU-scheduler state gate 2 blocks on; the
+RDMA-layer terminal bookkeeping is left to the RDMA session's own lifecycle. **Hardened across THREE adversarial
+review rounds** — the round-2/3 findings and their fixes are the load-bearing part of this design.
+
+- **Where:** all inside `HomerServiceDpuClosingSetupSemanticDrained` + one new helper
+  `HomerServiceDpuForceTerminalizeSelectedSessionCommandState`, plus a disarm in
+  `HomerServiceDpuResetSelectedSessionsForClosingSetup`. No `homer_service_dpu_setup_tcp.c` edits.
+- **★ PAYLOAD-FIRST GATING (the structural fix, round 3).** The callback evaluates
+  `HomerServiceDpuPayloadStreamsDrainedForClosingSetup` into a local `payloadDrained` **before** the session loop,
+  and abandons a stuck command **only when `deadlineExpired && payloadDrained`**. This is what makes the abandon
+  safe: because it runs only under `payloadDrained`, the callback returns **fully drained on the same pass (normal
+  path)**, so setup-TCP runs `closeFinalizeCallback` **immediately** (`homer_service_dpu_setup_tcp.c:790`) and
+  memsets the session with no intervening busy-poll pass. That single reorder closes THREE round-2 findings at
+  once: (a) the late-completion re-accumulation window, (b) the deadline-disarm skip (finalize runs on the abandon
+  path), (c) the re-fire. **Scope (round-3 A):** the same-pass finalize holds on the NORMAL path only — an
+  ownership-query error later in the loop, or the defensive `sessionCleared==0` branch, returns `*drained=false`
+  after an earlier abandon; those abnormal paths instead tear the setup down (error/retry), which cleans the
+  abandoned session. If payload is NOT drained the abandon does not fire (payload self-converges via the reclaim
+  pump); if BOTH wedge, close stays blocked on payload either way (separate concern).
+- **Deadline:** armed lazily per `(bridgeGeneration, clientInstanceId)` (re-armed on identity change), via
+  `HomerServiceDpuTeardownNowNs()` (`CLOCK_MONOTONIC_RAW`). `HOMER_SERVICE_DPU_CLOSE_DRAIN_FORCE_DEADLINE_NS` = 10 s.
+  **Disarmed at finalize** (which runs whenever semantic drain succeeds, incl. right after an abandon). **Residual,
+  corrected in round 3 (was overstated as "astronomically unlikely"):** the disarm is SKIPPED on an *error-path*
+  close (a gate/callback error closes the TCP client before finalize), leaving the deadline armed. The identity
+  tuple is NOT close-episode-unique — a **same-client close RETRY** rebuilds the header from the same acknowledged
+  generation/client id (`homer_client.c:~1357`) and the server accepts it without a nonce, so a retry after an
+  error close CAN inherit a stale deadline (**realistic, not astronomical**). Consequence is bounded/benign (one
+  early abandon during a close + a spurious alarm), and it **cannot trigger with the current frontend agent** (no
+  auto-retry). If a retrying frontend is ever added, disarm on episode-end (`HomerServiceDpuSetupTcpCloseClient`).
+- **Abandon pass** (per owned not-command-drained session): clear `commandInFlight` + `inFlightCommand*`; **zero
+  the completion-event ring DIRECTLY** (memset slots + count/head/tail = 0 — NOT a `Pop` loop, which refuses on a
+  corrupt head and would leave count>0; round-2 C3/C5); free every matching slot in the three arrays via the
+  count-guarded `Clear*` helpers; and **tombstone** any `peerCommandEgress` FIFO entry for the session (zero its
+  `serviceSessionId`, leaving head/tail/depth to the drainer's dead-session drop path at
+  `HomerServiceExecuteDpuPeerCommandEgressAction:4625`; round-2 MISSED — a remote START sets `commandInFlight` AND
+  enqueues this FIFO at `:45265`,`:45270`).
+- **Coverage guard, correctly scoped** (round-2 C3): the helper RETURNS only `CloseWorkDrained`-relevant clears
+  (command + completions + 3 slots), **NOT** FIFO tombstones — else an unrelated tombstone could mask a
+  genuinely-uncleared drain input. A not-drained session that cleared **nothing** does NOT claim drained; it
+  emits a distinct ALARM and keeps waiting (it can only mean `CloseWorkDrained` gained an input the helper does
+  not clear — a future coverage bug). Unreachable with today's inputs.
+- **Safety precondition (DOCA):** gate 2 runs only after gate 1 (`HomerDpuDmaHostMmapImportTeardownDrained`)
+  drained → DOCA in-flight == 0 for this setup's imports; no DOCA task references the cleared memory (round-2 C2
+  VERIFIED).
+- **Why abandon is safe as NOT-a-terminal (CORRECTED, round-2 C5):** finalize (`HomerServiceDpuResetSelectedSessionForClose`)
+  memsets only the **DPU-scheduler** `selectedSession`; it does **NOT** call `TupleSinkServiceResetSession`. The
+  RDMA `TupleSinkServiceSessionState` is a **separate** object that lingers and is reset later by its own lifecycle
+  (the T4 / peer-disconnect funnel → `TupleSinkServiceResetSession`), which clears its remote-terminal demand
+  (possibly *deferred* until command-mailbox writers quiesce) and lifetime. So the abandoned RDMA session's demand
+  is cleared **later**, not here. **DEPENDENCY (round-3 D, corrected from "never a leak"):** while it lingers with
+  `clientCommandsAwaitingTerminal>0` it keeps exact critical recv-CQ demand armed
+  (`remote_execution_peer_transport_rdma.c:~2102,~3141`) — wasted servicing for a dead command, **bounded by the
+  lifecycle reset (shutdown sweep / peer-disconnect) but unbounded if that reset stays deferred**; and reusing the
+  lingering session for a NEW command would trip the active-ticket double-mark `exit()` (`:~19963`). Both are safe
+  HERE only because this is **teardown** — the setup is being destroyed, so the session is reset by teardown and
+  never reused for a new command. ⇒ This abandon is correct on a genuine close/shutdown, **not** as a mid-life
+  command kill. A cross-node FAILED publish would be *wrong* (node A closing too).
+- **Stable event:** aggregate `HOMER_EVENT("alarm", "service", "close_drain_force_terminal", forced_sessions=…
+  cleared_items=…)` plus a per-session `close-drain ABANDONED … command_in_flight=… completion_events=…
+  publish_slots=… response_slots=… dispatch_slots=… egress_fifo=… last_sequence=…` breakdown line. A clean
+  acceptance run must NOT show these — their presence means a command genuinely wedged. Fires at most once per
+  closing-setup deadline (the abandon clears the state, so later passes find the sessions drained).
+
+**Only fires when a command is genuinely stuck**, so post-hang-fix it should never fire in a healthy run — a
+latent-outage backstop, not a hot path. **Adversarial review SETTLED after 3 rounds:** round 3 verified the
+functional logic (normal-path same-pass finalize, guard split, `*drained` semantics) directly in code; all
+remaining findings were *overstated claims in my comments* (not logic bugs) and were corrected to match what the
+review established — the accurately-scoped residuals (abnormal-path finalize skip, error-path deadline reuse under
+a same-client retry, lingering RDMA recv-demand bounded by teardown) are documented at their sites and above.
+**Owed: a build + the clean acceptance run** to certify it in a performance build.
+
+## Arena-unbind `LEAKED` alarm — VERDICT: COSMETIC (2026-07-20), alarm downgraded
+
+The recurring farnet1 teardown alarm `ALARM arena unbind found NO import … LEAKED … refused at the next bind`
+([`tuple_sink_service_process.c:22045`](../../../../../citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c))
+was traced end-to-end (code + retained farnet1 service log). **Both claims in the old wording are FALSE; it is a
+teardown ordering artifact, not a leak.**
+
+- `importFound==false` comes solely from `HomerDpuDmaFindArenaSlotImport` skipping a **non-submit-capable**
+  import — `HomerDpuDmaImportCanSubmit` (production DOCA build) requires `lifecycleState == ACTIVE`
+  ([`homer_service_dpu_dma.c:10295`](../../../../../citus-dbcomm/src/backend/distributed/utils/homer/homer_service_dpu_dma.c)).
+- At **every** arena-unbind call site the session is already tearing down, so the host-mmap import has normally
+  moved `ACTIVE → CLOSING` (first hiding transition, `HomerDpuDmaBeginHostMmapImportTeardown` `:10577`) → later
+  `HOST_DETACHED` (`HomerDpuDmaDetachHostMmapForClose` `:10711`), **or** was full-freed by a stale-export/fatal
+  retire — *before* the unbind runs. The import lifecycle, not this unbind, owns the ring + role-5 stamp teardown.
+- **"LEAKED" is false:** reclaim (`HomerDpuDmaReclaimDetachedImports → HomerDpuDmaClearHostMmapImport` `:10851`)
+  frees the whole `ringRuntime`/descriptor arrays, so the binding + role-5 stamp cease to exist.
+- **"refused at next bind" is false across generations:** a new frontend agent mints a new `bridgeGeneration`
+  with a fresh `calloc`'d `ringRuntime`, and arena lookup keys on exact generation. (A *within-generation* stale
+  full binding WOULD block a slot — but the alarm can't establish that, since its lookup found no ACTIVE import.)
+- **Retained-log evidence:** the one raw instance found (session 1, slot 0, gen `2534147404959863`) followed a
+  real stale-export/fatal teardown that had already *fully retired* the same-generation imports — not a normal
+  detach. So even that instance leaked nothing.
+- **A genuine leak** (a detached import whose reclaim never converges) surfaces separately as the
+  `host mmap import table is full` capacity failure, not here.
+
+**Action taken:** `fix only if structural` → it's cosmetic, so **no functional change.** But the alarm *lied*,
+and a lying diagnostic is worse than none (this verdict cost a full subagent trace), so the message was
+**downgraded to a bounded NOTE** that accurately says a missing ACTIVE import at teardown is expected. Refuted my
+own first hypothesis along the way: it is **not** simply "detach-before-unbind" — the first hiding transition is
+`ACTIVE→CLOSING`, and the observed instance was a fatal/stale-export full-retire.
 
 ## Consequences beyond this workload
 

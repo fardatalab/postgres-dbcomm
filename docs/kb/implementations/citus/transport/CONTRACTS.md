@@ -447,6 +447,33 @@ the call site. If it is not on the list, **it has not been checked.**
   (never hands out a deferred slot); `TupleSinkServiceHandleCloseSession` (`:~41762`) keeps its SUCCESS response on
   `DEFERRED` (does NOT convert to ERROR — §36.2); `main()`'s shutdown sweep and every other caller may ignore it.
 
+---
+
+## arena unbind `importFound == false` at teardown — **COSMETIC, NOT a leak. The alarm was downgraded.**
+
+*(`HomerDpuDmaUnbindRingSession` out-param, consumed at `tuple_sink_service_process.c:~22045`; the arena-slot
+release the T4/reset/spawn-rollback paths call.)*
+
+- **MEANS:** the unbind found no **submit-capable** import for `(dpuArenaBridgeGeneration, slot)` —
+  `HomerDpuDmaFindArenaSlotImport` requires `HomerDpuDmaImportCanSubmit`, which in the DOCA build requires
+  `lifecycleState == ACTIVE` (`homer_service_dpu_dma.c:10295`). At every arena-unbind call site the session is
+  already tearing down, so the host-mmap import has normally moved `ACTIVE → CLOSING → HOST_DETACHED` (or was
+  full-freed by a stale-export/fatal retire) FIRST. **The import lifecycle, not this unbind, owns the ring +
+  role-5 stamp teardown.**
+- **⛔ DOES NOT MEAN "the ring binding + role-5 stamp LEAKED, and the slot will be refused at the next bind."** Both
+  halves are FALSE — the exact wording the alarm used to print, and the reason it was downgraded to a `NOTE`
+  (2026-07-20). Reclaim (`HomerDpuDmaClearHostMmapImport`, `:10851`) frees the whole `ringRuntime`/descriptor
+  arrays, so nothing leaks; and a new generation gets a fresh `calloc`'d `ringRuntime` with exact-generation
+  lookup, so no next-bind refusal ACROSS generations. (A *within-generation* stale full binding WOULD block a
+  slot — but `importFound==false` cannot establish that condition.)
+- **A GENUINE leak** (a detached import whose reclaim never converges) surfaces separately as the
+  `host mmap import table is full` capacity failure — NOT here.
+- **ENFORCES:** the downgraded `NOTE` at `:~22045`. Do not re-escalate it to an ALARM without first proving a
+  case where the import is missing OUTSIDE a teardown/reclaim/retire that already owns the rings. Full verdict +
+  retained-log evidence in
+  [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md)
+  ("Arena-unbind `LEAKED` alarm — VERDICT: COSMETIC").
+
 ## `streamEntry->stream.peerResetAfterCleanClose` — **ONCE CLEAN, ALWAYS CLEAN**
 
 - **MEANS:** the owner asked for a **clean close**, and stamped that decision **onto the stream itself**.
@@ -1213,11 +1240,40 @@ server's `closeFinalizeCallback` = `HomerServiceDpuResetSelectedSessionForClose`
   `SelectedSessionCloseWorkDrained` returns true — and then let this finalizer run on a genuinely-drained session.
 - **ENFORCES:** the `!sessionDrained` error arm at `:43807`; its two callers
   (`...ForClosingSetup` finalize `:44018`, and `:46668`). Any future "force close after deadline" MUST route
-  through a command-terminalization step, not around it.
-- **STATUS (2026-07-20):** discovered while designing the close-drain blast-radius fix (Option A). The fix is
-  HELD pending the connection-reuse hang trace; design + rationale in
+  through a command-drain-convergence step, not around it.
+- **STATUS (2026-07-20): the deadline fix LANDED and routes through the drain exactly as this entry requires** —
+  see `HomerServiceDpuForceTerminalizeSelectedSessionCommandState` below.
+
+---
+
+## `HomerServiceDpuForceTerminalizeSelectedSessionCommandState()` — **close-drain best-effort ABANDON; makes the drain CONVERGE, never bypasses the finalizer**
+
+*(`tuple_sink_service_process.c`; called from `HomerServiceDpuClosingSetupSemanticDrained` (gate-2 close-drain
+callback) on a wall-clock deadline. Constant `HOMER_SERVICE_DPU_CLOSE_DRAIN_FORCE_DEADLINE_NS` = 10 s.)*
+
+- **MEANS:** when a command never completes, a single-client setup's close-drain wedges forever (total setup
+  outage). On the deadline this ABANDONS the stuck command's **DPU-scheduler** state — clears `commandInFlight` +
+  `inFlightCommand*`, zeroes the completion-event ring DIRECTLY, frees matching `backendCommandPublish` /
+  `pendingResponse` / `stagedCommandDispatch` slots, tombstones the `peerCommandEgress` FIFO entry — so
+  `HomerServiceDpuSelectedSessionCloseWorkDrained` returns true and the DRAIN-ASSUMING finalizer above runs
+  UNCHANGED. It is the "make the drain converge, then let the finalizer run" step the entry above demands.
+- **⛔ DOES NOT MEAN "a real terminal completion."** It emits **no** FAILED completion and runs **none** of the
+  terminal bookkeeping (no remote-terminal-demand clear, no lifetime advance). It clears ONLY DPU-scheduler state;
+  the RDMA `TupleSinkServiceSessionState` is a separate object reset later by its own lifecycle. **⇒ Correct ONLY
+  at genuine close/shutdown** (session destroyed, never reused) — NOT a mid-life command kill (a reused RDMA
+  session would trip the active-ticket double-mark `exit()`).
+- **⛔ FIRES ONLY UNDER `payloadDrained`.** The callback evaluates payload drain FIRST and abandons only when
+  command state is the SOLE remaining blocker, so the callback returns fully-drained on the same pass and finalize
+  memsets immediately — this ordering is what closes the late-completion / re-fire / disarm-skip windows. Do NOT
+  reorder the abandon before the payload check.
+- **ENFORCES:** its return counts ONLY `CloseWorkDrained`-relevant clears (NOT FIFO tombstones), so the caller's
+  "cleared nothing but not drained" coverage alarm cannot be masked. **Any new `CloseWorkDrained` input MUST also
+  be cleared here** — otherwise that alarm fires and the close waits. Stable event
+  `HOMER_EVENT(...event=close_drain_force_terminal...)`; its ABSENCE is the per-run proof no command wedged.
+- **STATUS (2026-07-20): LANDED, settled after 3 adversarial-review rounds.** Full design + accurately-scoped
+  residuals in
   [`dpu_collector_admission_starvation_mixed_workload.md`](./dpu_collector_admission_starvation_mixed_workload.md)
-  ("Deferred fix: close-drain blast radius").
+  ("Close-drain blast radius fix"). Owes only the clean acceptance run to certify in a perf build.
 
 ---
 
