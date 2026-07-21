@@ -722,9 +722,12 @@ in `remote_execution_peer_transport_rdma.h` is the consumer's cap. The two are O
 - **DIAGNOSTIC:** `HOMER_RECV_LIVENESS_DROP_DIAG=1` emits bounded first-8-then-every-1024th
   `[recv-liveness-drop] conn_idx=... conn_gen=... class=... n=...` records at the liveness budget refusal
   (`tuple_sink_service_process.c:92`, `:13063`). It is default-off and does not alter refusal behavior.
-- **STATUS (2026-07-20):** implemented; both DPU-service translation units pass compile-database
-  `gcc -fsyntax-only` with the diagnostic OFF and ON. The non-pre-armed `SCALE=150` mixed acceptance workload has
-  not yet run, so runtime correctness remains unproven.
+- **STATUS (2026-07-20): IMPLEMENTED AND VALIDATED.** The mixed workload PASSES on the deterministic-hang recipe
+  (non-pre-armed `-c4` `SCALE=150`, 118 s overlap): gate 8000/8000, basebackup 25.6 GB / 48,828 laps, zero
+  `BOUND BUT NEVER ARMED`. Positive mechanism confirmation: all 4 foreground result connections
+  (`conn_gen=3-6`) now cross `F2 recv-arm → F3 op-completed → F4 owner-consumed` — the exact frontier that was
+  dead in the reproduced-hang run. A clean NON-diagnostic acceptance run is still owed to certify the
+  performance build (Rule 6: the diag builds are sticky).
 
 ## `HOMER_DPU_BYTE_RING_SLOTS_PER_REGION` / `HOMER_DPU_BYTE_RING_POOL_REGIONS` — **the DPU byte-ring slot budget, and HOW TO DERIVE IT for a concurrency target**
 

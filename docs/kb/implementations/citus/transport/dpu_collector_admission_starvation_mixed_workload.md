@@ -2,15 +2,25 @@
 
 <!-- kb-summary: The mixed pgbench+basebackup hang is localized to a budget-starved foreground recv-CQ OPEN response; Option B exact recv demand is implemented and syntax-verified, with non-pre-armed SCALE=150 hardware validation still pending. -->
 
-**Status (2026-07-20, LATE): REPRODUCED + LOCALIZED to F1→F2. The response is POSTED but farnet1 NEVER
-RECV-PROCESSES it on the outgoing FOREGROUND result connections.**
-- **IMPLEMENTATION STATUS (2026-07-20): Option B is implemented and statically verified; hardware validation is
-  NOT YET RUN.** `payloadOpensAwaitingResponse` now arms the shared generation-bearing exact-demand bitmap from
-  service-result OPEN publish through every WAIT exit/reset (`remote_execution_peer_transport_rdma.c:1259`,
-  `:3200`, `:3252`; `tuple_sink_service_process.c:40309`, `:41546-41594`). The exact action is enumerated from
-  the shared aggregate count and now actually bypasses the six-collector budget
-  (`tuple_sink_service_process.c:13005`, `:48130`). Both service translation units pass the compile-database
-  `gcc -fsyntax-only` flags with the diagnostic OFF and with `HOMER_RECV_LIVENESS_DROP_DIAG=1`.
+**Status (2026-07-20, RESOLVED): THE MIXED-WORKLOAD HANG IS FIXED AND VALIDATED.** Option B (exact recv demand
+for foreground service-result peer-opens, citus `947b7692a`) PASSES the mixed workload on the exact recipe that
+DETERMINISTICALLY HUNG — with positive mechanism confirmation.
+- **VALIDATION (candidate-20260720, citus `947b7692a`, non-pre-armed `-c4`, `SCALE=150`, 118 s proven overlap):**
+  gate **8000/8000** / 0 failed; basebackup **25.6 GB / 48,828 ring laps**; frontier/teardown/alarm checks all
+  green; **ZERO `BOUND BUT NEVER ARMED`** on either DPU; no `kind=6 seq=5` timeout. Verified from raw logs
+  myself.
+- **POSITIVE MECHANISM CONFIRMATION (the reason this pass is trustworthy, unlike the pre-armed causation run):**
+  all 4 FOREGROUND result connections (`conn_gen=3,4,5,6` on farnet1) now show the full `F2 recv-arm → F3
+  op-completed` chain plus 4 `F4 owner-consumed` — the SAME connections that got NO F2/F3/F4 at all in the
+  reproduced-hang run. The previously-dead F1→F2 frontier now crosses through to F4. The fix works BY THE
+  MECHANISM, not by symptom absence.
+- **IMPLEMENTATION (citus `947b7692a`):** `payloadOpensAwaitingResponse` arms the shared generation-bearing
+  exact-demand bitmap from service-result OPEN publish through every WAIT exit/reset
+  (`remote_execution_peer_transport_rdma.c:1259`,`:3200`,`:3252`; `tuple_sink_service_process.c:40309`,
+  `:41546-41594`); the exact action enumerates from the shared aggregate count and is budget-free
+  (`tuple_sink_service_process.c:13005`,`:48130`). Reviewed adversarially + verified.
+- **REMAINING:** a clean NON-diagnostic acceptance run (Rule 6 — the diag builds are sticky; prove
+  `resp-deliv`/`mailbox-diag`/`starve-diag`/revert strings absent) to certify the performance build.
 - **REPRODUCTION RECIPE FOUND:** non-pre-armed launch order **+ `SCALE=150`** (a DB big enough that the basebackup
   sustains a real transfer window). `SCALE=1` is why the prior three runs passed — the basebackup finished before
   any overlap. Candidate `candidate-20260720-190749`, citus `99aa04a42`, gate `-c4`: all 4 clients time out on
