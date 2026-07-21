@@ -30,6 +30,65 @@ standalone scheduler actions when the code has a clean owner/ref boundary. The
 plan below treats that cleanup as a required milestone, not as an optional
 future possibility.
 
+## Motivating incidents — the two starvation bugs this design prevents (2026-07-20)
+
+Two mixed-workload hangs in one debugging session were the **same** structural
+failure: correctness-critical work starved by the flat, append-order collector
+budget (`HOMER_SERVICE_MACHINE_BASELINE_MAX_COLLECTOR_GRANTS = 6`), which the
+current scheduler can protect only by bolting on per-site bypasses. They are the
+canonical instances of the two failure modes the class model exists to make
+*unreachable*. (Full investigation:
+[`../../implementations/citus/transport/dpu_collector_admission_starvation_mixed_workload.md`](../../implementations/citus/transport/dpu_collector_admission_starvation_mixed_workload.md).)
+
+**Incident 1 — class-admission starvation (fix citus `6392a1853`).** Peer
+control-mailbox actions are enumerated up to 8 but the planner keeps only
+`HOMER_CONTROL_MAILBOX_ACTIONS_PER_PASS = 2`, walked in strict traffic-class
+priority with no rotation. Over 4 classes, "strict priority" silently meant lower
+classes (`FOREGROUND`) *never* ran while `CRITICAL` stayed busy — and the
+truncation happened **before** budget accounting, so no drop counter fired.
+- Failure mode **(a): a hard class crowded out by a soft one.**
+- `primaryClass`: the foreground control mailbox is `FOREGROUND_PAYLOAD` /
+  `DEMANDED_OBSERVATION`; it lost to `CRITICAL_CONTROL` purely because admission
+  was **order, not class**.
+- Patch produced: a per-class rotation cursor + "one action per class per pass"
+  (`TupleSinkServiceAppendReadyControlMailboxActionsRdma`).
+
+**Incident 2 — recv-CQ liveness silent drop (fix citus `947b7692a`; the deeper
+one).** A gate's `FOREGROUND` service-result peer-open publishes, the peer posts
+the OPEN response, but the requester never recv-processes it. The **only** path
+that discovers foreground payload recv WIMMs is the recv-CQ liveness action
+([`HomerServiceMachineBaselineAppendRecvCqLivenessAction`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c)),
+which competes for the same 6-collector budget and is **silently dropped** when
+full (`return true`, no diagnostic). A waiting `STREAM_WAIT_PEER_OPEN` op had *no*
+demand-driven recv poll — the machine-baseline peer collector bundle is only
+`PEER_CM_SETUP` + `PEER_CLOSE_LIFETIME`. `CRITICAL` had an exact-demand recv path;
+`FOREGROUND` had none.
+- Failure mode **(b): a must-run observation with no demand path.**
+- `primaryClass`: a waiting op's recv poll is `DEMANDED_OBSERVATION` — it unblocks
+  a waiting machine — and should be reserved by class.
+- Patch produced: extend the critical exact-demand bitmap to foreground
+  (`payloadOpensAwaitingResponse`) and make the exact append budget-free.
+
+**Why these matter to this design.** Both patches are local answers to *"who else
+must bypass the shared cap?"*, invisible to each other — which is why the *N*th
+workload finds the *N+1*th starvation. In the target model each is **one line at
+candidate construction**: incident 1's mailbox action is a
+`DEMANDED_OBSERVATION`/`FOREGROUND_PAYLOAD` candidate with a class reservation;
+incident 2's recv poll is a `DEMANDED_OBSERVATION` candidate raised by the waiting
+op. Neither can be silently dropped — hard classes are reserved (see "Fixed
+unified policy order"), and any refusal is **overflow debt with a counter**, not
+`return true`. **Slice 3's concrete acceptance criterion is that both of these
+patches dissolve into class reservations** — the reserved-lifecycle admission, the
+exact-demand bitmaps, and the mailbox rotation cursor should all *disappear*, not
+be ported.
+
+**The diagnostic lesson, made structural.** Incident 2 was invisible for a full
+validation run because the drop emitted no counter — it cost a dozen refuted
+hypotheses to localize. The design rule *"record overflow counters by action kind
+and class from the first implementation"* (see "Candidate slate and overflow
+semantics") is not garnish: it is the property that turns a silent multi-day hang
+into a one-pass observation. **No budget refusal may be a silent `return true`.**
+
 ## Key code pointers
 
 - [`HomerProgressActionKind`](/data/dbcomm/citus-dbcomm/src/backend/distributed/utils/homer/tuple_sink_service_process.c:1519) already names most action families, but still contains finer payload actions and peer-control actions that should be regrouped as aggregate candidates.
@@ -331,6 +390,51 @@ classes in this prototype; they should have hard reservations from the beginning
 
 Bulk throughput is preserved by grant sizing and spillover, not by allowing bulk
 to crowd out terminal visibility or resource relief.
+
+### Reservation, sizing, and eliminating the dangerous knob (proposed refinement)
+
+"Reservation" means guaranteeing per-pass action slots to a class regardless of
+other classes' demand; "sizing" is choosing those counts. The per-pass cap exists
+only because the service is a single-threaded busy-poll loop that must **revisit**
+all work at bounded latency — a pass cannot do unbounded work or every other class
+waits a whole pass. The cap is a revisit budget, not a memory limit.
+
+Reservation *counts* are a dangerous knob: under-size a hard class and it silently
+starves (this is exactly what both 2026-07-20 incidents were); over-size and bulk
+collapses. **The proposal is to eliminate the reservation-count knob entirely,
+using the structure both incidents share** — not to add a smarter tuner for it.
+
+The lever is the `COLLECT`/`OBSERVE` vs `ADVANCE` split this plan already draws
+(see "First-slice action set"). Both starvation bugs were on the OBSERVE half — a
+recv poll / a mailbox drain that only makes a response *fact* visible:
+
+- **Correctness-critical OBSERVE demand is structurally bounded and cheap.** At
+  most one recv poll per *waiting* op (bounded by the 64-entry async-op table),
+  one mailbox drain per connection. So do not reserve `N` slots for it — **admit
+  all of it exhaustively every pass.** The bound comes from the workload's own
+  fixed table sizes, so there is no count to tune.
+- **Only unbounded work needs a size clamp.** A `BULK_PAYLOAD`/`ADVANCE` action
+  can post arbitrarily many WRs per pass, so it keeps a grant *size* clamp
+  (`maxBytes`/`maxWrs`). But that clamp is a **throughput/latency tradeoff whose
+  worst case is "slower," never "hung"** — a safe knob, adaptive later (Slice 9).
+- **Degenerate safety.** If exhaustive OBSERVE demand ever overflows a pass,
+  overflow debt makes it visible and self-correcting (see overflow semantics) —
+  never silent.
+
+⇒ The reservation model becomes **"admit all bounded cheap OBSERVE demand
+exhaustively; clamp only unbounded BULK by size,"** *not* "reserve N control slots
+vs M bulk slots." This deletes reservation-count sizing for exactly the classes
+both incidents starved, and leaves only a size clamp that cannot cause a hang.
+
+Preconditions to confirm before adopting this as the reservation rule (each is a
+counter, not an assertion):
+- Exhaustive OBSERVE cost per pass stays small under maximum concurrency (e.g. all
+  64 async-op slots waiting) — measure mostly-empty CQ-poll cost per pass.
+- The `COLLECT`/`ADVANCE` boundary is real: an OBSERVE action must only arm facts,
+  never do the expensive follow-up work (that is a separate `ADVANCE` candidate
+  which *may* be bounded, but with debt-not-silence).
+- Any hard class whose per-action cost is genuinely expensive *and* high-count
+  still needs a per-pass bound — but with overflow debt, never a silent drop.
 
 ## Egress migration
 
@@ -877,7 +981,7 @@ peer-control ownership boundaries are cleaner after each staged split
 ## Open questions / TODO
 
 - Choose the first concrete `HomerGrantVector` field names and whether it replaces or wraps `HomerProgressGrant` during migration.
-- Decide the initial candidate slate size and hard reservation counts. Start with a small value, but record overflows before tuning.
+- Decide the initial candidate slate size and hard reservation counts. Start with a small value, but record overflows before tuning. **First evaluate the "eliminate the reservation-count knob" refinement** (see "Reservation, sizing, and eliminating the dangerous knob"): if bounded cheap OBSERVE demand is admitted exhaustively, there may be no hard-reservation *count* to choose at all — only a bulk size clamp. Confirm the per-pass exhaustive-OBSERVE cost first.
 - Define lane/CQ owner refs for the first standalone `DRAIN_SEND_CQ` implementation.
 - Decide whether peer request publication remains inside peer transport until connection readiness is explicit, or becomes an op-owned bounded step sooner.
 - Add a control-completion callback or document why RDMA-layer internal control retirement is safe under lane-owned `DRAIN_SEND_CQ`.
